@@ -233,3 +233,10 @@ struct llama_split_tensor {
 
 void  llama_decode_reset();
 void  llama_decode_stop();
+
+// 2026-05-26: ported from mainline am17an branch (commit 8ea2990).
+// Tensor name prefixes used to mark fused Gated Delta Net (GDN) outputs in
+// the compute graph, so the sched_reserve() probe can detect device-mismatch
+// and fall back to the sequential path when the chunked kernel can't be used.
+#define LLAMA_TENSOR_NAME_FGDNAR "__fgdnar__"
+#define LLAMA_TENSOR_NAME_FGDNCH "__fgdnch__"

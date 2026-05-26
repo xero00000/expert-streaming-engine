@@ -6685,6 +6685,11 @@ struct llama_context * llama_init_from_model(
     cparams.grouped_expert_routing = params.grouped_expert_routing;
     cparams.fused_up_gate    = params.fused_up_gate;
     cparams.fused_mmad       = params.fused_mmad;
+    // 2026-05-26: chunked GDN port scaffolding. Defaults: false (existing
+    // sequential kernel path stays active). Real activation via runtime probe
+    // and CLI flags (added in later port steps).
+    cparams.fused_gdn_ar     = false;
+    cparams.fused_gdn_ch     = false;
     cparams.rope_cache       = params.rope_cache;
     cparams.graph_reuse      = params.graph_reuse;
     cparams.k_cache_hadamard = params.k_cache_hadamard;

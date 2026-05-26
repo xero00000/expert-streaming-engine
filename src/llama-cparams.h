@@ -37,6 +37,13 @@ struct llama_cparams {
     bool grouped_expert_routing;
     bool fused_up_gate;
     bool fused_mmad;
+    // 2026-05-26: ported from mainline am17an branch (commit 8ea2990).
+    // fused_gdn_ar = use the existing sequential auto-regressive GDN kernel (decode)
+    // fused_gdn_ch = use the chunked CUDA prefill kernel for Gated Delta Net.
+    // Both default to false here; activation is determined at runtime by
+    // llama-context sched_reserve() probe and CLI flags.
+    bool fused_gdn_ar;
+    bool fused_gdn_ch;
     bool rope_cache;
     bool graph_reuse;
     bool k_cache_hadamard;
