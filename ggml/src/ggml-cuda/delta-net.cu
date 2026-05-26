@@ -342,7 +342,14 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         fflush(stderr);
         if (n_tokens > 1) _logged_pref = true; else _logged_dec = true;
     }
-    if (will_chunk) {
+    // 2026-05-26: extra n_tokens >= 64 gate. The chunked kernel internally
+    // uses CS=64 chunk size. When n_tokens < 64, n_full=0 and the kernel
+    // falls through to its OWN sequential fallback (am17an's
+    // launch_gated_delta_net) which has DIFFERENT output-layout expectations
+    // than ik_llama.cpp's delta_net_recurrent_f32. That mismatch corrupts
+    // downstream flash-attention. Only fire chunked when actual chunked
+    // work happens (n_chunks = n_tokens/64 >= 1).
+    if (will_chunk && n_tokens >= 64) {
         delta_net_chunk(ctx, dst);
         return;
     }
