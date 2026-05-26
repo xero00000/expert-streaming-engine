@@ -10052,7 +10052,12 @@ struct ggml_tensor * ggml_delta_net(
 
     GGML_ASSERT(k->ne[0] == S_k && k->ne[1] == n_tokens && k->ne[2] == H_k && k->ne[3] == n_seqs);
     GGML_ASSERT(v->ne[1] == n_tokens && v->ne[3] == n_seqs);
-    GGML_ASSERT(g->ne[0] == n_tokens && g->ne[1] == 1 && g->ne[2] == H_v && g->ne[3] == n_seqs);
+    // 2026-05-26: relaxed g check to accept either legacy [n_tokens, 1, H_v, n_seqs]
+    // OR aligned-with-beta [1, n_tokens, H_v, n_seqs] layout. Memory layout is
+    // identical in both cases — only the ggml shape interpretation differs.
+    GGML_ASSERT(((g->ne[0] == n_tokens && g->ne[1] == 1) ||
+                 (g->ne[0] == 1 && g->ne[1] == n_tokens)) &&
+                g->ne[2] == H_v && g->ne[3] == n_seqs);
     GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == n_tokens && beta->ne[2] == H_v && beta->ne[3] == n_seqs);
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v * H_v && state->ne[2] == 1 && state->ne[3] == n_seqs);
     //GGML_ASSERT(H_k == H_v);

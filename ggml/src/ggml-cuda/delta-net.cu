@@ -264,7 +264,14 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // V: [head_dim, n_tokens, n_heads, n_seqs]
     GGML_ASSERT(src2->ne[0] == head_dim && src2->ne[1] == n_tokens && src2->ne[2] == n_heads && src2->ne[3] == n_seqs);
     // G: [n_tokens, 1, n_heads, n_seqs]
-    GGML_ASSERT(src3->ne[0] == n_tokens && src3->ne[1] == 1 && src3->ne[2] == n_heads && src3->ne[3] == n_seqs);
+    // 2026-05-26: g accepted in either [n_tokens, 1, n_heads, n_seqs] (sequential
+    // legacy) or [1, n_tokens, n_heads, n_seqs] (matches beta, unblocks chunked).
+    // Memory layout is identical; only the ggml shape interpretation differs.
+    // Both paths through this function use g_stride_batch = n_tokens * n_heads
+    // and index via [t * n_heads] — that math is unaffected by which dim is 1.
+    GGML_ASSERT(((src3->ne[0] == n_tokens && src3->ne[1] == 1) ||
+                 (src3->ne[0] == 1 && src3->ne[1] == n_tokens)) &&
+                src3->ne[2] == n_heads && src3->ne[3] == n_seqs);
     // Beta: [1, n_tokens, n_heads, n_seqs]
     GGML_ASSERT(src4->ne[0] == 1 && src4->ne[1] == n_tokens && src4->ne[2] == n_heads && src4->ne[3] == n_seqs);
     // State: [head_dim, head_dim*n_heads, 1, n_seqs]

@@ -109,15 +109,14 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     cb(state,"state_in", il);
 
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-    // 2026-05-26: kept original g permute (2,0,3,1) — see note below.
-    // Tried changing g to [1, n_tokens, n_heads, n_seqs] (matching beta) to
-    // unblock the chunked kernel, but the change cascades into 3 separate
-    // shape assertions in ggml.c, ik_llama's delta-net.cu, AND beyond. Each
-    // place hardcodes the legacy [n_tokens, 1, n_heads, n_seqs] shape. For
-    // now we keep the old shape so chunked stays dormant; the dispatch in
-    // delta-net.cu falls back to the sequential path. Future port work:
-    // either (a) update all ggml/ik_llama shape checks consistently, or
-    // (b) extend the chunked kernel to handle the [n_tokens, 1, ...] layout.
+    // 2026-05-26: kept original (2,0,3,1) g permute → [n_tokens, 1, H_v, n_seqs].
+    // An attempt to align with beta's [1, n_tokens, ...] layout via (0,2,3,1)
+    // hit a runtime assertion failure — the actual pre-permute g shape isn't
+    // what the inverse-permute math from beta predicts (g and beta come from
+    // different paths through build_beta_gate, so they don't share source
+    // shape). Resolving requires either instrumented trace prints or static
+    // analysis through build_beta_gate's branches. Deferred. Chunked path
+    // remains dormant (delta-net.cu dispatch falls through to sequential).
     g = ggml_permute(ctx0, g, 2, 0, 3, 1);
     beta = ggml_permute(ctx0, beta, 2, 0, 1, 3);
 
