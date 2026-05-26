@@ -354,30 +354,61 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     if (!_enable_path_c || kda || n_tokens < 64 || head_dim != 128 || src6 != nullptr) {
         // Path C disabled or doesn't meet preconditions; fall through to sequential.
     } else {
-        ggml_tensor * src3_mut = dst->src[3];  // non-const access for override
-        int64_t saved_ne[4];
-        size_t  saved_nb[4];
+        // Path C EXTENDED 2026-05-26: ik_llama.cpp builds q/k/v with shape
+        // [S_v, n_tokens, H, n_seqs] (tokens at dim 1, heads at dim 2). am17an's
+        // chunked kernel reads them assuming [S_v, H, n_tokens, n_seqs] (heads
+        // at dim 1, tokens at dim 2). Underlying memory is the same — just
+        // swap each tensor's nb[1]↔nb[2] and ne[1]↔ne[2] so the kernel's stride
+        // math indexes the data correctly. Also swap g (override with beta's
+        // metadata since they share memory layout already). Restore everything
+        // before returning so the next sequential call sees the original.
+        ggml_tensor * src_q_mut = dst->src[0];
+        ggml_tensor * src_k_mut = dst->src[1];
+        ggml_tensor * src_v_mut = dst->src[2];
+        ggml_tensor * src_g_mut = dst->src[3];
+
+        int64_t saved_q_ne[4], saved_k_ne[4], saved_v_ne[4], saved_g_ne[4];
+        size_t  saved_q_nb[4], saved_k_nb[4], saved_v_nb[4], saved_g_nb[4];
         for (int i = 0; i < 4; i++) {
-            saved_ne[i] = src3_mut->ne[i];
-            saved_nb[i] = src3_mut->nb[i];
+            saved_q_ne[i] = src_q_mut->ne[i]; saved_q_nb[i] = src_q_mut->nb[i];
+            saved_k_ne[i] = src_k_mut->ne[i]; saved_k_nb[i] = src_k_mut->nb[i];
+            saved_v_ne[i] = src_v_mut->ne[i]; saved_v_nb[i] = src_v_mut->nb[i];
+            saved_g_ne[i] = src_g_mut->ne[i]; saved_g_nb[i] = src_g_mut->nb[i];
         }
-        // Overlay beta's shape + strides onto g (same data buffer, new labels).
+
+        // q/k/v: swap ne[1] ↔ ne[2] and nb[1] ↔ nb[2]
+        std::swap(src_q_mut->ne[1], src_q_mut->ne[2]);
+        std::swap(src_q_mut->nb[1], src_q_mut->nb[2]);
+        std::swap(src_k_mut->ne[1], src_k_mut->ne[2]);
+        std::swap(src_k_mut->nb[1], src_k_mut->nb[2]);
+        std::swap(src_v_mut->ne[1], src_v_mut->ne[2]);
+        std::swap(src_v_mut->nb[1], src_v_mut->nb[2]);
+
+        // g: overlay beta's metadata (same data layout, relabeled).
         for (int i = 0; i < 4; i++) {
-            src3_mut->ne[i] = src4->ne[i];
-            src3_mut->nb[i] = src4->nb[i];
+            src_g_mut->ne[i] = src4->ne[i];
+            src_g_mut->nb[i] = src4->nb[i];
         }
+
         static bool _logged_c = false;
         if (!_logged_c) {
-            fprintf(stderr, "[CHUNKED-PATH-C] engaging at n_tokens=%ld with g/beta nb=[%ld %ld %ld %ld]\n",
-                    n_tokens, src3_mut->nb[0], src3_mut->nb[1], src3_mut->nb[2], src3_mut->nb[3]);
+            fprintf(stderr, "[CHUNKED-PATH-C] engaging at n_tokens=%ld\n", n_tokens);
+            fprintf(stderr, "  q post-override ne=[%ld %ld %ld %ld] nb=[%ld %ld %ld %ld]\n",
+                src_q_mut->ne[0], src_q_mut->ne[1], src_q_mut->ne[2], src_q_mut->ne[3],
+                src_q_mut->nb[0], src_q_mut->nb[1], src_q_mut->nb[2], src_q_mut->nb[3]);
+            fprintf(stderr, "  v post-override ne=[%ld %ld %ld %ld] nb=[%ld %ld %ld %ld]\n",
+                src_v_mut->ne[0], src_v_mut->ne[1], src_v_mut->ne[2], src_v_mut->ne[3],
+                src_v_mut->nb[0], src_v_mut->nb[1], src_v_mut->nb[2], src_v_mut->nb[3]);
             fflush(stderr);
             _logged_c = true;
         }
         delta_net_chunk(ctx, dst);
-        // Restore g's original metadata so any subsequent inspection is sane.
+        // Restore everything
         for (int i = 0; i < 4; i++) {
-            src3_mut->ne[i] = saved_ne[i];
-            src3_mut->nb[i] = saved_nb[i];
+            src_q_mut->ne[i] = saved_q_ne[i]; src_q_mut->nb[i] = saved_q_nb[i];
+            src_k_mut->ne[i] = saved_k_ne[i]; src_k_mut->nb[i] = saved_k_nb[i];
+            src_v_mut->ne[i] = saved_v_ne[i]; src_v_mut->nb[i] = saved_v_nb[i];
+            src_g_mut->ne[i] = saved_g_ne[i]; src_g_mut->nb[i] = saved_g_nb[i];
         }
         return;
     }
