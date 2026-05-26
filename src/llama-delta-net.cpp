@@ -109,33 +109,10 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     cb(state,"state_in", il);
 
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-    // 2026-05-26: kept legacy g permute (2,0,3,1) → [n_tokens, 1, H_v, n_seqs].
-    //
-    // FUNDAMENTAL BLOCKER FOR THE CHUNKED PORT (full notes in port_plan.md):
-    // The chunked CUDA kernel requires g and beta to have matching MEMORY
-    // layouts. ik_llama.cpp's qwen3next builder gives them different layouts
-    // and ik's sequential `delta_net_recurrent_f32` reads them with HAND-
-    // CODED stride math (`g_ptr[t * n_heads]` assumes heads are 1 float
-    // apart in memory).
-    //
-    // If we ggml_cont() g into a layout that matches beta, the SEQUENTIAL
-    // kernel breaks because heads are no longer 1 float apart — the kernel's
-    // hardcoded indexing reads wrong bytes from g, corrupting outputs that
-    // eventually crash downstream flash-attention.
-    //
-    // To unblock chunked engagement, one of these must happen:
-    //   (A) Rewrite the sequential kernel to use ggml-derived strides
-    //       (nbb1, nbb2 etc.) instead of hardcoded stride math. Multi-day.
-    //   (B) Extend the chunked kernel to read g/beta with separate stride
-    //       pointers. Multi-day; touches ~800 LOC of am17an's kernel.
-    //   (C) Add a single CUDA kernel that permutes g's memory layout to
-    //       match what the chunked kernel expects, JUST before the chunked
-    //       call, then discard the permuted copy. Adds a small allocation
-    //       and memcpy per layer but minimal code change. Probably the
-    //       safest first attempt.
-    //
-    // For now, kept legacy permute so the sequential kernel works as
-    // before. Chunked dispatch remains dormant (stride check fails).
+    // 2026-05-26 PATH C: kept legacy g permute (2,0,3,1). The sequential
+    // kernel works as before. The chunked path is enabled by metadata
+    // override at the CUDA dispatch (in delta-net.cu) — same data, beta's
+    // strides applied to g just before delta_net_chunk(), restored after.
     g = ggml_permute(ctx0, g, 2, 0, 3, 1);
     beta = ggml_permute(ctx0, beta, 2, 0, 1, 3);
 

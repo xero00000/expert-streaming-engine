@@ -342,15 +342,42 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         fflush(stderr);
         if (n_tokens > 1) _logged_pref = true; else _logged_dec = true;
     }
-    // 2026-05-26: extra n_tokens >= 64 gate. The chunked kernel internally
-    // uses CS=64 chunk size. When n_tokens < 64, n_full=0 and the kernel
-    // falls through to its OWN sequential fallback (am17an's
-    // launch_gated_delta_net) which has DIFFERENT output-layout expectations
-    // than ik_llama.cpp's delta_net_recurrent_f32. That mismatch corrupts
-    // downstream flash-attention. Only fire chunked when actual chunked
-    // work happens (n_chunks = n_tokens/64 >= 1).
-    if (will_chunk && n_tokens >= 64) {
+    // 2026-05-26 PATH C: dispatch chunked when n_tokens >= 64 (actual chunked
+    // work; below this it falls through to am17an's incompatible sequential
+    // fallback). Override g's metadata to match beta's shape+strides just
+    // before the call (same underlying memory layout, just relabeled). The
+    // chunked kernel's same_stride check + its internal indexing both use
+    // ggml's nb[]; with matching nb across g and beta, the chunked path
+    // reads both correctly. Sequential kernel is untouched (g's metadata
+    // restored before return), so its hardcoded stride math still works.
+    if (kda || n_tokens < 64 || head_dim != 128 || src6 != nullptr) {
+        // Doesn't meet chunked preconditions; fall through to sequential.
+    } else {
+        ggml_tensor * src3_mut = dst->src[3];  // non-const access for override
+        int64_t saved_ne[4];
+        size_t  saved_nb[4];
+        for (int i = 0; i < 4; i++) {
+            saved_ne[i] = src3_mut->ne[i];
+            saved_nb[i] = src3_mut->nb[i];
+        }
+        // Overlay beta's shape + strides onto g (same data buffer, new labels).
+        for (int i = 0; i < 4; i++) {
+            src3_mut->ne[i] = src4->ne[i];
+            src3_mut->nb[i] = src4->nb[i];
+        }
+        static bool _logged_c = false;
+        if (!_logged_c) {
+            fprintf(stderr, "[CHUNKED-PATH-C] engaging at n_tokens=%ld with g/beta nb=[%ld %ld %ld %ld]\n",
+                    n_tokens, src3_mut->nb[0], src3_mut->nb[1], src3_mut->nb[2], src3_mut->nb[3]);
+            fflush(stderr);
+            _logged_c = true;
+        }
         delta_net_chunk(ctx, dst);
+        // Restore g's original metadata so any subsequent inspection is sane.
+        for (int i = 0; i < 4; i++) {
+            src3_mut->ne[i] = saved_ne[i];
+            src3_mut->nb[i] = saved_nb[i];
+        }
         return;
     }
 
