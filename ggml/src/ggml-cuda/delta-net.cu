@@ -285,6 +285,32 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     GGML_ASSERT(head_dim <= 256);  // Reasonable limit for shared memory
 
+    // 2026-05-26: chunked GDN dispatch (ported from mainline am17an branch
+    // commit 8ea2990). The chunked kernel runs the GDN prefill in O(C^2)
+    // per-chunk + O(C*N) reduction, much faster than the per-token sequential
+    // recurrence for large n_tokens. Engages when ALL conditions hold:
+    //   * not KDA (gate dim equals 1, not S_v)
+    //   * n_tokens > 1 (it's a prefill, not single-token decode)
+    //   * head_dim == 128 (only shape the chunked kernel targets)
+    //   * src6 (saved_steps for speculative-decoding checkpoint) is null —
+    //     the chunked kernel doesn't write per-step state.
+    //   * g and beta have matching strides — ik_llama.cpp's qwen3next graph
+    //     builder constructs g as [n_tokens, 1, n_heads, n_seqs] and beta as
+    //     [1, n_tokens, n_heads, n_seqs] (different strides). The chunked
+    //     kernel asserts same_stride(g, beta). Falling back keeps the model
+    //     working but means chunked never fires until we either (a) align
+    //     the graph builder, or (b) extend the kernel to handle ik_llama's
+    //     layout. TODO: aligning g/beta in build_qwen3next.cpp is the next
+    //     port step. For now, the dispatch compiles + the binary loads but
+    //     chunked is dormant.
+    // Otherwise falls through to the existing sequential per-token kernel.
+    const bool kda = (src3->ne[0] == head_dim);
+    const bool same_g_beta_stride = ggml_are_same_stride(src3, src4);
+    if (!kda && n_tokens > 1 && head_dim == 128 && src6 == nullptr && same_g_beta_stride) {
+        delta_net_chunk(ctx, dst);
+        return;
+    }
+
     // Get device info from ctx (avoids calling CUDA runtime APIs inside dispatch)
     const int device_id = ctx.device;
     const int cc = ggml_cuda_info().devices[device_id].cc;

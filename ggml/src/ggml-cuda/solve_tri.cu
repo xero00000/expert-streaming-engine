@@ -912,3 +912,30 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         dst->nb[2] / sizeof(float), dst->nb[3] / sizeof(float),
         ctx.stream());
 }
+
+// 2026-05-26: ported from mainline am17an branch (commit 8ea2990) — used by
+// the chunked Gated Delta Net kernel. Standalone solve-triangular interface
+// that takes raw pointers (B and X separately). For the fast path, ik_llama's
+// solve_tri_f32_cuda already supports B/X-separate. For cuBLAS path, ik_llama's
+// solve_tri_f32_cublas works in-place on X — so we copy B → X first.
+void ggml_cuda_solve_tri(ggml_backend_cuda_context & ctx,
+                         const float * A, const float * B, float * X,
+                         int n, int k,
+                         int64_t ne02, int64_t ne03,
+                         size_t nb02, size_t nb03,
+                         size_t nb12, size_t nb13,
+                         size_t nb2,  size_t nb3) {
+    if (n <= MAX_N_FAST && k <= MAX_K_FAST) {
+        solve_tri_f32_cuda(A, B, X, n, k, ne02, ne03, nb02, nb03, nb12, nb13, nb2, nb3, ctx.stream());
+        return;
+    }
+
+    // cuBLAS path: in-place on X. Copy B → X first, then solve.
+    if (X != B) {
+        const int64_t total_batches = ne02 * ne03;
+        const size_t  X_size = (size_t) n * (size_t) k * (size_t) total_batches * sizeof(float);
+        CUDA_CHECK(cudaMemcpyAsync(X, B, X_size, cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+
+    solve_tri_f32_cublas(ctx, A, X, n, k, ne02, ne03, nb02, nb03, nb2, nb3, ctx.stream());
+}
