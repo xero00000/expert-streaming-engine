@@ -1,7 +1,9 @@
 #include "common.cuh"
 #include "delta-net.cuh"
-#include <cstdlib>
-#include <cstring>
+// Note: cstdlib/cstring are transitively included via common.cuh -> cuda_runtime.h.
+// Do NOT add explicit includes here — conda nvcc's host compiler picks up a
+// mismatched glibc sysroot that defines _Float32/64/128 types incompatible
+// with this nvcc version, causing 100+ errors on stdlib.h / wchar.h.
 
 // Delta Net Linear Attention Kernel for Qwen3-Next (HEAD_DIM=128)
 // State layout: [S_v, S_v*H_v, 1, n_seqs] (column-major)
@@ -238,6 +240,38 @@ static void delta_net_f32_cuda(
 
 }
 
+// PATH D1 helper: de-interleave v from ik_llama's interleaved SSM buffer.
+// ik_llama's qwen3-next graph builder stores v interleaved with the z gate:
+//   source layout: [S_v, n_tokens, H_v, n_seqs]  (dim1=n_tokens, dim2=H_v)
+//   nb = [4, S_v*4, S_v*n_tokens*4, 2*S_v*n_tokens*H_v*4]  <- nb[3] is 2x tight
+// Output layout: [S_v, H_v, n_tokens, n_seqs] contiguous (what chunked expects)
+//   nb_tight = [4, S_v*4, S_v*H_v*4, S_v*H_v*n_tokens*4]
+// One thread per output element. Total elements = S_v * H_v * n_tokens * n_seqs.
+__global__ void extract_v_interleaved(
+    const float * __restrict__ src,   // original v buffer (interleaved)
+    float       * __restrict__ dst,   // tight output buffer
+    int64_t S_v, int64_t H_v, int64_t n_tokens, int64_t n_seqs,
+    int64_t src_nb1,   // token stride in floats  (= S_v)
+    int64_t src_nb2,   // head stride in floats   (= S_v * n_tokens)
+    int64_t src_nb3    // seq stride in floats    (= 2 * S_v * n_tokens * H_v, interleaved)
+) {
+    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = S_v * H_v * n_tokens * n_seqs;
+    if (idx >= total) return;
+
+    // Decode flat index into (d, h, t, s) for the tight [S_v, H_v, n_tokens, n_seqs] layout
+    const int64_t d = idx % S_v;
+    const int64_t h = (idx / S_v) % H_v;
+    const int64_t t = (idx / (S_v * H_v)) % n_tokens;
+    const int64_t s = idx / (S_v * H_v * n_tokens);
+
+    // Read from source using ik_llama's original strides:
+    //   src layout: [S_v, n_tokens, H_v, n_seqs]
+    //   index: s * src_nb3 + h * src_nb2 + t * src_nb1 + d
+    const int64_t src_idx = s * src_nb3 + h * src_nb2 + t * src_nb1 + d;
+    dst[idx] = src[src_idx];
+}
+
 void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];  // q
     const ggml_tensor * src1 = dst->src[1];  // k
@@ -331,7 +365,7 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const bool will_chunk = !kda && n_tokens > 1 && head_dim == 128 && src6 == nullptr && same_g_beta_stride;
     if ((n_tokens > 1 && !_logged_pref) || (n_tokens == 1 && !_logged_dec)) {
         fprintf(stderr, "[CHUNKED-DISPATCH] kda=%d n_tokens=%ld head_dim=%ld src6=%p same_stride=%d -> %s\n",
-                kda, n_tokens, head_dim, (void*)src6, same_g_beta_stride,
+                kda, n_tokens, head_dim, const_cast<void*>(static_cast<const void*>(src6)), same_g_beta_stride,
                 will_chunk ? "CHUNKED" : "sequential");
         fprintf(stderr, "  g    ne=[%ld %ld %ld %ld] nb=[%ld %ld %ld %ld]\n",
                 src3->ne[0], src3->ne[1], src3->ne[2], src3->ne[3],
@@ -342,33 +376,31 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         fflush(stderr);
         if (n_tokens > 1) _logged_pref = true; else _logged_dec = true;
     }
-    // 2026-05-26 PATH C: dispatch chunked when n_tokens >= 64. Path C is
-    // gated behind GDN_CHUNK=1 env var so default behavior is safe — the
-    // chunked path engages successfully but its output-write layout still
-    // mismatches ik_llama.cpp's downstream reads, causing CUDA crashes in
-    // the next layer's flash-attention. Default off until that's resolved.
+    // 2026-05-26 PATH C + D1:
+    // Path C overrides q/k/v/g metadata so am17an's chunked kernel can read
+    // them without a physical copy (ne[1]↔ne[2], nb[1]↔nb[2] swap).
+    // Path D1 additionally de-interleaves v into a tight temp buffer before
+    // calling delta_net_chunk(), because v's buffer is interleaved with the
+    // SSM z gate: nb[3] = 2× tight size. The chunked kernel's sv2 stride
+    // would otherwise span v+z, corrupting the computation.
+    //
+    // Gated behind GDN_CHUNK=1 env var so default behavior is unchanged.
     static const bool _enable_path_c = []() {
         const char * e = std::getenv("GDN_CHUNK");
         return e && *e && *e != '0';
     }();
     if (!_enable_path_c || kda || n_tokens < 64 || head_dim != 128 || src6 != nullptr) {
-        // Path C disabled or doesn't meet preconditions; fall through to sequential.
+        // Path C+D1 disabled or doesn't meet preconditions; fall through to sequential.
     } else {
-        // Path C EXTENDED 2026-05-26: ik_llama.cpp builds q/k/v with shape
-        // [S_v, n_tokens, H, n_seqs] (tokens at dim 1, heads at dim 2). am17an's
-        // chunked kernel reads them assuming [S_v, H, n_tokens, n_seqs] (heads
-        // at dim 1, tokens at dim 2). Underlying memory is the same — just
-        // swap each tensor's nb[1]↔nb[2] and ne[1]↔ne[2] so the kernel's stride
-        // math indexes the data correctly. Also swap g (override with beta's
-        // metadata since they share memory layout already). Restore everything
-        // before returning so the next sequential call sees the original.
         ggml_tensor * src_q_mut = dst->src[0];
         ggml_tensor * src_k_mut = dst->src[1];
         ggml_tensor * src_v_mut = dst->src[2];
         ggml_tensor * src_g_mut = dst->src[3];
 
+        // Save original metadata for all 4 tensors (restored after the call).
         int64_t saved_q_ne[4], saved_k_ne[4], saved_v_ne[4], saved_g_ne[4];
         size_t  saved_q_nb[4], saved_k_nb[4], saved_v_nb[4], saved_g_nb[4];
+        void *  saved_v_data = src_v_mut->data;
         for (int i = 0; i < 4; i++) {
             saved_q_ne[i] = src_q_mut->ne[i]; saved_q_nb[i] = src_q_mut->nb[i];
             saved_k_ne[i] = src_k_mut->ne[i]; saved_k_nb[i] = src_k_mut->nb[i];
@@ -376,40 +408,99 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             saved_g_ne[i] = src_g_mut->ne[i]; saved_g_nb[i] = src_g_mut->nb[i];
         }
 
-        // q/k/v: swap ne[1] ↔ ne[2] and nb[1] ↔ nb[2]
+        // q/k: swap ne[1]↔ne[2] and nb[1]↔nb[2]
         std::swap(src_q_mut->ne[1], src_q_mut->ne[2]);
         std::swap(src_q_mut->nb[1], src_q_mut->nb[2]);
         std::swap(src_k_mut->ne[1], src_k_mut->ne[2]);
         std::swap(src_k_mut->nb[1], src_k_mut->nb[2]);
-        std::swap(src_v_mut->ne[1], src_v_mut->ne[2]);
-        std::swap(src_v_mut->nb[1], src_v_mut->nb[2]);
 
-        // g: overlay beta's metadata (same data layout, relabeled).
+        // g: overlay beta's metadata (same data layout, just relabeled).
         for (int i = 0; i < 4; i++) {
             src_g_mut->ne[i] = src4->ne[i];
             src_g_mut->nb[i] = src4->nb[i];
         }
 
+        // PATH D1: extract v into a tight contiguous buffer.
+        // v's physical buffer is interleaved with the SSM z gate:
+        //   saved_v_nb[3] = 2 * S_v * H_v * n_tokens * sizeof(float)
+        // After the ne[1]↔ne[2] swap, the chunked kernel would see sv2 =
+        // nb[1]/sizeof(float) = (original nb[2])/4 = S_v * H_v * 2 (2x tight).
+        // We copy v into a contiguous [S_v, H_v, n_tokens, n_seqs] buffer so
+        // the chunked kernel sees sv1=S_v, sv2=S_v*H_v, sv3=S_v*H_v*n_tokens.
+        const int64_t S_v    = head_dim;        // 128
+        const int64_t H_v    = n_heads;         // 32 for qwen3-next
+        const int64_t v_elems = S_v * H_v * n_tokens * n_seqs;
+        ggml_cuda_pool_alloc<float> v_packed(ctx.pool(), v_elems);
+
+        // Original strides in float units (before any swap).
+        // src_v_mut currently still has original ne/nb (we haven't swapped v yet).
+        const int64_t src_nb1 = (int64_t)(saved_v_nb[1] / sizeof(float)); // S_v (token stride)
+        const int64_t src_nb2 = (int64_t)(saved_v_nb[2] / sizeof(float)); // S_v * n_tokens (ik_llama layout: dim1=n_tokens)
+        const int64_t src_nb3 = (int64_t)(saved_v_nb[3] / sizeof(float)); // 2 * S_v * n_tokens * H_v (interleaved)
+        // ik_llama v shape before swap: [S_v, n_tokens, H_v, n_seqs]
+        //   ne = [S_v=128, n_tokens=2048, H_v=32, n_seqs=1]
+        //   nb = [4, S_v*4, S_v*n_tokens*4, 2*S_v*n_tokens*H_v*4]
+        //                      ↑dim1=n_tokens          ↑interleaved z
+        // After D1 tight buffer: [S_v, H_v, n_tokens, n_seqs] contiguous
+        //   nb_tight = [4, S_v*4, S_v*H_v*4, S_v*H_v*n_tokens*4]
+
+        // Launch extract kernel: one thread per output element.
+        // Grid covers all (d, h, t, s) independently.
+        // Each thread: out[s*H_v*n_tokens*S_v + t*H_v*S_v + h*S_v + d]
+        //            = in[s*src_nb3 + h*src_nb2 + t*src_nb1 + d*src_nb0]
+        // Note: in ik_llama layout dim1=n_tokens, dim2=H_v, so:
+        //   in[s*src_nb3 + h*src_nb2 + t*src_nb1 + d]
+        // where src_nb2 = S_v*n_tokens (head stride), src_nb1 = S_v (token stride).
+        {
+            const float * v_src = (const float *)saved_v_data;
+            float *       v_dst = v_packed.get();
+            // Total elements: v_elems. Use a 1D grid of 256-thread blocks.
+            const int threads = 256;
+            const int blocks  = (v_elems + threads - 1) / threads;
+            // Pass strides and dims to the kernel.
+            // Kernel reads:  v_src[seq*src_nb3 + head*src_nb2 + tok*src_nb1 + dim]
+            // Kernel writes: v_dst[seq*H_v*n_tokens*S_v + head*n_tokens*S_v + tok*S_v + dim]
+            // (tight layout: [S_v, H_v, n_tokens, n_seqs] — same as what chunked expects)
+            extract_v_interleaved<<<blocks, threads, 0, ctx.stream()>>>(
+                v_src, v_dst,
+                S_v, H_v, n_tokens, n_seqs,
+                src_nb1, src_nb2, src_nb3);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // Override v metadata to point at the tight buffer.
+        // After swap, chunked kernel expects v as [S_v, H_v, n_tokens, n_seqs]:
+        src_v_mut->data  = v_packed.get();
+        src_v_mut->ne[0] = S_v;               src_v_mut->nb[0] = sizeof(float);
+        src_v_mut->ne[1] = H_v;               src_v_mut->nb[1] = S_v * sizeof(float);
+        src_v_mut->ne[2] = n_tokens;           src_v_mut->nb[2] = S_v * H_v * sizeof(float);
+        src_v_mut->ne[3] = n_seqs;             src_v_mut->nb[3] = S_v * H_v * n_tokens * sizeof(float);
+
         static bool _logged_c = false;
         if (!_logged_c) {
-            fprintf(stderr, "[CHUNKED-PATH-C] engaging at n_tokens=%ld\n", n_tokens);
+            fprintf(stderr, "[CHUNKED-PATH-C+D1] engaging at n_tokens=%ld\n", n_tokens);
             fprintf(stderr, "  q post-override ne=[%ld %ld %ld %ld] nb=[%ld %ld %ld %ld]\n",
                 src_q_mut->ne[0], src_q_mut->ne[1], src_q_mut->ne[2], src_q_mut->ne[3],
                 src_q_mut->nb[0], src_q_mut->nb[1], src_q_mut->nb[2], src_q_mut->nb[3]);
-            fprintf(stderr, "  v post-override ne=[%ld %ld %ld %ld] nb=[%ld %ld %ld %ld]\n",
+            fprintf(stderr, "  v tight ne=[%ld %ld %ld %ld] nb=[%ld %ld %ld %ld]\n",
                 src_v_mut->ne[0], src_v_mut->ne[1], src_v_mut->ne[2], src_v_mut->ne[3],
                 src_v_mut->nb[0], src_v_mut->nb[1], src_v_mut->nb[2], src_v_mut->nb[3]);
+            fprintf(stderr, "  v_elems=%ld (buf=%.1f MB)\n",
+                v_elems, v_elems * sizeof(float) / 1048576.0);
             fflush(stderr);
             _logged_c = true;
         }
+
         delta_net_chunk(ctx, dst);
-        // Restore everything
+
+        // Restore all metadata (v_packed auto-frees via RAII).
         for (int i = 0; i < 4; i++) {
             src_q_mut->ne[i] = saved_q_ne[i]; src_q_mut->nb[i] = saved_q_nb[i];
             src_k_mut->ne[i] = saved_k_ne[i]; src_k_mut->nb[i] = saved_k_nb[i];
             src_v_mut->ne[i] = saved_v_ne[i]; src_v_mut->nb[i] = saved_v_nb[i];
             src_g_mut->ne[i] = saved_g_ne[i]; src_g_mut->nb[i] = saved_g_nb[i];
         }
+        src_v_mut->data = saved_v_data;
         return;
     }
 
