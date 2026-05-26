@@ -312,8 +312,37 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     //     chunked is dormant.
     // Otherwise falls through to the existing sequential per-token kernel.
     const bool kda = (src3->ne[0] == head_dim);
-    const bool same_g_beta_stride = ggml_are_same_stride(src3, src4);
-    if (!kda && n_tokens > 1 && head_dim == 128 && src6 == nullptr && same_g_beta_stride) {
+    // 2026-05-26: ggml_are_same_stride() checks ALL nb[i] including trivial
+    // dims (size 1). After our permute alignment, g and beta have identical
+    // strides EXCEPT nb[0] (which is 256 vs 128 in our shape [1,n_tokens,H_v,1])
+    // — and ne[0]=1 means that stride can never actually be traversed. Use a
+    // size-aware check that only requires strides match for dims with ne > 1.
+    auto same_meaningful_stride = [](const ggml_tensor * a, const ggml_tensor * b) {
+        if (a->type != b->type) return false;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (a->ne[i] != b->ne[i]) return false;
+            if (a->ne[i] > 1 && a->nb[i] != b->nb[i]) return false;
+        }
+        return true;
+    };
+    const bool same_g_beta_stride = same_meaningful_stride(src3, src4);
+    // DIAG: log first prefill and first decode call separately
+    static bool _logged_pref = false, _logged_dec = false;
+    const bool will_chunk = !kda && n_tokens > 1 && head_dim == 128 && src6 == nullptr && same_g_beta_stride;
+    if ((n_tokens > 1 && !_logged_pref) || (n_tokens == 1 && !_logged_dec)) {
+        fprintf(stderr, "[CHUNKED-DISPATCH] kda=%d n_tokens=%ld head_dim=%ld src6=%p same_stride=%d -> %s\n",
+                kda, n_tokens, head_dim, (void*)src6, same_g_beta_stride,
+                will_chunk ? "CHUNKED" : "sequential");
+        fprintf(stderr, "  g    ne=[%ld %ld %ld %ld] nb=[%ld %ld %ld %ld]\n",
+                src3->ne[0], src3->ne[1], src3->ne[2], src3->ne[3],
+                src3->nb[0], src3->nb[1], src3->nb[2], src3->nb[3]);
+        fprintf(stderr, "  beta ne=[%ld %ld %ld %ld] nb=[%ld %ld %ld %ld]\n",
+                src4->ne[0], src4->ne[1], src4->ne[2], src4->ne[3],
+                src4->nb[0], src4->nb[1], src4->nb[2], src4->nb[3]);
+        fflush(stderr);
+        if (n_tokens > 1) _logged_pref = true; else _logged_dec = true;
+    }
+    if (will_chunk) {
         delta_net_chunk(ctx, dst);
         return;
     }

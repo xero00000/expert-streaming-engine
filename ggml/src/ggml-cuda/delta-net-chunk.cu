@@ -841,7 +841,20 @@ void delta_net_chunk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
     GGML_ASSERT(ggml_are_same_stride(src_q, src_k));
-    GGML_ASSERT(ggml_are_same_stride(src_g, src_beta));
+    // 2026-05-26: relaxed to allow stride mismatch on size-1 dims (which can't
+    // actually be indexed). In ik_llama.cpp's qwen3next graph, g and beta have
+    // matching strides on all dims with size > 1 but differ on nb[0] where
+    // ne[0] = 1 — irrelevant for any memory access. The kernel below only uses
+    // nbb1/2/3 (beta's non-trivial strides) and never indexes g via dim 0.
+    auto _same_meaningful = [](const ggml_tensor * a, const ggml_tensor * b) {
+        if (a->type != b->type) return false;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (a->ne[i] != b->ne[i]) return false;
+            if (a->ne[i] > 1 && a->nb[i] != b->nb[i]) return false;
+        }
+        return true;
+    };
+    GGML_ASSERT(_same_meaningful(src_g, src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));

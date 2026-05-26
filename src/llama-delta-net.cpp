@@ -109,14 +109,17 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     cb(state,"state_in", il);
 
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-    // 2026-05-26: kept original (2,0,3,1) g permute → [n_tokens, 1, H_v, n_seqs].
-    // An attempt to align with beta's [1, n_tokens, ...] layout via (0,2,3,1)
-    // hit a runtime assertion failure — the actual pre-permute g shape isn't
-    // what the inverse-permute math from beta predicts (g and beta come from
-    // different paths through build_beta_gate, so they don't share source
-    // shape). Resolving requires either instrumented trace prints or static
-    // analysis through build_beta_gate's branches. Deferred. Chunked path
-    // remains dormant (delta-net.cu dispatch falls through to sequential).
+    // 2026-05-26: chunked GDN port — reverted to legacy g permute
+    // (2,0,3,1) → [n_tokens, 1, H_v, n_seqs] after the full alignment
+    // attempt produced a CUDA illegal memory access in downstream
+    // flash-attention. Even with both g and beta aligned to
+    // [1, n_tokens, H_v, n_seqs] and ggml_cont'd to be contiguous, the
+    // chunked kernel's OUTPUT layout differs from what ik_llama.cpp's
+    // next-layer code reads. The output-layout audit is the next port
+    // step but requires a careful trace of the kernel's write pattern
+    // against ik's layer-attn-output expectations. For now, chunked
+    // stays dormant (dispatch's strict stride check fails, falls back to
+    // sequential — confirmed working at 393/50.4 baseline).
     g = ggml_permute(ctx0, g, 2, 0, 3, 1);
     beta = ggml_permute(ctx0, beta, 2, 0, 1, 3);
 
