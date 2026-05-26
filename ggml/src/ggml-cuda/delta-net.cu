@@ -342,16 +342,17 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         fflush(stderr);
         if (n_tokens > 1) _logged_pref = true; else _logged_dec = true;
     }
-    // 2026-05-26 PATH C: dispatch chunked when n_tokens >= 64 (actual chunked
-    // work; below this it falls through to am17an's incompatible sequential
-    // fallback). Override g's metadata to match beta's shape+strides just
-    // before the call (same underlying memory layout, just relabeled). The
-    // chunked kernel's same_stride check + its internal indexing both use
-    // ggml's nb[]; with matching nb across g and beta, the chunked path
-    // reads both correctly. Sequential kernel is untouched (g's metadata
-    // restored before return), so its hardcoded stride math still works.
-    if (kda || n_tokens < 64 || head_dim != 128 || src6 != nullptr) {
-        // Doesn't meet chunked preconditions; fall through to sequential.
+    // 2026-05-26 PATH C: dispatch chunked when n_tokens >= 64. Path C is
+    // gated behind GDN_CHUNK=1 env var so default behavior is safe — the
+    // chunked path engages successfully but its output-write layout still
+    // mismatches ik_llama.cpp's downstream reads, causing CUDA crashes in
+    // the next layer's flash-attention. Default off until that's resolved.
+    static const bool _enable_path_c = []() {
+        const char * e = std::getenv("GDN_CHUNK");
+        return e && *e && *e != '0';
+    }();
+    if (!_enable_path_c || kda || n_tokens < 64 || head_dim != 128 || src6 != nullptr) {
+        // Path C disabled or doesn't meet preconditions; fall through to sequential.
     } else {
         ggml_tensor * src3_mut = dst->src[3];  // non-const access for override
         int64_t saved_ne[4];
