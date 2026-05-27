@@ -22,6 +22,15 @@
 
 static constexpr int WM = 16, WN = 16, WK = 8;
 
+// 2026-05-26: ik_llama.cpp passes raw beta to ggml_delta_net (no sigmoid in graph
+// builder); the sequential kernel applies sigmoid internally. Mainline llama.cpp
+// pre-sigmoids beta in the graph builder before passing to ggml_gated_delta_net,
+// so am17an's chunked kernel reads beta raw. To make the chunked kernel work
+// with ik_llama's pre-sigmoid beta, we apply sigmoid here at the three read sites.
+__device__ __forceinline__ float sigmoid_chunk(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
 template<int M, int N, int N_WARPS>
 static __host__ __device__ constexpr int dot_max_tpw() {
     return ((M / WM) * (N / WN) + N_WARPS - 1) / N_WARPS;
@@ -145,7 +154,7 @@ gated_delta_net_cuda(const float * q,
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        const float beta_val = *beta_t;
+        const float beta_val = sigmoid_chunk(*beta_t);
 
         if constexpr (!KDA) {
             const float g_val = expf(*g_t);
@@ -293,14 +302,19 @@ static __global__ void compute_kkt_cuda(float * Akk, float * Akq, const float * 
     int64_t sk1, int64_t sk2, int64_t sk3,
     int64_t sg1, int64_t sg2, int64_t sg3,
     int64_t sb1, int64_t sb2, int64_t sb3,
+    int64_t H_k,    // 2026-05-26 PATH C+D1 GQA fix: q/k have H_k heads, not H_v.
     float scale) {
 
     const int h_idx = blockIdx.x;
     const int c_idx = blockIdx.y;
     const int s_idx = blockIdx.z;
 
-    k    += h_idx * sk1 + (CS * c_idx) * sk2 + s_idx * sk3;
-    q    += h_idx * sk1 + (CS * c_idx) * sk2 + s_idx * sk3;
+    // 2026-05-26 GQA: chunked grid is H_v blocks (one per v-head) but q/k only
+    // have H_k heads. Map v-head → q/k-head with modulo (ik_llama repeat_type=1).
+    const int hk_idx = h_idx % (int)H_k;
+
+    k    += hk_idx * sk1 + (CS * c_idx) * sk2 + s_idx * sk3;
+    q    += hk_idx * sk1 + (CS * c_idx) * sk2 + s_idx * sk3;
     g_cs += h_idx * sg1 + (CS * c_idx) * sg2 + s_idx * sg3;
     beta += h_idx * sb1 + (CS * c_idx) * sb2 + s_idx * sb3;
 
@@ -333,7 +347,7 @@ static __global__ void compute_kkt_cuda(float * Akk, float * Akq, const float * 
         }
         if (tid < (int)CS) {
             smem_g[tid] = g_cs[tid];
-            smem_b[tid] = beta[tid * sb2];
+            smem_b[tid] = sigmoid_chunk(beta[tid * sb2]);
         }
         __syncthreads();
 
@@ -361,7 +375,7 @@ static __global__ void compute_kkt_cuda(float * Akk, float * Akq, const float * 
                 const int i = i_off + di;
                 const int j = j_off + dj;
                 Akk[i + j * CS] = (i <= j)
-                    ? smem_tmp[warp_id * WM * WN + idx] * smem_b[j] * expf(smem_g[j] - smem_g[i])
+                    ? smem_tmp[warp_id * WM * WN + idx] * smem_b[j] * expf(fminf(smem_g[j] - smem_g[i], 50.0f))
                     : 0.0f;
             }
         }
@@ -386,7 +400,7 @@ static __global__ void compute_kkt_cuda(float * Akk, float * Akq, const float * 
                 const int i = i_off + di;
                 const int j = j_off + dj;
                 Akq[i + j * CS] = (i <= j)
-                    ? smem_tmp[warp_id * WM * WN + idx] * expf(smem_g[j] - smem_g[i]) * scale
+                    ? smem_tmp[warp_id * WM * WN + idx] * expf(fminf(smem_g[j] - smem_g[i], 50.0f)) * scale
                     : 0.0f;
             }
         }
@@ -438,13 +452,17 @@ static __global__ void compute_wu_cuda(
     const int64_t sa1, const int64_t sa2, const int64_t sa3,
     const int64_t sb1, const int64_t sb2, const int64_t sb3,
     const int64_t sg1, const int64_t sg2, const int64_t sg3,
-    const int64_t sd1, const int64_t sd2, const int64_t sd3) {
+    const int64_t sd1, const int64_t sd2, const int64_t sd3,
+    const int64_t H_k) {
 
     const int h_idx = blockIdx.x;
     const int c_idx = blockIdx.y;
     const int s_idx = blockIdx.z;
 
-    k       += h_idx * sk1 + (CS * c_idx) * sk2 + s_idx * sk3;
+    // 2026-05-26 GQA: k has only H_k heads; map v-head → k-head via modulo.
+    const int hk_idx = h_idx % (int)H_k;
+
+    k       += hk_idx * sk1 + (CS * c_idx) * sk2 + s_idx * sk3;
     v       += h_idx * sv1 + (CS * c_idx) * sv2 + s_idx * sv3;
     beta    += h_idx * sb1 + (CS * c_idx) * sb2 + s_idx * sb3;
     gate_cs += h_idx * sg1 + (CS * c_idx) * sg2 + s_idx * sg3;
@@ -466,9 +484,9 @@ static __global__ void compute_wu_cuda(
     }
 
     if (tid < CS) {
-        float b = beta[tid * sb2];
+        float b = sigmoid_chunk(beta[tid * sb2]);
         sc_vnew[tid] = b;
-        sc_kcd[tid]  = b * expf(gate_cs[tid]);
+        sc_kcd[tid]  = b * expf(fminf(gate_cs[tid], 50.0f));
     }
 
     __syncthreads();
@@ -505,6 +523,12 @@ static __global__ void compute_wu_cuda(
             store_matrix_sync(k_cd + tm * WM + tn * WN * S_v, acc[tt], S_v, mem_col_major);
         }
         __syncthreads();
+        // 2026-05-26: clamp k_cd to prevent inf/NaN cascading into downstream GEMMs.
+        for (int i = tid; i < (int)CS * (int)S_v; i += blockDim.x) {
+            float val = k_cd[i];
+            k_cd[i] = isfinite(val) ? fminf(fmaxf(val, -1e6f), 1e6f) : 0.0f;
+        }
+        __syncthreads();
 
         for (int i = tid; i < (int)CS * (int)S_v; i += blockDim.x) {
             const int kk = i % (int)CS;
@@ -522,6 +546,12 @@ static __global__ void compute_wu_cuda(
             const int tn = tiles[tt] % tn_dim;
             store_matrix_sync(v_new + tm * WM + tn * WN * S_v, acc[tt], S_v, mem_col_major);
         }
+        __syncthreads();
+        // 2026-05-26: clamp v_new to prevent inf/NaN from propagating.
+        for (int i = tid; i < (int)CS * (int)S_v; i += blockDim.x) {
+            float val = v_new[i];
+            v_new[i] = isfinite(val) ? fminf(fmaxf(val, -1e6f), 1e6f) : 0.0f;
+        }
     }
 }
 
@@ -537,7 +567,8 @@ static __global__ void compute_state_fused_cuda(
     int64_t sk1, int64_t sk2, int64_t sk3,
     int64_t ng1, int64_t ng3,
     int64_t sd1, int64_t sd2, int64_t sd3,
-    int64_t n_chunks, int64_t H) {
+    int64_t n_chunks, int64_t H,
+    int64_t H_k) {
 
     constexpr int SP = BV + 1;
     constexpr int BP = K  + 1;
@@ -617,12 +648,16 @@ static __global__ void compute_state_fused_cuda(
             const int i0 = i + tid;
             const int m = i0 % BV;
             const int t = i0 / BV;
-            const float vd = vnew_ptr[(v_start + m) + t * K] - smem_vbuf[m + t * VP];
+            // 2026-05-26: clamp vd to prevent unbounded growth from chained GEMMs.
+            float vd = vnew_ptr[(v_start + m) + t * K] - smem_vbuf[m + t * VP];
+            vd = isfinite(vd) ? fminf(fmaxf(vd, -1e6f), 1e6f) : 0.0f;
             smem_vbuf[m + t * VP] = vd;
             vnew_ptr[(v_start + m) + t * K] = vd;
         }
 
-        const float * k_ch = k_raw + h_idx * sk1 + s_idx * sk3 + c * (int64_t)CS * sk2;
+        // 2026-05-26 GQA fix: k_raw has H_k heads. compute_state_fused uses gridDim.y=H_v.
+        const int hk_idx = h_idx % (int)H_k;
+        const float * k_ch = k_raw + hk_idx * sk1 + s_idx * sk3 + c * (int64_t)CS * sk2;
         const float * g_ch = g_cs + h_idx * ng1 + s_idx * ng3 + c * CS;
         const float g_last = g_ch[CS - 1];
 #pragma unroll
@@ -630,11 +665,13 @@ static __global__ void compute_state_fused_cuda(
             const int i0 = i + tid;
             const int k = i0 % K;
             const int t = i0 / K;
-            smem_buf[k + t * BP] = k_ch[k + t * sk2] * expf(g_last - g_ch[t]);
+            // 2026-05-26: match sequential kernel's fminf(g, 50) clamp to prevent
+            // expf overflow for heads where cumsum-g exceeds typical range.
+            smem_buf[k + t * BP] = k_ch[k + t * sk2] * expf(fminf(g_last - g_ch[t], 50.0f));
         }
         __syncthreads();
 
-        const float gate = expf(g_last);
+        const float gate = expf(fminf(g_last, 50.0f));
         {
             using namespace nvcuda::wmma;
             constexpr int NW  = 256 / 32;
@@ -664,9 +701,15 @@ static __global__ void compute_state_fused_cuda(
                 for (int i = lane_id; i < WM * WN; i += 32) {
                     const int dk = i / WN;
                     const int dm = i % WN;
-                    smem_state[(k_off + dk) * SP + (m_off + dm)] =
+                    // 2026-05-26: match sequential kernel's [-1e6, 1e6] state clamp,
+                    // plus explicit NaN→0 (fminf/fmaxf propagate NaN). Without this,
+                    // a single NaN seed (e.g. from 0*Inf in upstream GEMM) corrupts
+                    // all subsequent chunks for that head.
+                    float _ns =
                         gate * smem_state[(k_off + dk) * SP + (m_off + dm)]
                             + smem_tmp[warp_id * WM * WN + i];
+                    _ns = isfinite(_ns) ? fminf(fmaxf(_ns, -1e6f), 1e6f) : 0.0f;
+                    smem_state[(k_off + dk) * SP + (m_off + dm)] = _ns;
                 }
                 __syncwarp();
             }
@@ -696,6 +739,7 @@ static __global__ void compute_output_cuda(
     int64_t ng1, int64_t ng3,
     int64_t sd1, int64_t sd2, int64_t sd3,
     int64_t n_chunks, int64_t H, int64_t n_tokens,
+    int64_t H_k,
     float scale) {
 
     const int h_idx = blockIdx.x;
@@ -708,8 +752,9 @@ static __global__ void compute_output_cuda(
     const float * chunk_vd = v_delta + h_idx * sd1 + c_idx * sd2 + s_idx * sd3;
     const float * chunk_akq = Akq + ((int64_t)s_idx * H * n_chunks + h_idx * n_chunks + c_idx) * CS * CS;
     const float * chunk_g = g_cs + h_idx * ng1 + s_idx * ng3 + c_idx * CS;
-    // TODO: handle GQA
-    const float * q_base = q + h_idx * sq1 + s_idx * sq3 + c_idx * (int64_t)CS * sq2;
+    // 2026-05-26 GQA fix: q has H_k heads, not H_v. Map v-head → q-head via modulo.
+    const int hk_idx = h_idx % (int)H_k;
+    const float * q_base = q + hk_idx * sq1 + s_idx * sq3 + c_idx * (int64_t)CS * sq2;
     float * out_base = output + h_idx * S_v + s_idx * n_tokens * S_v * H + c_idx * (int64_t)CS * S_v * H;
 
     __shared__ float s_akq[CS * CS];
@@ -723,7 +768,7 @@ static __global__ void compute_output_cuda(
         reinterpret_cast<float4 *>(s_akq)[i] = reinterpret_cast<const float4 *>(chunk_akq)[i];
     }
     if (tid < (int)CS) {
-        s_gexp[tid] = expf(chunk_g[tid]);
+        s_gexp[tid] = expf(fminf(chunk_g[tid], 50.0f));
     }
     for (int i = tid; i < (int)(S_v * S_v) / 4; i += blockDim.x) {
         reinterpret_cast<float4 *>(s_state)[i] = reinterpret_cast<const float4 *>(chunk_state)[i];
@@ -916,7 +961,7 @@ void delta_net_chunk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         CUDA_SET_SHARED_MEMORY_LIMIT((compute_kkt_cuda<CS, 128>), kkt_smem_bytes);
         switch (S_v) {
             case 128:
-                compute_kkt_cuda<CS, 128><<<grid, block, kkt_smem_bytes, ctx.stream()>>>(Akk.get(), Akq.get(), k_d, q_d, gate_csum.get(), b_d, sq1, sq2, sq3, ng1, ng2, ng3, sg1, sg2, sg3, scale);
+                compute_kkt_cuda<CS, 128><<<grid, block, kkt_smem_bytes, ctx.stream()>>>(Akk.get(), Akq.get(), k_d, q_d, gate_csum.get(), b_d, sq1, sq2, sq3, ng1, ng2, ng3, sg1, sg2, sg3, neq1, scale);
                 break;
             default:
                 GGML_ABORT("Fatal error");
@@ -970,7 +1015,8 @@ void delta_net_chunk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             sa1, sa2, sa3,
             sb1, sb2, sb3,
             ng1, ng2, ng3,
-            sd1, sd2, sd3);
+            sd1, sd2, sd3,
+            neq1);
     }
 
     constexpr int BV = 32;
@@ -989,7 +1035,8 @@ void delta_net_chunk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             sq1, sq2, sq3,
             ng1, ng3,
             sd1, sd2, sd3,
-            n_chunks, H);
+            n_chunks, H,
+            neq1);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1005,6 +1052,7 @@ void delta_net_chunk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             ng1, ng3,
             sd1, sd2, sd3,
             n_chunks, H, n_tokens,
+            neq1,
             scale);
         CUDA_CHECK(cudaGetLastError());
     }
