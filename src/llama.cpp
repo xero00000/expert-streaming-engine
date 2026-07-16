@@ -26,7 +26,485 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <cstdlib>
+#include <cstring>
+#include <algorithm>
+#include <array>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <fstream>
+#include <limits>
+#include <mutex>
+#include <numeric>
+#include <thread>
+#include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_context * target_ctx);
+
+namespace {
+
+bool expert_prefetch_is_topk(const ggml_tensor * tensor) {
+    static constexpr char prefix[] = "ffn_moe_topk-";
+    return std::strncmp(ggml_get_name(tensor), prefix, sizeof(prefix) - 1) == 0;
+}
+
+bool expert_prefetch_is_logits(const ggml_tensor * tensor) {
+    static constexpr char prefix[] = "ffn_moe_logits-";
+    return std::strncmp(ggml_get_name(tensor), prefix, sizeof(prefix) - 1) == 0;
+}
+
+int expert_prefetch_layer_from_name(const char * name) {
+    const char * separator = std::strrchr(name, '-');
+    return separator ? std::atoi(separator + 1) : -1;
+}
+
+template<typename T>
+bool expert_prefetch_read(std::ifstream & input, T & value) {
+    input.read(reinterpret_cast<char *>(&value), sizeof(value));
+    return input.good();
+}
+
+bool expert_prefetch_load_model(llama_context & lctx, const char * path) {
+    static constexpr std::array<char, 8> magic = { 'X', 'E', 'R', 'O', 'R', 'H', '0', '1' };
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        LLAMA_LOG_WARN("%s: cannot open route-head file: %s\n", __func__, path);
+        return false;
+    }
+
+    std::array<char, magic.size()> file_magic{};
+    uint32_t version = 0;
+    auto & head = lctx.expert_prefetch_model;
+    if (!expert_prefetch_read(input, file_magic) ||
+        !expert_prefetch_read(input, version) ||
+        !expert_prefetch_read(input, head.source_layer) ||
+        !expert_prefetch_read(input, head.layers) ||
+        !expert_prefetch_read(input, head.experts) ||
+        !expert_prefetch_read(input, head.train_tokens) ||
+        !expert_prefetch_read(input, head.prediction_experts) ||
+        !expert_prefetch_read(input, head.prefetch_targets) ||
+        !expert_prefetch_read(input, head.ridge_alpha)) {
+        LLAMA_LOG_WARN("%s: truncated route-head header: %s\n", __func__, path);
+        return false;
+    }
+
+    const size_t model_layers = lctx.model.layers.size();
+    const size_t model_experts = lctx.model.hparams.n_expert;
+    if (file_magic != magic || version != 1 || head.source_layer >= head.layers || head.layers != model_layers ||
+        head.experts != model_experts || head.train_tokens == 0 || head.prediction_experts == 0 ||
+        head.prediction_experts > head.experts || head.prefetch_targets == 0) {
+        LLAMA_LOG_WARN("%s: incompatible route-head file: %s\n", __func__, path);
+        return false;
+    }
+
+    const size_t experts = head.experts;
+    const size_t train_tokens = head.train_tokens;
+    const size_t targets = head.layers - 1;
+    if (train_tokens > std::numeric_limits<size_t>::max() / experts ||
+        targets > std::numeric_limits<size_t>::max() / (train_tokens * experts)) {
+        LLAMA_LOG_WARN("%s: route-head dimensions overflow: %s\n", __func__, path);
+        return false;
+    }
+
+    const auto read_floats = [&](std::vector<float> & values, size_t count) {
+        values.resize(count);
+        input.read(reinterpret_cast<char *>(values.data()), static_cast<std::streamsize>(count * sizeof(float)));
+        return input.good();
+    };
+    if (!read_floats(head.mean, experts) ||
+        !read_floats(head.scale, experts) ||
+        !read_floats(head.source_train, train_tokens * experts) ||
+        !read_floats(head.dual_by_target, targets * train_tokens * experts)) {
+        LLAMA_LOG_WARN("%s: truncated route-head payload: %s\n", __func__, path);
+        head = {};
+        return false;
+    }
+
+    head.loaded = true;
+    LLAMA_LOG_INFO("%s: loaded layer-%u route head (%u train tokens, %u targets x %u experts) from %s\n",
+            __func__, head.source_layer, head.train_tokens, head.prefetch_targets, head.prediction_experts, path);
+    return true;
+}
+
+size_t expert_prefetch_page_size() {
+#if defined(__linux__)
+    const long value = sysconf(_SC_PAGESIZE);
+    return value > 0 ? static_cast<size_t>(value) : 4096;
+#else
+    return 4096;
+#endif
+}
+
+} // namespace
+
+struct llama_expert_prefetch_worker {
+    struct task {
+        void * address;
+        size_t size;
+    };
+
+    explicit llama_expert_prefetch_worker(llama_context & lctx)
+        : lctx(lctx), worker(&llama_expert_prefetch_worker::run, this) {}
+
+    ~llama_expert_prefetch_worker() {
+        stop();
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        condition.notify_one();
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    uint64_t failure_count() const {
+        return failures;
+    }
+
+    bool submit(void * address, size_t size) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (stopping || queue.size() >= max_tasks) {
+            return false;
+        }
+        queue.push_back({ address, size });
+        condition.notify_one();
+        return true;
+    }
+
+private:
+    static constexpr size_t max_tasks = 96;
+
+    void run() {
+        for (;;) {
+            task next {};
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                condition.wait(lock, [&] { return stopping || !queue.empty(); });
+                if (queue.empty()) {
+                    if (stopping) {
+                        return;
+                    }
+                    continue;
+                }
+                next = queue.front();
+                queue.pop_front();
+            }
+
+#if defined(__linux__)
+            if (::madvise(next.address, next.size, MADV_WILLNEED) != 0) {
+                ++failures;
+                continue;
+            }
+
+            // MADV_WILLNEED is advisory. Touching one byte per page makes the
+            // worker's completion a real page-cache residency guarantee while
+            // keeping the scheduler thread free to execute later layers.
+            volatile const uint8_t * data = static_cast<const uint8_t *>(next.address);
+            uint8_t checksum = 0;
+            const size_t page = expert_prefetch_page_size();
+            for (size_t offset = 0; offset < next.size; offset += page) {
+                checksum ^= data[offset];
+            }
+            checksum ^= data[next.size - 1];
+            touch_checksum ^= checksum;
+            ++lctx.expert_prefetch_slices;
+            lctx.expert_prefetch_bytes += next.size;
+#else
+            (void) next;
+            ++failures;
+#endif
+        }
+    }
+
+    llama_context & lctx;
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::deque<task> queue;
+    bool stopping = false;
+    std::thread worker;
+    uint8_t touch_checksum = 0;
+    uint64_t failures = 0;
+};
+
+namespace {
+
+void expert_prefetch_slice(llama_context & lctx, ggml_tensor * tensor, int32_t expert) {
+    if (!tensor || !tensor->data || expert < 0 || expert >= tensor->ne[2]) {
+        ++lctx.expert_prefetch_failures;
+        return;
+    }
+    // GPU-resident layers already avoid the mmap fault path. More importantly,
+    // their addresses are not safe to touch from the host prefetch worker.
+    if (!tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer)) {
+        return;
+    }
+
+    const size_t stride = tensor->nb[2];
+    if (stride == 0) {
+        ++lctx.expert_prefetch_failures;
+        return;
+    }
+
+    const size_t page = expert_prefetch_page_size();
+    const uintptr_t raw_first = reinterpret_cast<uintptr_t>(tensor->data) + static_cast<size_t>(expert) * stride;
+    const uintptr_t raw_last = raw_first + stride;
+    const uintptr_t first = raw_first - raw_first % page;
+    const uintptr_t last = ((raw_last + page - 1) / page) * page;
+
+#if defined(__linux__)
+    if (::madvise(reinterpret_cast<void *>(first), last - first, MADV_WILLNEED) == 0) {
+        ++lctx.expert_prefetch_slices;
+        lctx.expert_prefetch_bytes += last - first;
+    } else {
+        ++lctx.expert_prefetch_failures;
+    }
+#else
+    (void) first;
+    (void) last;
+    ++lctx.expert_prefetch_failures;
+#endif
+}
+
+void expert_prefetch_slice_async(llama_context & lctx, ggml_tensor * tensor, int32_t expert) {
+    if (!tensor || !tensor->data || expert < 0 || expert >= tensor->ne[2]) {
+        ++lctx.expert_prefetch_failures;
+        return;
+    }
+    if (!tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer)) {
+        return;
+    }
+
+    const size_t stride = tensor->nb[2];
+    if (stride == 0) {
+        ++lctx.expert_prefetch_failures;
+        return;
+    }
+
+    const size_t page = expert_prefetch_page_size();
+    const uintptr_t raw_first = reinterpret_cast<uintptr_t>(tensor->data) + static_cast<size_t>(expert) * stride;
+    const uintptr_t raw_last = raw_first + stride;
+    const uintptr_t first = raw_first - raw_first % page;
+    const uintptr_t last = ((raw_last + page - 1) / page) * page;
+
+    if (lctx.expert_prefetch_worker &&
+        !lctx.expert_prefetch_worker->submit(reinterpret_cast<void *>(first), last - first)) {
+        ++lctx.expert_prefetch_failures;
+    }
+}
+
+void expert_prefetch_current_route(llama_context & lctx, ggml_tensor * tensor) {
+    const int layer = expert_prefetch_layer_from_name(ggml_get_name(tensor));
+    if (layer < 0 || static_cast<size_t>(layer) >= lctx.model.layers.size() || tensor->type != GGML_TYPE_I32 || tensor->ne[0] <= 0) {
+        ++lctx.expert_prefetch_failures;
+        return;
+    }
+
+    const size_t routes = tensor->ne[0];
+    const size_t tokens = ggml_nelements(tensor) / routes;
+    if (tokens == 0) {
+        ++lctx.expert_prefetch_failures;
+        return;
+    }
+
+    // For a prompt batch, prefetch only the final token's route.  Pulling all
+    // prompt routes would turn a bounded 50 MiB request into multi-GiB I/O.
+    std::vector<int32_t> experts(routes);
+    const size_t offset = (tokens - 1) * routes * sizeof(int32_t);
+    ggml_backend_tensor_get(tensor, experts.data(), offset, experts.size() * sizeof(int32_t));
+
+    const auto & weights = lctx.model.layers[layer];
+    ++lctx.expert_prefetch_callbacks;
+    for (const int32_t expert : experts) {
+        expert_prefetch_slice(lctx, weights.ffn_gate_exps, expert);
+        expert_prefetch_slice(lctx, weights.ffn_up_exps, expert);
+        expert_prefetch_slice(lctx, weights.ffn_down_exps, expert);
+    }
+}
+
+struct expert_prefetch_candidate {
+    float confidence;
+    uint32_t layer;
+    std::vector<int32_t> experts;
+};
+
+void expert_prefetch_predicted_routes(llama_context & lctx, ggml_tensor * tensor) {
+    const auto & head = lctx.expert_prefetch_model;
+    const int layer = expert_prefetch_layer_from_name(ggml_get_name(tensor));
+    if (!head.loaded || layer != static_cast<int>(head.source_layer) || tensor->type != GGML_TYPE_F32 ||
+        tensor->ne[0] != head.experts) {
+        ++lctx.expert_prefetch_failures;
+        return;
+    }
+
+    const size_t experts = head.experts;
+    const size_t tokens = ggml_nelements(tensor) / experts;
+    if (tokens == 0) {
+        ++lctx.expert_prefetch_failures;
+        return;
+    }
+
+    // A prompt graph contains many token columns.  Predict only the last one:
+    // its future layer work is still ahead while keeping each callback within
+    // the same byte budget as the scheduler simulation.
+    std::vector<float> logits(experts);
+    const size_t offset = (tokens - 1) * experts * sizeof(float);
+    ggml_backend_tensor_get(tensor, logits.data(), offset, logits.size() * sizeof(float));
+
+    std::vector<float> normalized(experts);
+    for (size_t expert = 0; expert < experts; ++expert) {
+        const float scale = head.scale[expert] == 0.0f ? 1.0f : head.scale[expert];
+        normalized[expert] = (logits[expert] - head.mean[expert]) / scale;
+    }
+
+    const size_t train_tokens = head.train_tokens;
+    std::vector<float> kernel(train_tokens, 0.0f);
+    for (size_t row = 0; row < train_tokens; ++row) {
+        const float * feature = head.source_train.data() + row * experts;
+        for (size_t expert = 0; expert < experts; ++expert) {
+            kernel[row] += normalized[expert] * feature[expert];
+        }
+    }
+
+    std::vector<expert_prefetch_candidate> candidates;
+    std::vector<float> scores(experts);
+    std::vector<uint32_t> ranking(experts);
+    std::iota(ranking.begin(), ranking.end(), 0);
+    const size_t chosen = head.prediction_experts;
+    const size_t rank_count = std::min(experts, chosen + 1);
+    for (uint32_t target = head.source_layer + 1; target < head.layers; ++target) {
+        std::fill(scores.begin(), scores.end(), 0.0f);
+        const size_t base = static_cast<size_t>(target - 1) * train_tokens * experts;
+        for (size_t row = 0; row < train_tokens; ++row) {
+            const float * dual = head.dual_by_target.data() + base + row * experts;
+            for (size_t expert = 0; expert < experts; ++expert) {
+                scores[expert] += kernel[row] * dual[expert];
+            }
+        }
+        std::iota(ranking.begin(), ranking.end(), 0);
+        std::partial_sort(ranking.begin(), ranking.begin() + rank_count, ranking.end(),
+                [&](uint32_t left, uint32_t right) {
+                    return scores[left] == scores[right] ? left < right : scores[left] > scores[right];
+                });
+        const auto & target_weights = lctx.model.layers[target];
+        // Resident expert tensors neither need nor permit host page staging.
+        if (!target_weights.ffn_gate_exps || !target_weights.ffn_up_exps || !target_weights.ffn_down_exps ||
+            !target_weights.ffn_gate_exps->buffer || !target_weights.ffn_up_exps->buffer || !target_weights.ffn_down_exps->buffer ||
+            !ggml_backend_buffer_is_host(target_weights.ffn_gate_exps->buffer) ||
+            !ggml_backend_buffer_is_host(target_weights.ffn_up_exps->buffer) ||
+            !ggml_backend_buffer_is_host(target_weights.ffn_down_exps->buffer)) {
+            continue;
+        }
+        expert_prefetch_candidate candidate {
+            .confidence = scores[ranking[chosen - 1]] - scores[ranking[rank_count - 1]],
+            .layer = target,
+            .experts = {},
+        };
+        candidate.experts.reserve(chosen);
+        for (size_t rank = 0; rank < chosen; ++rank) {
+            candidate.experts.push_back(static_cast<int32_t>(ranking[rank]));
+        }
+        candidates.push_back(std::move(candidate));
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const auto & left, const auto & right) {
+        return left.confidence == right.confidence ? left.layer < right.layer : left.confidence > right.confidence;
+    });
+
+    ++lctx.expert_prefetch_callbacks;
+    lctx.expert_prefetch_predictions.assign(head.layers, {});
+    const size_t target_count = std::min<size_t>(head.prefetch_targets, candidates.size());
+    for (size_t candidate_index = 0; candidate_index < target_count; ++candidate_index) {
+        const auto & candidate = candidates[candidate_index];
+        const auto & weights = lctx.model.layers[candidate.layer];
+        lctx.expert_prefetch_predictions[candidate.layer] = candidate.experts;
+        lctx.expert_prefetch_prediction_requests += candidate.experts.size();
+        for (const int32_t expert : candidate.experts) {
+            expert_prefetch_slice_async(lctx, weights.ffn_gate_exps, expert);
+            expert_prefetch_slice_async(lctx, weights.ffn_up_exps, expert);
+            expert_prefetch_slice_async(lctx, weights.ffn_down_exps, expert);
+        }
+    }
+}
+
+void expert_prefetch_record_prediction_actual(llama_context & lctx, ggml_tensor * tensor) {
+    const int layer = expert_prefetch_layer_from_name(ggml_get_name(tensor));
+    if (layer < 0 || static_cast<size_t>(layer) >= lctx.expert_prefetch_predictions.size() ||
+        lctx.expert_prefetch_predictions[layer].empty() || tensor->type != GGML_TYPE_I32 || tensor->ne[0] <= 0) {
+        return;
+    }
+
+    const size_t routes = tensor->ne[0];
+    const size_t tokens = ggml_nelements(tensor) / routes;
+    if (tokens == 0) {
+        ++lctx.expert_prefetch_failures;
+        return;
+    }
+    std::vector<int32_t> actual(routes);
+    const size_t offset = (tokens - 1) * routes * sizeof(int32_t);
+    ggml_backend_tensor_get(tensor, actual.data(), offset, actual.size() * sizeof(int32_t));
+
+    lctx.expert_prefetch_prediction_actuals += actual.size();
+    for (const int32_t predicted : lctx.expert_prefetch_predictions[layer]) {
+        lctx.expert_prefetch_prediction_matches += std::find(actual.begin(), actual.end(), predicted) != actual.end();
+    }
+}
+
+bool expert_prefetch_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto & lctx = *static_cast<llama_context *>(user_data);
+    const bool is_oracle_route = lctx.expert_prefetch_current_route && expert_prefetch_is_topk(tensor);
+    const bool is_prediction_source = lctx.expert_prefetch_enabled && lctx.expert_prefetch_predictor &&
+        expert_prefetch_is_logits(tensor) && expert_prefetch_layer_from_name(ggml_get_name(tensor)) ==
+            static_cast<int>(lctx.expert_prefetch_model.source_layer);
+    const bool is_prediction_observation = lctx.expert_prefetch_enabled && lctx.expert_prefetch_predictor && expert_prefetch_is_topk(tensor);
+    const bool is_route = is_oracle_route || is_prediction_source || is_prediction_observation;
+
+    if (ask) {
+        return is_route || (lctx.cb_eval_user && lctx.cb_eval_user(tensor, true, lctx.cb_eval_user_data));
+    }
+    if (is_oracle_route) {
+        expert_prefetch_current_route(lctx, tensor);
+    }
+    if (is_prediction_source) {
+        expert_prefetch_predicted_routes(lctx, tensor);
+    }
+    if (is_prediction_observation) {
+        expert_prefetch_record_prediction_actual(lctx, tensor);
+    }
+    return !lctx.cb_eval_user || lctx.cb_eval_user(tensor, false, lctx.cb_eval_user_data);
+}
+
+enum class expert_prefetch_mode {
+    none,
+    current_route_oracle,
+    layer_zero_predictor,
+    hybrid_current_and_predictor,
+};
+
+expert_prefetch_mode expert_prefetch_requested() {
+    const char * value = std::getenv("LLAMA_EXPERT_PREFETCH");
+    if (!value || std::strcmp(value, "0") == 0) {
+        return expert_prefetch_mode::none;
+    }
+    if (std::strcmp(value, "predictor") == 0) {
+        return expert_prefetch_mode::layer_zero_predictor;
+    }
+    if (std::strcmp(value, "hybrid") == 0) {
+        return expert_prefetch_mode::hybrid_current_and_predictor;
+    }
+    return expert_prefetch_mode::current_route_oracle;
+}
+
+} // namespace
 
 // TODO: fix these includes
 #include "iqk/iqk_quantize.h"
@@ -687,6 +1165,32 @@ void llama_context::set_mtp_op_type(llama_mtp_op_type value) {
 }
 
 llama_context::~llama_context() {
+    // Join the background prefetch worker before reporting its counters or
+    // releasing the model mappings it is allowed to touch.
+    if (expert_prefetch_worker) {
+        expert_prefetch_worker->stop();
+        expert_prefetch_failures += expert_prefetch_worker->failure_count();
+    }
+    expert_prefetch_worker.reset();
+    if (expert_prefetch_enabled) {
+        LLAMA_LOG_INFO("%s: mode=%s, route callbacks=%" PRIu64 ", successful slices=%" PRIu64 ", advised=%.2f MiB, failures=%" PRIu64 "\n",
+                __func__,
+                expert_prefetch_predictor && expert_prefetch_current_route ? "hybrid-current-route-plus-layer-0-predictor" :
+                expert_prefetch_predictor ? "layer-0-predictor" : "current-route-oracle",
+                expert_prefetch_callbacks,
+                expert_prefetch_slices,
+                expert_prefetch_bytes / 1024.0 / 1024.0,
+                expert_prefetch_failures);
+        if (expert_prefetch_predictor && expert_prefetch_prediction_requests) {
+            LLAMA_LOG_INFO("%s: predictor requests=%" PRIu64 ", observed actual routes=%" PRIu64 ", matches=%" PRIu64 ", precision=%.2f%%, recall=%.2f%%\n",
+                    __func__,
+                    expert_prefetch_prediction_requests,
+                    expert_prefetch_prediction_actuals,
+                    expert_prefetch_prediction_matches,
+                    100.0 * expert_prefetch_prediction_matches / expert_prefetch_prediction_requests,
+                    expert_prefetch_prediction_actuals ? 100.0 * expert_prefetch_prediction_matches / expert_prefetch_prediction_actuals : 0.0);
+        }
+    }
     ggml_backend_sched_free(sched);
 
     for (ggml_backend_t backend : backends) {
@@ -6748,6 +7252,33 @@ struct llama_context * llama_init_from_model(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    const auto prefetch_mode = expert_prefetch_requested();
+    const bool want_current_route = prefetch_mode == expert_prefetch_mode::current_route_oracle ||
+        prefetch_mode == expert_prefetch_mode::hybrid_current_and_predictor;
+    const bool want_predictor = prefetch_mode == expert_prefetch_mode::layer_zero_predictor ||
+        prefetch_mode == expert_prefetch_mode::hybrid_current_and_predictor;
+    bool enable_prefetch = want_current_route;
+    if (want_predictor) {
+        const char * model_path = std::getenv("LLAMA_EXPERT_PREFETCH_MODEL");
+        if (!model_path || !expert_prefetch_load_model(*ctx, model_path)) {
+            LLAMA_LOG_WARN("%s: layer-0 predictor disabled; set LLAMA_EXPERT_PREFETCH_MODEL to a compatible route-head file\n", __func__);
+        } else {
+            ctx->expert_prefetch_predictor = true;
+            ctx->expert_prefetch_worker = std::make_unique<llama_expert_prefetch_worker>(*ctx);
+            enable_prefetch = true;
+        }
+    }
+    if (enable_prefetch) {
+        ctx->expert_prefetch_enabled = true;
+        ctx->expert_prefetch_current_route = want_current_route;
+        ctx->cb_eval_user = params.cb_eval;
+        ctx->cb_eval_user_data = params.cb_eval_user_data;
+        cparams.cb_eval = expert_prefetch_callback;
+        cparams.cb_eval_user_data = ctx;
+        LLAMA_LOG_INFO("%s: enabling expert route mmap prefetch (%s)\n", __func__,
+                ctx->expert_prefetch_predictor && ctx->expert_prefetch_current_route ? "hybrid current-route control plus layer-0 predictor" :
+                ctx->expert_prefetch_predictor ? "layer-0 predictor" : "current-route oracle control");
+    }
 
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {

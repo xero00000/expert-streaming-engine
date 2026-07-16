@@ -7,11 +7,30 @@
 #include "llama-spec-features.h"
 
 struct llama_model;
+struct llama_expert_prefetch_worker;
 
 #include <vector>
 #include <map>
 #include <set>
 #include <memory>
+
+// Compact, model-specific layer-0 ridge head exported by
+// expert_streaming_lab/export_route_head.py.  It remains per-context because
+// the evaluation callback owns the prefetch policy.
+struct llama_expert_prefetch_model {
+    bool loaded = false;
+    uint32_t source_layer = 0;
+    uint32_t layers = 0;
+    uint32_t experts = 0;
+    uint32_t train_tokens = 0;
+    uint32_t prediction_experts = 0;
+    uint32_t prefetch_targets = 0;
+    float ridge_alpha = 0.0f;
+    std::vector<float> mean;
+    std::vector<float> scale;
+    std::vector<float> source_train;
+    std::vector<float> dual_by_target;
+};
 
 struct llama_kv_cell {
     llama_pos pos   = -1;
@@ -274,6 +293,26 @@ struct llama_context {
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
 
+    // Lab-only page-cache prefetch hook.  When LLAMA_EXPERT_PREFETCH=1 is
+    // supplied, llama.cpp observes the router's selected experts and issues a
+    // bounded MADV_WILLNEED for the corresponding mmap slices.  The original
+    // callback is retained so instrumentation clients keep working.
+    ggml_backend_sched_eval_callback cb_eval_user = nullptr;
+    void * cb_eval_user_data = nullptr;
+    bool expert_prefetch_enabled = false;
+    bool expert_prefetch_current_route = false;
+    bool expert_prefetch_predictor = false;
+    llama_expert_prefetch_model expert_prefetch_model;
+    std::unique_ptr<llama_expert_prefetch_worker> expert_prefetch_worker;
+    uint64_t expert_prefetch_callbacks = 0;
+    uint64_t expert_prefetch_slices = 0;
+    uint64_t expert_prefetch_bytes = 0;
+    uint64_t expert_prefetch_failures = 0;
+    uint64_t expert_prefetch_prediction_requests = 0;
+    uint64_t expert_prefetch_prediction_actuals = 0;
+    uint64_t expert_prefetch_prediction_matches = 0;
+    std::vector<std::vector<int32_t>> expert_prefetch_predictions;
+
     const float * draft_input_hidden_state = nullptr;
     size_t draft_input_hidden_state_n_floats = 0;
     std::vector<float> draft_input_hidden_state_owned;
@@ -320,4 +359,3 @@ struct llama_context {
     void set_mtp_op_type(llama_mtp_op_type value);
 
 };
-
