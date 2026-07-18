@@ -302,12 +302,17 @@ struct llama_context {
     bool expert_prefetch_enabled = false;
     bool expert_prefetch_current_route = false;
     bool expert_prefetch_predictor = false;
+    // Extra logit-ranked experts per CPU-MoE layer beyond the fired top-k
+    // (LLAMA_EXPERT_PREFETCH_TAIL). Lab-measured: the real router tail covers
+    // ~19-21% of the future experts that history-based reuse misses.
+    int32_t expert_prefetch_tail = 0;
     llama_expert_prefetch_model expert_prefetch_model;
     std::unique_ptr<llama_expert_prefetch_worker> expert_prefetch_worker;
     uint64_t expert_prefetch_callbacks = 0;
     uint64_t expert_prefetch_slices = 0;
     uint64_t expert_prefetch_bytes = 0;
     uint64_t expert_prefetch_failures = 0;
+    uint64_t expert_prefetch_tail_slices = 0;
     uint64_t expert_prefetch_prediction_requests = 0;
     uint64_t expert_prefetch_prediction_actuals = 0;
     uint64_t expert_prefetch_prediction_matches = 0;

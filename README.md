@@ -267,6 +267,7 @@ Automated multi-model runs under `all_model_bench_*` (older configs, useful as f
 | `--defer-experts` + mmap-backed CPU MoE | Production path |
 | Hybrid GPU-resident MoE tail (`--n-cpu-moe`) | Production path |
 | Route-aware page-cache prefetch (`LLAMA_EXPERT_PREFETCH` / router top-k → `MADV_WILLNEED`) | Production default on GPT-OSS slots |
+| Router logit-tail staging (`LLAMA_EXPERT_PREFETCH_TAIL=N` — stage the next *N* near-miss experts per CPU-MoE layer) | Experimental; lab replay shows the real tail covers ~19–21% of the future experts history misses |
 | Dual-GPU layer split (`--tensor-split 46,54`) | Measured fit for 8+10 GiB |
 | Q8 / Q4 K/V on hybrid placement | Q8 promoted for 1K/64K; Q4 for 8K fit |
 | Chunked GDN port work | Experimental branch history (`chunked-gdn-port`) |

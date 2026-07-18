@@ -331,6 +331,63 @@ void expert_prefetch_current_route(llama_context & lctx, ggml_tensor * tensor) {
     }
 }
 
+// True when this layer's expert tensors live in host (mmap/CPU) buffers —
+// the only case where page-cache staging is possible or safe.
+bool expert_prefetch_layer_is_host(const llama_context & lctx, int layer) {
+    if (layer < 0 || static_cast<size_t>(layer) >= lctx.model.layers.size()) {
+        return false;
+    }
+    const auto & weights = lctx.model.layers[layer];
+    return weights.ffn_gate_exps && weights.ffn_up_exps && weights.ffn_down_exps &&
+        weights.ffn_gate_exps->buffer && weights.ffn_up_exps->buffer && weights.ffn_down_exps->buffer &&
+        ggml_backend_buffer_is_host(weights.ffn_gate_exps->buffer) &&
+        ggml_backend_buffer_is_host(weights.ffn_up_exps->buffer) &&
+        ggml_backend_buffer_is_host(weights.ffn_down_exps->buffer);
+}
+
+// Tail extension of the current-route oracle: beyond the fired top-k, stage
+// the next LLAMA_EXPERT_PREFETCH_TAIL experts by router logit rank. These are
+// the near-miss experts most likely to fire on upcoming tokens (lab replay:
+// the real tail covers ~19-21% of the residual that history-based reuse
+// misses). Staged asynchronously — advisory work off the scheduler thread,
+// with the fired top-k always submitted first via the sync path.
+void expert_prefetch_route_tail(llama_context & lctx, ggml_tensor * tensor) {
+    const int layer = expert_prefetch_layer_from_name(ggml_get_name(tensor));
+    if (layer < 0 || tensor->type != GGML_TYPE_F32 || tensor->ne[0] <= 0 ||
+        !expert_prefetch_layer_is_host(lctx, layer)) {
+        return;
+    }
+
+    const size_t experts = tensor->ne[0];
+    const size_t tokens = ggml_nelements(tensor) / experts;
+    const size_t fired = lctx.model.hparams.n_expert_used;
+    const size_t tail = static_cast<size_t>(lctx.expert_prefetch_tail);
+    if (tokens == 0 || fired == 0 || fired + tail > experts) {
+        return;
+    }
+
+    // Last token's logits only — same batch-bounding rule as the oracle path.
+    std::vector<float> logits(experts);
+    const size_t offset = (tokens - 1) * experts * sizeof(float);
+    ggml_backend_tensor_get(tensor, logits.data(), offset, logits.size() * sizeof(float));
+
+    std::vector<uint32_t> ranking(experts);
+    std::iota(ranking.begin(), ranking.end(), 0);
+    std::partial_sort(ranking.begin(), ranking.begin() + fired + tail, ranking.end(),
+            [&](uint32_t left, uint32_t right) {
+                return logits[left] == logits[right] ? left < right : logits[left] > logits[right];
+            });
+
+    const auto & weights = lctx.model.layers[layer];
+    for (size_t rank = fired; rank < fired + tail; ++rank) {
+        const int32_t expert = static_cast<int32_t>(ranking[rank]);
+        expert_prefetch_slice_async(lctx, weights.ffn_gate_exps, expert);
+        expert_prefetch_slice_async(lctx, weights.ffn_up_exps, expert);
+        expert_prefetch_slice_async(lctx, weights.ffn_down_exps, expert);
+        ++lctx.expert_prefetch_tail_slices;
+    }
+}
+
 struct expert_prefetch_candidate {
     float confidence;
     uint32_t layer;
@@ -466,13 +523,21 @@ bool expert_prefetch_callback(ggml_tensor * tensor, bool ask, void * user_data) 
         expert_prefetch_is_logits(tensor) && expert_prefetch_layer_from_name(ggml_get_name(tensor)) ==
             static_cast<int>(lctx.expert_prefetch_model.source_layer);
     const bool is_prediction_observation = lctx.expert_prefetch_enabled && lctx.expert_prefetch_predictor && expert_prefetch_is_topk(tensor);
-    const bool is_route = is_oracle_route || is_prediction_source || is_prediction_observation;
+    // Tail staging observes router logits of CPU-MoE layers only — claiming
+    // logits of GPU-resident layers would add pointless device syncs.
+    const bool is_tail_source = lctx.expert_prefetch_current_route && lctx.expert_prefetch_tail > 0 &&
+        expert_prefetch_is_logits(tensor) &&
+        expert_prefetch_layer_is_host(lctx, expert_prefetch_layer_from_name(ggml_get_name(tensor)));
+    const bool is_route = is_oracle_route || is_prediction_source || is_prediction_observation || is_tail_source;
 
     if (ask) {
         return is_route || (lctx.cb_eval_user && lctx.cb_eval_user(tensor, true, lctx.cb_eval_user_data));
     }
     if (is_oracle_route) {
         expert_prefetch_current_route(lctx, tensor);
+    }
+    if (is_tail_source) {
+        expert_prefetch_route_tail(lctx, tensor);
     }
     if (is_prediction_source) {
         expert_prefetch_predicted_routes(lctx, tensor);
@@ -7271,13 +7336,27 @@ struct llama_context * llama_init_from_model(
     if (enable_prefetch) {
         ctx->expert_prefetch_enabled = true;
         ctx->expert_prefetch_current_route = want_current_route;
+        if (want_current_route) {
+            // LLAMA_EXPERT_PREFETCH_TAIL=N stages the next N experts per
+            // CPU-MoE layer by router logit rank beyond the fired top-k
+            // (near-miss experts for upcoming tokens). Needs the async worker.
+            const char * tail_env = std::getenv("LLAMA_EXPERT_PREFETCH_TAIL");
+            const int tail = tail_env ? std::atoi(tail_env) : 0;
+            if (tail > 0) {
+                ctx->expert_prefetch_tail = std::min(tail, 32);
+                if (!ctx->expert_prefetch_worker) {
+                    ctx->expert_prefetch_worker = std::make_unique<llama_expert_prefetch_worker>(*ctx);
+                }
+            }
+        }
         ctx->cb_eval_user = params.cb_eval;
         ctx->cb_eval_user_data = params.cb_eval_user_data;
         cparams.cb_eval = expert_prefetch_callback;
         cparams.cb_eval_user_data = ctx;
-        LLAMA_LOG_INFO("%s: enabling expert route mmap prefetch (%s)\n", __func__,
+        LLAMA_LOG_INFO("%s: enabling expert route mmap prefetch (%s, tail=%d)\n", __func__,
                 ctx->expert_prefetch_predictor && ctx->expert_prefetch_current_route ? "hybrid current-route control plus layer-0 predictor" :
-                ctx->expert_prefetch_predictor ? "layer-0 predictor" : "current-route oracle control");
+                ctx->expert_prefetch_predictor ? "layer-0 predictor" : "current-route oracle control",
+                ctx->expert_prefetch_tail);
     }
 
     auto rope_scaling_type = params.rope_scaling_type;
@@ -7764,6 +7843,13 @@ struct llama_context * llama_init_from_model(
 }
 
 void llama_free(struct llama_context * ctx) {
+    if (ctx && ctx->expert_prefetch_enabled) {
+        LLAMA_LOG_INFO("%s: expert prefetch stats: callbacks=%" PRIu64 " slices=%" PRIu64
+                " tail_slices=%" PRIu64 " bytes=%.1f MiB failures=%" PRIu64 "\n",
+                __func__, ctx->expert_prefetch_callbacks, ctx->expert_prefetch_slices,
+                ctx->expert_prefetch_tail_slices,
+                ctx->expert_prefetch_bytes / (1024.0 * 1024.0), ctx->expert_prefetch_failures);
+    }
     delete ctx;
 }
 
