@@ -4,17 +4,13 @@
 
 This repository is a focused fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (itself a [llama.cpp](https://github.com/ggml-org/llama.cpp) fork). The goal is not a new quant format. It is **making F16 / MXFP4 MoE weights that do not fit in VRAM usable at interactive speeds** on low-VRAM multi-GPU hosts.
 
-| Badge | |
-| --- | --- |
-| License | [MIT](LICENSE) |
-| Branch | `chunked-gdn-port` |
-| Headline result | **GPT-OSS 120B F16** · **~140 tok/s prefill** · **~11.5 tok/s decode** |
+**License:** [MIT](LICENSE) · **Branch:** `chunked-gdn-port` · **Headline:** GPT-OSS 120B F16 · ~140 tok/s prefill · ~11.5 tok/s decode
 
 ---
 
 ## Headline result
 
-**Model:** [GPT-OSS 120B](https://huggingface.co/) F16 GGUF (~61 GiB on disk)  
+**Model:** [GPT-OSS 120B](https://huggingface.co/openai/gpt-oss-120b) F16 GGUF (~61 GiB on disk)  
 **Hardware:** dual Ampere (8 GiB + 10 GiB) · Ryzen 9 5950X · ~47 GiB DDR4 · NVMe  
 **Daily-driver slot:** 64K context, Q8 K/V, hybrid CPU-MoE + 6 GPU-resident MoE layers
 
@@ -353,7 +349,7 @@ On a different GPU pair, re-sweep `--n-cpu-moe` and `--tensor-split` until both 
 
 ---
 
-## What did *not* work 
+## What did *not* work
 
 1. **Naive full-expert streaming from disk** — cold 1.77 GiB/token class I/O.  
 2. **Pinned ~58 GiB expert host mapping** on a 31–47 GiB RAM machine — slow or impossible; use mmap + `GGML_CUDA_NO_PINNED`.  
