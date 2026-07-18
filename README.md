@@ -53,7 +53,7 @@ Only **4 of 128 experts per layer** are active per token. The engine:
 
 ## Benchmarks (measured)
 
-All numbers below are from the isolated `:8014` harness and the live `:8000` launcher on the same dual-Ampere host. Full lab log: local `expert_streaming_lab/RESULTS.md` (methodology, raw JSON paths, rejected ablations).
+GPT-OSS numbers below are from the isolated `:8014` harness and the live `:8000` launcher on the same dual-Ampere host. Full lab log: local `expert_streaming_lab/RESULTS.md` (methodology, raw JSON paths, rejected ablations). **Other models** on this host are summarized in [Fleet benchmarks](#fleet-benchmarks-same-dual-gpu-host).
 
 ### Hardware
 
@@ -156,6 +156,111 @@ Geometry: 64K Q8 K/V, `--n-cpu-moe 30` (six GPU-resident MoE layers), warm 4,747
 | Learned layer-0 route head in executor | **Rejected for default** (~1.36 tok/s; near no-prefetch) |
 | Generic n-gram speculation | **Rejected** (6.12 tok/s vs ~9.4 hybrid) |
 | Standard Q3_K_M conversion | **Blocked** (MXFP4 expert rows incompatible without force-requantize) |
+
+---
+
+## Fleet benchmarks (same dual-GPU host)
+
+The numbers below are **measured on the same workstation** (dual ~8+10 GiB Ampere, Ryzen 9 5950X, ~47 GiB DDR4). Most daily drivers run on **ik_llama.cpp** with hybrid CPU-MoE / mixed quants; GPT-OSS uses **this expert-streaming fork**; Bonsai uses a Prism 1-bit fork; Gemma-4 uses a TurboQuant gemma4 fork. Decode rates are warm-path short generations unless noted. Prefill is listed when recorded in the launcher notes.
+
+**Takeaway:** hybrid placement + good quants put **35B-A3B MoE models in the ~50–120 tok/s decode band** on 18 GiB VRAM; **120B F16** is interactive but slower (~9–13 tok/s) because it is much larger and still mostly CPU-MoE.
+
+### At a glance
+
+| Model family | Best daily decode | Context | Engine | Notes |
+| --- | ---: | ---: | --- | --- |
+| **Qwen3.6 35B-A3B VRAM13** (all-GPU quant) | **~122 t/s** | 256K | ik | Fastest 35B class (stronger compression) |
+| **Qwen3.6 + transplanted MTP** | **~90–93 t/s** | 128K | ik | +15–19% vs mixed base |
+| **Qwopus-Coder native MTP** | **~91–98 t/s** (code) | 128K | ik | Prose ~break-even (~76) |
+| **Mixed q2k+imatrix fleet** (Qwen / Ornith / Agents / AgentWorld / Qwopus) | **~78–80 t/s** | **256K** | ik | Default daily class |
+| **IQ4_XS uniform** | ~77 / ~65 / ~51 t/s | 64K / 128K / 256K | ik | Full-size quality path |
+| **Bonsai-27B 1-bit** | **~53 t/s** fresh · **~10 @256K depth** | **256K all-VRAM** | prism | Only full-VRAM 256K dense option |
+| **Q8_0 35B fleet** (max quality) | **~32–33 t/s** | 64K | ik | Heavy `n-cpu-moe 26` |
+| **Gemma-4 26B-A4B Q8** | **~22 t/s** decode · **~273 pf** | 256K | tq | Needs `--no-op-offload` |
+| **GPT-OSS 120B F16** (this fork) | **~11.5–13 t/s** · **~140 pf** | 1K–64K | expert-streaming | Huge F16 on 18 GiB VRAM |
+
+### GPT-OSS 120B F16 (expert-streaming engine)
+
+| Slot | Ctx | K/V | Placement | Prefill | Decode |
+| --- | ---: | --- | --- | ---: | ---: |
+| `gpt-oss-expert-streaming` | 1K | Q8 | 28 CPU-MoE + 8 GPU MoE · 46/54 | — | **~12.8 t/s** workload median · warm short **~15.8** |
+| `gpt-oss-expert-streaming-8k` | 8K | Q4 | same 8 resident | — | **~5.6–9 t/s** class |
+| `gpt-oss-expert-streaming-64k` | **64K** | Q8 | 30 CPU-MoE + 6 GPU MoE | **~139–141 t/s** | **~11.5** short · **~8.9 @22K** |
+
+### Qwen3.6 35B-A3B (base)
+
+| Slot / quant | Ctx | Offload | Prefill | Decode | Notes |
+| --- | ---: | --- | ---: | ---: | --- |
+| UD-IQ4_XS (`qwen36`) | 16K | `n-cpu-moe 4` | — | **~80 t/s** | Light hybrid |
+| UD-IQ4_XS (`qwen36-64k`) | 64K | `n-cpu-moe 4` | **~1203 t/s** | **~77 t/s** | Max-speed IQ4 |
+| UD-IQ4_XS (`qwen36-128k`) | 128K | `n-cpu-moe 8` | **~881 t/s** | **~64.7 t/s** | Was ~358/60 on Q3_K_XL |
+| UD-IQ4_XS (`qwen36-256k`) | 256K | `n-cpu-moe 14` | **~626 t/s** | **~51 t/s** | Full window IQ4 |
+| **Mixed q2k+imatrix** (`qwen36-mixed`) | **256K** | `-ot` layers 13–26 → CPU | — | **~77–78 t/s** | **Default** · PPL 2.4195 vs Q8 2.4053 |
+| Mixed tight (`qwen36-mixed-max`) | 256K | fewer CPU layers | — | **~80 t/s** | Solo use · tight GPU1 |
+| **VRAM13 q2ex+imat** (`qwen36-vram13`) | **256K** | **all-VRAM** | — | **~122 t/s** (was ~129 @short) | ~5% drop at full 256K KV |
+| Phone ufs-q2ex-q40 | 64K | all-VRAM | — | all-VRAM speed class | Harsher quant; parity tests |
+| Q8_0 (`qwen36-q8`) | 64K | `n-cpu-moe 26` | **~533 t/s** | **~33 t/s** | Lossless · not daily |
+| Mixed + transplanted MTP (`qwen36-mtp`) | 128K | `-ot` 13–29 + `-mtp` | — | **~93 code / ~90 prose / ~91 thinking** | **+15–19%** vs ~78 base |
+
+### Qwen3.6 abliterated (uncensored)
+
+| Slot | Ctx | Decode | Notes |
+| --- | ---: | ---: | --- |
+| Abliterated mixed q2k (`qwen36-ablit-mixed`) | 256K | **~78 t/s** | Replaces slower Huihui Q4_K_M (~66–72) |
+| Abliterated + transplanted MTP | 128K | **~87 code / ~83 prose** | **+6–11%** vs mixed |
+
+Older uniform-Q4 abliterated harness (2026-06-24 `all_model_bench`): 128K **708 pf / 76 dec**, 256K **639 pf / 68 dec** (browser-stress PASS).
+
+### Coding / agent fine-tunes (same 35B-A3B geometry)
+
+| Model | Slot class | Ctx | Decode | Notes |
+| --- | --- | ---: | ---: | --- |
+| **Qwopus-Coder** mixed | daily coding | 256K | **~78 t/s** | Thinking-off |
+| Qwopus native MTP | `qwopus-mtp` | 128K | **~91–98 code** · ~76 prose | Self-spec; verification-lossless |
+| Qwopus MTP corpus-tuned | `qwopus-mtp-tuned` | 128K | (A/B vs native) | Head val top-1 62.17% |
+| Qwopus VRAM13 + MTP | all-VRAM | 64K | all-VRAM + MTP class | Forge-safe ctx (128K FA+MTP OOM risk) |
+| Qwopus Q8_0 | max quality | 64K | **~32 t/s** | `n-cpu-moe 26` |
+| **Ornith-1.0** mixed | RL reasoning | 256K | **~78 t/s** | Was Q4_K_M ~61 · PPL mixed 2.3676 / Q8 2.3434 |
+| Ornith + MTP | transplanted | 128K | **~83 code / ~80 prose** | +3–7% (modest) |
+| Ornith Q8_0 | max quality | 64K | **~33 t/s** | Max quality |
+| **Agents-A1** mixed | agentic thinking | 256K | **~78 t/s** | IFEval 94.8 / Seal-0 56.4 (upstream) |
+| Agents-A1 native MTP | native head | 128K | **~83 code / ~78 prose / ~82 thinking** | +5–7% only |
+| Agents-A1 Q8_0 | max quality | 64K | **~32 t/s** | Official headless Q8 |
+| **AgentWorld** mixed | world-model / tools | 256K | **~79 t/s** | AgentWorldBench 56.4 class (upstream) |
+| AgentWorld + MTP | transplanted | 128K | **~82 code / ~79 prose** | +2–5% marginal |
+| AgentWorld Q8_0 | max quality | 64K | **~32 t/s** | Max quality |
+
+### Dense / other architectures
+
+| Model | Engine | Ctx | Prefill | Decode | Notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| **Bonsai-27B Q1_0** (1-bit) | prism | **256K all-VRAM** | **~476 t/s** (pp262144) | **~53 fresh / ~10.2 @256K depth** | ~13.5 GiB across both GPUs · RAM free |
+| **Huihui Gemma-4 26B-A4B** Q8 abliterated | turboquant gemma4 | 256K | **~273 t/s** | **~22 t/s** | `n-cpu-moe 23` + **`--no-op-offload`** (op-offload was 94 pf) |
+| Qwen2.5-0.5B Fable-5 FT | ik | 8K | — | very fast (tiny) | Experimental · needs anti-loop sampling |
+
+### Quant / placement improvements (cross-model)
+
+| Change | Typical effect on this host |
+| --- | --- |
+| Uniform IQ4_XS @256K → **mixed q2k+imatrix + `-ot` CPU mid-layers** | Decode **~51 → ~78 t/s** at full 256K (**~1.5×**) while keeping quality near Q8 (PPL +0.6%) |
+| Mixed base → **transplanted / native MTP** | **+3% to +26%** decode depending on head match (best on Qwen/Qwopus code) |
+| Uniform Q4 / Q3 abliterated → **mixed abliterated** | ~66–72 → **~78 t/s** @256K |
+| All-VRAM purpose quant (**VRAM13**) | **~122 t/s** decode @256K — speed king, stronger compression |
+| Q8 max-quality path | **~32–33 t/s** @64K — ~2.4× slower than mixed, best fidelity |
+| ik free flags `-sas` + `-rtr` on CPU-MoE slots | **~+2–3%** + **~+1.7%** decode (measured on qwen36-mixed) |
+| Gemma-4: disable op-offload | Prefill **94 → 273 t/s** (**~2.9×**) |
+
+### Historical harness snapshots
+
+Automated multi-model runs under `all_model_bench_*` (older configs, useful as floor references):
+
+| Date | Config | Prefill | Decode |
+| --- | --- | ---: | ---: |
+| 2026-06-21 | Qwen3.6 UD-Q3_K_XL 16K | 1786 | 102 |
+| 2026-06-24 | Ablit Q3_K_M 256K | ~700 | ~78 |
+| 2026-06-24 | Ablit Q4_K_M browser-safe 128K | 708 | 76 |
+| 2026-06-24 | Ablit Q4_K_M browser-safe 256K | 639 | 68 |
+| 2026-06-24 | Q4 offload sweep 64K (`n-cpu-moe` 12→10) | 690→777 | 75→82 |
 
 ---
 
