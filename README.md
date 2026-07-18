@@ -248,7 +248,7 @@ On a different GPU pair, re-sweep `--n-cpu-moe` and `--tensor-split` until both 
 
 ---
 
-## What did *not* work (so you do not re-learn it)
+## What did *not* work 
 
 1. **Naive full-expert streaming from disk** — cold 1.77 GiB/token class I/O.  
 2. **Pinned ~58 GiB expert host mapping** on a 31–47 GiB RAM machine — slow or impossible; use mmap + `GGML_CUDA_NO_PINNED`.  
