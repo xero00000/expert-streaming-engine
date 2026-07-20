@@ -22,6 +22,18 @@
 
 static constexpr int WM = 16, WN = 16, WK = 8;
 
+// Turing (sm_75, the RTX 2080 SUPER added 2026-07-19) lacks the m16n16k8 TF32
+// WMMA fragments the chunked GDN prefill helpers below require. That path is
+// DORMANT on ik — delta-net.cu gates the chunked launch on cc>=800 and it is
+// off unless GDN_CHUNK=1 — so on the sm_75 device pass these bodies compile out
+// to empty stubs: valid __global__ symbols that are simply never launched.
+// Ampere and the host pass keep the real code unchanged.
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800)
+#define GDN_WMMA_AVAILABLE 1
+#else
+#define GDN_WMMA_AVAILABLE 0
+#endif
+
 // 2026-05-26: ik_llama.cpp passes raw beta to ggml_delta_net (no sigmoid in graph
 // builder); the sequential kernel applies sigmoid internally. Mainline llama.cpp
 // pre-sigmoids beta in the graph builder before passing to ggml_gated_delta_net,
@@ -36,6 +48,7 @@ static __host__ __device__ constexpr int dot_max_tpw() {
     return ((M / WM) * (N / WN) + N_WARPS - 1) / N_WARPS;
 }
 
+#if GDN_WMMA_AVAILABLE
 template<int M, int N, int N_WARPS>
 __device__ __forceinline__ void dot_init(
     int warp_id,
@@ -89,6 +102,7 @@ __device__ __forceinline__ void dot_mma(
         }
     }
 }
+#endif // GDN_WMMA_AVAILABLE (dot_init / dot_mma helpers)
 
 template <int S_v, bool KDA>
 __global__ void __launch_bounds__(S_v, 1)
@@ -304,6 +318,7 @@ static __global__ void compute_kkt_cuda(float * Akk, float * Akq, const float * 
     int64_t sb1, int64_t sb2, int64_t sb3,
     int64_t H_k,    // 2026-05-26 PATH C+D1 GQA fix: q/k have H_k heads, not H_v.
     float scale) {
+#if GDN_WMMA_AVAILABLE
 
     const int h_idx = blockIdx.x;
     const int c_idx = blockIdx.y;
@@ -405,6 +420,7 @@ static __global__ void compute_kkt_cuda(float * Akk, float * Akq, const float * 
             }
         }
     }
+#endif // GDN_WMMA_AVAILABLE (compute_kkt_cuda)
 }
 
 template<size_t CS>
@@ -454,6 +470,7 @@ static __global__ void compute_wu_cuda(
     const int64_t sg1, const int64_t sg2, const int64_t sg3,
     const int64_t sd1, const int64_t sd2, const int64_t sd3,
     const int64_t H_k) {
+#if GDN_WMMA_AVAILABLE
 
     const int h_idx = blockIdx.x;
     const int c_idx = blockIdx.y;
@@ -553,6 +570,7 @@ static __global__ void compute_wu_cuda(
             v_new[i] = isfinite(val) ? fminf(fmaxf(val, -1e6f), 1e6f) : 0.0f;
         }
     }
+#endif // GDN_WMMA_AVAILABLE (compute_wu_cuda)
 }
 
 template<int K, int BV, int CS>
@@ -569,6 +587,7 @@ static __global__ void compute_state_fused_cuda(
     int64_t sd1, int64_t sd2, int64_t sd3,
     int64_t n_chunks, int64_t H,
     int64_t H_k) {
+#if GDN_WMMA_AVAILABLE
 
     constexpr int SP = BV + 1;
     constexpr int BP = K  + 1;
@@ -725,6 +744,7 @@ static __global__ void compute_state_fused_cuda(
         const int k = i0 / BV;
         s_final[(v_start + m) + k * K] = smem_state[k * SP + m];
     }
+#endif // GDN_WMMA_AVAILABLE (compute_state_fused_cuda)
 }
 
 template<size_t CS, size_t S_v>
@@ -741,6 +761,7 @@ static __global__ void compute_output_cuda(
     int64_t n_chunks, int64_t H, int64_t n_tokens,
     int64_t H_k,
     float scale) {
+#if GDN_WMMA_AVAILABLE
 
     const int h_idx = blockIdx.x;
     const int s_idx = blockIdx.y;
@@ -846,6 +867,7 @@ static __global__ void compute_output_cuda(
             __syncwarp();
         }
     }
+#endif // GDN_WMMA_AVAILABLE (compute_output_cuda)
 }
 
 // 2026-05-26: non-static so the dispatch in delta-net.cu can call us. All

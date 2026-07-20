@@ -391,7 +391,13 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         const char * e = std::getenv("GDN_CHUNK");
         return e && *e && *e != '0';
     }();
-    if (!_enable_path_c || kda || n_tokens < 64 || head_dim != 128 || src6 != nullptr) {
+    // 2026-07-19 (RTX 2080 SUPER / sm_75 port): the chunked prefill kernel uses
+    // Ampere-only TF32 WMMA and is stubbed to an empty body on sm_75. Never launch
+    // it on a pre-Ampere device — fall through to the sequential per-token kernel,
+    // which is arch-portable and already the default path. Belt-and-braces: the
+    // chunked path is also off unless GDN_CHUNK=1.
+    const int gdn_cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!_enable_path_c || gdn_cc < 800 || kda || n_tokens < 64 || head_dim != 128 || src6 != nullptr) {
         // Path C+D1 disabled or doesn't meet preconditions; fall through to sequential.
     } else {
         ggml_tensor * src_q_mut    = dst->src[0];
