@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <set>
 
+#include "llama-reload-info.h"
+
 // available llama models
 enum e_model {
     MODEL_UNKNOWN,
@@ -105,9 +107,11 @@ enum e_model {
     MODEL_A13B,
     MODEL_7B_A1B,
     MODEL_8B_A1B,
+    MODEL_12B_A2_5B,
     MODEL_16B_A1B,
     MODEL_21B_A3B, // Ernie MoE small
     MODEL_30B_A3B,
+    MODEL_33B_A3B,
     MODEL_35B_A3B,
     MODEL_80B_A3B, // Qwen3-Next
     MODEL_80B_A13B,
@@ -181,6 +185,9 @@ struct llama_layer {
     // as "attn_kv_b.weight". Materialized under -sm graph + mla>1; mla=1 skips.
     struct ggml_tensor * wk_b_pp = nullptr;
     struct ggml_tensor * wv_b = nullptr;
+    struct ggml_tensor * wkv_latent = nullptr;
+    struct ggml_tensor * wo_a = nullptr;
+    struct ggml_tensor * wo_b = nullptr;
     struct ggml_tensor * wq_cross = nullptr;
     struct ggml_tensor * wk_cross = nullptr;
     struct ggml_tensor * wv_cross = nullptr;
@@ -222,7 +229,7 @@ struct llama_layer {
     llama_split_tensor split_sinks;
     llama_split_tensor split_wqkv_gate;
 
-    // MLA per-device shards (-sm graph for DEEPSEEK2/GLM_DSA/MISTRAL4).
+    // MLA per-device shards (-sm graph for DEEPSEEK2/DEEPSEEK4/GLM_DSA/MISTRAL4).
     llama_split_tensor split_wq_a;
     llama_split_tensor split_wq_b;
     llama_split_tensor split_wkv_a_mqa;
@@ -325,6 +332,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+    struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
     llama_split_tensor split_ffn_gate_b;
     llama_split_tensor split_ffn_down_b;
@@ -362,6 +370,21 @@ struct llama_layer {
     struct ggml_tensor * indexer_proj     = nullptr;
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
+    struct ggml_tensor * indexer_comp_wkv   = nullptr;
+    struct ggml_tensor * indexer_comp_wgate = nullptr;
+    struct ggml_tensor * indexer_comp_ape   = nullptr;
+    struct ggml_tensor * indexer_comp_norm  = nullptr;
+    struct ggml_tensor * attn_kv_norm       = nullptr;
+    struct ggml_tensor * hc_attn_base     = nullptr;
+    struct ggml_tensor * hc_attn_fn       = nullptr;
+    struct ggml_tensor * hc_attn_scale    = nullptr;
+    struct ggml_tensor * hc_ffn_base      = nullptr;
+    struct ggml_tensor * hc_ffn_fn        = nullptr;
+    struct ggml_tensor * hc_ffn_scale     = nullptr;
+    struct ggml_tensor * attn_comp_wkv     = nullptr;
+    struct ggml_tensor * attn_comp_wgate   = nullptr;
+    struct ggml_tensor * attn_comp_ape     = nullptr;
+    struct ggml_tensor * attn_comp_norm    = nullptr;
 
     // long rope factors
     struct ggml_tensor * rope_long  = nullptr;
@@ -384,10 +407,30 @@ struct llama_layer {
 
     struct llama_layer_nextn nextn;
 
+    // openPangu-2.0: MoME causal convs + learned static param sink + mHC + block post-norm
+    struct ggml_tensor * qa_conv          = nullptr;
+    struct ggml_tensor * kv_conv          = nullptr; // compresskv_conv
+    struct ggml_tensor * o_conv           = nullptr;
+    struct ggml_tensor * param_sink_kv    = nullptr;
+    struct ggml_tensor * param_sink_k_pe  = nullptr;
+    struct ggml_tensor * param_sink_blk   = nullptr;
+    struct ggml_tensor * param_sink_lat_t = nullptr;
+    struct ggml_tensor * block_post_norm  = nullptr;
+    struct ggml_tensor * mhc_attn_phi     = nullptr;
+    struct ggml_tensor * mhc_attn_alpha   = nullptr;
+    struct ggml_tensor * mhc_attn_beta    = nullptr;
+    struct ggml_tensor * mhc_attn_gamma   = nullptr;
+    struct ggml_tensor * mhc_mlp_phi      = nullptr;
+    struct ggml_tensor * mhc_mlp_alpha    = nullptr;
+    struct ggml_tensor * mhc_mlp_beta     = nullptr;
+    struct ggml_tensor * mhc_mlp_gamma    = nullptr;
+
     std::unique_ptr<ggml_tensor> computed_wk_b;
     std::unique_ptr<ggml_tensor> computed_wk_b_pp;
     std::unique_ptr<ggml_tensor> computed_wv_b;
     std::unique_ptr<ggml_tensor> computed_wkv_b;
+    std::unique_ptr<ggml_tensor> computed_param_sink_blk;
+    std::unique_ptr<ggml_tensor> computed_param_sink_lat_t;
 
     // Per-device replicas of computed wk_b/wv_b (-sm graph). Buffers owned via model.bufs.
     std::vector<std::unique_ptr<ggml_tensor>> computed_wk_b_replicas;
@@ -428,6 +471,9 @@ struct llama_model {
     struct ggml_tensor * mtp_post_proj = nullptr;
     struct ggml_tensor * mtp_token_ordering = nullptr;
     struct ggml_tensor * mtp_centroids = nullptr;
+    struct ggml_tensor * dflash_fc = nullptr;
+    struct ggml_tensor * dflash_aux_norm = nullptr;
+    struct ggml_tensor * dflash_hidden_norm = nullptr;
 
     struct ggml_tensor * output_norm;
     struct ggml_tensor * output_norm_b;
@@ -435,6 +481,15 @@ struct llama_model {
     struct ggml_tensor * output_b;
     struct ggml_tensor * output_norm_enc;
     struct ggml_tensor * output_mtp = nullptr;
+    struct ggml_tensor * hc_head_base = nullptr;
+    struct ggml_tensor * hc_head_fn = nullptr;
+    struct ggml_tensor * hc_head_scale = nullptr;
+
+    // openPangu-2.0: global mHC stream-merge module (non-block)
+    struct ggml_tensor * mhc_merge_phi   = nullptr;
+    struct ggml_tensor * mhc_merge_alpha = nullptr;
+    struct ggml_tensor * mhc_merge_beta  = nullptr;
+    struct ggml_tensor * mhc_merge_gamma = nullptr;
 
     std::unique_ptr<ggml_tensor> output_mtp_ptr;
 
@@ -515,7 +570,31 @@ struct llama_model {
         return tensor_overrides;
     }
 
-    size_t cache_size(int il, ggml_type type_k, ggml_type type_v, uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const;
+    bool is_mla_model() const {
+        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4;
+    }
+
+    static inline int hadamard_size(int head_size) {
+        if ((head_size & ~(head_size - 1)) == head_size) return head_size;
+        // Note: we do not include 32 as an option because the CUDA Hadamard implementation
+        //       does not hcurrently andle a block size of 32.
+        for (int i = 512; i >= 64; i >>= 1) {
+            if (head_size % i == 0) return i;
+        }
+        return 0;
+    }
+
+    inline int hadamard_size_k(int il) const {
+        if (is_mla_model()) return 64;
+        return hadamard_size(hparams.n_embd_head_k(il));
+    }
+
+    inline int hadamard_size_v(int il) const {
+        if (is_mla_model()) return 64;
+        return hadamard_size(hparams.n_embd_head_v(il));
+    }
+
+    size_t cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_type idx_type_k, uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const;
 
     void set_tensor_overrides(const llama_model_params& params);
 
@@ -524,7 +603,14 @@ struct llama_model {
 
     std::vector<float> splits;
     ggml_backend_buffer_type_t split_buft = nullptr;
+
+    std::unique_ptr<reload_info> reload;
 };
+
+// Recompute the load-time-derived combined wkv_b (computed_wkv_b) of layer il
+// from the current wk_b/wv_b tensor data (hot-swap support). Defined in
+// llama.cpp next to llm_prepare_mla.
+bool llm_refresh_computed_wkv_b(llama_model & model, int il);
 
 struct llama_lora_weight {
     struct ggml_tensor * a = nullptr;
@@ -597,4 +683,3 @@ struct LLM_TN {
 std::string llama_model_ftype_name(llama_ftype ftype);
 
 const char * llama_model_type_name(e_model type);
-

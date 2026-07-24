@@ -6426,7 +6426,7 @@ void vec_dot_q3_k_r4_q8_k(int n, float * s, size_t bs, const void * vx, size_t b
 //
 
 void quantize_row_q2_k_r4_ref(const float * x, block_q2_k_r4 * y, int64_t k) {
-    quantize_q3_k_r4(x, (void *)y, 4, k/4, nullptr, nullptr);
+    quantize_q2_k_r4(x, (void *)y, 4, k/4, nullptr, nullptr);
 }
 
 void quantize_row_q2_k_r4(const float * x, void * y, int64_t k) {
@@ -8353,10 +8353,7 @@ const Modify * get_modify_info(ggml_type type) {
     return it != k_mod_map.end() ? &it->second : nullptr;
 }
 bool is_forbidden_tensor(const std::string& name) {
-    static const std::string kTokenEmbd{"token_embd.weight"};
-    if (name == kTokenEmbd) return true;
-    //if (auto pos = name.find("attn_kv_b.weight"); pos != std::string::npos) return true;
-    return false;
+    return (name == "token_embd.weight" || name == "per_layer_token_embd.weight");
 }
 }
 

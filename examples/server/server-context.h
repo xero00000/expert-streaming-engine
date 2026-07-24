@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 
 
@@ -22,25 +23,12 @@ enum slot_command {
     SLOT_COMMAND_RELEASE,
 };
 
-struct server_speculative_checkpoint {
-    bool valid = false;
-    bool per_step_enabled = false; // per-step SSM checkpoints active
-    llama_pos n_past = 0;
-    llama_token sampled = LLAMA_TOKEN_NULL;
-    common_sampler * sampler = nullptr; // saved sampler state
-
-    void clear();
-};
-
 struct server_slot {
     int id;
     int id_task = -1;
     int id_multi = -1;
 
     struct slot_params params;
-
-    llama_batch batch_spec = {};
-    llama_context * ctx_dft = nullptr;
 
     bool released = false;
     slot_state state = SLOT_STATE_IDLE;
@@ -64,6 +52,8 @@ struct server_slot {
 
     int32_t i_batch = -1;
     int32_t n_predict = -1; // TODO: disambiguate from params.n_predict
+    int32_t prompt_batch_i0 = -1;
+    int32_t prompt_batch_i1 = -1;
 
     int32_t n_prompt_tokens = 0;
     int32_t n_prompt_tokens_cache = 0;
@@ -127,7 +117,7 @@ struct server_slot {
 
     void prompt_save(server_prompt_cache& prompt_cache) const;
 
-    void prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens);
+    void prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction);
 
     size_t checkpoint_pos = 0;
     bool do_checkpoint = false;
@@ -136,7 +126,7 @@ struct server_slot {
     // sampling
     llama_token sampled; // in speculative mode, this is the last accepted token
     llama_tokens drafted;
-    common_speculative_type drafted_spec_type = COMMON_SPECULATIVE_TYPE_NONE;
+    bool spec_target_only = false;
 
     json json_schema;
 
@@ -171,14 +161,12 @@ struct server_slot {
     // expiring logit bias
     std::vector<common_sampler::elb_state> prev_elb_states;
 
-    bool has_mtp = false;
-
-    // saves recurrent state before a speculative batch so it can be restored on rejection
-    server_speculative_checkpoint spec_ckpt;
-
+    bool spec_prompt_warmup_failed = false;
     // speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
+    std::vector<int32_t> n_draft_by_depth;
+    std::vector<int32_t> n_draft_accepted_by_depth;
 
     int32_t n_past_se = 0; // self-extend
 
@@ -195,6 +183,7 @@ struct server_slot {
     void reset();
 
     bool need_embd() const;
+    bool uses_mtp() const;
 
     bool has_budget(gpt_params& global_params);
 
@@ -265,11 +254,6 @@ struct server_context {
 
     // multimodal
     mtmd_context* mctx = nullptr;
-
-    // For speculative decoding
-    llama_model* model_draft = nullptr;
-    llama_context* ctx_draft = nullptr;
-    llama_context_params cparams_dft;
 
     int32_t n_ctx; // total context for all clients / slots
 
@@ -350,7 +334,7 @@ struct server_context {
 
     void apply_server_biases(server_slot& slot);
 
-    void request_completion(int id_task, int id_multi, json data, bool infill, bool embedding, server_tokens&& inputs);
+    void request_completion(int id_task, int id_multi, json data, bool infill, bool embedding, server_tokens & inputs);
 
     void request_cancel(int id_task);
 

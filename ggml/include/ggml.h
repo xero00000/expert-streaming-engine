@@ -240,7 +240,10 @@
 // if you need to load more than 64 model shards.
 #define GGML_MAX_CONTEXTS       64
 #endif
-#define GGML_MAX_SRC            12
+#ifndef GGML_MAX_SRC
+// For the machines with 11+ GPUs use -DGGML_MAX_SRC=N
+#define GGML_MAX_SRC            16
+#endif
 #ifndef GGML_MAX_NAME
 #define GGML_MAX_NAME           64
 #endif
@@ -700,6 +703,14 @@ extern "C" {
         GGML_OP_FAKE_CPY,
         GGML_OP_FUSED_NORM,
         GGML_OP_FUSED_RMS_RMS_ADD,
+        GGML_OP_BLEND,
+        GGML_OP_INDEXER_TOPK,
+        GGML_OP_MASK_TOPK,
+        GGML_OP_SINKHORN,
+        GGML_OP_HC_PRE,
+        GGML_OP_HC_POST,
+        GGML_OP_MASK_TO_IDX,
+        GGML_OP_LATENT_ATTN,
 
         GGML_OP_COUNT,
     };
@@ -723,6 +734,7 @@ extern "C" {
         GGML_UNARY_OP_GELU,
         GGML_UNARY_OP_EXP,
         GGML_UNARY_OP_SOFTPLUS,
+        GGML_UNARY_OP_SQRT_SOFTPLUS,
 
         GGML_UNARY_OP_COUNT,
     };
@@ -826,6 +838,9 @@ extern "C" {
         // abort ggml_graph_compute when true
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+
+        // read-ahead selected MoE expert weights in the CPU matmul-id kernels
+        bool moe_expert_prefetch;
     };
 
     enum ggml_cgraph_eval_order {
@@ -1216,6 +1231,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    GGML_API struct ggml_tensor * ggml_sqrt_softplus(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_sqrt_softplus_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
     // return scalar
     GGML_API struct ggml_tensor * ggml_sum(
             struct ggml_context * ctx,
@@ -1225,6 +1248,10 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_sum_rows(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+    GGML_API struct ggml_tensor * ggml_sum_rows_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   dim);
 
     GGML_API struct ggml_tensor * ggml_cumsum(
             struct ggml_context * ctx,
@@ -2390,6 +2417,19 @@ extern "C" {
             struct ggml_tensor  * a,
             float                 c);
 
+    // Overwrite values in a with c for the indeces stored in b
+    GGML_API struct ggml_tensor * ggml_blend(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 c);
+
+    GGML_API struct ggml_tensor * ggml_indexer_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * topk);
+
+
     // sort rows
     enum ggml_sort_order {
         GGML_SORT_ORDER_ASC,
@@ -2449,6 +2489,10 @@ extern "C" {
             float                 max_bias,
             float                 softcap);
 
+    // Backend hint stored in ggml_flash_attn_ext op_params slot 4.
+    // Negative values request the generic implementation instead of IQK FA.
+    #define GGML_FLASH_ATTN_EXT_IQK_DISABLED (-1)
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
@@ -2456,6 +2500,53 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Latent attention over a packed K/V cache with an independently-visible K/V prefix.
+    // The value vector of cache row n is cache[dv_off .. dv_off+dv, n] (MLA "absorbed"
+    // layout: openPangu packs [ckv|k_pe] -> dv_off=0; DeepSeek/GLM_DSA packs [k_pe|ckv]
+    // rope-first -> dv_off=64). The prefix K/V rows are always visible (bias 0); the mask
+    // applies to the cache segment only.
+    //
+    // q:        [Dk, T, H]   F32, contiguous
+    // cache:    [Dk, N]      F32 / F16: row stride nb[1] arbitrary (windowed views ok);
+    //                        Q8_0: rows must be packed (nb[1] == row size)
+    // prefix_k: [Dk, P]      F32 / F16, contiguous; NULL iff P == 0
+    // prefix_v: [P,  Dv]     F32 / F16, contiguous (value-transposed: ne0 = P); NULL iff P == 0
+    // mask:     [N,  >=T]    F32, additive, cache segment only; NULL = unmasked cache
+    // returns:  [Dv, T, H]   F32, contiguous
+    // Precondition: every query column must have at least one visible position (a prefix row,
+    // or a cache row not masked to -inf). Violating it is undefined: a fully-masked column with
+    // P == 0 yields NaN on CUDA and on the CPU dense path, and zeros on the CPU indexed path, so
+    // callers must not depend on the value. Inference-only: a gradient-bearing input is rejected.
+    GGML_API struct ggml_tensor * ggml_latent_attn_prefix_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * cache,
+            struct ggml_tensor  * prefix_k,
+            struct ggml_tensor  * prefix_v,
+            struct ggml_tensor  * mask,
+            int                   dv,
+            int                   dv_off,
+            float                 scale,
+            float                 max_bias);
+
+    // Indexed latent attention over absolute cache row ids shared across heads.
+    // indices: [topk, T] I32, contiguous; mask remains [N, >=T] and is gathered by index.
+    // Preconditions: each index must lie in [0, N); an out-of-range id aborts on CPU and is
+    // undefined behavior (an out-of-bounds device read) on CUDA. The visible-position and
+    // inference-only preconditions above apply here as well.
+    GGML_API struct ggml_tensor * ggml_latent_attn_indexed_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * cache,
+            struct ggml_tensor  * prefix_k,
+            struct ggml_tensor  * prefix_v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * indices,
+            int                   dv,
+            int                   dv_off,
+            float                 scale,
+            float                 max_bias);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
@@ -2552,6 +2643,53 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             struct ggml_tensor  * saved_steps);
+
+    GGML_API struct ggml_tensor * ggml_indexer_topk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * mask,
+            enum ggml_unary_op    op,
+            int                   n_top_k);
+
+    // Sinkhorn normalization of a flat [S*S, T] batch of S x S matrices into
+    // doubly-stochastic form: softmax over columns, then column normalization,
+    // then (n_iters - 1) rounds of row + column normalization (ends on columns).
+    // The flat input is row-major (column index fastest). eps, when non-zero, is
+    // added to the softmax output and to every normalization sum before dividing.
+    // With output_transposed the result is [S, S, T] with ne0 = row, ne1 = column
+    // (ready for out[c] = sum_r m[r,c] * residual[r] consumers); otherwise the
+    // bare input layout (ne0 = column) is kept.
+    GGML_API struct ggml_tensor * ggml_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   S,
+            int                   n_iters,
+            float                 eps,
+            bool                  output_transposed);
+
+    GGML_API struct ggml_tensor * ggml_hc_pre(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * bias,
+            int                   S,
+            int                   n_iters,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_hc_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * res,
+            struct ggml_tensor  * comb);
+
+    GGML_API struct ggml_tensor * ggml_mask_to_index(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            int                   max_row_size);
+
 
     // custom operators
 
@@ -3123,7 +3261,6 @@ extern "C" {
     GGML_API int ggml_cpu_has_blas       (void);
     GGML_API int ggml_cpu_has_cuda       (void);
     GGML_API int ggml_cpu_has_vulkan     (void);
-    GGML_API int ggml_cpu_has_kompute    (void);
     GGML_API int ggml_cpu_has_gpublas    (void);
     GGML_API int ggml_cpu_has_sse3       (void);
     GGML_API int ggml_cpu_has_ssse3      (void);

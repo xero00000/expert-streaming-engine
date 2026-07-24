@@ -13,6 +13,7 @@ enum llm_expert_gating_func_type {
     LLM_EXPERT_GATING_FUNC_SOFTMAX               = 1,
     LLM_EXPERT_GATING_FUNC_SIGMOID               = 2,
     LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3,
+    LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS  = 4,
 };
 
 struct llama_hparams {
@@ -82,7 +83,6 @@ struct llama_hparams {
     float    yarn_attn_factor =  1.0f;
     float    yarn_beta_fast   = 32.0f;
     float    yarn_beta_slow   =  1.0f;
-
     std::array<int, 4> rope_sections;
     std::array<float,    LLAMA_MAX_LAYERS> rope_freq_base_per_layer;
     std::array<uint32_t, LLAMA_MAX_LAYERS> rope_dim_per_layer;
@@ -127,6 +127,30 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    // GLM-5.2 IndexShare: per-layer full/shared indexer map. "full" layers compute their own lightning-
+    // indexer top-k; "shared" layers reuse the previous full layer's top-k. Populated from GGUF
+    // indexer_types metadata if present, else derived from the GLM-5.2 config rule at load time.
+    std::array<bool, LLAMA_MAX_LAYERS> indexer_is_full = {};
+
+    // openPangu-2.0 (mHC / Hyper-Connections + learned param sink)
+    uint32_t mhc_num_stream    = 1;
+    uint32_t mhc_recur_norm    = 0;
+    uint32_t param_sink_number = 0;
+    // openPangu DSA/SWA schedule: per-layer sliding window (0 = DSA layer, full causal
+    // attention over the indexer's top-k selection). The NextN/MTP layers carry their own
+    // (larger) window, applied when the graph is built with an MTP op type.
+    uint32_t n_swa_mtp = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> openpangu_window = {};
+
+    // DeepSeek-V4
+    uint32_t dsv4_o_group_count     = 0;
+    uint32_t dsv4_o_lora_rank       = 0;
+    uint32_t dsv4_hc_mult           = 0;
+    uint32_t dsv4_hc_sinkhorn_iters = 0;
+    uint32_t dsv4_hash_layer_count  = 0;
+    float    dsv4_compress_rope_base = 0.0f;
+    float    dsv4_hc_eps             = 0.0f;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios = {};
 
 	// qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
@@ -139,6 +163,14 @@ struct llama_hparams {
     bool     mtp_use_ordered_embeddings = false;
     uint32_t mtp_num_centroids = 0;
     uint32_t mtp_centroid_top_k = 0;
+
+    // DFlash draft model metadata
+    uint32_t dflash_block_size = 16;
+    uint32_t dflash_mask_token_id = 0;
+    uint32_t dflash_n_target_features = 0;
+    uint32_t dflash_n_target_layers = 0;
+    uint32_t dflash_target_layer_ids[8] = {};
+    float    dflash_backbone_rotary_base = 0.0f;
 
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggerganov/llama.cpp/pull/8141
@@ -159,6 +191,10 @@ struct llama_hparams {
         if (this->n_ctx_train   != other.n_ctx_train)   return true;
         if (this->n_embd        != other.n_embd)        return true;
         if (this->mtp_backbone_n_embd != other.mtp_backbone_n_embd) return true;
+        if (this->dflash_block_size != other.dflash_block_size) return true;
+        if (this->dflash_mask_token_id != other.dflash_mask_token_id) return true;
+        if (this->dflash_n_target_features != other.dflash_n_target_features) return true;
+        if (this->dflash_n_target_layers != other.dflash_n_target_layers) return true;
         if (this->n_layer       != other.n_layer)       return true;
         if (this->n_rot         != other.n_rot)         return true;
         if (this->n_swa         != other.n_swa)         return true;
@@ -189,6 +225,9 @@ struct llama_hparams {
         if (this->ssm_dt_rank != other.ssm_dt_rank) return true;
         if (this->ssm_n_group != other.ssm_n_group) return true;
         if (this->recurrent_layer_arr != other.recurrent_layer_arr) return true;
+        for (int i = 0; i < 8; ++i) {
+            if (this->dflash_target_layer_ids[i] != other.dflash_target_layer_ids[i]) return true;
+        }
 
         if (this->dec_start_token_id != other.dec_start_token_id) return true;
 
@@ -204,6 +243,7 @@ struct llama_hparams {
         if (!is_float_close(this->f_residual_scale,      other.f_residual_scale,      EPSILON)) return true;
         if (!is_float_close(this->f_embedding_scale,     other.f_embedding_scale,     EPSILON)) return true;
         if (!is_float_close(this->f_attention_scale,     other.f_attention_scale,     EPSILON)) return true;
+        if (!is_float_close(this->f_attn_v_scale,        other.f_attn_v_scale,        EPSILON)) return true;
 
         return false;
     }

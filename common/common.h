@@ -127,7 +127,16 @@ enum common_webui {
     COMMON_WEBUI_LLAMACPP,
 };
 
+enum common_checkpoint_eviction {
+    COMMON_CHECKPOINT_EVICTION_AUTO,
+    COMMON_CHECKPOINT_EVICTION_FIFO,
+    COMMON_CHECKPOINT_EVICTION_VARIANCE
+};
+
 common_webui common_webui_from_name(const std::string& format);
+
+common_checkpoint_eviction common_checkpoint_eviction_from_name(const std::string & format);
+
 
 struct thinking_tokens {
     bool exclude = true;
@@ -140,6 +149,7 @@ thinking_tokens thinking_tokens_from_string(const std::string& format);
 enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
+    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash draft model
     COMMON_SPECULATIVE_TYPE_MTP,           // MTP model
     COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
@@ -162,6 +172,8 @@ struct common_speculative_stage_params {
     int32_t n_max = -1;
     int32_t n_min = -1;
     float   p_min = -1.0f;
+    int32_t mtp_heads = -1;
+    int32_t dflash_cross_ctx = -1;
 
     uint16_t ngram_size_n = 0;
     uint16_t ngram_size_m = 0;
@@ -169,15 +181,19 @@ struct common_speculative_stage_params {
 
     int32_t suffix_min_match_len = -1;
     int32_t suffix_max_depth = -1;
+    std::string suffix_corpus;
 
     bool has_n_max_override() const { return n_max >= 0; }
     bool has_n_min_override() const { return n_min >= 0; }
     bool has_p_min_override() const { return p_min >= 0.0f; }
+    bool has_mtp_heads_override() const { return mtp_heads >= 0; }
+    bool has_dflash_cross_ctx_override() const { return dflash_cross_ctx >= 0; }
     bool has_ngram_size_n_override() const { return ngram_size_n > 0; }
     bool has_ngram_size_m_override() const { return ngram_size_m > 0; }
     bool has_ngram_min_hits_override() const { return ngram_min_hits > 0; }
     bool has_suffix_min_match_len_override() const { return suffix_min_match_len >= 0; }
     bool has_suffix_max_depth_override() const { return suffix_max_depth >= 0; }
+    bool has_suffix_corpus_override() const { return !suffix_corpus.empty(); }
 };
 
 struct common_params_model {
@@ -204,6 +220,8 @@ struct common_params_speculative {
     int32_t n_max = 16; // number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of tokens to draft during speculative decoding
     std::vector<common_speculative_stage_params> stages; // explicit stage chain for single-spec or self-spec + model fallback
+    int32_t mtp_heads = 1; // MTP heads to use; 1 is the default, while >1 and 0 (all model heads) are experimental
+    int32_t dflash_cross_ctx = 512; // target-feature context window for DFlash
 
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min = 0.75f; // minimum speculative decoding probability (greedy)
@@ -250,7 +268,10 @@ struct common_params_speculative {
     common_params_speculative with_stage_overrides(const common_speculative_stage_params & stage) const;
     bool has_stage_chain() const;
     bool has_stage_type(common_speculative_type stage_type) const;
+    void remove_stage_type(common_speculative_type stage_type);
     bool has_composite_stage_chain() const;
+    bool needs_dft_model() const;
+    void clear_dft();
     int32_t get_max_stage_n_max() const;
     int32_t get_min_usable_stage_n_min() const;
 
@@ -399,6 +420,9 @@ struct gpt_params {
     bool grouped_expert_routing = false; // if to use grouped expert routing (BailingMoeV2 arch)
     bool rope_cache        = false; // if to use RoPE cache (for supported models)
     bool graph_reuse       = true;  // if to reuse compute graphs
+    bool dsa               = false; // enable GLM DSA sparse attention (off by default; opt-in via --dsa)
+    bool fused_idx_topk    = true;  // enable the fused indexer topk op (off by default; opt-in via -fidx pr --fused-indexer-topk)
+    int  dsa_top_k         = -1;    // DSA top-k override (<0 => use the model's configured indexer_top_k)
     int  min_experts       = -1;
     float thresh_experts   = 0;
 
@@ -422,6 +446,8 @@ struct gpt_params {
     bool merge_qkv         = false; // if true, merge separate Q, K, V tensors into a single, contiguous tensor
     bool merge_up_gate_exps= false; // if true, merge ffn_up_exps and ffn_gate_exps into a single, contiguous tensor
     bool defer_experts     = false; // if true, defer expert mmap residency to speed up model loading (Linux only)
+    bool prefetch_experts  = false; // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
+    int  prefetch_experts_threads = 0; // number of expert prefetch workers (<=0 = auto)
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
     bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)
     bool split_mode_graph_scheduling = false; // if true, force split mode graph scheduling
@@ -432,6 +458,7 @@ struct gpt_params {
 
     std::string cache_type_k = "f16"; // KV cache data type for the K
     std::string cache_type_v = "f16"; // KV cache data type for the V
+    std::string indexer_cache_type_k = "f16"; // indexer K-cache data type
 
     std::string reduce_type = "f16";
     std::string graph_attn_precision = "f16";
@@ -501,6 +528,7 @@ struct gpt_params {
 
     // "advanced" endpoints are disabled by default for better security
     common_webui webui = COMMON_WEBUI_AUTO;
+    bool webui_mcp_proxy  = false;
     bool endpoint_slots   = true;
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
@@ -516,7 +544,8 @@ struct gpt_params {
     bool do_checkpoint = false;               // do checkpoint for recurrent models only
     int32_t ctx_checkpoints_n = 32;           // max number of context checkpoints per slot
     int32_t ctx_checkpoints_interval = 512;   // minimum number of tokens between each context checkpoints
-    int32_t ctx_checkpoints_tolerance = 5;    // the number of tokens before the full prompt to create the checkpoint 
+    int32_t ctx_checkpoints_tolerance = 5;    // the number of tokens before the full prompt to create the checkpoint
+    common_checkpoint_eviction ctx_checkpoint_eviction = COMMON_CHECKPOINT_EVICTION_VARIANCE;
     int32_t cache_ram_mib = 8192;   // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_ram_n_min = 0;     // min number of tokens required to save in the ram
     float cache_ram_similarity = 0.5f; // similarity of tokens to cached tokens

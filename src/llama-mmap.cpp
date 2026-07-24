@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstring>
 #include <climits>
@@ -76,7 +77,7 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode) {
+    impl(const char * fname, const char * mode) : path(fname), mode(mode) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -155,13 +156,15 @@ struct llama_file::impl {
         write_raw(&val, sizeof(val));
     }
 
+    std::string path;
+
     ~impl() {
         if (fp) {
             std::fclose(fp);
         }
     }
 #else
-    impl(const char * fname, const char * mode) {
+    impl(const char * fname, const char * mode) : path(fname), mode(mode) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -231,6 +234,7 @@ struct llama_file::impl {
     void write_u32(uint32_t val) const {
         write_raw(&val, sizeof(val));
     }
+    std::string path;
 
     ~impl() {
         if (fp) {
@@ -241,10 +245,19 @@ struct llama_file::impl {
 
     FILE * fp;
     size_t size;
+    std::string mode;
 };
 
 llama_file::llama_file(const char * fname, const char * mode) : pimpl(std::make_unique<impl>(fname, mode)) {}
 llama_file::~llama_file() = default;
+
+std::unique_ptr<llama_file> llama_file::clone() const {
+    //can only clone readable file pointers without truncating.
+    GGML_ASSERT(!pimpl->mode.empty() && pimpl->mode[0] == 'r'
+                && pimpl->mode.find('+') == std::string::npos);
+    return std::make_unique<llama_file>(pimpl->path.c_str(), pimpl->mode.c_str());
+}
+
 
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
@@ -314,6 +327,17 @@ struct llama_mmap::impl {
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
+
+#if defined(MADV_HUGEPAGE)
+        // MAP_HUGETLB needs a pre-reserved huge-page pool and commonly fails on
+        // desktop systems. Keep the normal file mapping in that case, but still
+        // ask the kernel's transparent-huge-page policy to promote eligible
+        // ranges as they become resident.
+        if (use_thp && madvise(addr, file->size(), MADV_HUGEPAGE) != 0) {
+            LLAMA_LOG_WARN("warning: madvise(.., MADV_HUGEPAGE) failed: %s\n",
+                    strerror(errno));
+        }
+#endif
 
         if (prefetch > 0) {
             if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
@@ -423,6 +447,7 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
+        ggml_backend_prefetch_unregister_mapping(addr);
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
@@ -681,3 +706,5 @@ const bool llama_mlock::SUPPORTED = false;
 size_t llama_path_max() {
     return PATH_MAX;
 }
+
+const std::string & llama_file::get_path() const { return pimpl->path; }
