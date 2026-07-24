@@ -32,6 +32,28 @@ struct llama_expert_prefetch_model {
     std::vector<float> dual_by_target;
 };
 
+struct llama_openpangu_swa_window_view {
+    int64_t w_view  = 0;
+    int64_t win_off = 0;
+    bool engaged    = false;
+};
+
+static inline llama_openpangu_swa_window_view llama_openpangu_calc_swa_window_view(
+        int64_t n_kv, int64_t n_tokens, int64_t window, int64_t pad) {
+    llama_openpangu_swa_window_view result;
+    if (window <= 0 || n_kv <= 0) {
+        result.w_view = n_kv;
+        return result;
+    }
+
+    const int64_t unpadded = window + pad + n_tokens;
+    const int64_t overcovered = pad > 1 ? ((unpadded + pad - 1) / pad) * pad : unpadded;
+    result.w_view  = overcovered < n_kv ? overcovered : n_kv;
+    result.win_off = n_kv - result.w_view;
+    result.engaged = result.w_view < n_kv;
+    return result;
+}
+
 struct llama_kv_cell {
     llama_pos pos   = -1;
     llama_pos delta = 0;
@@ -61,6 +83,11 @@ struct llama_kv_cache {
     bool hybrid    = false;
     bool v_trans   = true;  // the value tensor is transposed
 
+    // openPangu s_l holds position-strict MoME conv state, not per-sequence recurrent
+    // slots; Qwen3Next-style s_l handling (seq ops, state serialization, s_copy) must
+    // skip it. Speculative rollback snapshots/restores it via the whole-slot spec checkpoint.
+    bool s_l_position_strict = false;
+
     // Note: The value of head isn't only used to optimize searching
     // for a free KV slot. llama_decode_internal also uses it, so it
     // cannot be freely changed after a slot has been allocated.
@@ -79,6 +106,12 @@ struct llama_kv_cache {
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
     std::vector<struct ggml_tensor *> s_l; // per layer recurrent state storage (Qwen3Next)
+
+    // Persistent DSA indexer-key cache. One per indexer layer, MQA single head:
+    // [indexer_head_size, kv_size]. Stores architecture-specific indexer keys in their
+    // scoring representation so a decoded token scores against all past indexer keys.
+    // Empty unless the model has the DSA indexer.
+    std::vector<struct ggml_tensor *> kr_l;
 
     // When true, the delta_net graph builder will enable per-step SSM state saves
     bool save_per_step_ssm = false;
@@ -238,9 +271,6 @@ struct llama_context {
 #ifdef GGML_USE_METAL
     ggml_backend_t backend_metal = nullptr;
 #endif
-#ifdef GGML_USE_BLAS
-    ggml_backend_t backend_blas = nullptr;
-#endif
     ggml_backend_t backend_cpu = nullptr;
 
     bool has_evaluated_once = false;
@@ -322,6 +352,205 @@ struct llama_context {
     size_t draft_input_hidden_state_n_floats = 0;
     std::vector<float> draft_input_hidden_state_owned;
 
+    struct dflash_runtime {
+        struct target_window_state {
+            const float * features = nullptr;
+            size_t features_n_floats = 0;
+            int32_t features_n_rows = 0;
+            const float * append_features = nullptr;
+            size_t append_features_n_floats = 0;
+            int32_t append_features_n_rows = 0;
+            const llama_pos * positions = nullptr;
+            size_t positions_n = 0;
+            uint64_t version = 0;
+            int32_t keep_rows = 0;
+            int32_t append_rows = 0;
+            bool replace = false;
+            std::vector<float> features_owned;
+            std::vector<float> append_features_owned;
+            std::vector<llama_pos> positions_owned;
+            std::vector<float> features_padded;
+            std::vector<llama_pos> pos_ctx_data;
+            std::vector<float> kq_mask_data;
+            std::vector<float> kq_mask_swa_data;
+        };
+
+        struct kv_runtime_state {
+            std::vector<struct ggml_tensor *> k_ctx_cache;
+            std::vector<struct ggml_tensor *> v_ctx_cache;
+            struct ggml_context * cache_ctx = nullptr;
+            std::vector<ggml_backend_buffer_t> cache_bufs;
+            std::vector<llama_pos> cache_pos;
+            std::vector<uint8_t> cache_slot_valid;
+            int32_t cache_write_pos = 0;
+            int32_t cache_n_filled = 0;
+            int32_t cache_update_rows = 0;
+            int32_t cache_reserved_rows = 0;
+            int32_t cache_view_write_pos = 0;
+            int32_t cache_view_n_filled = 0;
+            uint64_t cache_applied_window_version = 0;
+            bool cache_valid = false;
+            bool cache_view_valid = false;
+            std::vector<uint8_t> cache_compute_meta;
+            ggml_backend_sched_t cache_sched = nullptr;
+            ggml_cgraph * cache_graph = nullptr;
+            int32_t cache_graph_rows = 0;
+            int32_t cache_graph_write_pos = 0;
+            struct ggml_tensor * cache_input_target_features = nullptr;
+            struct ggml_tensor * cache_input_pos_ctx = nullptr;
+            struct ggml_tensor * kq_mask_tensor = nullptr;
+            struct ggml_tensor * kq_mask_swa_tensor = nullptr;
+            struct ggml_tensor * draft_tail_rows_tensor = nullptr;
+        };
+
+        struct capture_state {
+            std::vector<int32_t> layer_ids;
+            std::vector<std::vector<float>> layer_rows;
+            int32_t row_count = 0;
+            int32_t row_width = 0;
+            uint64_t capture_batch_id = 0;
+            std::vector<uint64_t> layer_seen_batch_id;
+            ggml_backend_sched_eval_callback prev_cb_eval = nullptr;
+            void * prev_cb_eval_user_data = nullptr;
+        };
+
+        struct input_state {
+            struct ggml_tensor * target_features = nullptr; // F32 [n_target_features, cross_ctx]
+            struct ggml_tensor * pos_ctx = nullptr;         // I32 [cross_ctx]
+            struct ggml_tensor * kq_mask = nullptr;         // F32 [cross_ctx + n_batch, GGML_PAD(n_batch)]
+            struct ggml_tensor * kq_mask_swa = nullptr;     // F32 [cross_ctx + n_batch, GGML_PAD(n_batch)]
+        };
+
+        target_window_state target;
+        kv_runtime_state kv;
+        std::unique_ptr<capture_state> capture;
+        std::vector<float> feature_view_buffer;
+        input_state inputs;
+        int32_t visible_cross_ctx = 0;
+
+        // Argmax token IDs from the DFlash draft graph, computed via GPU argmax.
+        // Populated in llama_decode_internal after graph compute.
+        std::vector<llama_token> draft_tokens;
+        struct ggml_tensor * draft_tokens_tensor = nullptr;
+    };
+    dflash_runtime dflash;
+    using dflash_capture_state = dflash_runtime::capture_state;
+
+    struct dsv4_runtime {
+        static constexpr uint32_t CSA_RATIO = 4;
+        static constexpr uint32_t HCA_RATIO = 128;
+
+        struct slot_info {
+            int32_t s0 = 0;
+            int32_t s1 = 0;
+            std::vector<llama_seq_id> strm;
+            std::vector<std::vector<uint32_t>> idxs;
+
+            void resize(size_t n) {
+                strm.resize(n);
+                idxs.resize(n);
+            }
+
+            size_t size() const {
+                GGML_ASSERT(strm.size() == idxs.size());
+                if (idxs.empty()) {
+                    return 0;
+                }
+
+                return idxs[0].size();
+            }
+
+            size_t n_stream() const {
+                GGML_ASSERT(strm.size() == idxs.size());
+                return strm.size();
+            }
+
+            bool empty() const {
+                return idxs.empty();
+            }
+        };
+
+        struct raw_context {
+            std::vector<int32_t> write_src_idxs;
+            std::vector<int32_t> write_dst_idxs;
+            std::vector<int32_t> read_dst_idxs;
+            std::vector<int32_t> write_counts;
+            std::vector<int32_t> read_counts;
+            slot_info sinfo_write;
+            slot_info sinfo_read;
+            int64_t graph_n_stream = 1;
+            int64_t n_kv = 0;
+        };
+
+        struct comp_context {
+            slot_info sinfo;
+            int64_t graph_n_stream = 1;
+            int64_t n_kv = 0;
+        };
+
+        struct comp_plan {
+            std::vector<int32_t> state_pos;
+            std::vector<int32_t> state_persist_src_idxs;
+            std::vector<int32_t> state_persist_dst_idxs;
+            std::vector<int32_t> state_read_idxs;
+            std::vector<int64_t> state_write_idxs;
+            std::vector<int32_t> state_write_pos;
+            std::vector<int32_t> n_visible;
+            int64_t n_stream = 1;
+            int64_t n_kv = 0;
+        };
+
+        struct comp_inputs {
+            struct ggml_tensor * state_pos = nullptr;
+            struct ggml_tensor * state_persist_src_idxs = nullptr;
+            struct ggml_tensor * state_persist_dst_idxs = nullptr;
+            struct ggml_tensor * state_read_idxs = nullptr;
+            struct ggml_tensor * state_write_idxs = nullptr;
+            struct ggml_tensor * state_write_pos = nullptr;
+            struct ggml_tensor * kq_mask = nullptr;
+        };
+
+        struct storage {
+            std::vector<struct ggml_tensor *> csa_k;
+            std::vector<struct ggml_tensor *> hca_k;
+            std::vector<struct ggml_tensor *> lid_k;
+
+            std::vector<struct ggml_tensor *> csa_state_kv;
+            std::vector<struct ggml_tensor *> csa_state_score;
+            std::vector<struct ggml_tensor *> hca_state_kv;
+            std::vector<struct ggml_tensor *> hca_state_score;
+            std::vector<struct ggml_tensor *> lid_state_kv;
+            std::vector<struct ggml_tensor *> lid_state_score;
+
+            struct ggml_context * cache_ctx = nullptr;
+            std::vector<ggml_backend_buffer_t> cache_bufs;
+            uint32_t n_stream = 1;
+        };
+
+        struct input_state {
+            struct ggml_tensor * raw_k_write_src_idxs = nullptr;
+            struct ggml_tensor * raw_k_write_idxs = nullptr;
+            struct ggml_tensor * raw_k_read_idxs = nullptr;
+            comp_inputs csa;
+            comp_inputs hca;
+            comp_inputs lid;
+        };
+
+        storage cache;
+        input_state inputs;
+        raw_context raw;
+        comp_context csa_ctx;
+        comp_context hca_ctx;
+        comp_context lid_ctx;
+        comp_plan csa_plan;
+        comp_plan hca_plan;
+        comp_plan lid_plan;
+
+        std::vector<float> csa_mask_data;
+        std::vector<float> hca_mask_data;
+    };
+    dsv4_runtime dsv4;
+
     // input tensors
     struct ggml_tensor * inp_tokens;      // I32 [n_batch]
     struct ggml_tensor * inp_embd;        // F32 [n_embd, n_batch]
@@ -329,6 +558,7 @@ struct llama_context {
     struct ggml_tensor * inp_out_ids;     // I32 [n_outputs]
     struct ggml_tensor * inp_KQ_mask;     // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
+    struct ggml_tensor * inp_KQ_mask_swa_win = nullptr; // F32 [openPangu SWA W_view, n_batch]
     struct ggml_tensor * inp_K_shift;     // I32 [kv_size]
     struct ggml_tensor * inp_mean;        // F32 [n_batch, n_batch]
     struct ggml_tensor * inp_cls;         // I32 [n_batch]
@@ -341,12 +571,34 @@ struct llama_context {
     struct ggml_tensor * inp_KQ_mask_cross; // F32 [n_outputs_enc, n_batch]
     struct ggml_tensor * inp_scale = nullptr; // F32 [n_tokens]
     struct ggml_tensor * inp_mtp_states = nullptr;
+    struct ggml_tensor * inp_mtp_carry = nullptr; // F32 [n_embd, nextn-1] per-head hidden at the last committed position
+    struct ggml_tensor * inp_dsa_sink = nullptr; // F32 [n_kv, n_tokens] per-sequence attention-sink boost for DSA indexer top-k
+
+    struct openpangu_swa_window_view_state {
+        bool active       = false;
+        int32_t n_kv      = 0;
+        int32_t n_tokens  = 0;
+        uint32_t window   = 0;
+        uint32_t pad      = 0;
+        int64_t w_view    = 0;
+        int64_t win_off   = 0;
+    } openpangu_swa_window_view;
+
+    // multi-head MTP chaining state: head k's output row at the last committed position,
+    // written back after each warmup/update decode and fed into the next MTP graph through
+    // inp_mtp_carry (zeroed when a prompt warmup restarts from position 0). The readback is
+    // issued async after compute; mtp_carry_pending marks a copy that must be synchronized
+    // before the host buffer is read or resized.
+    std::vector<float> mtp_carry;
+    bool mtp_carry_pending = false;
 
     ggml_backend_t ggml_backend_by_name(const char * name);
 
     struct Prev;
     std::unique_ptr<Prev> prev;
     std::unique_ptr<Prev> prev_mtp;
+    int32_t mtp_step_idx = 0;
+    int32_t mtp_n_heads = 0;
 
     void reset_scheduler();
     bool can_reuse_graph(const llama_batch & u_batch);
@@ -356,11 +608,29 @@ struct llama_context {
         size_t        step = 0;
     };
     std::vector<CacheCopy> cache_copies;
+    // GLM-DSA lightning indexer: the indexer-key cache (kr_l) write is a separate ggml_cpy that
+    // the K/V cache_copies fixup does NOT cover. Under graph reuse (FA pads KV to 256, so n_kv
+    // stays constant across consecutive decode ubatches and the graph IS reused) its view_offs
+    // would stay baked at the first ubatch's kv_head, scattering this ubatch's indexer keys to a
+    // stale slot. Later ubatches never populate their own recent index-key cells (those cells read
+    // uninitialized -> wrong block-max-pool/top-k -> degraded/NaN sparse-FA decode). Register the
+    // kr_l cpy per layer here and patch its offset in update_cache_copies(), exactly like K/V.
+    std::vector<CacheCopy> dsa_cache_copies;
+    std::vector<CacheCopy> openpangu_cache_copies;
+    std::vector<CacheCopy> openpangu_cache_copies_mtp;
 
     bool update_cache_copies();
+
+    bool ensure_dflash_kv_cache_tensors(int32_t cross_ctx);
+    void free_dflash_kv_cache_tensors();
+    bool ensure_dsv4_cache_tensors();
+    void free_dsv4_cache_tensors();
 
     bool prepare_mtp_graph_inputs(
         struct llama_context & lctx);
     void set_mtp_op_type(llama_mtp_op_type value);
+    void set_mtp_step_idx(int32_t value);
+    void set_mtp_n_heads(int32_t value);
 
+    int max_nodes(int n_tokens, int n_kv) const;
 };

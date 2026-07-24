@@ -42,12 +42,8 @@ option(BUILD_SHARED_LIBS "ggml: build shared libraries" ${BUILD_SHARED_LIBS_DEFA
 
 if (APPLE)
     set(GGML_METAL_DEFAULT ON)
-    set(GGML_BLAS_DEFAULT ON)
-    set(GGML_BLAS_VENDOR_DEFAULT "Apple")
 else()
     set(GGML_METAL_DEFAULT OFF)
-    set(GGML_BLAS_DEFAULT OFF)
-    set(GGML_BLAS_VENDOR_DEFAULT "Generic")
 endif()
 
 if (CMAKE_CROSSCOMPILING)
@@ -86,6 +82,7 @@ option(GGML_CPU_HBM     "ggml: use memkind for CPU HBM" OFF)
 
 option(GGML_AVX         "ggml: enable AVX"              ${INS_ENB})
 option(GGML_AVX2        "ggml: enable AVX2"             ${INS_ENB})
+option(GGML_AVXVNNI     "ggml: enable AVX-VNNI"         OFF)
 option(GGML_AVX512      "ggml: enable AVX512"           OFF)
 option(GGML_AVX512_VBMI "ggml: enable AVX512-VBMI"      OFF)
 option(GGML_AVX512_VNNI "ggml: enable AVX512-VNNI"      OFF)
@@ -114,9 +111,6 @@ set(GGML_MAX_CONTEXTS       "" CACHE STRING "ggml: max model contexts (override 
 
 # 3rd party libs / backends
 option(GGML_ACCELERATE                      "ggml: enable Accelerate framework"               ON)
-option(GGML_BLAS                            "ggml: use BLAS"                                  ${GGML_BLAS_DEFAULT})
-set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
-                                            "ggml: BLAS library vendor")
 option(GGML_IQK_MUL_MAT                     "ggml: use optimized iqk matrix multiplications"  ON)
 
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
@@ -160,7 +154,6 @@ option(GGML_VULKAN_NO_COOPMAT               "ggml: don't use Vulkan coopmat even
 option(GGML_VULKAN_NO_COOPMAT2              "ggml: don't use Vulkan coopmat2 even if supported"      OFF)
 option(GGML_VULKAN_NO_BF16                  "ggml: don't use Vulkan bf16 even if supported"          OFF)
 option(GGML_VULKAN_NO_INT_DOT               "ggml: don't use Vulkan integer dot even if supported"   OFF)
-option(GGML_KOMPUTE                         "ggml: use Kompute"                               OFF)
 option(GGML_METAL                           "ggml: use Metal"                                 ${GGML_METAL_DEFAULT})
 option(GGML_METAL_NDEBUG                    "ggml: disable Metal debugging"                   OFF)
 option(GGML_METAL_SHADER_DEBUG              "ggml: compile Metal with -fno-fast-math"         OFF)
@@ -224,11 +217,9 @@ set(GGML_PUBLIC_HEADERS
     include/ggml.h
     include/ggml-alloc.h
     include/ggml-backend.h
-    include/ggml-blas.h
     include/ggml-cann.h
     include/ggml-cuda.h
     include/ggml.h
-    include/ggml-kompute.h
     include/ggml-metal.h
     include/ggml-rpc.h
     include/ggml-sycl.h

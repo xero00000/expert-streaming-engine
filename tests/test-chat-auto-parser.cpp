@@ -62,6 +62,12 @@ static void test_nemotron_tool_format(testing & t);
 static void test_cohere_reasoning_detection(testing & t);
 static void test_cohere_analysis(testing & t);
 
+// End-to-end Cohere2MoE (North Code) dedicated PEG parser coverage.
+static void test_cohere2moe_parser(testing & t);
+
+// End-to-end MiniMax-M3 dedicated PEG parser coverage.
+static void test_minimax_m3_partial_reasoning_parser(testing & t);
+
 // SmolLM3 template analysis tests
 static void test_smollm3_analysis(testing & t);
 
@@ -98,6 +104,8 @@ int main(int argc, char * argv[]) {
     t.test("segments", test_marker_separation);
     t.test("seed_oss_diffs", test_seed_oss_tool_analysis);
     t.test("cohere", test_cohere_analysis);
+    t.test("cohere2moe_parser", test_cohere2moe_parser);
+    t.test("minimax_m3_partial_reasoning_parser", test_minimax_m3_partial_reasoning_parser);
     t.test("nemotron", test_nemotron_analysis);
     t.test("smollm3", test_smollm3_analysis);
     t.test("standard_json_tools", test_standard_json_tools_formats);
@@ -1967,3 +1975,342 @@ static void test_tagged_args_with_embedded_quotes(testing & t) {
     }
 }
 
+// End-to-end coverage for MiniMax-M3 partial reasoning streams:
+// template apply -> PEG parse -> assert message and streaming diff. The partial
+// case mirrors a real leaked <mm:think> stream where </mm:think> had not arrived.
+static void test_minimax_m3_partial_reasoning_parser(testing & t) {
+    const std::string template_str = R"(
+{%- set ns_token = ']<]minimax[>[' -%}
+{%- set toolcall_begin_token = ns_token ~ '<tool_call>' -%}
+{%- set toolcall_end_token = ns_token ~ '</tool_call>' -%}
+{%- for message in messages -%}
+{{- message.role ~ ': ' ~ message.content ~ '\n' -}}
+{%- endfor -%}
+{%- if tools -%}
+{{- toolcall_begin_token ~ ns_token ~ '<invoke name="example">' ~ ns_token ~ '</invoke>' ~ toolcall_end_token -}}
+{%- endif -%}
+{%- if add_generation_prompt -%}
+{{- '<mm:think>' -}}
+{%- endif -%}
+)";
+
+    common_chat_templates_inputs inputs;
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "Please inspect the extension state.";
+
+    inputs.messages              = { user };
+    inputs.add_generation_prompt = true;
+    inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
+    inputs.enable_thinking       = true;
+    inputs.tools                 = {
+        common_chat_tool{
+            /* .name        = */ "example",
+            /* .description = */ "Example tool",
+            /* .parameters  = */ R"({"type":"object","properties":{}})",
+        },
+        common_chat_tool{
+            /* .name        = */ "bash",
+            /* .description = */ "Run shell commands",
+            /* .parameters  = */ R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})",
+        },
+    };
+
+    common_chat_templates_ptr tmpls(common_chat_templates_init(/* model = */ nullptr, template_str));
+    auto params = common_chat_templates_apply(tmpls.get(), inputs);
+    t.assert_equal("MiniMax-M3 parser selected", COMMON_CHAT_FORMAT_PEG_MINIMAX_M3, params.format);
+    t.assert_true("MiniMax-M3 parser generated", !params.parser.empty());
+
+    common_peg_arena arena;
+    arena.load(params.parser);
+
+    common_chat_parser_params parser_params(params);
+    parser_params.parser = arena;
+
+    const std::string partial_reasoning =
+        "The user is asking why I'm implementing F3 directly. Looking at the context:\n\n"
+        "1. The user said earlier: \"yes we do F3 manually, by";
+
+    auto partial_msg = common_chat_parse(partial_reasoning, /* is_partial = */ true, parser_params);
+    t.assert_equal("partial reasoning", partial_reasoning, partial_msg.reasoning_content);
+    t.assert_equal("partial visible content", std::string(), partial_msg.content);
+    t.assert_true("partial has no tool calls", partial_msg.tool_calls.empty());
+
+    auto diffs = common_chat_msg_diff::compute_diffs(common_chat_msg{}, partial_msg);
+    t.assert_equal("partial emits one diff", 1u, diffs.size());
+    if (diffs.size() == 1) {
+        t.assert_equal("partial diff is reasoning", partial_reasoning, diffs[0].reasoning_content_delta);
+        t.assert_equal("partial diff has no visible content", std::string(), diffs[0].content_delta);
+        t.assert_equal("partial diff has no tool index", std::string::npos, diffs[0].tool_call_index);
+    }
+
+    const std::string closed_output = partial_reasoning + "</mm:think>You're right to question.";
+    auto closed_msg = common_chat_parse(closed_output, /* is_partial = */ false, parser_params);
+    t.assert_equal("closed reasoning", partial_reasoning, closed_msg.reasoning_content);
+    t.assert_equal("closed visible content", std::string("You're right to question."), closed_msg.content);
+    t.assert_true("closed has no tool calls", closed_msg.tool_calls.empty());
+
+    const std::string command =
+        "# Deploy to electra and erabus\n"
+        "SSH_AUTH_SOCK=/run/user/1001/ssh-agent.socket scp index.ts electra:/tmp/index.ts";
+    const std::string tool_output =
+        "Let me do that."
+        "]<]minimax[>[<tool_call>\n"
+        "]<]minimax[>[<invoke name=\"bash\">"
+        "]<]minimax[>[<command>" + command + "]<]minimax[>[</command>"
+        "]<]minimax[>[</invoke>\n"
+        "]<]minimax[>[</tool_call>";
+
+    auto tool_msg = common_chat_parse(tool_output, /* is_partial = */ false, parser_params);
+    t.assert_equal("tool reasoning excludes markers", std::string("Let me do that."), tool_msg.reasoning_content);
+    t.assert_equal("tool visible content", std::string(), tool_msg.content);
+    t.assert_equal("tool call count", 1u, tool_msg.tool_calls.size());
+    if (tool_msg.tool_calls.size() == 1) {
+        t.assert_equal("tool call name", std::string("bash"), tool_msg.tool_calls[0].name);
+        t.assert_equal("tool call args", json({{"command", command}}).dump(), tool_msg.tool_calls[0].arguments);
+    }
+
+    const std::string cmux_command =
+        "cmux rpc surface.scrollback '{\"surface_id\":\"20CD49E8-A0FA-42E3-B349-7CCCC1075425\","
+        "\"workspace_id\":\"826FA4BA-01E5-4D84-893A-D70B0DAF9970\"}' 2>&1 | head -3";
+    const std::string malformed_nested_tool_output =
+        "]<]minimax[>[<tool_call>\n"
+        "]<]minimax[>[<invoke name=\"bash\">"
+        "]<]minimax[>[<command>" + cmux_command +
+        "]<]minimax[>[<tool_call>\n"
+        "]<]minimax[>[</invoke>\n"
+        "]<]minimax[>[</tool_call>老实\n"
+        "</command>]<]minimax[>[</invoke>\n"
+        "]<]minimax[>[</tool_call>\n"
+        "]<]minimax[>[<tool_call>\n"
+        "bash\n"
+        "</parameter>]<]minimax[>[</command>"
+        "]<]minimax[>[</invoke>\n"
+        "]<]minimax[>[</tool_call>";
+
+    auto malformed_nested_tool_msg = common_chat_parse(malformed_nested_tool_output,
+                                                       /* is_partial = */ false,
+                                                       parser_params);
+    t.assert_equal("malformed nested tool call count", 1u, malformed_nested_tool_msg.tool_calls.size());
+    if (malformed_nested_tool_msg.tool_calls.size() == 1) {
+        t.assert_equal("malformed nested tool call name", std::string("bash"), malformed_nested_tool_msg.tool_calls[0].name);
+        t.assert_equal(
+            "malformed nested tool args truncate namespace leak",
+            json({{"command", cmux_command}}).dump(),
+            malformed_nested_tool_msg.tool_calls[0].arguments);
+        t.assert_true("malformed nested tool args contain no minimax marker",
+            malformed_nested_tool_msg.tool_calls[0].arguments.find("]<]minimax[>[") == std::string::npos);
+    }
+
+    inputs.enable_thinking = false;
+    auto params_thinking_off = common_chat_templates_apply(tmpls.get(), inputs);
+
+    common_peg_arena thinking_off_arena;
+    thinking_off_arena.load(params_thinking_off.parser);
+
+    common_chat_parser_params thinking_off_parser_params(params_thinking_off);
+    thinking_off_parser_params.parser = thinking_off_arena;
+
+    const std::string leaked_reasoning =
+        "Right pane is up. Now let me think about the workflow lessons and update "
+        "kickass + smartass to include them explicitly.\n\n"
+        "Looking at kickass.md:\n"
+        "- Rule 4 covers L7 partially\n"
+        "- Rule 2 covers L15\n\n"
+        "Let me update kickass and smartass.";
+    const std::string tool_prelude =
+        "Let me update kickass and smartass with the workflow lessons explicitly. "
+        "First check what's there:";
+    const std::string unopened_closed_tool_output =
+        leaked_reasoning + "</mm:think>" + tool_prelude +
+        "]<]minimax[>[<tool_call>\n"
+        "]<]minimax[>[<invoke name=\"bash\">"
+        "]<]minimax[>[<command>cat /home/leaf/.pi/agent/agents/kickass.md 2>&1]<]minimax[>[</command>"
+        "]<]minimax[>[</invoke>\n"
+        "]<]minimax[>[</tool_call>";
+
+    auto unopened_closed_tool_msg = common_chat_parse(unopened_closed_tool_output, /* is_partial = */ false, thinking_off_parser_params);
+    t.assert_equal("unopened closed tool reasoning", leaked_reasoning + tool_prelude, unopened_closed_tool_msg.reasoning_content);
+    t.assert_equal("unopened closed tool visible content", std::string(), unopened_closed_tool_msg.content);
+    t.assert_equal("unopened closed tool call count", 1u, unopened_closed_tool_msg.tool_calls.size());
+    if (unopened_closed_tool_msg.tool_calls.size() == 1) {
+        t.assert_equal("unopened closed tool name", std::string("bash"), unopened_closed_tool_msg.tool_calls[0].name);
+        t.assert_equal(
+            "unopened closed tool args",
+            json({{"command", "cat /home/leaf/.pi/agent/agents/kickass.md 2>&1"}}).dump(),
+            unopened_closed_tool_msg.tool_calls[0].arguments);
+    }
+
+    const std::string migrated_prefix =
+        "Chain 6 started. JakASS is reading the prompt. Now sleeping 1 hour:";
+    auto migrated_content_msg = common_chat_parse(migrated_prefix, /* is_partial = */ true, thinking_off_parser_params);
+    t.assert_equal("migrated prefix parser treats as reasoning", migrated_prefix, migrated_content_msg.reasoning_content);
+    t.assert_equal("migrated prefix parser has no visible content", std::string(), migrated_content_msg.content);
+
+    auto migrated_reasoning_msg = common_chat_parse(migrated_prefix + "</mm:think>",
+                                                    /* is_partial = */ true,
+                                                    thinking_off_parser_params);
+    t.assert_equal("migrated prefix later reasoning", migrated_prefix, migrated_reasoning_msg.reasoning_content);
+    t.assert_equal("migrated prefix later not visible", std::string(), migrated_reasoning_msg.content);
+
+    common_chat_msg streamed_as_content;
+    streamed_as_content.role    = "assistant";
+    streamed_as_content.content = migrated_prefix;
+    auto migrated_diffs = common_chat_msg_diff::compute_diffs(streamed_as_content, migrated_reasoning_msg);
+    t.assert_equal("migrated prefix emits no duplicate diff", 0u, migrated_diffs.size());
+}
+
+// End-to-end coverage for the dedicated Cohere2MoE (North Code) parser:
+// template apply -> PEG parse -> assert message. Exercises the reasoning-mode
+// matrix, including the unopened-thinking-under---reasoning-off case (#1968
+// follow-up). Routing rule: reasoning surfaces to reasoning_content whenever the
+// output format != NONE (DEEPSEEK), and folds into content under NONE.
+static void test_cohere2moe_parser(testing & t) {
+    std::ifstream fin("models/templates/Cohere2MoE.jinja", std::ios::binary);
+    std::ostringstream buf; buf << fin.rdbuf();
+    std::string src = buf.str();
+    t.assert_true("Cohere2MoE template loaded", src.length() > 0);
+    if (src.empty()) {
+        return;
+    }
+
+    common_chat_templates_ptr tmpls(common_chat_templates_init(/* model = */ nullptr, src));
+
+    common_chat_tool special_function{
+        /* .name        = */ "special_function",
+        /* .description = */ "I'm special",
+        /* .parameters  = */ R"({"type":"object","properties":{"arg1":{"type":"integer"}},"required":["arg1"]})",
+    };
+    common_chat_tool python{
+        /* .name        = */ "python",
+        /* .description = */ "Run Python code",
+        /* .parameters  = */ R"({"type":"object","properties":{"code":{"type":"string"}},"required":["code"]})",
+    };
+
+    common_chat_msg user;
+    user.role    = "user";
+    user.content = "Hey";
+
+    const std::string act =
+        "<|START_ACTION|>[\n"
+        "    {\"tool_call_id\": \"0\", \"tool_name\": \"special_function\", \"parameters\": {\"arg1\": 1}}\n"
+        "]<|END_ACTION|>";
+    const std::string act_numeric_id =
+        "<|START_ACTION|>[\n"
+        "    {\"tool_call_id\": 0, \"tool_name\": \"special_function\", \"parameters\": {\"arg1\": 1}}\n"
+        "]<|END_ACTION|>";
+    const std::string text_resp = "<|START_TEXT|>Hello, world!<|END_TEXT|>";
+
+    struct cohere_case {
+        const char *             name;
+        std::string              input;
+        common_reasoning_format  reasoning_format;
+        bool                     enable_thinking;
+        common_chat_tool_choice  tool_choice;
+        std::string              exp_content;
+        std::string              exp_reasoning;
+        size_t                   exp_tool_calls;
+    };
+
+    const std::vector<cohere_case> cases = {
+        // #1968 follow-up fix: orphaned thinking (no <|START_THINKING|>) under --reasoning off.
+        { "unopened/DEEPSEEK -> reasoning_content", "I'm\nthinking<|END_THINKING|>" + act,
+          COMMON_REASONING_FORMAT_DEEPSEEK, false, COMMON_CHAT_TOOL_CHOICE_AUTO, "", "I'm\nthinking", 1 },
+        { "unopened/NONE -> content", "I'm\nthinking<|END_THINKING|>" + act,
+          COMMON_REASONING_FORMAT_NONE, false, COMMON_CHAT_TOOL_CHOICE_AUTO, "I'm\nthinking", "", 1 },
+        { "unopened/DEEPSEEK/required -> reasoning_content", "I'm\nthinking<|END_THINKING|>" + act,
+          COMMON_REASONING_FORMAT_DEEPSEEK, false, COMMON_CHAT_TOOL_CHOICE_REQUIRED, "", "I'm\nthinking", 1 },
+        { "unopened text/DEEPSEEK -> reasoning_content + content", "I'm\nthinking<|END_THINKING|>" + text_resp,
+          COMMON_REASONING_FORMAT_DEEPSEEK, false, COMMON_CHAT_TOOL_CHOICE_AUTO, "Hello, world!", "I'm\nthinking", 0 },
+        { "tool-choice-none text/DEEPSEEK -> reasoning_content + content", "I'm\nthinking<|END_THINKING|>" + text_resp,
+          COMMON_REASONING_FORMAT_DEEPSEEK, false, COMMON_CHAT_TOOL_CHOICE_NONE, "Hello, world!", "I'm\nthinking", 0 },
+        // Regression: reasoning enabled still routes thinking to reasoning_content.
+        { "thinking-on/DEEPSEEK -> reasoning_content", "I'm\nthinking<|END_THINKING|>" + act,
+          COMMON_REASONING_FORMAT_DEEPSEEK, true, COMMON_CHAT_TOOL_CHOICE_AUTO, "", "I'm\nthinking", 1 },
+        { "thinking-on/NONE -> tagged content", "<|START_THINKING|>I'm\nthinking<|END_THINKING|>" + act,
+          COMMON_REASONING_FORMAT_NONE, true, COMMON_CHAT_TOOL_CHOICE_AUTO,
+          "<|START_THINKING|>I'm\nthinking<|END_THINKING|>", "", 1 },
+        // Regression: existing #1968 shapes still parse to clean native tool calls.
+        { "bare-end/DEEPSEEK -> clean call", "<|END_THINKING|>" + act,
+          COMMON_REASONING_FORMAT_DEEPSEEK, false, COMMON_CHAT_TOOL_CHOICE_AUTO, "", "", 1 },
+        { "bare-end/trailing-end-text/DEEPSEEK -> clean call", "<|END_THINKING|>" + act + "<|END_TEXT|>",
+          COMMON_REASONING_FORMAT_DEEPSEEK, false, COMMON_CHAT_TOOL_CHOICE_AUTO, "", "", 1 },
+        { "bare-end/numeric-id/DEEPSEEK -> clean call", "<|END_THINKING|>" + act_numeric_id,
+          COMMON_REASONING_FORMAT_DEEPSEEK, false, COMMON_CHAT_TOOL_CHOICE_AUTO, "", "", 1 },
+        { "empty-block/DEEPSEEK -> clean call", "<|START_THINKING|><|END_THINKING|>" + act,
+          COMMON_REASONING_FORMAT_DEEPSEEK, false, COMMON_CHAT_TOOL_CHOICE_AUTO, "", "", 1 },
+        { "no-thinking/DEEPSEEK -> clean call", act,
+          COMMON_REASONING_FORMAT_DEEPSEEK, false, COMMON_CHAT_TOOL_CHOICE_AUTO, "", "", 1 },
+    };
+
+    for (const auto & c : cases) {
+        common_chat_templates_inputs inputs;
+        inputs.messages         = { user };
+        inputs.tools            = { special_function };
+        inputs.tool_choice      = c.tool_choice;
+        inputs.reasoning_format = c.reasoning_format;
+        inputs.enable_thinking  = c.enable_thinking;
+
+        auto params = common_chat_templates_apply(tmpls.get(), inputs);
+        auto pos    = params.generation_prompt.rfind("<|START_THINKING|>");
+
+        common_peg_arena arena;
+        arena.load(params.parser);
+
+        common_chat_parser_params pp(params);
+        if (pos != std::string::npos) {
+            pp.generation_prompt = params.generation_prompt.substr(0, pos);
+        }
+
+        auto msg = common_chat_peg_parse(arena, c.input, /* is_partial = */ false, pp);
+
+        t.assert_equal(std::string(c.name) + " : content",    c.exp_content,    msg.content);
+        t.assert_equal(std::string(c.name) + " : reasoning",  c.exp_reasoning,  msg.reasoning_content);
+        t.assert_equal(std::string(c.name) + " : tool calls", c.exp_tool_calls, msg.tool_calls.size());
+        if (c.exp_tool_calls == 1 && msg.tool_calls.size() == 1) {
+            t.assert_equal(std::string(c.name) + " : tool name", std::string("special_function"), msg.tool_calls[0].name);
+            t.assert_equal(std::string(c.name) + " : tool id",   std::string("0"),                msg.tool_calls[0].id);
+        }
+    }
+
+    const std::string parallel_act =
+        "<|START_ACTION|>[\n"
+        "    {\"tool_call_id\": \"0\", \"tool_name\": \"special_function\", \"parameters\": {\"arg1\": 1}},\n"
+        "    {\"tool_call_id\": \"1\", \"tool_name\": \"python\", \"parameters\": {\"code\": \"print('hey')\"}}\n"
+        "]<|END_ACTION|>";
+
+    common_chat_templates_inputs parallel_inputs;
+    parallel_inputs.messages            = { user };
+    parallel_inputs.tools               = { special_function, python };
+    parallel_inputs.tool_choice         = COMMON_CHAT_TOOL_CHOICE_AUTO;
+    parallel_inputs.reasoning_format    = COMMON_REASONING_FORMAT_DEEPSEEK;
+    parallel_inputs.enable_thinking     = false;
+    parallel_inputs.parallel_tool_calls = true;
+
+    auto parallel_params = common_chat_templates_apply(tmpls.get(), parallel_inputs);
+    auto parallel_pos    = parallel_params.generation_prompt.rfind("<|START_THINKING|>");
+
+    common_peg_arena parallel_arena;
+    parallel_arena.load(parallel_params.parser);
+
+    common_chat_parser_params parallel_pp(parallel_params);
+    if (parallel_pos != std::string::npos) {
+        parallel_pp.generation_prompt = parallel_params.generation_prompt.substr(0, parallel_pos);
+    }
+
+    auto parallel_msg = common_chat_peg_parse(
+        parallel_arena,
+        "I'm\nthinking<|END_THINKING|>" + parallel_act,
+        /* is_partial = */ false,
+        parallel_pp);
+
+    t.assert_equal("parallel : content", std::string(""), parallel_msg.content);
+    t.assert_equal("parallel : reasoning", std::string("I'm\nthinking"), parallel_msg.reasoning_content);
+    t.assert_equal("parallel : tool calls", 2u, parallel_msg.tool_calls.size());
+    if (parallel_msg.tool_calls.size() == 2) {
+        t.assert_equal("parallel : tool 0 name", std::string("special_function"), parallel_msg.tool_calls[0].name);
+        t.assert_equal("parallel : tool 0 id",   std::string("0"),                parallel_msg.tool_calls[0].id);
+        t.assert_equal("parallel : tool 1 name", std::string("python"),           parallel_msg.tool_calls[1].name);
+        t.assert_equal("parallel : tool 1 id",   std::string("1"),                parallel_msg.tool_calls[1].id);
+    }
+}

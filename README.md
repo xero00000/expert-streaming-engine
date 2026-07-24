@@ -171,8 +171,11 @@ The numbers below are **measured on the same workstation** (dual ~8+10 GiB Amp
 | **Mixed q2k+imatrix fleet** (Qwen / Ornith / Agents / AgentWorld / Qwopus) | **~78–80 t/s** | **256K** | ik | Default daily class |
 | **IQ4_XS uniform** | ~77 / ~65 / ~51 t/s | 64K / 128K / 256K | ik | Full-size quality path |
 | **Bonsai-27B 1-bit** | **~53 t/s** fresh · **~10 @256K depth** | **256K all-VRAM** | prism | Only full-VRAM 256K dense option |
+| **Bonsai-27B Q1_0 FAST** (1-bit) | **1283 t/s pp4K / 1095 t/s pp32K · 70.64 fresh / 36.62 @64K / 24.52 @128K** | **128K** | prism | `bonsai-128k-fast` · RTX 3080 only · no-thinking · ~2.54 GiB VRAM free · exact/tool gates pass |
+| **Bonsai-27B Q1_0 3060 Ti** (1-bit) | **648.27 t/s pp4K / 565.09 t/s pp32K · 39.41 fresh / 18.37 @64K / 14.41 @98K / 11.92 @128K** | **128K** | prism | `bonsai-128k-3060ti` · RTX 3060 Ti only · no-thinking · ~0.99 GiB free at max-depth bench |
 | **Q8_0 35B fleet** (max quality) | **~32–33 t/s** | 64K | ik | Heavy `n-cpu-moe 26` |
 | **Gemma-4 26B-A4B Q8** | **~22 t/s** decode · **~273 pf** | 256K | tq | Needs `--no-op-offload` |
+| **Laguna-S-2.1 IQ4_XS + Q4 DFlash** | **~13.48 code / ~11.45 tool t/s** | 8K | this fork | 3-GPU · 81% code draft acceptance · Poolside standard DFlash GGUF |
 | **GPT-OSS 120B F16** (this fork) | **~11.5–13 t/s** · **~140 pf** | 1K–64K | expert-streaming | Huge F16 on 18 GiB VRAM |
 
 ### GPT-OSS 120B F16 (expert-streaming engine)
@@ -271,6 +274,7 @@ Automated multi-model runs under `all_model_bench_*` (older configs, useful as f
 | Dual-GPU layer split (`--tensor-split 46,54`) | Measured fit for 8+10 GiB |
 | Q8 / Q4 K/V on hybrid placement | Q8 promoted for 1K/64K; Q4 for 8K fit |
 | Chunked GDN port work | Experimental branch history (`chunked-gdn-port`) |
+| Poolside standard DFlash GGUFs (`general.architecture=dflash`) | Validated with Laguna-S-2.1 target + Q4_K_M DFlash draft |
 | Learned cross-layer route head | Lab-only; not launcher default |
 | Persistent CUDA expert cache | Dead-end experiment (kept for reference) |
 

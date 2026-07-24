@@ -45,6 +45,28 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
               LOG_DBG(ANSI_ORANGE "[Patch: old Qwen/Deepseek thinking template]\n" ANSI_RESET);
           }
       },
+      // Poolside Laguna templates prefill <think> in the generation prompt, so generated
+      // reasoning starts immediately and is delimited only by </think>.
+      [](const common_chat_template & tmpl, autoparser & analysis) -> void {
+          if (tmpl.src.find("laguna_glm_thinking") != std::string::npos &&
+              tmpl.src.find("{{- \"<assistant>\\n\" -}}") != std::string::npos &&
+              tmpl.src.find("{{- '<think>' -}}") != std::string::npos) {
+              analysis.reasoning.mode  = reasoning_mode::TAG_BASED;
+              analysis.reasoning.start = "";
+              analysis.reasoning.end   = "</think>";
+              analysis.content.mode     = content_mode::END_DELIMITED;
+              analysis.content.end      = "</assistant>";
+              if (std::find(analysis.preserved_tokens.begin(), analysis.preserved_tokens.end(), "</think>") ==
+                  analysis.preserved_tokens.end()) {
+                  analysis.preserved_tokens.push_back("</think>");
+              }
+              if (std::find(analysis.preserved_tokens.begin(), analysis.preserved_tokens.end(), "</assistant>") ==
+                  analysis.preserved_tokens.end()) {
+                  analysis.preserved_tokens.push_back("</assistant>");
+              }
+              LOG_DBG(ANSI_ORANGE "[Patch: Poolside Laguna thinking template]\n" ANSI_RESET);
+          }
+      },
       // Granite 3.3, with separate reasoning and content markers
       [](const common_chat_template & tmpl, autoparser & analysis) -> void {
           if (tmpl.src.find("Write your thoughts between <think></think> and write your response between "
@@ -107,6 +129,27 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
               analysis.tools.format.per_call_end   = "<｜tool▁call▁end｜>";
               analysis.tools.function.close        = "```";
               LOG_DBG(ANSI_ORANGE "[Patch: DeepSeek-R1-Distill-Qwen]\n" ANSI_RESET);
+          }
+      },
+      // openPangu-2.0 - prefills <think> in the generation prompt (like the Laguna case above),
+      // so the generated reasoning starts immediately and is delimited only by </think>. The
+      // <think> is concatenated into a larger literal ('...assistant\n<think>'), so the
+      // standalone-literal reasoning detector does not pick it up; set the markers explicitly.
+      // Tool calls (<|tool_call_start|>[{...}]<|tool_call_end|>) are already handled by the auto-parser.
+      [](const common_chat_template & tmpl, autoparser & analysis) -> void {
+          if (tmpl.src.find("<|pangu_text_start|>") != std::string::npos) {
+              // Force-set (do not gate on mode==NONE): the differential detector sees the
+              // assistant-history form <think>reasoning</think> and sets start="<think>", but at
+              // generation time <think> is prompt-prefilled, so the output is delimited only by
+              // </think> (start=""). Same shape as the Laguna patch above.
+              analysis.reasoning.mode  = reasoning_mode::TAG_BASED;
+              analysis.reasoning.start = "";
+              analysis.reasoning.end   = "</think>";
+              if (std::find(analysis.preserved_tokens.begin(), analysis.preserved_tokens.end(), "</think>") ==
+                  analysis.preserved_tokens.end()) {
+                  analysis.preserved_tokens.push_back("</think>");
+              }
+              LOG_DBG(ANSI_ORANGE "[Patch: openPangu-2.0 thinking template]\n" ANSI_RESET);
           }
       }
     });
@@ -550,6 +593,10 @@ analyze_content::analyze_content(const common_chat_template & tmpl, const analyz
 
 bool analyze_content::is_always_wrapped() const {
     return mode == content_mode::ALWAYS_WRAPPED && !start.empty() && !end.empty();
+}
+
+bool analyze_content::is_end_delimited() const {
+    return mode == content_mode::END_DELIMITED && !end.empty();
 }
 
 analyze_tools::analyze_tools(const common_chat_template & tmpl,

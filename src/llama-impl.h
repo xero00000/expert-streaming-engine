@@ -240,3 +240,5 @@ void  llama_decode_stop();
 // and fall back to the sequential path when the chunked kernel can't be used.
 #define LLAMA_TENSOR_NAME_FGDNAR "__fgdnar__"
 #define LLAMA_TENSOR_NAME_FGDNCH "__fgdnch__"
+
+std::vector<llama_model *> & llama_all_loaded_models();
