@@ -450,7 +450,7 @@ ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx,
             if (o.second == default_cpu_buft) has_buft_overrides = true;
             const struct ggml_tensor * cur = ml.get_tensor_meta(name.c_str());
             const size_t nbytes = cur ? ggml_nbytes(cur) : 0;
-            LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overriden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(o.second));
+            LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overridden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(o.second));
             ctx = ctx_for_buft(o.second);
             break;
         }
@@ -461,7 +461,7 @@ ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx,
     //        if (std::regex_search(name, pattern)) {
     //            const struct ggml_tensor * cur = ml.get_tensor_meta(name.c_str());
     //            const size_t nbytes = cur ? ggml_nbytes(cur) : 0;
-    //            LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overriden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(overrides->buft));
+    //            LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overridden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(overrides->buft));
     //            ctx = ctx_for_buft(overrides->buft);
     //            break;
     //        }
@@ -2308,6 +2308,20 @@ bool create_tensors_helper::create_dflash_tensors(const LLM_TN & tn) {
     } else {
         model.dflash_fc = create_tensor(ctx_output, tn(LLM_TENSOR_DFLASH_FC, "weight"), {(int64_t) hparams.dflash_n_target_features, n_embd}, 0);
         model.dflash_hidden_norm = create_tensor(ctx_output, tn(LLM_TENSOR_DFLASH_HIDDEN_NORM, "weight"), {n_embd}, 0);
+        model.dflash_aux_hidden_norms.clear();
+        if (hparams.dflash_laguna) {
+            GGML_ASSERT(hparams.dflash_n_target_layers > 0);
+            GGML_ASSERT(hparams.dflash_n_target_features % hparams.dflash_n_target_layers == 0);
+            const int64_t aux_width = hparams.dflash_n_target_features / hparams.dflash_n_target_layers;
+            model.dflash_aux_hidden_norms.reserve(hparams.dflash_n_target_layers);
+            for (uint32_t i = 0; i < hparams.dflash_n_target_layers; ++i) {
+                model.dflash_aux_hidden_norms.push_back(create_tensor(
+                        ctx_output,
+                        tn(LLM_TENSOR_DFLASH_AUX_HIDDEN_NORM, "weight", i),
+                        {aux_width},
+                        0));
+            }
+        }
     }
 
     for (int i = 0; i < n_layer; ++i) {
@@ -2323,6 +2337,9 @@ bool create_tensors_helper::create_dflash_tensors(const LLM_TN & tn) {
         layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, n_embd_gqa}, 0);
         layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, n_embd_gqa}, 0);
         layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_v * n_head, n_embd}, 0);
+        if (hparams.dflash_laguna) {
+            layer.wqkv_gate = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head}, 0);
+        }
 
         if (is_standard_dflash) {
             const std::string gate_name = format("blk.%d.attn_gate.weight", i);
@@ -2787,13 +2804,63 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN &) {
         return format("blk.%d.%s.weight", i, stem);
     };
 
+    const int mtp_layer = n_layer - (int) hparams.nextn_predict_layers;
+    const bool is_standalone_mtp = hparams.nextn_predict_layers == 1 &&
+        ml.get_tensor_meta("blk.0.attn_norm.weight") == nullptr &&
+        ml.get_tensor_meta(format("blk.%d.nextn.eh_proj.weight", mtp_layer).c_str()) != nullptr;
+
     model.tok_embd    = create_tensor_from_meta(ctx_input,  "token_embd.weight");
     model.output_norm = create_tensor_from_meta(ctx_output, "output_norm.weight");
     model.output      = create_tensor_from_meta(ctx_output, "output.weight");
 
-    model.hc_head_base  = create_tensor_from_meta(ctx_output, pick_tensor_name({"hc_head_base.weight", "output_hc_base.weight"}), llama_model_loader::TENSOR_NOT_REQUIRED);
-    model.hc_head_fn    = create_tensor_from_meta(ctx_output, pick_tensor_name({"hc_head_fn.weight", "output_hc_fn.weight"}), llama_model_loader::TENSOR_NOT_REQUIRED);
-    model.hc_head_scale = create_tensor_from_meta(ctx_output, pick_tensor_name({"hc_head_scale.weight", "output_hc_scale.weight"}), llama_model_loader::TENSOR_NOT_REQUIRED);
+    const int hc_head_flags = is_standalone_mtp ? 0 : llama_model_loader::TENSOR_NOT_REQUIRED;
+    model.hc_head_base  = create_tensor_from_meta(ctx_output, pick_tensor_name({"hc_head_base.weight", "output_hc_base.weight"}), hc_head_flags);
+    model.hc_head_fn    = create_tensor_from_meta(ctx_output, pick_tensor_name({"hc_head_fn.weight", "output_hc_fn.weight"}), hc_head_flags);
+    model.hc_head_scale = create_tensor_from_meta(ctx_output, pick_tensor_name({"hc_head_scale.weight", "output_hc_scale.weight"}), hc_head_flags);
+
+    // Standalone companions declare the full block count but contain only predictor tensors.
+    if (is_standalone_mtp) {
+        const int i = mtp_layer;
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+        auto & layer = model.layers[i];
+
+        layer.attn_norm      = create_tensor_from_meta(ctx_split, format("blk.%d.attn_norm.weight", i));
+        layer.attn_sinks     = create_tensor_from_meta(ctx_split, format("blk.%d.attn_sinks.weight", i));
+        layer.wq_a           = create_tensor_from_meta(ctx_split, format("blk.%d.attn_q_a.weight", i));
+        layer.attn_q_a_norm  = create_tensor_from_meta(ctx_split, format("blk.%d.attn_q_a_norm.weight", i));
+        layer.wq_b           = create_tensor_from_meta(ctx_split, format("blk.%d.attn_q_b.weight", i));
+        layer.wkv_latent     = create_tensor_from_meta(ctx_split, format("blk.%d.attn_kv.weight", i));
+        layer.wkv_b          = layer.wkv_latent;
+        layer.wkv_a_mqa      = layer.wkv_latent;
+        layer.attn_kv_a_norm = create_tensor_from_meta(ctx_split, format("blk.%d.attn_kv_a_norm.weight", i));
+        layer.attn_kv_norm   = layer.attn_kv_a_norm;
+        layer.wo_a           = create_tensor_from_meta(ctx_split, format("blk.%d.attn_output_a.weight", i));
+        layer.wo_b           = create_tensor_from_meta(ctx_split, format("blk.%d.attn_output_b.weight", i));
+        layer.wo             = layer.wo_b;
+
+        layer.hc_attn_base  = create_tensor_from_meta(ctx_split, format("blk.%d.hc_attn_base.weight", i));
+        layer.hc_attn_fn    = create_tensor_from_meta(ctx_split, format("blk.%d.hc_attn_fn.weight", i));
+        layer.hc_attn_scale = create_tensor_from_meta(ctx_split, format("blk.%d.hc_attn_scale.weight", i));
+        layer.hc_ffn_base   = create_tensor_from_meta(ctx_split, format("blk.%d.hc_ffn_base.weight", i));
+        layer.hc_ffn_fn     = create_tensor_from_meta(ctx_split, format("blk.%d.hc_ffn_fn.weight", i));
+        layer.hc_ffn_scale  = create_tensor_from_meta(ctx_split, format("blk.%d.hc_ffn_scale.weight", i));
+
+        layer.ffn_norm       = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_norm.weight", i));
+        layer.ffn_gate_inp   = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_gate_inp.weight", i));
+        layer.ffn_exp_probs_b = create_tensor_from_meta(ctx_split, format("blk.%d.exp_probs_b.bias", i));
+        layer.ffn_gate_exps  = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_gate_exps.weight", i));
+        layer.ffn_down_exps  = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_down_exps.weight", i));
+        layer.ffn_up_exps    = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_up_exps.weight", i));
+        layer.ffn_gate_shexp = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_gate_shexp.weight", i));
+        layer.ffn_down_shexp = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_down_shexp.weight", i));
+        layer.ffn_up_shexp   = create_tensor_from_meta(ctx_split, format("blk.%d.ffn_up_shexp.weight", i));
+
+        layer.nextn.eh_proj          = create_tensor_from_meta(ctx_split, format("blk.%d.nextn.eh_proj.weight", i));
+        layer.nextn.enorm            = create_tensor_from_meta(ctx_split, format("blk.%d.nextn.enorm.weight", i));
+        layer.nextn.hnorm            = create_tensor_from_meta(ctx_split, format("blk.%d.nextn.hnorm.weight", i));
+        layer.nextn.shared_head_norm = create_tensor_from_meta(ctx_split, format("blk.%d.nextn.shared_head_norm.weight", i));
+        return use_mmap_buffer;
+    }
 
     for (int i = 0; i < n_layer; ++i) {
         ggml_context * ctx_split = ctx_for_layer_split(i);
@@ -5344,7 +5411,7 @@ bool create_tensors_helper::create_tensors() {
         if (model.output) {
             if (auto it = split_tensors.find(model.output); it != split_tensors.end()) {
                 if (ggml_backend_buft_is_host(model.buft_output.buft_matrix)) {
-                    LLAMA_LOG_INFO("%s: not splitting output tensor becausee buffer is host\n", __func__);
+                    LLAMA_LOG_INFO("%s: not splitting output tensor because buffer is host\n", __func__);
                 } else {
                     auto ctx_split = ctx_map[model.buft_output.buft_matrix];
                     auto split = create_split(model.output->ne[1], 16, model.splits, mem_used);

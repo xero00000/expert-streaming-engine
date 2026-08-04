@@ -4,15 +4,21 @@
 
 This repository is a focused fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (itself a [llama.cpp](https://github.com/ggml-org/llama.cpp) fork). The goal is not a new quant format. It is **making F16 / MXFP4 MoE weights that do not fit in VRAM usable at interactive speeds** on low-VRAM multi-GPU hosts.
 
-**License:** [MIT](LICENSE) · **Branch:** `chunked-gdn-port` · **Headline:** GPT-OSS 120B F16 · ~140 tok/s prefill · ~11.5 tok/s decode
+**License:** [MIT](LICENSE) · **Branch:** `deepseek4-expert-streaming` · **Headline:** GPT-OSS 120B F16 · ~140 tok/s prefill · ~11.5 tok/s decode · **DeepSeek-V4 Flash** (`LLM_ARCH_DEEPSEEK4`) supported via ik upstream DS4 + deferred expert streaming
 
 ---
+
+>[!IMPORTANT]
+>If you are running hybrid CPU/GPU inference for MoE models with all or some experts left on the CPU, **do not use -rtr** unless you know what you are doing. The `-rtr` option causes all tensors left in RAM to be repacked to row-interleaved format while loading the model. As not all quantization types have a CUDA implementation, this will result in matrix multiplications with these tensors to be **always done on the CPU**, even when it would have been much better to offload the computation to the GPU, typically resulting in lower prompt processing speed. Most notably, k-quants (`K2_K, Q3_K, Q4_K, Q5_K, Q6_K`) do not have CUDA row-interleaved implementation.
 
 ## Headline result
 
 **Model:** [GPT-OSS 120B](https://huggingface.co/openai/gpt-oss-120b) F16 GGUF (~61 GiB on disk)  
 **Hardware:** dual Ampere (8 GiB + 10 GiB) · Ryzen 9 5950X · ~47 GiB DDR4 · NVMe  
 **Daily-driver slot:** 64K context, Q8 K/V, hybrid CPU-MoE + 6 GPU-resident MoE layers
+
+>[!NOTE]
+>Some users have reported issues with graph parallel (a.k.a. split mode `graph`) and partial GPU offload (using `--cpu-moe` or `--n-cpu-moe` or tensor overrides). If you are using/want to use split mode graph and observe gibberish/incoherent responses, try adding `-cuda graphs=0` to your command line.
 
 | Metric | Value | Notes |
 | --- | ---: | --- |
