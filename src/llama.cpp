@@ -9123,6 +9123,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_QWEN3:
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_MELLUM:
+        case LLM_ARCH_MAPLE: // DeepGrove Maple-Preview: interleaved/neox-style partial RoPE on SWA layers
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_PHI2:
         case LLM_ARCH_PHI3:

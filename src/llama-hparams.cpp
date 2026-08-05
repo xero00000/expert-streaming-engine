@@ -586,6 +586,37 @@ void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_MAPLE:
+            {
+                // DeepGrove Maple-Preview: 20B-A1B ternary MoE, 3:1 SWA-512:GA.
+                // Full-attention layers (il % 4 == 3) use n_rot=0 (no RoPE);
+                // SWA layers use n_rot_swa=64 (partial RoPE).
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa, false);
+
+                // Explicit rope dims from GGUF (0 / 64 for Maple packs).
+                ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT,     hparams.n_rot,     false);
+                ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT_SWA, hparams.n_rot_swa, false);
+
+                if (hparams.n_swa > 0) {
+                    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+                    hparams.rope_freq_scale_train_swa = 1.0f;
+                    ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
+
+                    if (!ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false)) {
+                        // 3:1 SWA:GA — full attention every 4th layer (il % 4 == 3)
+                        for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                            hparams.swa_layers[i] = ((i + 1) % 4 != 0);
+                        }
+                    }
+                }
+
+                hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SOFTMAX;
+                hparams.expert_weights_norm = true;
+                model.type = e_model::MODEL_UNKNOWN;
+            } break;
+
         case LLM_ARCH_QWEN3NEXT:
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);

@@ -2701,6 +2701,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_mellum();
             } break;
+        case LLM_ARCH_MAPLE:
+            {
+                result = llm.build_maple();
+            } break;
         case LLM_ARCH_QWEN3NEXT:
             {
                 result = llm.build_qwen3next();
@@ -3068,7 +3072,9 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     auto extra = (ggml_split_tensor_t *)model.layers[il].rope_freqs->extra;
                     rope_factors = extra->splits[id];
                 }
-                if (do_rope) {
+                // Maple full-attention layers use n_rot=0 (no position encoding). CUDA rope
+                // rejects n_dims==0 ("invalid argument"), so skip the op entirely.
+                if (do_rope && n_rot_l > 0) {
                     if (is_multi) {
                         int sections[4];
                         std::copy(hparams.rope_sections.begin(), hparams.rope_sections.begin() + GGML_MROPE_SECTIONS, sections);
@@ -3295,7 +3301,8 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         }
     }
 
-    if (do_rope) {
+    // Skip rope when n_rot_l==0 (Maple GA layers). CUDA ggml_rope rejects zero dims.
+    if (do_rope && n_rot_l > 0) {
         if (is_multi) {
             int sections[4];
             std::copy(hparams.rope_sections.begin(), hparams.rope_sections.begin() + GGML_MROPE_SECTIONS, sections);

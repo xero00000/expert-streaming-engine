@@ -640,6 +640,8 @@ static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE/sizeof(float);
 static void ggml_vec_dot_f32(int n, float * restrict s, size_t bs, const float * restrict x, size_t bx, const float * restrict y, size_t by, int nrc);
 static void ggml_vec_dot_f16(int n, float * restrict s, size_t bs, ggml_fp16_t * restrict x, size_t bx, ggml_fp16_t * restrict y, size_t by, int nrc);
 static void ggml_vec_dot_bf16(int n, float * restrict s, size_t bs, ggml_bf16_t * restrict x, size_t bx, ggml_bf16_t * restrict y, size_t by, int nrc);
+static void ggml_vec_dot_tq2_0_f32(int n, float * restrict s, size_t bs, const void * restrict x, size_t bx, const void * restrict y, size_t by, int nrc);
+static void ggml_vec_dot_tq1_0_f32(int n, float * restrict s, size_t bs, const void * restrict x, size_t bx, const void * restrict y, size_t by, int nrc);
 
 static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I8] = {
@@ -1951,7 +1953,31 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
-    [GGML_TYPE_I2_S] = {
+        [GGML_TYPE_TQ1_0] = {
+        .type_name                = "tq1_0",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_tq1_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tq1_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tq1_0_ref,
+        .vec_dot                  = ggml_vec_dot_tq1_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
+    [GGML_TYPE_TQ2_0] = {
+        .type_name                = "tq2_0",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_tq2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tq2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tq2_0_ref,
+        .vec_dot                  = ggml_vec_dot_tq2_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
+[GGML_TYPE_I2_S] = {
         .type_name                = "i2_s",
         .blck_size                = 1,
         .type_size                = 1,
@@ -30744,6 +30770,8 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ2_KT:  result = quantize_iq2_kt (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ3_KT:  result = quantize_iq3_kt (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ4_KT:  result = quantize_iq4_kt (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
+        case GGML_TYPE_TQ1_0:     result = quantize_tq1_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TQ2_0:     result = quantize_tq2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q1_0_G128: result = quantize_q1_0_g128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ3_K:   result = quantize_iq3_k  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ3_KS:  result = quantize_iq3_ks (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
@@ -32203,3 +32231,45 @@ int ggml_cpu_has_matmul_int8(void) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+
+// Maple / mainline ternary: CPU mul_mat via dequant + F32 dot (correctness first).
+static void ggml_vec_dot_tq2_0_f32(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    GGML_ASSERT(n % QK_K == 0);
+
+    const block_tq2_0 * x = (const block_tq2_0 *) vx;
+    const float * y = (const float *) vy;
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        float tmp[QK_K];
+        dequantize_row_tq2_0(x + i, tmp, QK_K);
+        for (int j = 0; j < QK_K; ++j) {
+            sumf += tmp[j] * y[i * QK_K + j];
+        }
+    }
+    *s = sumf;
+}
+
+static void ggml_vec_dot_tq1_0_f32(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    GGML_ASSERT(n % QK_K == 0);
+
+    const block_tq1_0 * x = (const block_tq1_0 *) vx;
+    const float * y = (const float *) vy;
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        float tmp[QK_K];
+        dequantize_row_tq1_0(x + i, tmp, QK_K);
+        for (int j = 0; j < QK_K; ++j) {
+            sumf += tmp[j] * y[i * QK_K + j];
+        }
+    }
+    *s = sumf;
+}

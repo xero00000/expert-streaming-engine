@@ -423,6 +423,8 @@ extern "C" {
         GGML_TYPE_Q4_0_4_4  = 31,
         GGML_TYPE_Q4_0_4_8  = 32,
         GGML_TYPE_Q4_0_8_8  = 33,
+        GGML_TYPE_TQ1_0     = 34,  // mainline ternary (TriLM/Maple); kept for GGUF interop
+        GGML_TYPE_TQ2_0     = 35,  // mainline ternary 2.06bpw (Maple experts/projections)
         GGML_TYPE_I2_S      = 36,  // So we are able to consume MS BitNet I2_S quants
         GGML_TYPE_MXFP4     = 39,  // so we are compatible with mainline
         GGML_TYPE_Q1_0_G128 = 41,  // Bonsai 1-bit quants

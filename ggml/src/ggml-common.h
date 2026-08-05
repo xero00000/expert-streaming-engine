@@ -170,6 +170,22 @@ typedef struct {
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
+// Ternary quants (mainline TQ1_0 / TQ2_0 layout — used by Maple-Preview GGUFs)
+// 1.6875 bpw
+typedef struct {
+    uint8_t qs[(QK_K - 4 * QK_K / 64) / 5]; // 5 elements per byte (3^5 = 243 < 256)
+    uint8_t qh[QK_K/64]; // 4 elements per byte
+    ggml_half d;
+} block_tq1_0;
+static_assert(sizeof(block_tq1_0) == sizeof(ggml_half) + QK_K / 64 + (QK_K - 4 * QK_K / 64) / 5, "wrong tq1_0 block size/padding");
+
+// 2.0625 bpw — Maple experts / q/k/v/o projections
+typedef struct {
+    uint8_t qs[QK_K/4]; // 2 bits per element
+    ggml_half d;
+} block_tq2_0;
+static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
+
 #define QK4_1 32
 typedef struct {
     GGML_SCALE_TYPE1(m, dm);
