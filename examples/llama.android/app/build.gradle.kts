@@ -4,15 +4,17 @@ plugins {
 }
 
 android {
+    // Keep the source namespace stable so the existing Compose/theme package
+    // does not need a mechanical rename; use a real application id for the port.
     namespace = "com.example.llama"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.llama"
+        applicationId = "com.xero.expertstreaming"
         minSdk = 33
         targetSdk = 34
         versionCode = 1
-        versionName = "1.0"
+        versionName = "0.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -45,7 +47,6 @@ android {
 }
 
 dependencies {
-
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
     implementation("androidx.activity:activity-compose:1.8.2")
