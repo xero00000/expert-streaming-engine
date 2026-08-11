@@ -35,12 +35,12 @@ class MainViewModel(
     private var modelDocument: ParcelFileDescriptor? = null
 
     override fun onCleared() {
+        // viewModelScope is cancelled as the ViewModel is cleared, so teardown
+        // must not depend on launching a new coroutine into that scope.
+        runCatching { llamaAndroid.unloadBlocking() }
+        runCatching { modelDocument?.close() }
+        modelDocument = null
         super.onCleared()
-        viewModelScope.launch {
-            runCatching { llamaAndroid.unload() }
-            modelDocument?.close()
-            modelDocument = null
-        }
     }
 
     fun updateConfig(transform: (LLamaAndroid.EngineConfig) -> LLamaAndroid.EngineConfig) {
