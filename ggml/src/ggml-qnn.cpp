@@ -178,14 +178,27 @@ static bool weight_type_supported(enum ggml_type type) {
     return activation_type_supported(type) || type == GGML_TYPE_MXFP4;
 }
 
-static bool tensor_is_plain_2d(const ggml_tensor * tensor) {
-    return tensor && tensor->data && activation_type_supported(tensor->type) &&
+// supports_op() is called while the graph is still unallocated. Capability
+// checks therefore inspect only type/shape/strides; execution-time checks add
+// the data-pointer requirement after the scheduler has allocated the split.
+static bool tensor_layout_plain_2d(const ggml_tensor * tensor) {
+    return tensor && activation_type_supported(tensor->type) &&
+           tensor->ne[0] > 0 && tensor->ne[1] > 0 &&
            tensor->ne[2] == 1 && tensor->ne[3] == 1 && ggml_is_contiguous(tensor);
 }
 
+static bool tensor_is_plain_2d(const ggml_tensor * tensor) {
+    return tensor && tensor->data && tensor_layout_plain_2d(tensor);
+}
+
+static bool weight_layout_2d(const ggml_tensor * tensor) {
+    return tensor && weight_type_supported(tensor->type) &&
+           tensor->ne[0] > 0 && tensor->ne[1] > 0 &&
+           tensor->ne[2] == 1 && tensor->ne[3] == 1;
+}
+
 static bool weight_is_2d(const ggml_tensor * tensor) {
-    return tensor && tensor->data && weight_type_supported(tensor->type) &&
-           tensor->ne[0] > 0 && tensor->ne[1] > 0 && tensor->ne[2] == 1 && tensor->ne[3] == 1;
+    return tensor && tensor->data && weight_layout_2d(tensor);
 }
 
 static void tensor_to_half(const ggml_tensor * src, uint16_t * dst, size_t count) {
@@ -553,7 +566,7 @@ private:
             context_ = nullptr;
         }
         if (backend_ && interface_.backendFree) {
-            interface_.backendFree(backend_);
+            interface_.backendFree(backend_, nullptr);
             backend_ = nullptr;
         }
         if (lib_) {
@@ -688,15 +701,14 @@ static bool qnn_mul_mat_id_supported(const ggml_tensor * op) {
     const ggml_tensor * input = op->src[1];
     const ggml_tensor * ids = op->src[2];
 
-    if (!weights->data || !weight_type_supported(weights->type) || weights->ne[2] <= 0 ||
-        !tensor_is_plain_2d(input) || input->ne[1] != 1 ||
-        !ids->data || ids->type != GGML_TYPE_I32 || ids->ne[1] != 1 || ids->ne[0] <= 0 || ids->ne[0] > 64 ||
-        !op->data || !activation_type_supported(op->type) || op->ne[1] != 1 || op->ne[2] < ids->ne[0] || op->ne[3] != 1) {
+    if (!weight_type_supported(weights->type) || weights->ne[0] <= 0 || weights->ne[1] <= 0 || weights->ne[2] <= 0 ||
+        !tensor_layout_plain_2d(input) || input->ne[1] != 1 ||
+        ids->type != GGML_TYPE_I32 || ids->ne[1] != 1 || ids->ne[0] <= 0 || ids->ne[0] > 64 ||
+        !activation_type_supported(op->type) || op->ne[0] <= 0 || op->ne[1] != 1 || op->ne[2] < ids->ne[0] || op->ne[3] != 1) {
         return false;
     }
 
-    if (weights->ne[0] <= 0 || weights->ne[1] <= 0 ||
-        weights->ne[0] > std::numeric_limits<uint32_t>::max() ||
+    if (weights->ne[0] > std::numeric_limits<uint32_t>::max() ||
         weights->ne[1] > std::numeric_limits<uint32_t>::max()) return false;
 
     return stage_geometry_allowed(
@@ -710,7 +722,7 @@ static bool qnn_backend_supports_op(ggml_backend_t, const ggml_tensor * op) {
     if (op->op == GGML_OP_MUL_MAT_ID) return qnn_mul_mat_id_supported(op);
     if (op->op != GGML_OP_MUL_MAT || !op->src[0] || !op->src[1]) return false;
 
-    if (!weight_is_2d(op->src[0]) || !tensor_is_plain_2d(op->src[1]) || !tensor_is_plain_2d(op) ||
+    if (!weight_layout_2d(op->src[0]) || !tensor_layout_plain_2d(op->src[1]) || !tensor_layout_plain_2d(op) ||
         op->src[0]->ne[0] != op->src[1]->ne[0] ||
         op->ne[0] != op->src[0]->ne[1] || op->ne[1] != op->src[1]->ne[1]) return false;
 
