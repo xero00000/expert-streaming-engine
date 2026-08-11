@@ -22,11 +22,7 @@ class LLamaAndroid {
         val prefetchThreads: Int = 2,
         val gpuLayers: Int = 0,
         val cpuMoeLayers: Int = -1,
-        // Requests the optional QNN0/HTP backend. A non-QNN build or a device
-        // without the runtime falls back to the normal CPU/Vulkan path.
         val useQnn: Boolean = true,
-        // Directory containing compatible Hexagon/HTP skeleton libraries when
-        // they are bundled outside the system search path.
         val qnnDspLibraryPath: String? = null,
     )
 
@@ -102,7 +98,12 @@ class LLamaAndroid {
     private external fun kv_cache_clear(context: Long)
 
     suspend fun systemInfo(): String = withContext(runLoop) { system_info() }
-    suspend fun qnnStatus(): String = withContext(runLoop) { qnn_probe() }
+
+    suspend fun qnnStatus(dspLibraryPath: String? = null): String = withContext(runLoop) {
+        dspLibraryPath?.takeIf { it.isNotBlank() }?.let { set_dsp_library_path(it) }
+        qnn_probe()
+    }
+
     suspend fun backendSummary(): String = withContext(runLoop) { backend_summary() }
 
     suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1): String {
