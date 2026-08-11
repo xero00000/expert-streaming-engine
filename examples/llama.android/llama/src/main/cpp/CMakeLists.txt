@@ -14,6 +14,7 @@ add_subdirectory(../../../../../../ build-llama)
 
 add_library(${CMAKE_PROJECT_NAME} SHARED
         llama-android.cpp
+        expert-android-jni.cpp
         qnn-probe.cpp)
 
 target_compile_features(${CMAKE_PROJECT_NAME} PRIVATE cxx_std_17)
