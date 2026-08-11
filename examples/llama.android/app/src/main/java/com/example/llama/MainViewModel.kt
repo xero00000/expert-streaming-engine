@@ -1,6 +1,9 @@
 package com.example.llama
 
+import android.content.ContentResolver
 import android.llama.cpp.LLamaAndroid
+import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -10,96 +13,151 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 
-class MainViewModel(private val llamaAndroid: LLamaAndroid = LLamaAndroid.instance()): ViewModel() {
-    companion object {
-        @JvmStatic
-        private val NanosPerSecond = 1_000_000_000.0
-    }
-
+class MainViewModel(
+    private val llamaAndroid: LLamaAndroid = LLamaAndroid.instance(),
+) : ViewModel() {
     private val tag: String? = this::class.simpleName
 
-    var messages by mutableStateOf(listOf("Initializing..."))
+    var messages by mutableStateOf(listOf("Expert Streaming Engine Android"))
         private set
-
     var message by mutableStateOf("")
         private set
+    var loadedModel by mutableStateOf<String?>(null)
+        private set
+    var backendStatus by mutableStateOf("Backend status not queried")
+        private set
+    var isBusy by mutableStateOf(false)
+        private set
+
+    var config by mutableStateOf(LLamaAndroid.EngineConfig())
+        private set
+
+    // A SAF document can be mmap'd through /proc/self/fd/<fd>, but the file
+    // descriptor must remain alive for the model lifetime. This avoids copying
+    // giant GGUF files into app-private storage just to obtain a pathname.
+    private var modelDocument: ParcelFileDescriptor? = null
 
     override fun onCleared() {
         super.onCleared()
-
         viewModelScope.launch {
-            try {
-                llamaAndroid.unload()
-            } catch (exc: IllegalStateException) {
-                messages += exc.message!!
-            }
+            runCatching { llamaAndroid.unload() }
+            modelDocument?.close()
+            modelDocument = null
         }
     }
 
-    fun send() {
-        val text = message
-        message = ""
+    fun updateConfig(transform: (LLamaAndroid.EngineConfig) -> LLamaAndroid.EngineConfig) {
+        if (!isBusy && loadedModel == null) config = transform(config)
+    }
 
-        // Add to messages console.
-        messages += text
-        messages += ""
-
+    fun refreshBackends() {
         viewModelScope.launch {
-            llamaAndroid.send(text)
-                .catch {
-                    Log.e(tag, "send() failed", it)
-                    messages += it.message!!
-                }
-                .collect { messages = messages.dropLast(1) + (messages.last() + it) }
+            val qnn = runCatching { llamaAndroid.qnnStatus() }.getOrElse { "QNN: ${it.message}" }
+            val all = runCatching { llamaAndroid.backendSummary() }.getOrElse { "unknown" }
+            backendStatus = "Registered: $all\n$qnn"
+            messages += backendStatus
         }
     }
 
-    fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1) {
+    fun loadUri(contentResolver: ContentResolver, uri: Uri) {
+        if (isBusy || loadedModel != null) return
         viewModelScope.launch {
+            isBusy = true
+            var fd: ParcelFileDescriptor? = null
             try {
-                val start = System.nanoTime()
-                val warmupResult = llamaAndroid.bench(pp, tg, pl, nr)
-                val end = System.nanoTime()
-
-                messages += warmupResult
-
-                val warmup = (end - start).toDouble() / NanosPerSecond
-                messages += "Warm up time: $warmup seconds, please wait..."
-
-                if (warmup > 5.0) {
-                    messages += "Warm up took too long, aborting benchmark"
-                    return@launch
-                }
-
-                messages += llamaAndroid.bench(512, 128, 1, 3)
-            } catch (exc: IllegalStateException) {
-                Log.e(tag, "bench() failed", exc)
-                messages += exc.message!!
+                fd = contentResolver.openFileDescriptor(uri, "r")
+                    ?: throw IllegalStateException("Unable to open selected model")
+                val fdPath = "/proc/self/fd/${fd.fd}"
+                llamaAndroid.load(fdPath, config)
+                modelDocument = fd
+                fd = null
+                loadedModel = uri.toString()
+                messages += "Loaded GGUF through SAF: $uri"
+                backendStatus = "Registered: ${llamaAndroid.backendSummary()}\n${llamaAndroid.qnnStatus()}"
+            } catch (t: Throwable) {
+                Log.e(tag, "loadUri() failed", t)
+                messages += "Load failed: ${t.message ?: t.javaClass.simpleName}"
+            } finally {
+                runCatching { fd?.close() }
+                isBusy = false
             }
         }
     }
 
     fun load(pathToModel: String) {
+        if (isBusy || loadedModel != null) return
         viewModelScope.launch {
+            isBusy = true
             try {
-                llamaAndroid.load(pathToModel)
+                llamaAndroid.load(pathToModel, config)
+                loadedModel = pathToModel
                 messages += "Loaded $pathToModel"
-            } catch (exc: IllegalStateException) {
-                Log.e(tag, "load() failed", exc)
-                messages += exc.message!!
+                backendStatus = "Registered: ${llamaAndroid.backendSummary()}\n${llamaAndroid.qnnStatus()}"
+            } catch (t: Throwable) {
+                Log.e(tag, "load() failed", t)
+                messages += "Load failed: ${t.message ?: t.javaClass.simpleName}"
+            } finally {
+                isBusy = false
             }
         }
     }
 
-    fun updateMessage(newMessage: String) {
-        message = newMessage
+    fun unload() {
+        if (isBusy || loadedModel == null) return
+        viewModelScope.launch {
+            isBusy = true
+            try {
+                llamaAndroid.unload()
+                modelDocument?.close()
+                modelDocument = null
+                messages += "Model unloaded"
+                loadedModel = null
+            } catch (t: Throwable) {
+                Log.e(tag, "unload() failed", t)
+                messages += "Unload failed: ${t.message ?: t.javaClass.simpleName}"
+            } finally {
+                isBusy = false
+            }
+        }
     }
 
-    fun clear() {
-        messages = listOf()
+    fun send() {
+        val text = message.trim()
+        if (text.isEmpty() || isBusy || loadedModel == null) return
+        message = ""
+        messages += "You: $text"
+        messages += ""
+        isBusy = true
+
+        viewModelScope.launch {
+            llamaAndroid.send(text)
+                .catch {
+                    Log.e(tag, "send() failed", it)
+                    messages = messages.dropLast(1) + "Generation failed: ${it.message}"
+                }
+                .collect { token ->
+                    messages = messages.dropLast(1) + (messages.last() + token)
+                }
+            isBusy = false
+        }
     }
 
-    fun log(message: String) {
-        messages += message
+    fun bench(pp: Int = 128, tg: Int = 32, pl: Int = 1, nr: Int = 1) {
+        if (isBusy || loadedModel == null) return
+        viewModelScope.launch {
+            isBusy = true
+            try {
+                messages += llamaAndroid.bench(pp, tg, pl, nr)
+            } catch (t: Throwable) {
+                Log.e(tag, "bench() failed", t)
+                messages += "Benchmark failed: ${t.message ?: t.javaClass.simpleName}"
+            } finally {
+                isBusy = false
+            }
+        }
     }
+
+    fun updateMessage(newMessage: String) { message = newMessage }
+    fun clear() { messages = emptyList() }
+    fun log(value: String) { messages += value }
 }
