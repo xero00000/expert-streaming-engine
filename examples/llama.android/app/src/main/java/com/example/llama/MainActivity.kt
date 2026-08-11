@@ -19,11 +19,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Button
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Divider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -68,6 +69,11 @@ class MainActivity : ComponentActivity() {
             "Memory available: ${Formatter.formatFileSize(this, mem.availMem)} / " +
                 Formatter.formatFileSize(this, mem.totalMem),
         )
+
+        QnnRuntimeInstaller.installIfBundled(this)?.let { dspPath ->
+            viewModel.updateConfig { it.copy(qnnDspLibraryPath = dspPath) }
+            viewModel.log("Bundled QNN DSP runtime extracted to $dspPath")
+        }
         viewModel.refreshBackends()
 
         setContent {
@@ -102,6 +108,7 @@ private fun ToggleRow(label: String, checked: Boolean, enabled: Boolean, onChang
 
 @Composable
 private fun IntField(
+    modifier: Modifier,
     label: String,
     value: Int,
     enabled: Boolean,
@@ -109,7 +116,7 @@ private fun IntField(
     onValue: (Int) -> Unit,
 ) {
     OutlinedTextField(
-        modifier = Modifier.weight(1f),
+        modifier = modifier,
         value = value.toString(),
         enabled = enabled,
         singleLine = true,
@@ -152,7 +159,7 @@ fun ExpertStreamingScreen(
             modifier = Modifier.padding(vertical = 4.dp),
         )
 
-        HorizontalDivider()
+        Divider()
         Text("Engine", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 6.dp))
 
         ToggleRow("Qualcomm QNN / Hexagon HTP", config.useQnn, settingsEnabled) {
@@ -166,39 +173,39 @@ fun ExpertStreamingScreen(
         }
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            IntField("Context", config.contextSize, settingsEnabled) {
+            IntField(Modifier.weight(1f), "Context", config.contextSize, settingsEnabled) {
                 viewModel.updateConfig { c -> c.copy(contextSize = it.coerceAtLeast(512)) }
             }
-            IntField("Threads (0=auto)", config.threads, settingsEnabled) {
+            IntField(Modifier.weight(1f), "Threads (0=auto)", config.threads, settingsEnabled) {
                 viewModel.updateConfig { c -> c.copy(threads = it.coerceAtLeast(0)) }
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            IntField("Batch", config.batchSize, settingsEnabled) {
+            IntField(Modifier.weight(1f), "Batch", config.batchSize, settingsEnabled) {
                 viewModel.updateConfig { c -> c.copy(batchSize = it.coerceAtLeast(32)) }
             }
-            IntField("Ubatch", config.ubatchSize, settingsEnabled) {
+            IntField(Modifier.weight(1f), "Ubatch", config.ubatchSize, settingsEnabled) {
                 viewModel.updateConfig { c -> c.copy(ubatchSize = it.coerceAtLeast(1)) }
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            IntField("Prefetch threads", config.prefetchThreads, settingsEnabled) {
+            IntField(Modifier.weight(1f), "Prefetch threads", config.prefetchThreads, settingsEnabled) {
                 viewModel.updateConfig { c -> c.copy(prefetchThreads = it) }
             }
-            IntField("Accelerator layers", config.gpuLayers, settingsEnabled) {
+            IntField(Modifier.weight(1f), "Accelerator layers", config.gpuLayers, settingsEnabled) {
                 viewModel.updateConfig { c -> c.copy(gpuLayers = it.coerceAtLeast(0)) }
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            IntField("CPU MoE (-1=auto)", config.cpuMoeLayers, settingsEnabled, allowNegative = true) {
+            IntField(Modifier.weight(1f), "CPU MoE (-1=auto)", config.cpuMoeLayers, settingsEnabled, allowNegative = true) {
                 viewModel.updateConfig { c -> c.copy(cpuMoeLayers = it.coerceAtLeast(-1)) }
             }
-            IntField("Max output", config.maxTokens, settingsEnabled) {
+            IntField(Modifier.weight(1f), "Max output", config.maxTokens, settingsEnabled) {
                 viewModel.updateConfig { c -> c.copy(maxTokens = it.coerceAtLeast(1)) }
             }
         }
 
-        HorizontalDivider(modifier = Modifier.padding(top = 6.dp))
+        Divider(modifier = Modifier.padding(top = 6.dp))
 
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             LazyColumn(state = logState, modifier = Modifier.fillMaxSize()) {
