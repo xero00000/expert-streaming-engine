@@ -132,6 +132,7 @@ Java_android_llama_cpp_LLamaAndroid_new_1engine_1context(
     const int threads = n_threads > 0 ? static_cast<int>(n_threads) : auto_threads();
     const int batch   = std::max(32, static_cast<int>(n_batch));
     const int ubatch  = std::max(1, std::min(batch, static_cast<int>(n_ubatch)));
+    const bool qnn_ready = configure_qnn(use_qnn == JNI_TRUE);
 
     llama_context_params params = llama_context_default_params();
     params.seed                     = 1234;
@@ -143,9 +144,10 @@ Java_android_llama_cpp_LLamaAndroid_new_1engine_1context(
     params.prefetch_experts         = prefetch_experts == JNI_TRUE;
     params.prefetch_experts_threads = prefetch_threads;
 
-    // HTP implements standard MUL_MAT_ID for routed decode. Keep that graph
-    // form while QNN is selected; unsupported graph nodes remain on CPU/Vulkan.
-    if (use_qnn == JNI_TRUE) params.fused_moe_up_gate = false;
+    // HTP implements standard MUL_MAT_ID for routed decode. Only alter the MoE
+    // graph shape when QNN is actually registered; if QAIRT is missing, retain
+    // the fork's normal fused CPU/Vulkan behavior without a performance penalty.
+    if (qnn_ready) params.fused_moe_up_gate = false;
 
     LOGI("Creating context ctx=%u threads=%u batch=%u ubatch=%u prefetch=%d prefetch_threads=%d qnn=%d",
          params.n_ctx,
@@ -154,7 +156,7 @@ Java_android_llama_cpp_LLamaAndroid_new_1engine_1context(
          params.n_ubatch,
          params.prefetch_experts ? 1 : 0,
          params.prefetch_experts_threads,
-         use_qnn == JNI_TRUE ? 1 : 0);
+         qnn_ready ? 1 : 0);
 
     llama_context * ctx = llama_new_context_with_model(model, params);
     if (!ctx) {
@@ -194,12 +196,22 @@ Java_android_llama_cpp_LLamaAndroid_set_1dsp_1library_1path(JNIEnv * env, jobjec
     if (!path) return;
     const char * value = env->GetStringUTFChars(path, nullptr);
     if (!value) return;
+
     const char * old = getenv("ADSP_LIBRARY_PATH");
-    std::string merged(value);
+    std::string merged;
     if (old && *old) {
+        const std::string previous(old);
+        if (previous.find(value) != std::string::npos) {
+            env->ReleaseStringUTFChars(path, value);
+            return;
+        }
+        merged = value;
         merged += ";";
-        merged += old;
+        merged += previous;
+    } else {
+        merged = value;
     }
+
     setenv("ADSP_LIBRARY_PATH", merged.c_str(), 1);
     env->ReleaseStringUTFChars(path, value);
     LOGI("Configured ADSP_LIBRARY_PATH");
