@@ -22,6 +22,12 @@ class LLamaAndroid {
         val prefetchThreads: Int = 2,
         val gpuLayers: Int = 0,
         val cpuMoeLayers: Int = -1,
+        // Requests the optional QNN0/HTP backend. A non-QNN build or a device
+        // without the runtime falls back to the normal CPU/Vulkan path.
+        val useQnn: Boolean = true,
+        // Directory containing compatible Hexagon/HTP skeleton libraries when
+        // they are bundled outside the system search path.
+        val qnnDspLibraryPath: String? = null,
     )
 
     private val tag: String? = this::class.simpleName
@@ -34,7 +40,6 @@ class LLamaAndroid {
             log_to_android()
             backend_init()
             Log.d(tag, system_info())
-            Log.d(tag, qnn_probe())
             it.run()
         }.apply {
             uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, exception: Throwable ->
@@ -49,6 +54,7 @@ class LLamaAndroid {
         deferExperts: Boolean,
         nGpuLayers: Int,
         nCpuMoe: Int,
+        useQnn: Boolean,
     ): Long
     private external fun load_model(filename: String): Long
     private external fun free_model(model: Long)
@@ -60,6 +66,7 @@ class LLamaAndroid {
         nUbatch: Int,
         prefetchExperts: Boolean,
         prefetchThreads: Int,
+        useQnn: Boolean,
     ): Long
     private external fun new_context(model: Long): Long
     private external fun free_context(context: Long)
@@ -78,6 +85,8 @@ class LLamaAndroid {
     ): String
     private external fun system_info(): String
     private external fun qnn_probe(): String
+    private external fun backend_summary(): String
+    private external fun set_dsp_library_path(path: String)
     private external fun completion_init(
         context: Long,
         batch: Long,
@@ -93,8 +102,8 @@ class LLamaAndroid {
     private external fun kv_cache_clear(context: Long)
 
     suspend fun systemInfo(): String = withContext(runLoop) { system_info() }
-
     suspend fun qnnStatus(): String = withContext(runLoop) { qnn_probe() }
+    suspend fun backendSummary(): String = withContext(runLoop) { backend_summary() }
 
     suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1): String {
         return withContext(runLoop) {
@@ -109,11 +118,16 @@ class LLamaAndroid {
         withContext(runLoop) {
             when (threadLocalState.get()) {
                 is State.Idle -> {
+                    config.qnnDspLibraryPath
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { set_dsp_library_path(it) }
+
                     val model = load_engine_model(
                         pathToModel,
                         config.deferExperts,
                         config.gpuLayers,
                         config.cpuMoeLayers,
+                        config.useQnn,
                     )
                     if (model == 0L) throw IllegalStateException("load_engine_model() failed")
 
@@ -126,6 +140,7 @@ class LLamaAndroid {
                             config.ubatchSize,
                             config.prefetchExperts,
                             config.prefetchThreads,
+                            config.useQnn,
                         )
                     } catch (t: Throwable) {
                         free_model(model)
@@ -144,7 +159,7 @@ class LLamaAndroid {
                         throw IllegalStateException("new_batch() failed")
                     }
 
-                    Log.i(tag, "Loaded $pathToModel with $config")
+                    Log.i(tag, "Loaded $pathToModel with $config; backends=${backend_summary()}")
                     threadLocalState.set(State.Loaded(model, context, batch, config))
                 }
                 else -> throw IllegalStateException("Model already loaded")
@@ -186,10 +201,7 @@ class LLamaAndroid {
             @Volatile
             var value: Int = value
                 private set
-
-            fun inc() {
-                synchronized(this) { value += 1 }
-            }
+            fun inc() { synchronized(this) { value += 1 } }
         }
 
         private sealed interface State {
