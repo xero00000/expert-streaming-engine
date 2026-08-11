@@ -3,6 +3,10 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val expertVulkan = providers.gradleProperty("expertVulkan")
+    .orElse("false")
+    .map(String::toBoolean)
+
 android {
     namespace = "android.llama.cpp"
     compileSdk = 34
@@ -12,17 +16,25 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
+
         ndk {
-            // Add NDK properties if wanted, e.g.
-            // abiFilters += listOf("arm64-v8a")
+            // The S25 Ultra is arm64 only for our first optimized target. Keeping
+            // one ABI also avoids packaging several copies of the large native runtime.
+            abiFilters += listOf("arm64-v8a")
         }
+
         externalNativeBuild {
             cmake {
-                arguments += "-DCMAKE_BUILD_TYPE=Release"
-                cppFlags += listOf()
-                arguments += listOf()
-
-                cppFlags("")
+                arguments += listOf(
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DGGML_VULKAN=${if (expertVulkan.get()) "ON" else "OFF"}",
+                    "-DGGML_OPENMP=OFF",
+                    "-DGGML_BUILD_TESTS=OFF",
+                    "-DGGML_BUILD_EXAMPLES=OFF",
+                )
+                // Safe ARMv8.2 baseline with dot-product/FP16 acceleration. A later
+                // S25-only flavor can raise this after device-side ISA validation.
+                cppFlags += listOf("-O3", "-march=armv8.2-a+dotprod+fp16")
             }
         }
     }
@@ -32,16 +44,18 @@ android {
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
+                "proguard-rules.pro",
             )
         }
     }
+
     externalNativeBuild {
         cmake {
             path("src/main/cpp/CMakeLists.txt")
             version = "3.22.1"
         }
     }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
@@ -58,7 +72,6 @@ android {
 }
 
 dependencies {
-
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
