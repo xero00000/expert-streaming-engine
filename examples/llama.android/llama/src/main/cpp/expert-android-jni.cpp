@@ -172,10 +172,10 @@ extern "C"
 JNIEXPORT jstring JNICALL
 Java_android_llama_cpp_LLamaAndroid_qnn_1probe(JNIEnv * env, jobject) {
 #ifdef GGML_USE_QNN
-    // Probe without registering. This is intentionally retryable so the UI can
-    // query status before ADSP_LIBRARY_PATH is configured, then try again after
-    // bundled Hexagon skeletons have been extracted.
-    (void) ggml_backend_qnn_get_device_count();
+    // ADSP_LIBRARY_PATH is configured by Kotlin before this call. Registration
+    // is retryable: if QAIRT/HTP is not visible yet, a later refresh can try
+    // again without restarting the app.
+    (void) configure_qnn(true);
     return env->NewStringUTF(ggml_backend_qnn_status());
 #else
     const std::string status = expert_android_qnn_probe();
