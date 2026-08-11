@@ -7,6 +7,16 @@ val expertVulkan = providers.gradleProperty("expertVulkan")
     .orElse("false")
     .map(String::toBoolean)
 
+val expertQnn = providers.gradleProperty("expertQnn")
+    .orElse("false")
+    .map(String::toBoolean)
+
+// Prefer an explicit Gradle property so Android Studio builds are reproducible,
+// but accept Qualcomm's conventional QNN_SDK_ROOT environment variable too.
+val qnnSdkRoot = providers.gradleProperty("qnnSdkRoot")
+    .orElse(providers.environmentVariable("QNN_SDK_ROOT"))
+    .orElse("")
+
 android {
     namespace = "android.llama.cpp"
     compileSdk = 34
@@ -28,10 +38,18 @@ android {
                 arguments += listOf(
                     "-DCMAKE_BUILD_TYPE=Release",
                     "-DGGML_VULKAN=${if (expertVulkan.get()) "ON" else "OFF"}",
+                    "-DEXPERT_ANDROID_QNN=${if (expertQnn.get()) "ON" else "OFF"}",
                     "-DGGML_OPENMP=OFF",
                     "-DGGML_BUILD_TESTS=OFF",
                     "-DGGML_BUILD_EXAMPLES=OFF",
                 )
+                if (expertQnn.get()) {
+                    require(qnnSdkRoot.get().isNotBlank()) {
+                        "-PexpertQnn=true requires -PqnnSdkRoot=/path/to/qairt or QNN_SDK_ROOT"
+                    }
+                    arguments += "-DQNN_SDK_ROOT=${qnnSdkRoot.get()}"
+                }
+
                 // Safe ARMv8.2 baseline with dot-product/FP16 acceleration. A later
                 // S25-only flavor can raise this after device-side ISA validation.
                 cppFlags += listOf("-O3", "-march=armv8.2-a+dotprod+fp16")
