@@ -11,39 +11,59 @@ import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 class LLamaAndroid {
-    private val tag: String? = this::class.simpleName
+    data class EngineConfig(
+        val contextSize: Int = 4096,
+        val threads: Int = 0,
+        val batchSize: Int = 512,
+        val ubatchSize: Int = 256,
+        val maxTokens: Int = 128,
+        val deferExperts: Boolean = true,
+        val prefetchExperts: Boolean = true,
+        val prefetchThreads: Int = 2,
+        val gpuLayers: Int = 0,
+        val cpuMoeLayers: Int = -1,
+    )
 
+    private val tag: String? = this::class.simpleName
     private val threadLocalState: ThreadLocal<State> = ThreadLocal.withInitial { State.Idle }
 
     private val runLoop: CoroutineDispatcher = Executors.newSingleThreadExecutor {
-        thread(start = false, name = "Llm-RunLoop") {
-            Log.d(tag, "Dedicated thread for native code: ${Thread.currentThread().name}")
-
-            // No-op if called more than once.
+        thread(start = false, name = "ExpertStreaming-RunLoop") {
+            Log.d(tag, "Dedicated native run loop: ${Thread.currentThread().name}")
             System.loadLibrary("llama-android")
-
-            // Set llama log handler to Android
             log_to_android()
-            backend_init(false)
-
+            backend_init()
             Log.d(tag, system_info())
-
+            Log.d(tag, qnn_probe())
             it.run()
         }.apply {
             uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, exception: Throwable ->
-                Log.e(tag, "Unhandled exception", exception)
+                Log.e(tag, "Unhandled native run-loop exception", exception)
             }
         }
     }.asCoroutineDispatcher()
 
-    private val nlen: Int = 64
-
     private external fun log_to_android()
+    private external fun load_engine_model(
+        filename: String,
+        deferExperts: Boolean,
+        nGpuLayers: Int,
+        nCpuMoe: Int,
+    ): Long
     private external fun load_model(filename: String): Long
     private external fun free_model(model: Long)
+    private external fun new_engine_context(
+        model: Long,
+        nCtx: Int,
+        nThreads: Int,
+        nBatch: Int,
+        nUbatch: Int,
+        prefetchExperts: Boolean,
+        prefetchThreads: Int,
+    ): Long
     private external fun new_context(model: Long): Long
     private external fun free_context(context: Long)
-    private external fun backend_init(numa: Boolean)
+    private external fun backend_init()
     private external fun backend_free()
     private external fun free_batch(batch: Long)
     private external fun new_batch(nTokens: Int, embd: Int, nSeqMax: Int): Long
@@ -54,55 +74,78 @@ class LLamaAndroid {
         pp: Int,
         tg: Int,
         pl: Int,
-        nr: Int
+        nr: Int,
     ): String
-
     private external fun system_info(): String
-
+    private external fun qnn_probe(): String
     private external fun completion_init(
         context: Long,
         batch: Long,
         text: String,
-        nLen: Int
+        nLen: Int,
     ): Int
-
     private external fun completion_loop(
         context: Long,
         batch: Long,
         nLen: Int,
-        ncur: IntVar
+        ncur: IntVar,
     ): String?
-
     private external fun kv_cache_clear(context: Long)
+
+    suspend fun systemInfo(): String = withContext(runLoop) { system_info() }
+
+    suspend fun qnnStatus(): String = withContext(runLoop) { qnn_probe() }
 
     suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1): String {
         return withContext(runLoop) {
             when (val state = threadLocalState.get()) {
-                is State.Loaded -> {
-                    Log.d(tag, "bench(): $state")
-                    bench_model(state.context, state.model, state.batch, pp, tg, pl, nr)
-                }
-
+                is State.Loaded -> bench_model(state.context, state.model, state.batch, pp, tg, pl, nr)
                 else -> throw IllegalStateException("No model loaded")
             }
         }
     }
 
-    suspend fun load(pathToModel: String) {
+    suspend fun load(pathToModel: String, config: EngineConfig = EngineConfig()) {
         withContext(runLoop) {
             when (threadLocalState.get()) {
                 is State.Idle -> {
-                    val model = load_model(pathToModel)
-                    if (model == 0L)  throw IllegalStateException("load_model() failed")
+                    val model = load_engine_model(
+                        pathToModel,
+                        config.deferExperts,
+                        config.gpuLayers,
+                        config.cpuMoeLayers,
+                    )
+                    if (model == 0L) throw IllegalStateException("load_engine_model() failed")
 
-                    val context = new_context(model)
-                    if (context == 0L) throw IllegalStateException("new_context() failed")
+                    val context = try {
+                        new_engine_context(
+                            model,
+                            config.contextSize,
+                            config.threads,
+                            config.batchSize,
+                            config.ubatchSize,
+                            config.prefetchExperts,
+                            config.prefetchThreads,
+                        )
+                    } catch (t: Throwable) {
+                        free_model(model)
+                        throw t
+                    }
 
-                    val batch = new_batch(512, 0, 1)
-                    if (batch == 0L) throw IllegalStateException("new_batch() failed")
+                    if (context == 0L) {
+                        free_model(model)
+                        throw IllegalStateException("new_engine_context() failed")
+                    }
 
-                    Log.i(tag, "Loaded model $pathToModel")
-                    threadLocalState.set(State.Loaded(model, context, batch))
+                    val batch = new_batch(config.batchSize, 0, 1)
+                    if (batch == 0L) {
+                        free_context(context)
+                        free_model(model)
+                        throw IllegalStateException("new_batch() failed")
+                    }
+
+                    Log.i(tag, "Loaded $pathToModel with $config")
+                    threadLocalState.set(State.Loaded(model, context, batch, config))
                 }
                 else -> throw IllegalStateException("Model already loaded")
             }
@@ -112,25 +155,18 @@ class LLamaAndroid {
     fun send(message: String): Flow<String> = flow {
         when (val state = threadLocalState.get()) {
             is State.Loaded -> {
-                val ncur = IntVar(completion_init(state.context, state.batch, message, nlen))
-                while (ncur.value <= nlen) {
-                    val str = completion_loop(state.context, state.batch, nlen, ncur)
-                    if (str == null) {
-                        break
-                    }
+                val nLen = state.config.maxTokens
+                val ncur = IntVar(completion_init(state.context, state.batch, message, nLen))
+                while (ncur.value <= nLen) {
+                    val str = completion_loop(state.context, state.batch, nLen, ncur) ?: break
                     emit(str)
                 }
                 kv_cache_clear(state.context)
             }
-            else -> {}
+            else -> throw IllegalStateException("No model loaded")
         }
     }.flowOn(runLoop)
 
-    /**
-     * Unloads the model and frees resources.
-     *
-     * This is a no-op if there's no model loaded.
-     */
     suspend fun unload() {
         withContext(runLoop) {
             when (val state = threadLocalState.get()) {
@@ -138,10 +174,9 @@ class LLamaAndroid {
                     free_context(state.context)
                     free_model(state.model)
                     free_batch(state.batch)
-
                     threadLocalState.set(State.Idle)
                 }
-                else -> {}
+                else -> Unit
             }
         }
     }
@@ -153,20 +188,21 @@ class LLamaAndroid {
                 private set
 
             fun inc() {
-                synchronized(this) {
-                    value += 1
-                }
+                synchronized(this) { value += 1 }
             }
         }
 
         private sealed interface State {
-            data object Idle: State
-            data class Loaded(val model: Long, val context: Long, val batch: Long): State
+            data object Idle : State
+            data class Loaded(
+                val model: Long,
+                val context: Long,
+                val batch: Long,
+                val config: EngineConfig,
+            ) : State
         }
 
-        // Enforce only one instance of Llm.
-        private val _instance: LLamaAndroid = LLamaAndroid()
-
-        fun instance(): LLamaAndroid = _instance
+        private val instance = LLamaAndroid()
+        fun instance(): LLamaAndroid = instance
     }
 }
