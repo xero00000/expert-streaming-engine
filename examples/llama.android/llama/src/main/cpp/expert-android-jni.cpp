@@ -22,8 +22,6 @@ namespace {
 int auto_threads() {
     const long online = sysconf(_SC_NPROCESSORS_ONLN);
     if (online <= 2) return 1;
-    // Leave two cores for Android/UI/background work and cap the default so
-    // thermals do not immediately dominate on phones. The UI can override it.
     return std::max(1, std::min(8, static_cast<int>(online) - 2));
 }
 
@@ -83,12 +81,8 @@ Java_android_llama_cpp_LLamaAndroid_load_1engine_1model(
     params.defer_experts = defer_experts == JNI_TRUE;
     params.n_gpu_layers  = std::max(0, static_cast<int>(n_gpu_layers));
 
-    // Restrict accelerator discovery to QNN when explicitly requested and
-    // available. The pointer is static because llama_model_params stores the
-    // device string for the duration of model construction.
     static const char qnn_device[] = "QNN0";
     if (qnn_ready) params.devices = qnn_device;
-
     if (n_cpu_moe >= 0) params.ncmoe = static_cast<int32_t>(n_cpu_moe);
 
     const char * path = env->GetStringUTFChars(filename, nullptr);
@@ -149,9 +143,8 @@ Java_android_llama_cpp_LLamaAndroid_new_1engine_1context(
     params.prefetch_experts         = prefetch_experts == JNI_TRUE;
     params.prefetch_experts_threads = prefetch_threads;
 
-    // HTP implements standard MUL_MAT_ID for routed decode. Disable the fork's
-    // fused up/gate op while QNN is selected so the graph remains expressible
-    // by the QNN backend, with unsupported nodes automatically falling back.
+    // HTP implements standard MUL_MAT_ID for routed decode. Keep that graph
+    // form while QNN is selected; unsupported graph nodes remain on CPU/Vulkan.
     if (use_qnn == JNI_TRUE) params.fused_moe_up_gate = false;
 
     LOGI("Creating context ctx=%u threads=%u batch=%u ubatch=%u prefetch=%d prefetch_threads=%d qnn=%d",
@@ -177,7 +170,10 @@ extern "C"
 JNIEXPORT jstring JNICALL
 Java_android_llama_cpp_LLamaAndroid_qnn_1probe(JNIEnv * env, jobject) {
 #ifdef GGML_USE_QNN
-    configure_qnn(true);
+    // Probe without registering. This is intentionally retryable so the UI can
+    // query status before ADSP_LIBRARY_PATH is configured, then try again after
+    // bundled Hexagon skeletons have been extracted.
+    (void) ggml_backend_qnn_get_device_count();
     return env->NewStringUTF(ggml_backend_qnn_status());
 #else
     const std::string status = expert_android_qnn_probe();
@@ -198,8 +194,6 @@ Java_android_llama_cpp_LLamaAndroid_set_1dsp_1library_1path(JNIEnv * env, jobjec
     if (!path) return;
     const char * value = env->GetStringUTFChars(path, nullptr);
     if (!value) return;
-    // QNN HTP uses this to find Hexagon skeleton libraries when the app bundles
-    // them in its private storage. Preserve an existing path by prepending ours.
     const char * old = getenv("ADSP_LIBRARY_PATH");
     std::string merged(value);
     if (old && *old) {
