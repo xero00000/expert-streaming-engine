@@ -31,3 +31,8 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# Qualcomm QAIRT/QNN redistributables are staged locally by
+# prepare-qnn-runtime.sh and must not be committed to this repository.
+llama/src/main/jniLibs/arm64-v8a/libQnn*.so
+app/src/main/assets/qnn/*.so
