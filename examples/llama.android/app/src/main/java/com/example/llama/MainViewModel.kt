@@ -32,9 +32,6 @@ class MainViewModel(
     var config by mutableStateOf(LLamaAndroid.EngineConfig())
         private set
 
-    // A SAF document can be mmap'd through /proc/self/fd/<fd>, but the file
-    // descriptor must remain alive for the model lifetime. This avoids copying
-    // giant GGUF files into app-private storage just to obtain a pathname.
     private var modelDocument: ParcelFileDescriptor? = null
 
     override fun onCleared() {
@@ -52,7 +49,8 @@ class MainViewModel(
 
     fun refreshBackends() {
         viewModelScope.launch {
-            val qnn = runCatching { llamaAndroid.qnnStatus() }.getOrElse { "QNN: ${it.message}" }
+            val qnn = runCatching { llamaAndroid.qnnStatus(config.qnnDspLibraryPath) }
+                .getOrElse { "QNN: ${it.message}" }
             val all = runCatching { llamaAndroid.backendSummary() }.getOrElse { "unknown" }
             backendStatus = "Registered: $all\n$qnn"
             messages += backendStatus
@@ -73,7 +71,8 @@ class MainViewModel(
                 fd = null
                 loadedModel = uri.toString()
                 messages += "Loaded GGUF through SAF: $uri"
-                backendStatus = "Registered: ${llamaAndroid.backendSummary()}\n${llamaAndroid.qnnStatus()}"
+                backendStatus = "Registered: ${llamaAndroid.backendSummary()}\n" +
+                    llamaAndroid.qnnStatus(config.qnnDspLibraryPath)
             } catch (t: Throwable) {
                 Log.e(tag, "loadUri() failed", t)
                 messages += "Load failed: ${t.message ?: t.javaClass.simpleName}"
@@ -92,7 +91,8 @@ class MainViewModel(
                 llamaAndroid.load(pathToModel, config)
                 loadedModel = pathToModel
                 messages += "Loaded $pathToModel"
-                backendStatus = "Registered: ${llamaAndroid.backendSummary()}\n${llamaAndroid.qnnStatus()}"
+                backendStatus = "Registered: ${llamaAndroid.backendSummary()}\n" +
+                    llamaAndroid.qnnStatus(config.qnnDspLibraryPath)
             } catch (t: Throwable) {
                 Log.e(tag, "load() failed", t)
                 messages += "Load failed: ${t.message ?: t.javaClass.simpleName}"
