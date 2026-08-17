@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Unified launcher and memory planner for Expert Streaming Engine.
 
-The launcher is intentionally standard-library only. It does not replace the
-native runtime; it selects a conservative, inspectable set of native flags for
-one of three policies:
+The launcher is intentionally standard-library only. It chooses one of the
+native execution paths that this branch actually exposes:
 
-* resident: the model is expected to fit in aggregate VRAM;
-* cache: experts stay in host RAM while hot rows/tensors use spare VRAM;
-* stream: expert storage is deferred and paged from the model file.
+* resident: ordinary GPU offload / native auto-fit;
+* hybrid: dense tensors on GPU with routed experts on CPU, optionally keeping
+  a user-selected MoE tail on GPU;
+* stream: the hybrid path plus deferred mmap expert residency and route-aware
+  page-cache prefetch.
 
-Every generated command can be inspected with ``ese plan`` or ``--dry-run``.
-Unknown native options can be appended after ``--``.
+``ese plan`` always prints the exact environment and native command. Native
+llama-server options can be appended after ``--``.
 """
 
 from __future__ import annotations
@@ -31,10 +32,11 @@ import sys
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Sequence
 
-GIB = 1024 ** 3
-MIB = 1024 ** 2
+GIB = 1024**3
+MIB = 1024**2
 DEFAULT_SERVER = Path("build/bin/llama-server")
 KNOWN_KV_TYPES = ("auto", "f16", "q8_0", "q4_0")
+POLICIES = ("auto", "resident", "hybrid", "stream")
 
 
 class ESEError(RuntimeError):
@@ -47,10 +49,6 @@ class GPUInfo:
     name: str
     total_bytes: int
     free_bytes: int
-
-    @property
-    def free_fraction(self) -> float:
-        return self.free_bytes / self.total_bytes if self.total_bytes else 0.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,22 +78,26 @@ class ModelInfo:
 
     @property
     def block_count(self) -> int | None:
-        candidates = (
-            f"{self.architecture}.block_count",
-            "llama.block_count",
-            "general.block_count",
+        return _first_positive_int(
+            self.metadata,
+            (
+                f"{self.architecture}.block_count",
+                "llama.block_count",
+                "general.block_count",
+            ),
         )
-        return _first_positive_int(self.metadata, candidates)
 
     @property
     def expert_count(self) -> int | None:
-        candidates = (
-            f"{self.architecture}.expert_count",
-            f"{self.architecture}.expert_used_count",
-            "llama.expert_count",
-            "general.expert_count",
+        return _first_positive_int(
+            self.metadata,
+            (
+                f"{self.architecture}.expert_count",
+                f"{self.architecture}.expert_used_count",
+                "llama.expert_count",
+                "general.expert_count",
+            ),
         )
-        return _first_positive_int(self.metadata, candidates)
 
     @property
     def is_moe(self) -> bool:
@@ -137,8 +139,7 @@ class LaunchPlan:
         env = " ".join(
             f"{key}={shlex.quote(value)}" for key, value in sorted(self.environment.items())
         )
-        cmd = shlex.join(self.command())
-        return f"{env} {cmd}".strip()
+        return f"{env} {shlex.join(self.command())}".strip()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -190,9 +191,7 @@ def human_bytes(value: int) -> str:
     number = float(max(0, value))
     for suffix in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
         if number < 1024.0 or suffix == "PiB":
-            if suffix == "B":
-                return f"{int(number)} {suffix}"
-            return f"{number:.2f} {suffix}"
+            return f"{int(number)} {suffix}" if suffix == "B" else f"{number:.2f} {suffix}"
         number /= 1024.0
     raise AssertionError("unreachable")
 
@@ -206,27 +205,26 @@ def parse_size(value: str) -> int:
         raise argparse.ArgumentTypeError(
             f"invalid size {value!r}; examples: 1024M, 8GiB, 1.5T"
         )
-    number = float(match.group(1))
     suffix = (match.group(2) or "b").lower()
     multipliers = {
         "b": 1,
         "k": 1000,
         "kb": 1000,
         "kib": 1024,
-        "m": 1000 ** 2,
-        "mb": 1000 ** 2,
-        "mib": 1024 ** 2,
-        "g": 1000 ** 3,
-        "gb": 1000 ** 3,
-        "gib": 1024 ** 3,
-        "t": 1000 ** 4,
-        "tb": 1000 ** 4,
-        "tib": 1024 ** 4,
-        "p": 1000 ** 5,
-        "pb": 1000 ** 5,
-        "pib": 1024 ** 5,
+        "m": 1000**2,
+        "mb": 1000**2,
+        "mib": 1024**2,
+        "g": 1000**3,
+        "gb": 1000**3,
+        "gib": 1024**3,
+        "t": 1000**4,
+        "tb": 1000**4,
+        "tib": 1024**4,
+        "p": 1000**5,
+        "pb": 1000**5,
+        "pib": 1024**5,
     }
-    return int(number * multipliers[suffix])
+    return int(float(match.group(1)) * multipliers[suffix])
 
 
 def _run_capture(command: Sequence[str]) -> str | None:
@@ -281,14 +279,14 @@ def detect_host_memory() -> HostMemory:
                 if ":" not in line:
                     continue
                 key, raw = line.split(":", 1)
-                amount = raw.strip().split()[0]
-                values[key] = int(amount) * 1024
+                values[key] = int(raw.strip().split()[0]) * 1024
         except (OSError, ValueError, IndexError):
             pass
-        total = values.get("MemTotal", 0)
-        available = values.get("MemAvailable", values.get("MemFree", 0))
-        if total:
-            return HostMemory(total_bytes=total, available_bytes=available)
+        if values.get("MemTotal"):
+            return HostMemory(
+                total_bytes=values["MemTotal"],
+                available_bytes=values.get("MemAvailable", values.get("MemFree", 0)),
+            )
 
     if sys.platform == "darwin":
         total_raw = _run_capture(("sysctl", "-n", "hw.memsize"))
@@ -313,10 +311,7 @@ def detect_host_memory() -> HostMemory:
         status = MEMORYSTATUSEX()
         status.dwLength = ctypes.sizeof(status)
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-            return HostMemory(
-                total_bytes=int(status.ullTotalPhys),
-                available_bytes=int(status.ullAvailPhys),
-            )
+            return HostMemory(int(status.ullTotalPhys), int(status.ullAvailPhys))
 
     return HostMemory(total_bytes=0, available_bytes=0)
 
@@ -339,11 +334,9 @@ def discover_model_shards(path: Path) -> tuple[Path, ...]:
     requested = path.expanduser().resolve()
     if not requested.is_file():
         raise ESEError(f"model file does not exist: {requested}")
-
     match = _SPLIT_RE.match(requested.name)
     if not match:
         return (requested,)
-
     expected = int(match.group("count"))
     pattern = str(requested.with_name(f"{match.group('prefix')}-?????-of-{expected:05d}.gguf"))
     candidates = sorted(Path(item).resolve() for item in glob.glob(pattern))
@@ -354,31 +347,20 @@ def discover_model_shards(path: Path) -> tuple[Path, ...]:
     return tuple(candidates)
 
 
-_GGUF_U8 = 0
-_GGUF_I8 = 1
-_GGUF_U16 = 2
-_GGUF_I16 = 3
-_GGUF_U32 = 4
-_GGUF_I32 = 5
-_GGUF_F32 = 6
-_GGUF_BOOL = 7
 _GGUF_STRING = 8
 _GGUF_ARRAY = 9
-_GGUF_U64 = 10
-_GGUF_I64 = 11
-_GGUF_F64 = 12
 _GGUF_SCALARS: dict[int, str] = {
-    _GGUF_U8: "<B",
-    _GGUF_I8: "<b",
-    _GGUF_U16: "<H",
-    _GGUF_I16: "<h",
-    _GGUF_U32: "<I",
-    _GGUF_I32: "<i",
-    _GGUF_F32: "<f",
-    _GGUF_BOOL: "<?",
-    _GGUF_U64: "<Q",
-    _GGUF_I64: "<q",
-    _GGUF_F64: "<d",
+    0: "<B",
+    1: "<b",
+    2: "<H",
+    3: "<h",
+    4: "<I",
+    5: "<i",
+    6: "<f",
+    7: "<?",
+    10: "<Q",
+    11: "<q",
+    12: "<d",
 }
 
 
@@ -397,20 +379,15 @@ def _read_u64(handle: BinaryIO) -> int:
     return struct.unpack("<Q", _read_exact(handle, 8))[0]
 
 
-def _read_gguf_string(handle: BinaryIO) -> str:
+def _read_gguf_string(handle: BinaryIO, *, decode: bool = True) -> str:
     length = _read_u64(handle)
     if length > 64 * MIB:
         raise ESEError(f"unreasonable GGUF string length: {length}")
-    return _read_exact(handle, length).decode("utf-8", errors="replace")
+    raw = _read_exact(handle, length)
+    return raw.decode("utf-8", errors="replace") if decode else ""
 
 
-def _read_gguf_value(
-    handle: BinaryIO,
-    value_type: int,
-    *,
-    materialize_arrays: bool = False,
-    depth: int = 0,
-) -> Any:
+def _read_gguf_value(handle: BinaryIO, value_type: int, *, depth: int = 0) -> Any:
     if depth > 4:
         raise ESEError("GGUF metadata nesting is too deep")
     scalar_format = _GGUF_SCALARS.get(value_type)
@@ -423,36 +400,27 @@ def _read_gguf_value(
         length = _read_u64(handle)
         if length > 100_000_000:
             raise ESEError(f"unreasonable GGUF array length: {length}")
-        if materialize_arrays and length <= 4096:
-            return [
-                _read_gguf_value(
-                    handle,
-                    element_type,
-                    materialize_arrays=materialize_arrays,
-                    depth=depth + 1,
-                )
-                for _ in range(length)
-            ]
-        for _ in range(length):
-            _read_gguf_value(
-                handle,
-                element_type,
-                materialize_arrays=False,
-                depth=depth + 1,
-            )
+        scalar_format = _GGUF_SCALARS.get(element_type)
+        if scalar_format:
+            handle.seek(struct.calcsize(scalar_format) * length, os.SEEK_CUR)
+        elif element_type == _GGUF_STRING:
+            for _ in range(length):
+                _read_gguf_string(handle, decode=False)
+        else:
+            for _ in range(length):
+                _read_gguf_value(handle, element_type, depth=depth + 1)
         return {"type": element_type, "length": length}
     raise ESEError(f"unsupported GGUF metadata value type: {value_type}")
 
 
 def read_gguf_metadata(path: Path) -> dict[str, Any]:
-    """Read scalar/string metadata without loading tensor data or large arrays."""
+    """Read GGUF metadata without loading tensor payloads or materializing arrays."""
     with path.open("rb") as handle:
-        magic = _read_exact(handle, 4)
-        if magic != b"GGUF":
+        if _read_exact(handle, 4) != b"GGUF":
             raise ESEError(f"not a GGUF file: {path}")
         version = _read_u32(handle)
         if version not in (2, 3):
-            raise ESEError(f"unsupported GGUF version {version}; expected version 2 or 3")
+            raise ESEError(f"unsupported GGUF version {version}; expected 2 or 3")
         _tensor_count = _read_u64(handle)
         metadata_count = _read_u64(handle)
         if metadata_count > 1_000_000:
@@ -460,14 +428,12 @@ def read_gguf_metadata(path: Path) -> dict[str, Any]:
         metadata: dict[str, Any] = {"_gguf.version": version}
         for _ in range(metadata_count):
             key = _read_gguf_string(handle)
-            value_type = _read_u32(handle)
-            metadata[key] = _read_gguf_value(handle, value_type)
+            metadata[key] = _read_gguf_value(handle, _read_u32(handle))
         return metadata
 
 
 def inspect_model(path: Path) -> ModelInfo:
     shards = discover_model_shards(path)
-    metadata: dict[str, Any]
     try:
         metadata = read_gguf_metadata(shards[0])
     except ESEError as exc:
@@ -502,35 +468,26 @@ def select_policy(
             f"MoE size {human_bytes(model.total_bytes)} exceeds 90% of available RAM "
             f"({human_bytes(available_ram)}); use deferred disk-backed experts",
         )
-
-    if "gpt-oss" in text and model.total_bytes > max(free_vram, int(available_ram * 0.70)):
+    if "gpt-oss" in text and available_ram and model.total_bytes > max(
+        free_vram, int(available_ram * 0.70)
+    ):
         return (
             "stream",
-            "GPT-OSS model exceeds the safe resident memory budget; use ESE deferred experts",
+            "GPT-OSS exceeds the safe resident-memory budget; use deferred experts",
         )
-
     if model.is_moe and (not free_vram or model.total_bytes > int(free_vram * 0.85)):
         return (
-            "cache",
-            "MoE weights do not fit safely in free VRAM but can use host-backed adaptive expert caching",
+            "hybrid",
+            "MoE weights do not fit safely in free VRAM; keep experts on CPU and dense tensors on GPU",
         )
-
     if free_vram and model.total_bytes <= int(free_vram * 0.85):
         return (
             "resident",
             f"model fits within 85% of detected free VRAM ({human_bytes(free_vram)})",
         )
-
     if model.is_moe:
-        return (
-            "cache",
-            "GPU capacity was not detected; host-backed MoE cache is the conservative default",
-        )
-
-    return (
-        "resident",
-        "dense/non-MoE model and no stronger memory-pressure signal was detected",
-    )
+        return "hybrid", "GPU capacity was not detected; CPU MoE is the safe default"
+    return "resident", "dense/non-MoE model; use the native resident/auto-fit path"
 
 
 def auto_tensor_split(gpus: Sequence[GPUInfo]) -> str | None:
@@ -539,8 +496,7 @@ def auto_tensor_split(gpus: Sequence[GPUInfo]) -> str | None:
     weights = [max(1, gpu.free_bytes) for gpu in gpus]
     total = sum(weights)
     percentages = [round(value * 100 / total) for value in weights]
-    difference = 100 - sum(percentages)
-    percentages[-1] += difference
+    percentages[-1] += 100 - sum(percentages)
     return ",".join(str(max(1, value)) for value in percentages)
 
 
@@ -564,10 +520,29 @@ def _default_threads(logical_cpus: int) -> tuple[int, int]:
     return decode, batch
 
 
-def _resident_moe_layers(hardware: HardwareInfo, requested: int | None) -> int:
-    if requested is not None:
-        return max(0, requested)
-    return max(0, min(8, int(hardware.free_vram / (1500 * MIB))))
+def _moe_placement_args(
+    model: ModelInfo,
+    gpu_resident_moe: int | None,
+    *,
+    require_cpu_layer: bool,
+) -> list[str]:
+    keep = 0 if gpu_resident_moe is None else gpu_resident_moe
+    if keep < 0:
+        raise ESEError("--gpu-resident-moe cannot be negative")
+    blocks = model.block_count
+    if keep == 0:
+        return ["--cpu-moe"]
+    if blocks is None:
+        raise ESEError(
+            "--gpu-resident-moe requires a readable GGUF block_count; "
+            "use --cpu-moe after -- as a conservative fallback"
+        )
+    if keep > blocks or (require_cpu_layer and keep >= blocks):
+        limit = blocks - 1 if require_cpu_layer else blocks
+        raise ESEError(f"--gpu-resident-moe must be at most {limit} for this model")
+    if keep == blocks:
+        return []
+    return ["--n-cpu-moe", str(blocks - keep)]
 
 
 def build_launch_plan(
@@ -586,15 +561,15 @@ def build_launch_plan(
     ubatch_size: int | None = None,
     kv_type: str = "auto",
     reserve_vram: int = GIB,
-    resident_moe_layers: int | None = None,
+    gpu_resident_moe: int | None = None,
     tensor_split: str | None = None,
     prefetch_tail: int = 0,
     extra_args: Sequence[str] = (),
 ) -> LaunchPlan:
     selected_policy, reason = select_policy(model, hardware, policy)
-    detected_threads, detected_batch_threads = _default_threads(hardware.logical_cpus)
-    threads = threads or detected_threads
-    batch_threads = batch_threads or detected_batch_threads
+    decode_default, batch_default = _default_threads(hardware.logical_cpus)
+    threads = threads or decode_default
+    batch_threads = batch_threads or batch_default
     kv = choose_kv_type(kv_type, context, hardware, reserve_vram)
     split = tensor_split or auto_tensor_split(hardware.gpus)
 
@@ -621,42 +596,37 @@ def build_launch_plan(
         kv,
     ]
     env: dict[str, str] = {}
-
     if split:
         args.extend(("--tensor-split", split))
 
     if selected_policy == "resident":
         args.extend(("-ngl", "99"))
+        if hardware.gpus and model.total_bytes > int(hardware.free_vram * 0.85):
+            args.append("--fit")
         if batch_size is not None:
             args.extend(("-b", str(batch_size)))
         if ubatch_size is not None:
             args.extend(("-ub", str(ubatch_size)))
 
-    elif selected_policy == "cache":
-        args.extend(("-ngl", "99", "-sm", "layer", "-ot", "exps=CPU"))
-        if len(hardware.gpus) >= 2:
-            args.extend(("--moe-cache", "auto", "--moe-cache-expert-parallel", "auto"))
-        else:
-            args.extend(("--moe-cache", "on"))
+    elif selected_policy == "hybrid":
+        if not model.is_moe:
+            raise ESEError("--policy hybrid requires a sparse MoE model")
+        args.extend(("-ngl", "99"))
+        args.extend(
+            _moe_placement_args(model, gpu_resident_moe, require_cpu_layer=False)
+        )
         args.extend(("-b", str(batch_size or 1024), "-ub", str(ubatch_size or 512)))
 
     elif selected_policy == "stream":
-        env.update(
-            {
-                "GGML_CUDA_NO_PINNED": "1",
-                "LLAMA_EXPERT_PREFETCH": "1",
-            }
-        )
+        if not model.is_moe:
+            raise ESEError("--policy stream requires a sparse MoE model")
+        env.update({"GGML_CUDA_NO_PINNED": "1", "LLAMA_EXPERT_PREFETCH": "1"})
         if prefetch_tail > 0:
             env["LLAMA_EXPERT_PREFETCH_TAIL"] = str(min(prefetch_tail, 32))
         args.extend(("-ngl", "99", "--defer-experts"))
-        text = _model_text(model)
-        blocks = model.block_count
-        keep_gpu = _resident_moe_layers(hardware, resident_moe_layers)
-        if "gpt-oss" in text and blocks and keep_gpu < blocks:
-            args.extend(("--n-cpu-moe", str(max(1, blocks - keep_gpu))))
-        else:
-            args.append("--cpu-moe")
+        args.extend(
+            _moe_placement_args(model, gpu_resident_moe, require_cpu_layer=True)
+        )
         args.extend(("-b", str(batch_size or 1024), "-ub", str(ubatch_size or 512)))
 
     else:
@@ -685,9 +655,8 @@ def _repo_root() -> Path:
 def _resolve_binary(value: str | None, build_dir: Path | None = None) -> Path:
     if value:
         return Path(value).expanduser().resolve()
-    env_binary = os.environ.get("ESE_SERVER")
-    if env_binary:
-        return Path(env_binary).expanduser().resolve()
+    if os.environ.get("ESE_SERVER"):
+        return Path(os.environ["ESE_SERVER"]).expanduser().resolve()
     root = _repo_root()
     if build_dir:
         return (build_dir / "bin" / "llama-server").resolve()
@@ -704,9 +673,9 @@ def _print_plan(plan: LaunchPlan, as_json: bool) -> None:
         f"Model  : {plan.model.name} | {human_bytes(plan.model.total_bytes)} | "
         f"{len(plan.model.shards)} shard(s)"
     )
-    architecture = plan.model.architecture or "unknown"
     print(
-        f"GGUF   : arch={architecture}, blocks={plan.model.block_count or 'unknown'}, "
+        f"GGUF   : arch={plan.model.architecture or 'unknown'}, "
+        f"blocks={plan.model.block_count or 'unknown'}, "
         f"experts={plan.model.expert_count or 'unknown'}"
     )
     print(
@@ -768,7 +737,6 @@ def _build(args: argparse.Namespace) -> int:
     build_dir = Path(args.build_dir).expanduser().resolve()
     if args.clean and build_dir.exists():
         shutil.rmtree(build_dir)
-
     backend = args.backend
     if backend == "auto":
         backend = "cuda" if shutil.which("nvidia-smi") or shutil.which("nvcc") else "cpu"
@@ -782,17 +750,10 @@ def _build(args: argparse.Namespace) -> int:
         f"-DCMAKE_BUILD_TYPE={args.build_type}",
         "-DLLAMA_BUILD_TESTS=OFF",
         "-DLLAMA_BUILD_SERVER=ON",
+        f"-DGGML_CUDA={'ON' if backend == 'cuda' else 'OFF'}",
     ]
-    if backend == "cuda":
-        configure.append("-DGGML_CUDA=ON")
-    elif backend == "cpu":
-        configure.append("-DGGML_CUDA=OFF")
-    else:
-        raise ESEError(f"unsupported build backend: {backend}")
-
     if shutil.which("ninja"):
         configure.extend(("-G", "Ninja"))
-
     print("+", shlex.join(configure))
     subprocess.run(configure, cwd=root, check=True)
     build = [
@@ -808,8 +769,7 @@ def _build(args: argparse.Namespace) -> int:
     ]
     print("+", shlex.join(build))
     subprocess.run(build, cwd=root, check=True)
-    binary = _resolve_binary(None, build_dir)
-    print(f"Built: {binary}")
+    print(f"Built: {_resolve_binary(None, build_dir)}")
     return 0
 
 
@@ -817,9 +777,9 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("model", type=Path, help="GGUF file or first shard")
     parser.add_argument(
         "--policy",
-        choices=("auto", "resident", "cache", "stream"),
+        choices=POLICIES,
         default="auto",
-        help="memory policy; auto is recommended",
+        help="resident, hybrid CPU-MoE, or deferred stream; auto is recommended",
     )
     parser.add_argument("--binary", help="path to llama-server (or set ESE_SERVER)")
     parser.add_argument("-c", "--context", type=int, default=65_536)
@@ -836,12 +796,12 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         type=parse_size,
         default=GIB,
         metavar="SIZE",
-        help="VRAM safety reserve used by the planner (default: 1GiB)",
+        help="VRAM safety reserve used by KV planning (default: 1GiB)",
     )
     parser.add_argument(
         "--gpu-resident-moe",
         type=int,
-        help="stream policy: requested number of MoE layers kept on GPU",
+        help="hybrid/stream: number of final MoE layers retained on GPU",
     )
     parser.add_argument(
         "--tensor-split",
@@ -851,7 +811,7 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         "--prefetch-tail",
         type=int,
         default=0,
-        help="stream policy: prefetch N router-logit tail experts (0-32)",
+        help="stream: stage N router-logit near-miss experts (0-32)",
     )
     parser.add_argument("--json", action="store_true")
 
@@ -859,9 +819,9 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
 def _make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ese",
-        description="One front door for resident, cached, and disk-streamed ESE inference.",
+        description="One front door for resident, hybrid, and disk-streamed ESE inference.",
     )
-    parser.add_argument("--version", action="version", version="ese unified launcher 0.1")
+    parser.add_argument("--version", action="version", version="ese unified launcher 0.2")
     commands = parser.add_subparsers(dest="command", required=True)
 
     doctor = commands.add_parser("doctor", help="inspect build tools, RAM, and GPUs")
@@ -874,16 +834,12 @@ def _make_parser() -> argparse.ArgumentParser:
     build.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1))
     build.add_argument("--clean", action="store_true")
 
-    plan = commands.add_parser("plan", help="inspect the selected policy and native command")
+    plan = commands.add_parser("plan", help="inspect the policy and native command")
     _add_plan_arguments(plan)
 
     serve = commands.add_parser("serve", help="plan and execute llama-server")
     _add_plan_arguments(serve)
-    serve.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="print the plan without executing the server",
-    )
+    serve.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -894,13 +850,10 @@ def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
         raise ESEError("--slots must be positive")
     if not 1 <= args.port <= 65535:
         raise ESEError("--port must be between 1 and 65535")
-    model = inspect_model(args.model)
-    hardware = detect_hardware()
-    binary = _resolve_binary(args.binary)
     return build_launch_plan(
-        model=model,
-        hardware=hardware,
-        binary=binary,
+        model=inspect_model(args.model),
+        hardware=detect_hardware(),
+        binary=_resolve_binary(args.binary),
         policy=args.policy,
         context=args.context,
         slots=args.slots,
@@ -912,7 +865,7 @@ def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
         ubatch_size=args.ubatch_size,
         kv_type=args.kv,
         reserve_vram=args.reserve_vram,
-        resident_moe_layers=args.gpu_resident_moe,
+        gpu_resident_moe=args.gpu_resident_moe,
         tensor_split=args.tensor_split,
         prefetch_tail=args.prefetch_tail,
         extra_args=args.extra,
@@ -932,21 +885,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.extra = native_args
     elif native_args:
         parser.error("native arguments after -- are supported only by plan and serve")
+
     try:
         if args.command == "doctor":
             return _doctor(args.json)
         if args.command == "build":
             return _build(args)
-
         plan = _plan_from_args(args)
         _print_plan(plan, args.json)
         if args.command == "plan" or args.dry_run:
             return 0
-
         if not plan.binary.is_file():
             raise ESEError(
-                f"server binary not found: {plan.binary}; run './ese build' "
-                "or pass --binary"
+                f"server binary not found: {plan.binary}; run './ese build' or pass --binary"
             )
         environment = os.environ.copy()
         environment.update(plan.environment)

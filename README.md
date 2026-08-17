@@ -1,14 +1,14 @@
 # Expert Streaming Engine
 
-Run models that do not fit comfortably in VRAM—and, for sparse MoE models, can exceed available system RAM—through one inspectable launcher.
+Run sparse Mixture-of-Experts models on machines where the full model does not fit comfortably in VRAM—and, with deferred experts, where the expert set can exceed the safe system-RAM budget.
 
-ESE combines three execution policies behind a single command:
+ESE is a focused `ik_llama.cpp`/`llama.cpp` fork with one transparent launcher and three native execution policies:
 
 - **resident** — normal GPU offload when the model fits;
-- **cache** — routed experts remain in host RAM while spare VRAM becomes an adaptive hot-expert cache;
-- **stream** — expert storage is deferred and paged from the GGUF through the OS page cache, with route-aware prefetch.
+- **hybrid** — dense tensors on GPU, routed experts on CPU, with an optional MoE tail retained on GPU;
+- **stream** — hybrid execution plus deferred mmap expert residency and route-aware page-cache prefetch.
 
-The native engine is a focused `ik_llama.cpp`/`llama.cpp` fork. The `ese` launcher does not hide the native runtime: `ese plan` prints the exact environment and `llama-server` command before execution.
+The launcher never replaces the native runtime. `ese plan` prints the exact environment and `llama-server` command before anything runs.
 
 ## Start here
 
@@ -23,17 +23,17 @@ cd expert-streaming-engine
 ./ese serve /models/model.gguf
 ```
 
-Inspect the plan without starting the server:
+Inspect a launch without starting the server:
 
 ```bash
 ./ese plan /models/model.gguf
 ```
 
-Force a policy when auto-selection is not what you want:
+Force a policy:
 
 ```bash
 ./ese serve /models/model.gguf --policy resident
-./ese serve /models/model.gguf --policy cache
+./ese serve /models/model.gguf --policy hybrid
 ./ese serve /models/model.gguf --policy stream
 ```
 
@@ -47,35 +47,32 @@ The default API address is `http://127.0.0.1:8080`.
 
 ## What auto mode does
 
-`ese` reads scalar GGUF metadata, totals all split shards, checks available RAM and VRAM, then chooses the least complicated safe path.
+`ese` reads scalar GGUF metadata, validates and totals split shards, checks available RAM and NVIDIA VRAM, and selects the least complicated safe path.
 
 | Policy | Selected when | Native mechanism |
 | --- | --- | --- |
-| `resident` | The model fits safely in detected free VRAM | Conventional `-ngl 99` |
-| `cache` | MoE experts fit in RAM but not VRAM | `exps=CPU` plus adaptive `--moe-cache` |
-| `stream` | A sparse model exceeds the safe RAM budget | `--defer-experts`, CPU MoE, route prefetch |
+| `resident` | The model fits safely in free VRAM, or is dense | `-ngl 99`, with native `--fit` when needed |
+| `hybrid` | A MoE fits RAM but not VRAM | `--cpu-moe`, optionally `--n-cpu-moe N` |
+| `stream` | A MoE exceeds the safe RAM budget | `--defer-experts` plus CPU MoE and route prefetch |
 
-On multiple NVIDIA GPUs, the launcher derives `--tensor-split` from currently free VRAM. For cached MoE inference it enables expert-parallel dispatch; on one GPU it uses the single-device cache path.
+On multiple NVIDIA GPUs, the launcher derives `--tensor-split` from currently free VRAM. Every decision includes a readable reason and can be emitted as JSON.
 
-Auto mode is conservative. Every decision includes a human-readable reason:
-
-```text
-Policy : stream
-Reason : MoE size 61.00 GiB exceeds 90% of available RAM (47.00 GiB);
-         use deferred disk-backed experts
+```bash
+./ese plan /models/model.gguf --json
 ```
 
 ## Useful commands
 
 ```bash
-./ese doctor                         # hardware and build prerequisites
-./ese build                          # auto-select CUDA or CPU
+./ese doctor
+./ese build
 ./ese build --backend cuda --clean
-./ese plan MODEL --json              # machine-readable memory plan
-./ese serve MODEL --dry-run
-./ese serve MODEL --kv q4_0 -c 262144
-./ese serve MODEL --tensor-split 46,54
-./ese serve MODEL --policy stream --gpu-resident-moe 6
+./ese plan MODEL.gguf --json
+./ese serve MODEL.gguf --dry-run
+./ese serve MODEL.gguf --kv q4_0 -c 262144
+./ese serve MODEL.gguf --tensor-split 46,54
+./ese serve MODEL.gguf --policy hybrid --gpu-resident-moe 6
+./ese serve MODEL.gguf --policy stream --gpu-resident-moe 6
 ```
 
 Run `./ese <command> --help` for the complete interface.
@@ -88,45 +85,38 @@ Run `./ese <command> --help` for the complete interface.
                     GGUF metadata + hardware
                                │
                          memory planner
-              ┌────────────────┼────────────────┐
+              ┌────────────────┼───────────────┐
               │                │                │
-           resident          cache            stream
+           resident          hybrid           stream
               │                │                │
-       GPU model path    experts in RAM   experts on NVMe
-                               │                │
-                         adaptive VRAM     bounded page cache
-                           hot cache       + route prefetch
-              └────────────────┴────────────────┘
+       GPU/native fit    CPU MoE + GPU     deferred mmap
+                         dense/tail         + route prefetch
+              └────────────────┴───────────────┘
                                │
                      llama-server / OpenAI API
 ```
 
-The intended end state is one bounded hierarchy:
-
-```text
-NVMe → RAM expert cache → VRAM expert cache
-                    ↘ KV / scratch / draft budget
-```
+The current engine has static hybrid placement and a specialized disk-backed stream path. A unified bounded `NVMe → RAM cache → VRAM cache` controller is the next native phase; it is not mislabeled as already complete.
 
 See [Architecture](docs/ESE_ARCHITECTURE.md) for invariants and component boundaries.
 
-## Current engine capabilities
+## Current native capabilities
 
-- deferred-mmap expert storage and route-aware page-cache prefetch;
-- CPU MoE with selected MoE layers resident on GPU;
-- adaptive VRAM MoE caching for RAM-backed experts;
-- multi-GPU expert-parallel cache dispatch;
-- DeepSeek V4 Flash and DSpark paths on the integration line;
-- native MTP and model-specific speculative paths inherited from the engine;
-- CUDA sparse/grouped MoE work, including MXFP4 and TQ2_0 paths;
-- Flash Attention, quantized KV types already supported by the native runtime;
+- deferred-mmap expert storage;
+- route-aware top-k page-cache prefetch and optional router-logit-tail staging;
+- CPU MoE with a selected final MoE tail resident on GPU;
+- multi-GPU tensor splitting;
+- DeepSeek V4 Flash integration work;
+- DSpark, native MTP, and model-specific speculative paths on the integration line;
+- Maple/DeepGrove architecture and native TQ2_0 CPU/CUDA paths;
+- CUDA sparse/grouped MoE work, MXFP4 support, Flash Attention, and existing quantized KV types;
 - standard `llama-server`, CLI, conversion, and API compatibility inherited upstream.
 
-VBR and TCQ from `buun-llama-cpp` are **not labeled complete** in this branch. Their port is isolated behind explicit quality and lifecycle acceptance gates rather than copied into the public path without validation. See [Port roadmap](docs/PORT_ROADMAP.md).
+The adaptive MoE cache, expert-parallel cache distribution, VBR, Turbo KV, and TCQ ideas from `buun-llama-cpp` are tracked as native ports with explicit parity, memory, quality, and lifecycle gates. They are **not** advertised as completed flags in this branch. See [Port roadmap](docs/PORT_ROADMAP.md).
 
 ## Verified reference result
 
-The existing ESE benchmark record includes GPT-OSS 120B F16 GGUF (about 61 GiB) on dual Ampere GPUs with 18 GiB combined VRAM, a Ryzen 9 5950X, about 47 GiB usable DDR4, and NVMe storage:
+The retained ESE benchmark record includes GPT-OSS 120B F16 GGUF (about 61 GiB) on dual Ampere GPUs with 18 GiB combined VRAM, a Ryzen 9 5950X, about 47 GiB usable DDR4, and NVMe storage:
 
 | Workload | Recorded result |
 | --- | ---: |
@@ -151,8 +141,8 @@ These are machine- and configuration-specific measurements, not universal promis
 
 ## Branch policy
 
-`ese-unified` is the proposed consolidated core. It is based on the newer DeepSeek/expert-cache integration line rather than the older public default. Android/QNN remains a separate platform port until its backend can pass the same parity and lifecycle gates. Historical experiment branches are retained only as source references.
+`ese-unified` is the proposed consolidated core. It is based on the newer DeepSeek/Maple integration line rather than the older public default. Android/QNN remains a separate platform port until it passes the same parity and lifecycle gates. Historical experiment branches are retained as source references until their unique commits are tagged.
 
 ## License and lineage
 
-MIT licensed. ESE is derived from `ik_llama.cpp`, which is derived from `llama.cpp`. Individual imported or adapted features must retain their original attribution and license notices. The roadmap tracks `buun-llama-cpp` ideas by source commit before any code-level port.
+MIT licensed. ESE is derived from `ik_llama.cpp`, which is derived from `llama.cpp`. Imported or adapted features must retain their original attribution and license notices. The roadmap pins the analyzed `buun-llama-cpp` revision before any code-level port.

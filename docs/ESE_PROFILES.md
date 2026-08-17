@@ -6,48 +6,62 @@ The recommended entry point is:
 ./ese serve MODEL.gguf
 ```
 
-Use `./ese plan MODEL.gguf` before a large run. The plan shows the selected policy, model/shard size, available RAM/VRAM, GGUF architecture metadata, environment variables, and exact native command.
+Use `./ese plan MODEL.gguf` first. It shows the selected policy, model and shard size, RAM/VRAM, GGUF architecture metadata, environment variables, and exact native command.
 
 ## Resident policy
 
-Use when model weights fit safely in aggregate free VRAM.
+Use when weights fit safely in VRAM or for a normal dense-model launch:
 
 ```bash
 ./ese serve MODEL.gguf --policy resident
-```
-
-Generated core flags:
-
-```text
--ngl 99 -fa on -ctk TYPE -ctv TYPE
-```
-
-This policy does not enable expert deferral or an adaptive expert cache. Leave headroom for KV, graph workspace, and transient allocations.
-
-## Cache policy
-
-Use for sparse models whose experts fit in host RAM but not VRAM.
-
-```bash
-./ese serve MODEL.gguf --policy cache
 ```
 
 Core behavior:
 
 ```text
 -ngl 99
--sm layer
--ot exps=CPU
---moe-cache on                         # one NVIDIA GPU
---moe-cache auto
---moe-cache-expert-parallel auto       # two or more NVIDIA GPUs
+-fa on
+-ctk TYPE -ctv TYPE
 ```
 
-The cache path makes otherwise unused VRAM useful while preserving CPU execution for misses. Layer splitting is preferred for this workload. Multi-GPU fanout, thread count, reserve size, and cache admission are hardware-specific; benchmark rather than assuming every GPU should participate.
+For a dense model above the conservative free-VRAM threshold, the launcher adds native `--fit` so the engine calculates offload rather than forcing a full allocation.
+
+## Hybrid policy
+
+Use for sparse models that fit host RAM but not VRAM:
+
+```bash
+./ese serve MODEL.gguf --policy hybrid
+```
+
+Safe default:
+
+```text
+-ngl 99
+--cpu-moe
+```
+
+Dense and non-expert tensors use normal GPU offload while routed experts remain in CPU memory.
+
+Retain a measured final MoE tail on GPU:
+
+```bash
+./ese serve MODEL.gguf \
+  --policy hybrid \
+  --gpu-resident-moe 6
+```
+
+For a 36-block GGUF this produces:
+
+```text
+--n-cpu-moe 30
+```
+
+The launcher requires a readable GGUF block count before translating this option. It does not guess layer geometry.
 
 ## Stream policy
 
-Use when a sparse model exceeds the safe host-RAM budget.
+Use when a sparse model exceeds the safe host-RAM budget:
 
 ```bash
 ./ese serve MODEL.gguf --policy stream
@@ -67,9 +81,7 @@ and adds:
 --cpu-moe
 ```
 
-For GPT-OSS models with a readable block count, `--gpu-resident-moe N` is converted to `--n-cpu-moe BLOCKS-N`. This keeps a small MoE tail on GPU while the remaining expert set is deferred.
-
-Example matching the documented six-resident-layer 64K shape:
+Keep a known-good GPU tail when capacity permits:
 
 ```bash
 ./ese serve /models/gpt-oss-120b-F16.gguf \
@@ -79,20 +91,22 @@ Example matching the documented six-resident-layer 64K shape:
   --kv q8_0
 ```
 
-Route-logit-tail staging is available but disabled by default because it should be promoted only after cold-cache A/B validation:
+Router-logit-tail staging remains opt-in:
 
 ```bash
 ./ese serve MODEL.gguf --policy stream --prefetch-tail 4
 ```
 
+This sets `LLAMA_EXPERT_PREFETCH_TAIL=4`. The fired top-k stays first; the extra near-miss experts are advisory asynchronous work.
+
 ## KV selection
 
-Current automatic selection is intentionally limited to types supported by the native engine:
+Automatic selection deliberately uses only existing native types:
 
 - `q8_0` for the normal path;
 - `q4_0` when context exceeds 131K or detected usable VRAM is very low.
 
-Override it directly:
+Override directly:
 
 ```bash
 ./ese serve MODEL.gguf --kv f16
@@ -100,13 +114,11 @@ Override it directly:
 ./ese serve MODEL.gguf --kv q4_0
 ```
 
-VBR/Turbo/TCQ is tracked separately and is not presented as available until its kernels, quality measurements, and lifecycle tests pass.
+VBR/Turbo/TCQ is not exposed until its kernels, quality measurements, and lifecycle tests pass.
 
 ## Multi-GPU split
 
 With two or more NVIDIA GPUs, auto mode calculates `--tensor-split` from currently free memory, not nominal card size.
-
-Example:
 
 ```text
 GPU 0 free: 7 GiB
@@ -114,32 +126,32 @@ GPU 1 free: 9 GiB
 derived split: 44,56
 ```
 
-Override when a measured model-specific split is better:
+Override after measuring a better model-specific split:
 
 ```bash
 ./ese serve MODEL.gguf --tensor-split 46,54
 ```
 
-The split is visible in every plan.
+The current unified line does not claim buun-style adaptive expert-parallel VRAM caching. That work is tracked in Phase 2.
 
-## Context and VRAM reserve
+## Context and reserve
 
-The default context is 65,536 tokens and the planner reserves 1 GiB of VRAM when choosing an automatic KV type.
+The default context is 65,536 and the planner retains a 1 GiB VRAM reserve when selecting an automatic KV type.
 
 ```bash
 ./ese serve MODEL.gguf -c 131072 --reserve-vram 2GiB
 ```
 
-The reserve currently guides planning; the native runtime remains the authority on actual allocations.
+The native runtime remains the authority on actual allocations.
 
 ## Threads and batching
 
 Defaults:
 
-- decode threads: up to 8, approximately half the detected logical CPUs;
+- decode threads: up to 8, approximately half detected logical CPUs;
 - batch threads: up to 32;
-- cache policy: batch 1024, ubatch 512;
-- stream policy: batch 1024, ubatch 512.
+- hybrid/stream batch: 1024;
+- hybrid/stream ubatch: 512.
 
 Override after measuring your host:
 
@@ -151,11 +163,11 @@ Override after measuring your host:
   --ubatch-size 512
 ```
 
-Do not assume decode and prefill want the same thread count. Large CPU-MoE prefill often benefits from a wider batch thread pool and large ubatches; decode can regress when every logical core is used.
+Decode and prefill often want different thread counts. Large CPU-MoE prefill can benefit from wide batch threads and large ubatches; decode can regress when every logical core is used.
 
 ## Native options
 
-Everything after `--` is appended verbatim to `llama-server`:
+Everything after `--` is appended verbatim:
 
 ```bash
 ./ese serve MODEL.gguf -- \
@@ -164,53 +176,41 @@ Everything after `--` is appended verbatim to `llama-server`:
   --log-verbosity 1
 ```
 
-Use this escape hatch for experimental flags. Stable ESE policy options belong before `--`.
+Stable ESE policy options belong before `--`; experimental native flags remain available after it.
 
 ## JSON plans
-
-Automation can consume the planner without parsing terminal text:
 
 ```bash
 ./ese plan MODEL.gguf --json
 ```
 
-The JSON includes:
-
-- selected policy and reason;
-- all shards and total size;
-- GGUF architecture, expert count, and block count when available;
-- detected RAM and per-GPU memory;
-- environment variables;
-- argument vector;
-- shell-rendered command.
+The JSON includes policy and reason, shards and total size, architecture metadata, RAM/per-GPU VRAM, environment, argument vector, and a shell-rendered command.
 
 ## Troubleshooting
 
 ### Startup allocates most host RAM
 
-Confirm the stream command includes `GGML_CUDA_NO_PINNED=1` and `--defer-experts`. Use `./ese plan` to verify.
+Verify the stream plan contains `GGML_CUDA_NO_PINNED=1` and `--defer-experts`.
 
-### Cache mode leaves one GPU mostly idle
+### Hybrid mode is too slow
 
-Check whether expert-parallel cache dispatch is active. On two or more detected NVIDIA GPUs, the launcher adds `--moe-cache-expert-parallel auto`; explicit native flags after `--` can override behavior.
+Measure a small GPU tail with `--gpu-resident-moe N`. Increase gradually; a tail that does not fit can prevent startup.
 
 ### Auto chose the wrong policy
 
-Force it with `--policy`. Include the JSON plan and server startup log in a bug report.
+Force `--policy` and attach `./ese plan MODEL --json` plus the server startup log to the issue.
 
 ### Split GGUF is incomplete
 
-Point `ese` at any correctly named shard. It validates that all `-00001-of-000NN.gguf` files are present before launching.
+Point `ese` at any correctly named shard. It validates all `-00001-of-000NN.gguf` files before launch.
 
-### The server binary is missing
-
-Run:
+### Server binary is missing
 
 ```bash
 ./ese build
 ```
 
-or set a custom binary:
+or:
 
 ```bash
 ESE_SERVER=/path/to/llama-server ./ese serve MODEL.gguf

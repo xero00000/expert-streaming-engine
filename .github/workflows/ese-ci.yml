@@ -43,7 +43,7 @@ jobs:
       - name: Compile Python
         run: python -m compileall -q ese tools tests
 
-      - name: Unit tests
+      - name: Unit tests and native surface guard
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
       - name: CLI smoke
@@ -68,3 +68,11 @@ jobs:
 
       - name: Build llama-server
         run: cmake --build build-ci --target llama-server -j2
+
+      - name: Verify compiled policy surface
+        run: |
+          build-ci/bin/llama-server --help > native-help.txt 2>&1
+          grep -F -- "--fit" native-help.txt
+          grep -F -- "--cpu-moe" native-help.txt
+          grep -F -- "--n-cpu-moe" native-help.txt
+          grep -F -- "--defer-experts" native-help.txt

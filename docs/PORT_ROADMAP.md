@@ -1,8 +1,8 @@
 # Port Roadmap
 
-This roadmap converts the useful ideas from `buun-llama-cpp` into ESE without replacing ESE's defining capability: disk-backed, bounded expert execution.
+This roadmap brings the best applicable ideas from `buun-llama-cpp` into ESE without replacing ESE's defining capability: disk-backed expert execution.
 
-Reference source for the current analysis:
+Reference analyzed for planning:
 
 ```text
 spiritbuun/buun-llama-cpp
@@ -10,258 +10,112 @@ master observed at a2bd802d81936bab8a066cbf789a427776fb4839
 MIT license
 ```
 
-A code port must pin the actual source commit used and preserve attribution. Similar behavior already present independently in ESE should be consolidated rather than duplicated.
+Every code port must pin the exact source commit it uses, retain attribution, and separate mechanical adaptation from ESE-specific redesign.
 
-## Status key
-
-- **Integrated** — present on the unified core line.
-- **Foundation** — public interface or test boundary exists; native implementation remains.
-- **Planned** — acceptance gates defined, code not presented as complete.
-- **Rejected** — not appropriate for ESE's architecture or failed measurement.
-
-## Consolidation status
+## Status
 
 | Capability | Status | Unified treatment |
 | --- | --- | --- |
 | Deferred mmap expert storage | Integrated | `stream` policy |
 | Route-aware page-cache prefetch | Integrated | enabled by `stream` |
-| CPU MoE plus GPU-resident tail | Integrated | `--gpu-resident-moe` |
-| Adaptive VRAM MoE cache | Integrated | `cache` policy |
-| Multi-GPU expert-parallel cache | Integrated | automatic on 2+ NVIDIA GPUs |
-| DeepSeek V4 Flash support | Integrated | native integration branch |
-| DSpark / native MTP paths | Integrated | native options remain available |
+| CPU MoE plus optional GPU-resident tail | Integrated | `hybrid` / `stream` |
 | One startup interface | Integrated | `ese doctor/build/plan/serve` |
-| GGUF-aware auto-fit startup policy | Foundation | standard-library launcher |
-| Global dynamic C++ resource controller | Planned | Phase 2 |
-| VBR / Turbo / TCQ KV | Planned | Phase 1 |
-| `mmproj` / MTP transient swapping | Planned | Phase 3 |
-| Adaptive MTP depth and vocabulary trim | Planned | Phase 3 |
+| GGUF-aware startup policy | Foundation | standard-library planner |
+| DeepSeek V4, DSpark, MTP integration-line work | Integrated | native options remain available |
+| Maple/TQ2_0 CPU and CUDA work | Integrated | integration-line native path |
+| Adaptive VRAM MoE cache | Planned | Phase 2 / issue #5 |
+| Multi-GPU expert-parallel cache | Planned | Phase 2 / issue #5 |
+| Turbo KV, TCQ, and VBR | Planned | Phase 1 / issue #4 |
+| Transient mmproj/MTP sharing | Planned | Phase 3 / issue #6 |
+| Adaptive MTP depth / mapped vocabulary | Planned | Phase 3 / issue #6 |
+| Global dynamic resource controller | Planned | Phase 4 / issue #7 |
 
 ## Phase 1 — KV ladder, TCQ, and VBR
 
-### 1A. Fixed Turbo codecs
+### Fixed Turbo codecs
 
-Port and validate fixed:
-
-```text
-turbo8
-turbo4
-turbo3
-turbo2
-```
-
-Required work:
-
-- GGML type declarations and storage accounting;
-- CPU reference dequantization;
-- CUDA kernels, then ROCm where practical;
-- Flash Attention integration;
-- odd head-dimension padding;
-- conversion/serialization tests;
-- fixed-type CLI exposure.
+Port `turbo8`, `turbo4`, `turbo3`, and `turbo2` with GGML storage accounting, CPU reference paths, CUDA kernels, Flash Attention integration, unusual-head-dimension padding, and serialization tests.
 
 Acceptance:
 
-- no fallback while a native codec is claimed;
-- deterministic encode/decode reference vectors;
-- KLD, perplexity, prompt-processing, decode, and memory matrix;
-- one- and multi-slot coverage;
-- at least Ampere plus one newer NVIDIA architecture.
+- prove the claimed native path executes;
+- deterministic reference vectors;
+- full bits/value accounting;
+- F16-reference KLD and perplexity;
+- prompt-processing and decode measured separately;
+- context-depth and one/multi-slot coverage;
+- Ampere plus one newer NVIDIA architecture.
 
-### 1B. TCQ codecs
+### TCQ codecs
 
-Port:
+Port `turbo3_tcq`, `turbo2_tcq`, and `turbo1_tcq`, including codebook provenance, FWHT/sign rotation, Viterbi encode, O(1) decode, context-adaptive scale, and fused attention paths.
 
-```text
-turbo3_tcq
-turbo2_tcq
-turbo1_tcq
-```
+Acceptance additionally requires bit-exact CPU-reference decode, bounded temporary memory, KLD distribution rather than only a mean, and measured policy for compute-poor GPUs.
 
-Required work:
+### Static mixed-tier KV
 
-- codebook file format and embedded defaults;
-- FWHT/sign-rotation path;
-- Viterbi encoder;
-- O(1) sliding-window decode;
-- context-adaptive norm scale;
-- fused attention decode;
-- codebook-training utilities isolated from runtime.
+Before dynamic VBR, support an explicit per-layer/per-side map. K and V may use different tiers; every layer reports its type; checkpoints record tier metadata; resize and rollback tests pass.
 
-Acceptance:
+### Dynamic VBR
 
-- bit-exact decode against CPU reference;
-- no unbounded temporary allocation;
-- median and tail KLD reported against F16;
-- speed reported separately for prefill and decode;
-- compute-poor GPU fallback policy measured, not guessed.
-
-### 1C. Static mixed-tier KV
-
-Before runtime VBR, support an explicit per-layer/per-side tier map. This proves that graph construction, Flash Attention, allocation, and cache indexing can handle heterogeneous storage.
-
-Acceptance:
-
-- K and V may use different tiers;
-- every layer/side reports its active type;
-- context checkpoints record tier metadata;
-- resize and failure rollback tests pass;
-- context fill stops cleanly at the calculated limit.
-
-### 1D. Dynamic VBR controller
-
-Implement the quality ladder and model-specific sensitivity order.
-
-Controller inputs:
+Inputs:
 
 ```text
 target context
 KV VRAM budget
 minimum quality floor
 current fill
-per-layer sensitivity order
+model sensitivity order
 ```
 
-Controller outputs:
-
-```text
-next layer/side to retier
-new storage type
-memory released
-quality-floor proof
-```
-
-Acceptance:
-
-- starts at the highest quality that fits;
-- transitions are failure-atomic;
-- no token/logit discontinuity beyond the measured codec error;
-- multi-slot unified KV is covered;
-- checkpoints survive retiering;
-- model-specific orders have reproducible KLD evidence;
-- generic fallback order is clearly identified.
+Transitions must be failure-atomic, preserve multi-slot behavior and checkpoints, never cross the declared floor, and have reproducible quality evidence.
 
 ## Phase 2 — One NVMe → RAM → VRAM expert hierarchy
 
-The existing stream path and RAM-backed MoE cache must become levels of one bounded cache rather than separate modes internally.
+The current `stream` and static `hybrid` paths should become levels of one bounded native cache.
 
-### 2A. Common expert descriptor
+### Common expert descriptor
 
-Use the existing immutable 64-bit sidecar extent model for every backing source:
+Use immutable checked 64-bit descriptors containing layer, expert, component, one or more shard extents, dtype/quant geometry, dimensions/strides/axis, and source identity.
 
-```text
-layer
-expert
-component: gate/up/down or fused form
-one or more shard extents
-dtype/quant geometry
-dimensions/strides/axis
-checksum or source identity
-```
+### Bounded RAM cache
 
-### 2B. Bounded RAM cache
+Add explicit byte capacity, admission, lease lifetime, deterministic eviction, reusable staging, and mmap/pread/io_uring backends. Correctness and limits cannot depend on an unobservable unlimited OS page cache.
 
-Add explicit capacity, admission, lease lifetime, eviction, and telemetry around disk-backed expert materialization. The OS page cache may remain a fast backend, but correctness and limits cannot depend on unobservable global page-cache behavior.
+### Adaptive VRAM cache
 
-### 2C. VRAM cache over either backing source
+Consume expert leases from any host/storage backend. Add hysteresis, minimum observations, route frequency, predicted route, reuse distance, load cost, eviction cost, asynchronous promotion/demotion, and event-scoped readiness.
 
-Make adaptive GPU residency consume expert leases from:
+### Multi-GPU expert parallelism
 
-```text
-mmap/page cache
-pread
-io_uring
-RAM cache
-```
-
-The cache policy must not care which storage backend supplied a valid expert.
-
-### 2D. Admission policy
-
-Start with a measurable score:
-
-```text
-recent route frequency
-+ predicted next-route probability
-+ reuse-distance benefit
-+ load-cost benefit
-- eviction cost
-- churn penalty
-```
-
-Use hysteresis and minimum-observation thresholds. Compare against LRU, LFU, and the existing policy.
-
-### 2E. Async promotion and expert parallelism
-
-- dedicated transfer streams;
-- event-scoped readiness;
-- no compute-stream global synchronization;
-- per-device capacity and topology;
-- optional row/tensor distribution across GPUs;
-- CPU computation overlaps misses where profitable.
-
-Acceptance for Phase 2:
-
-- total RAM and VRAM remain within configured budgets under forced churn;
-- exact token, route, and intermediate parity;
-- deterministic forced eviction;
-- `pread`, `io_uring`, and mmap backends;
-- one-, two-, and three-device execution;
-- cold and warm latency distributions;
-- no original-tensor fallback while sidecar-only mode is asserted.
-
-## Phase 3 — Transient modules and speculation
-
-### 3A. Generalized transient GPU residency
-
-Adapt the `mmproj`/MTP swap concept into a generic interface for stateless modules:
-
-```text
-MTP/draft head
-vision projection/encoder
-audio encoder
-reranker
-embedding head
-temporary LoRA
-```
-
-A swap transaction must reserve capacity, quiesce only the affected streams, move or release the old module, activate the requested module, then restore prior residency if required.
-
-### 3B. Adaptive MTP depth
-
-Choose draft depth from recent acceptance and measured net speed. Disable speculation automatically when target verification plus draft cost loses to ordinary decode.
-
-### 3C. Mapped draft vocabulary
-
-Port the reduced draft-vocabulary idea with full target verification.
+Add per-device capacities/reserves, topology-aware placement, row/tensor distribution, and CPU miss overlap where profitable.
 
 Acceptance:
 
-- target output remains byte-identical at temperature zero;
-- map provenance and corpus bias are documented;
-- unsupported tokens remain impossible for the draft but available to target verification;
-- memory and LM-head speed deltas are reported;
-- prose, code, tool use, and multilingual prompts are separated.
+- exact token, route, intermediate, and output parity;
+- forced eviction/churn tests;
+- configured RAM and VRAM bounds never exceeded;
+- no original-tensor fallback in asserted sidecar-only mode;
+- one-, two-, and three-GPU execution;
+- cold/warm distributions and structured telemetry.
 
-### 3D. Speculation telemetry
+## Phase 3 — Transient modules and speculation
 
-Record:
+### General transient residency
 
-```text
-proposed tokens
-accepted tokens
-acceptance by depth
-draft time
-verification time
-net tokens/s
-disable/retune decisions
-```
+Share a bounded VRAM budget among MTP/draft heads, vision/audio modules, rerankers, embedding heads, and temporary LoRAs. Transactions must reserve, quiesce only affected streams, swap, restore, and roll back atomically.
 
-## Phase 4 — Global resource controller
+### Adaptive MTP depth
 
-Move startup-only planning into a native runtime controller.
+Select draft depth from recent acceptance and measured net throughput; automatically reduce or disable speculation when draft plus verification loses.
 
-Budget participants:
+### Mapped draft vocabulary
+
+Port reduced draft-vocabulary projection while retaining full target verification. Temperature-zero output must remain byte-identical. Map provenance and bias must be documented across code, prose, tools, multilingual, and long-context prompts.
+
+## Phase 4 — Global native resource controller
+
+Budget:
 
 ```text
 dense weights
@@ -271,20 +125,11 @@ KV
 graph workspace
 I/O staging
 MTP/draft
-vision/audio modules
+transient multimodal modules
 safety reserve
 ```
 
-The controller chooses among:
-
-- KV quality;
-- context capacity;
-- expert residency;
-- draft residency/depth;
-- batch and ubatch limits;
-- transient module swaps.
-
-User-facing constraints should be declarative:
+Target declarative interface:
 
 ```text
 --memory-policy auto
@@ -294,23 +139,23 @@ User-facing constraints should be declarative:
 --max-context 128K
 ```
 
-The runtime must expose the resulting allocation plan before serving requests.
+The runtime must print a reproducible allocation plan before serving and rebalance failure-atomically without silent precision or backend fallback.
 
 ## Phase 5 — Portability and release gates
 
-- CUDA: Ampere, Ada, Hopper, Blackwell policies measured separately;
+- architecture-specific CUDA policy for Ampere, Ada, Hopper, and Blackwell;
 - ROCm fixed codecs and cache path;
-- Windows/MSVC build restoration for supported features;
-- Linux `pread` and `io_uring`;
-- CPU-only correctness reference;
+- Windows/MSVC support for promoted features;
+- Linux mmap/pread/io_uring;
+- CPU reference correctness;
 - API/server regression suite;
-- release artifacts and reproducible build metadata.
+- reproducible release artifacts.
 
-## Explicit non-goals
+## Non-goals
 
-- Replacing disk-backed experts with a requirement that the full model fit in RAM.
-- Copying all buun changes wholesale into a divergent ik/llama base.
-- Publishing VBR/TCQ flags before lifecycle and quality validation.
-- Keeping duplicate implementations of the same MoE cache.
-- Promoting model-specific benchmarks as universal defaults.
-- Hiding native commands or silently changing precision.
+- requiring the full model to fit RAM;
+- merging all buun changes wholesale into a divergent base;
+- publishing VBR/TCQ flags before quality and lifecycle validation;
+- keeping duplicate cache implementations;
+- promoting one machine's best run as a universal default;
+- hiding native commands or silently changing precision.

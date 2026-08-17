@@ -2,87 +2,94 @@
 
 ## Goal
 
-Expert Streaming Engine should expose one inference runtime whose capacity is determined by the useful memory hierarchy—not by a requirement that every routed expert stay permanently resident in RAM or VRAM.
+Expert Streaming Engine exposes one inference runtime whose useful capacity is not limited by requiring every routed expert to stay permanently resident in VRAM or RAM.
 
-The public model is deliberately small:
+The public model matches native capabilities:
 
 ```text
-resident  model fits in aggregate VRAM
-cache     model fits in RAM; hot experts use spare VRAM
-stream    model or expert set exceeds the safe RAM budget
+resident  ordinary GPU offload / native fit
+hybrid    experts on CPU, dense tensors and an optional MoE tail on GPU
+stream    hybrid execution with deferred disk-backed experts
 ```
 
-All three policies end in the same native `llama-server` binary and API.
+All policies end in the same `llama-server` binary and API.
 
 ## Control plane and data plane
 
-The `ese` launcher is the control plane. It:
+The standard-library `ese` launcher is the control plane. It:
 
 1. reads the GGUF header and scalar metadata;
 2. discovers and totals split shards;
 3. detects available host RAM and NVIDIA VRAM;
 4. selects a policy or honors an explicit one;
-5. allocates a VRAM safety reserve;
+5. reserves VRAM headroom for KV/workspace planning;
 6. derives a proportional multi-GPU tensor split;
 7. prints or executes the exact native command.
 
-It never reads tensor payloads, rewrites a model, or intercepts inference.
+It does not read tensor payloads, rewrite a model, or intercept inference.
 
-The C++/CUDA runtime is the data plane. It owns model loading, routing, computation, caches, synchronization, and API service.
+The C++/CUDA runtime is the data plane. It owns model loading, routing, computation, synchronization, KV, and API service.
 
-## Memory hierarchy
+## Current memory paths
 
 ### Resident
 
 ```text
-GGUF → host loader → GPU tensors
-                      + KV
-                      + graph workspace
+GGUF → native loader → GPU tensors
+                       + KV
+                       + graph workspace
 ```
 
-Use this when the model fits with enough headroom for KV, scratch, and transient allocations.
+`ese` uses normal `-ngl 99`. When a dense model does not fit the conservative VRAM threshold, it adds the native `--fit` planner rather than inventing a separate offload scheme.
 
-### Cache
+### Hybrid
 
 ```text
-GGUF → host-resident experts ──────────────┐
-                         cache miss → CPU  │
-                                          ▼
-                                  adaptive VRAM cache
-                                          │
-                               one or more GPUs
+GGUF → dense/non-expert tensors → GPU(s)
+     └→ routed experts          → CPU RAM
+                                  └→ optional final MoE layers on GPU
 ```
 
-Dense and non-expert tensors remain offloaded normally. Routed experts remain addressable in host memory. Spare VRAM is treated as a hot cache rather than left idle. On multiple GPUs, expert-parallel mode distributes resident expert work across eligible devices.
+The conservative default is `--cpu-moe`. `--gpu-resident-moe N` converts a readable GGUF block count into `--n-cpu-moe BLOCKS-N`. This is static placement, not an adaptive VRAM expert cache.
 
 ### Stream
 
 ```text
 GGUF on NVMe
       │
-      ├─ deferred mmap
+      ├─ deferred mmap expert tensors
       ▼
-bounded OS page cache / staging
+OS page cache / host mappings
       │
-router top-k + optional logit tail prefetch
+router top-k + optional logit-tail advice
       ▼
-CPU MoE + selected GPU-resident MoE layers
+CPU MoE + optional final GPU-resident MoE layers
 ```
 
-The model file is the backing store. `GGML_CUDA_NO_PINNED=1` prevents a pinned host allocation from defeating deferred paging. Route-aware prefetch requests only relevant expert ranges. The intended invariant is that the active working set remains bounded even when the complete expert set is larger than RAM.
+The launcher sets `GGML_CUDA_NO_PINNED=1` so CPU MoE does not recreate a whole-model pinned allocation. `LLAMA_EXPERT_PREFETCH=1` activates ESE's route-aware `MADV_WILLNEED` path. `LLAMA_EXPERT_PREFETCH_TAIL=N` is optional because cold-cache A/B evidence is still required before making tail staging a default.
 
-## Unified planner
+## Startup policy
 
-Auto policy currently uses transparent conservative rules:
+Auto mode currently uses transparent conservative rules:
 
 1. A sparse model larger than 90% of available RAM selects `stream`.
-2. A MoE model larger than 85% of free VRAM selects `cache`, provided the RAM limit did not already require streaming.
-3. A model smaller than 85% of free VRAM selects `resident`.
-4. Missing GPU telemetry falls back to `cache` for MoE and `resident` for dense models.
+2. GPT-OSS exceeding the safe resident-memory budget selects `stream`.
+3. A MoE larger than 85% of free VRAM selects `hybrid` if RAM remains sufficient.
+4. A model within 85% of free VRAM selects `resident`.
+5. Missing GPU telemetry defaults MoE models to `hybrid` and dense models to the native resident path.
 
-These are startup decisions, not hidden runtime migrations. `ese plan --json` exposes all inputs and the resulting command.
+These are startup decisions, not hidden runtime migrations. `ese plan --json` exposes every input and output.
 
-The planned C++ resource controller will eventually rebalance:
+## Target memory hierarchy
+
+The planned native resource controller will unify the current paths:
+
+```text
+NVMe/model shards → bounded RAM expert cache → adaptive VRAM expert cache
+                                      ↘ KV / draft / workspace budget
+```
+
+Budget participants will include:
 
 ```text
 dense weights
@@ -90,69 +97,68 @@ expert RAM cache
 expert VRAM cache
 KV cache
 MTP/draft model
-vision projection
+vision/audio transient modules
 graph workspace
 I/O staging
-VRAM safety reserve
+per-device safety reserve
 ```
 
-The launcher already provides the stable policy vocabulary and extension boundary for that controller.
+That controller is Phase 2/4 work, not a current launcher promise.
 
 ## Design invariants
 
 ### Bounded memory
 
-Every new cache must have a configured or automatically calculated capacity. “Use the remaining memory” must still retain a safety reserve and fail predictably.
+Every new cache requires an explicit or calculated capacity and a safety reserve. “Use the remaining memory” is not a bound.
 
-### No silent fallback
+### No unsupported flags or silent fallback
 
-A requested accelerated path must report whether it is active. Validation must distinguish native execution from compilation-only coverage or an unnoticed CPU fallback.
+The launcher must generate only options present in the consolidated native parser. CI statically checks the policy-specific surface and checks the compiled server help. Accelerated paths must report whether they actually execute.
 
 ### Exact storage descriptions
 
-Disk-backed expert tensors are identified through immutable 64-bit extents. Validation covers shard bounds, overflow, overlap, alignment, dimensions, strides, axes, missing shards, and duplicate keys.
+Disk-backed expert tensors use immutable checked 64-bit extents. Validation covers shard bounds, overflow, overlap, alignment, dimensions, strides, axes, missing shards, and duplicate keys.
 
 ### Lease-scoped lifetime
 
-A loaded or staged expert remains valid until the graph or synchronized callback that consumes it has completed. Eviction cannot invalidate an in-flight tensor.
+Loaded or staged experts remain valid until the consuming graph or synchronized callback completes. Eviction may not invalidate in-flight tensors.
 
 ### Failure-atomic reconfiguration
 
-Cache resize, KV retiering, transient-module swapping, and recurrent-state changes must either complete fully or leave the prior state usable.
+Future cache resize, KV retiering, transient-module swapping, and recurrent-state changes must either complete fully or preserve the prior usable state.
 
 ### Deterministic validation
 
-Lossless changes require token, route, logit/intermediate, and output parity where applicable. Lossy KV codecs require KLD, perplexity, task-quality, and speed measurements against an F16 reference.
+Lossless changes require token, route, logit/intermediate, and output parity where applicable. Lossy KV codecs require KLD, perplexity, task-quality, and speed measurements against F16.
 
 ### Observable decisions
 
-Policy, cache capacity, hits, misses, evictions, bytes read, staging waits, per-device residency, and speculation acceptance must be available as structured telemetry.
+Policy, capacities, hits, misses, evictions, bytes read, staging waits, per-device residency, and speculation acceptance must be available as structured telemetry.
 
-## Why VBR/TCQ is not merged blindly
+## Why VBR/TCQ is staged
 
-Variable-bit-rate KV and trellis-coded codecs are attractive because KV cannot be paged like immutable expert weights. They also touch Flash Attention, cache lifecycle, context checkpoints, multi-slot behavior, CUDA/ROCm kernels, and quality.
+VBR and trellis-coded KV touch Flash Attention, cache lifecycle, checkpoints, multi-slot behavior, GPU kernels, and quality. The port is intentionally split into:
 
-The port is therefore split into independently reviewable layers:
-
-1. fixed Turbo scalar codecs and reference tests;
+1. fixed Turbo scalar codecs;
 2. TCQ encode/decode kernels and codebooks;
-3. per-layer sensitivity orders;
-4. static mixed-tier KV;
-5. dynamic VBR controller;
+3. static per-layer/per-side mixed tiers;
+4. model sensitivity orders;
+5. dynamic VBR retiering;
 6. checkpoint, resize, multi-slot, and context-limit lifecycle;
 7. global resource-controller integration.
 
-Until those gates pass, `ese --kv auto` chooses only native KV types already present in this engine.
+Until those gates pass, `--kv auto` selects only KV types already supported by this engine.
 
-## Source layout added by the unified branch
+## Unified branch layout
 
 ```text
 ese                         executable front door
-tools/ese.py                planner, GGUF reader, hardware detection
+tools/ese.py                GGUF reader, hardware detection, policy planner
 tests/test_ese_launcher.py  deterministic control-plane tests
+tests/test_native_surface.py parser-surface guard
 docs/ESE_*.md               focused user and architecture docs
-docs/PORT_ROADMAP.md        code-port gates and status
+docs/PORT_ROADMAP.md        native port gates and status
 .github/workflows/ese-ci.yml
 ```
 
-No native source directory is renamed in this first consolidation, minimizing conflict with future upstream synchronization.
+Native directories are not renamed in this consolidation, minimizing conflicts with future ik/llama synchronization.
