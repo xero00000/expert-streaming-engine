@@ -1,35 +1,116 @@
-# Pull requests (for contributors)
+# Contributing to Expert Streaming Engine
 
-- Test your changes:
-  - Using the commands in the [`tests`](tests) folder. For instance, running the `./tests/test-backend-ops` command tests different backend implementations of the GGML library
-  - Execute [the full CI locally on your machine](ci/README.md) before publishing
-- Please rate the complexity of your PR (i.e. `Review Complexity : Low`, `Review Complexity : Medium`, `Review Complexity : High`). This makes it easier for maintainers to triage the PRs.
-  - The PR template has a series of review complexity checkboxes `[ ]` that [you can mark as](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/about-task-lists) `[X]` for your convenience
-- Consider allowing write access to your branch for faster review
-- If your PR becomes stale, don't hesitate to ping the maintainers in the comments
+ESE is a performance-oriented inference fork, but correctness and bounded memory come before benchmark wins.
 
-# AI usage
+## Before opening a change
 
-AI usage is not encouraged but it is tolerated. However, if you use AI to prepare PRs, please
-- Disclose it
-- PRs having Claude or similar as author will be rejected.
-- Minimize as much as possible the AI slop. Both, in the PR description and in the endless comments left behind in the code by the LLM. If in doubt, just remove all AI generated comments before submitting the PR. Comments can be added during the review process if needed and where appropriate.
-- Please do not submit PRs that you don't understand how they work and/or have never tested (or have not tested sufficiently)
+1. Base general work on `ese-unified`.
+2. Keep Android/QNN work on its platform branch unless the change is backend-neutral.
+3. Run:
 
-# Pull requests (for collaborators)
+```bash
+./ese doctor
+python -m unittest discover -s tests -p "test_*.py" -v
+./ese build --backend cpu
+```
 
-- Squash-merge PRs
-- Use the following format for the squashed commit title: `<module> : <commit title> (#<issue_number>)`. For example: `utils : fix typo in utils.py (#1234)`
+4. For CUDA changes, record the GPU architecture and prove the intended kernel/path executed.
 
-# Coding guidelines
+## Pull-request scope
 
-- Avoid adding third-party dependencies, extra files, extra headers, etc.
-- Always consider cross-compatibility with other operating systems and architectures
-- Avoid fancy looking modern STL constructs, use basic `for` loops, avoid templates, keep it simple
-- There are no strict rules for the code style, but try to follow the patterns in the code (indentation, spaces, etc.). Vertical alignment makes things more readable and easier to batch edit
-- Clean-up any trailing whitespaces, use 4 spaces for indentation, brackets on the same line, `void * ptr`, `int & a`
-- Tensors store data in row-major order. We refer to dimension 0 as columns, 1 as rows, 2 as matrices
-- Matrix multiplication is unconventional: `C = ggml_mul_mat(ctx, A, B)` means $C^T = A B^T \Leftrightarrow C = B A^T.$
+Prefer one independently testable capability per pull request. Avoid combining:
 
-![matmul](media/matmul.png)
+- upstream synchronization;
+- a new model architecture;
+- a cache-policy change;
+- a new quant/KV codec;
+- broad documentation cleanup.
 
+Small, reviewable ports are easier to validate and preserve across future ik/llama synchronization.
+
+## Required evidence
+
+### Lossless changes
+
+Include, where applicable:
+
+- exact token/output parity;
+- route ID parity;
+- logits or selected intermediate parity;
+- one cold and one warm run;
+- peak RAM and per-device VRAM;
+- proof that no fallback path handled the work.
+
+### Lossy quantization or KV changes
+
+Also include:
+
+- F16 reference;
+- bits per value including metadata;
+- perplexity;
+- KLD distribution, not only a mean;
+- at least one task-quality panel;
+- prompt-processing and decode speed separately;
+- context-depth sweep.
+
+### Cache and storage changes
+
+Also include:
+
+- configured capacity;
+- forced eviction;
+- hit/miss/eviction counts;
+- bytes read and read backend;
+- lease/in-flight lifetime test;
+- bounded-memory trace;
+- cold-cache behavior.
+
+## Performance reports
+
+Provide:
+
+```text
+commit
+model and quant
+complete command/environment
+CPU/RAM/storage
+GPU/driver/interconnect
+context fill
+prompt tokens
+generated tokens
+repetition count
+median and low tail
+cold or warm state
+```
+
+Do not promote a faster result that changes output unexpectedly, relies on an unreported warm cache, or silently falls back to another backend.
+
+## External ports
+
+ESE is MIT licensed, but imported code still requires provenance.
+
+For every port:
+
+- pin the source repository and commit;
+- identify the original files/commits;
+- retain copyright and license notices;
+- separate mechanical adaptation from ESE-specific redesign;
+- document behavior differences;
+- add acceptance tests before exposing a stable flag.
+
+Do not merge an external fork wholesale. Port the smallest coherent layer that satisfies ESE's architecture.
+
+## Design rules
+
+- Every cache is bounded.
+- Every accelerated path is observable.
+- Reconfiguration is failure-atomic.
+- In-flight tensors cannot be evicted.
+- Disk extents use checked 64-bit arithmetic.
+- No feature is called complete based on compilation alone.
+- Defaults are promoted from repeated workloads, not one best run.
+- Native options remain available; the `ese` launcher must print what it selects.
+
+## Documentation
+
+User-facing changes should update one focused document under `docs/` and keep the README limited to the main path. Detailed experiments belong in benchmark records or issues, not in the landing page.

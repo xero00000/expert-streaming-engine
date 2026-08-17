@@ -1,0 +1,70 @@
+name: ESE unified CI
+
+on:
+  push:
+    branches:
+      - ese-unified
+  pull_request:
+    paths:
+      - "ese"
+      - "tools/**"
+      - "tests/**"
+      - "docs/ESE_*.md"
+      - "docs/PORT_ROADMAP.md"
+      - "docs/BRANCH_POLICY.md"
+      - "README.md"
+      - "CMakeLists.txt"
+      - "ggml/**"
+      - "src/**"
+      - "common/**"
+      - "examples/server/**"
+      - ".github/workflows/ese-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ese-unified-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  launcher:
+    name: Launcher and planner
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile Python
+        run: python -m compileall -q ese tools tests
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: CLI smoke
+        run: |
+          ./ese --help
+          ./ese doctor --json
+
+  cpu-build:
+    name: Native CPU server build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-ci
+          -DCMAKE_BUILD_TYPE=Release
+          -DGGML_CUDA=OFF
+          -DLLAMA_BUILD_TESTS=OFF
+          -DLLAMA_BUILD_SERVER=ON
+
+      - name: Build llama-server
+        run: cmake --build build-ci --target llama-server -j2
