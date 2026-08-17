@@ -70,9 +70,29 @@ jobs:
         run: cmake --build build-ci --target llama-server -j2
 
       - name: Verify compiled policy surface
+        shell: bash
         run: |
+          # This ik_llama-derived server may return a non-zero status after
+          # printing help. Treat the help text itself as the test artifact;
+          # a missing/empty help page or missing required flag still fails CI.
+          set +e
           build-ci/bin/llama-server --help > native-help.txt 2>&1
-          grep -F -- "--fit" native-help.txt
-          grep -F -- "--cpu-moe" native-help.txt
-          grep -F -- "--n-cpu-moe" native-help.txt
-          grep -F -- "--defer-experts" native-help.txt
+          help_rc=$?
+          set -e
+
+          if [[ ! -s native-help.txt ]]; then
+            echo "llama-server produced no --help output (exit ${help_rc})"
+            exit 1
+          fi
+
+          echo "llama-server --help exit code: ${help_rc}"
+          for flag in --fit --cpu-moe --n-cpu-moe --defer-experts; do
+            if ! grep -Fq -- "$flag" native-help.txt; then
+              echo "Required native option is missing: $flag"
+              echo "--- llama-server --help ---"
+              cat native-help.txt
+              exit 1
+            fi
+          done
+
+          echo "Verified native ESE policy surface."
