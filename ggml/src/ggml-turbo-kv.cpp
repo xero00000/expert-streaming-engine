@@ -14,6 +14,7 @@
 #include "ggml-turbo-kv.h"
 
 #include <array>
+#include <cstdlib>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -476,6 +477,127 @@ enum ggml_turbo_kv_status ggml_turbo_kv_dequantize_reference(
         }
     }
     return GGML_TURBO_KV_STATUS_OK;
+}
+
+
+[[noreturn]] static void abort_adapter_failure() {
+    std::abort();
+}
+
+static size_t checked_value_count(int64_t value_count) {
+    if (value_count < 0) {
+        abort_adapter_failure();
+    }
+    return static_cast<size_t>(value_count);
+}
+
+static size_t checked_total_value_count(int64_t nrows, int64_t n_per_row) {
+    if (nrows < 0 || n_per_row < 0) {
+        abort_adapter_failure();
+    }
+
+    const size_t rows = static_cast<size_t>(nrows);
+    const size_t per_row = static_cast<size_t>(n_per_row);
+    if (per_row != 0 && rows > std::numeric_limits<size_t>::max() / per_row) {
+        abort_adapter_failure();
+    }
+    return rows * per_row;
+}
+
+static void require_adapter_status(enum ggml_turbo_kv_status status) {
+    if (status != GGML_TURBO_KV_STATUS_OK) {
+        abort_adapter_failure();
+    }
+}
+
+static void adapter_to_float(
+        enum ggml_turbo_kv_format format,
+        const void * src,
+        float * dst,
+        int64_t value_count) {
+    const size_t count = checked_value_count(value_count);
+    const size_t bytes = ggml_turbo_kv_encoded_size(format, count);
+    if (count != 0 && bytes == 0) {
+        abort_adapter_failure();
+    }
+
+    require_adapter_status(
+        ggml_turbo_kv_dequantize_reference(format, src, bytes, dst, count));
+}
+
+static void adapter_from_float(
+        enum ggml_turbo_kv_format format,
+        const float * src,
+        void * dst,
+        int64_t value_count) {
+    const size_t count = checked_value_count(value_count);
+    const size_t bytes = ggml_turbo_kv_encoded_size(format, count);
+    if (count != 0 && bytes == 0) {
+        abort_adapter_failure();
+    }
+
+    require_adapter_status(
+        ggml_turbo_kv_quantize_reference(format, src, count, dst, bytes));
+}
+
+static size_t adapter_quantize_rows(
+        enum ggml_turbo_kv_format format,
+        const float * src,
+        void * dst,
+        int64_t nrows,
+        int64_t n_per_row,
+        const float * imatrix) {
+    (void) imatrix;
+
+    const size_t total = checked_total_value_count(nrows, n_per_row);
+    if (n_per_row % static_cast<int64_t>(GGML_TURBO_KV_BLOCK_ELEMENTS) != 0) {
+        abort_adapter_failure();
+    }
+
+    const size_t bytes = ggml_turbo_kv_encoded_size(format, total);
+    if (total != 0 && bytes == 0) {
+        abort_adapter_failure();
+    }
+
+    require_adapter_status(
+        ggml_turbo_kv_quantize_reference(format, src, total, dst, bytes));
+    return bytes;
+}
+
+void ggml_turbo4_to_float(const void * src, float * dst, int64_t value_count) {
+    adapter_to_float(GGML_TURBO_KV_FORMAT_TURBO4, src, dst, value_count);
+}
+
+void ggml_turbo8_to_float(const void * src, float * dst, int64_t value_count) {
+    adapter_to_float(GGML_TURBO_KV_FORMAT_TURBO8, src, dst, value_count);
+}
+
+void ggml_turbo4_from_float(const float * src, void * dst, int64_t value_count) {
+    adapter_from_float(GGML_TURBO_KV_FORMAT_TURBO4, src, dst, value_count);
+}
+
+void ggml_turbo8_from_float(const float * src, void * dst, int64_t value_count) {
+    adapter_from_float(GGML_TURBO_KV_FORMAT_TURBO8, src, dst, value_count);
+}
+
+size_t ggml_turbo4_quantize_rows(
+        const float * src,
+        void * dst,
+        int64_t nrows,
+        int64_t n_per_row,
+        const float * imatrix) {
+    return adapter_quantize_rows(
+        GGML_TURBO_KV_FORMAT_TURBO4, src, dst, nrows, n_per_row, imatrix);
+}
+
+size_t ggml_turbo8_quantize_rows(
+        const float * src,
+        void * dst,
+        int64_t nrows,
+        int64_t n_per_row,
+        const float * imatrix) {
+    return adapter_quantize_rows(
+        GGML_TURBO_KV_FORMAT_TURBO8, src, dst, nrows, n_per_row, imatrix);
 }
 
 const char * ggml_turbo_kv_status_string(enum ggml_turbo_kv_status status) {

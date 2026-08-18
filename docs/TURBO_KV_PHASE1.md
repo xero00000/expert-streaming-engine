@@ -33,18 +33,27 @@ The implementation preserves the pinned design:
 
 ESE wraps the reference in a small checked C ABI. It validates alignment, sizes, overflow, null arguments, and non-finite source values. Rotation initialization uses a C++ function-local immutable object, avoiding the unsynchronized mutable lazy globals in the source revision.
 
+## Internal core integration
+
+Turbo4 and Turbo8 now have pinned internal GGML/GGUF numeric IDs matching the source revision:
+
+| Format | Internal type | Numeric ID |
+| --- | --- | ---: |
+| Turbo4 | `GGML_TYPE_TURBO4_0` | 44 |
+| Turbo8 | `GGML_TYPE_TURBO8_0` | 48 |
+
+Core traits report the exact 128-value block geometry and 66/130-byte storage sizes. `ggml_quantize_chunk` routes both formats through the same checked deterministic CPU reference used by the standalone tests. The integration test proves core output is byte-identical to the reference codec.
+
 ## Deliberately not exposed yet
 
 This slice does **not** add `turbo4` or `turbo8` to:
 
-- `enum ggml_type`;
-- GGUF tensor type IDs;
 - `--cache-type-k` or `--cache-type-v`;
 - `tools/ese.py`;
 - CUDA, ROCm, Metal, Vulkan, or Flash Attention;
 - server save/restore or cache lifecycle operations.
 
-That separation is intentional. A codec is not a serving feature until storage accounting, backend execution, lifecycle behavior, and quality gates all pass.
+The native KV parser remains an explicit whitelist, and a source-level regression test prevents the internal type names from being added accidentally. A registered storage type is still not a serving feature until backend execution, lifecycle behavior, and quality gates all pass.
 
 ## Why Turbo2, Turbo3, and TCQ are not copied in this slice
 
@@ -81,16 +90,17 @@ The test is intentionally backend-independent. Later CUDA work must compare its 
 
 ## Promotion gates
 
-### Gate A — core type integration
+### Gate A — core type integration — complete
 
-Before assigning public GGML type names:
+- complete `ggml_type_traits`;
+- checked tensor and row sizing;
+- checked quantize/dequantize dispatch;
+- deterministic core-vs-reference byte parity;
+- pinned numeric IDs 44 and 48;
+- compile-time block ABI assertions;
+- native and launcher visibility guards.
 
-- add complete `ggml_type_traits`;
-- add checked tensor sizing;
-- add quantize/dequantize dispatch;
-- add serialization compatibility tests;
-- confirm numeric type IDs against the pinned source;
-- prove existing type IDs and ABI behavior remain unchanged.
+The types remain internal until the later gates pass.
 
 ### Gate B — CUDA and Flash Attention
 

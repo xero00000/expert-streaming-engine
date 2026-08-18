@@ -54,6 +54,31 @@ enum ggml_turbo_kv_status ggml_turbo_kv_dequantize_reference(
         float * dst,
         size_t value_count);
 
+
+/*
+ * Internal GGML row adapters. These make the checked CPU references usable by
+ * core type traits and ggml_quantize_chunk without exposing a server cache
+ * option. The row width must be a multiple of 128.
+ */
+void ggml_turbo4_to_float(const void * src, float * dst, int64_t value_count);
+void ggml_turbo8_to_float(const void * src, float * dst, int64_t value_count);
+void ggml_turbo4_from_float(const float * src, void * dst, int64_t value_count);
+void ggml_turbo8_from_float(const float * src, void * dst, int64_t value_count);
+
+size_t ggml_turbo4_quantize_rows(
+        const float * src,
+        void * dst,
+        int64_t nrows,
+        int64_t n_per_row,
+        const float * imatrix);
+
+size_t ggml_turbo8_quantize_rows(
+        const float * src,
+        void * dst,
+        int64_t nrows,
+        int64_t n_per_row,
+        const float * imatrix);
+
 const char * ggml_turbo_kv_status_string(enum ggml_turbo_kv_status status);
 
 #ifdef __cplusplus
