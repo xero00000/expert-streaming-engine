@@ -457,6 +457,26 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        LLM_ARCH_MAPLE,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,         "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,        "output_norm" },
+            { LLM_TENSOR_OUTPUT,             "output" },
+            { LLM_TENSOR_ATTN_NORM,          "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q,             "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_Q_NORM,        "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K,             "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_K_NORM,        "blk.%d.attn_k_norm" },
+            { LLM_TENSOR_ATTN_V,             "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,           "blk.%d.attn_output" },
+            { LLM_TENSOR_FFN_NORM,           "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE_INP,       "blk.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_GATE_EXPS,      "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,      "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,        "blk.%d.ffn_up_exps" },
+        },
+    },
+    {
         LLM_ARCH_QWEN3NEXT,
         {
             { LLM_TENSOR_TOKEN_EMBD,         "token_embd" },
@@ -857,6 +877,7 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_ATTN_K,               "blk.%d.attn_k" },
             { LLM_TENSOR_ATTN_K_NORM,          "blk.%d.attn_k_norm" },
             { LLM_TENSOR_ATTN_V,               "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_GATE,            "blk.%d.attn_gate" },
             { LLM_TENSOR_ATTN_SINKS,           "blk.%d.attn_sinks" },
             { LLM_TENSOR_ATTN_OUT,             "blk.%d.attn_output" },
             { LLM_TENSOR_ATTN_POST_NORM,       "blk.%d.post_attention_norm" },
@@ -865,6 +886,7 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_FFN_UP,               "blk.%d.ffn_up" },
             { LLM_TENSOR_DFLASH_FC,            "dflash_fc" },
             { LLM_TENSOR_DFLASH_HIDDEN_NORM,   "dflash_hidden_norm" },
+            { LLM_TENSOR_DFLASH_AUX_HIDDEN_NORM, "dflash_aux_hidden_norm.%d" },
         },
     },
     {
@@ -1950,7 +1972,9 @@ std::string LLM_TN::operator()(llm_tensor tensor, const std::string & suffix, in
 }
 
 void llama_model::set_tensor_overrides(const llama_model_params& params) {
-    tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+    if (params.n_gpu_layers > 0) {
+        tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+    }
 }
 
 std::string llama_model_ftype_name(llama_ftype ftype) {
@@ -2176,6 +2200,10 @@ bool llama_model_has_recurrent(const llama_model * model) {
     return llm_arch_is_hybrid(model->arch) || llm_arch_is_recurrent(model->arch);
 }
 
+bool llama_model_is_deepseek4(const llama_model * model) {
+    return model && model->arch == LLM_ARCH_DEEPSEEK4;
+}
+
 bool llama_model_is_openpangu(const llama_model * model) {
     return model && model->arch == LLM_ARCH_OPENPANGU;
 }
@@ -2211,8 +2239,7 @@ bool llama_model_supports_ctx_shift(const struct llama_model * model) {
 }
 
 bool llama_model_supports_partial_kv_reuse(const struct llama_model * model) {
-    // These architectures cannot reconstruct their private per-position state after a mid-sequence rewind.
-    return model && model->arch != LLM_ARCH_OPENPANGU && model->arch != LLM_ARCH_DEEPSEEK4;
+    return model != nullptr;
 }
 
 llm_tensor llm_tensor_type(llm_arch arch, const std::string & tensor_name, int il) {

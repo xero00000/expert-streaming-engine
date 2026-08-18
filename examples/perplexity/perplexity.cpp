@@ -1103,7 +1103,7 @@ static void hellaswag_score(llama_context * ctx, const gpt_params & params) {
 
             //printf("max logprob ending idx %lu, gold ending idx %lu\n", ending_logprob_max_idx, hs_cur.gold_ending_idx);
 
-            // If the gold ending got the maximum logprobe add one accuracy point
+            // If the gold ending got the maximum logprob add one accuracy point
             if (ending_logprob_max_idx == hs_cur.gold_ending_idx) {
                 acc += 1.0;
             }
@@ -1198,7 +1198,7 @@ static std::vector<winogrande_entry> load_winogrande_from_csv(const std::string 
 
 /*
  * Evaluates the Winogrande score.
- * Uses a CSV containing task index, dentence, choice 1, choice 2, answer (1 or 2)
+ * Uses a CSV containing task index, sentence, choice 1, choice 2, answer (1 or 2)
  * You can get one such dataset from e.g. https://huggingface.co/datasets/ikawrakow/winogrande-eval-for-llama.cpp
  * As an example, the 1st row in the above dataset is
  *

@@ -423,6 +423,8 @@ extern "C" {
         GGML_TYPE_Q4_0_4_4  = 31,
         GGML_TYPE_Q4_0_4_8  = 32,
         GGML_TYPE_Q4_0_8_8  = 33,
+        GGML_TYPE_TQ1_0     = 34,  // mainline ternary (TriLM/Maple); kept for GGUF interop
+        GGML_TYPE_TQ2_0     = 35,  // mainline ternary 2.06bpw (Maple experts/projections)
         GGML_TYPE_I2_S      = 36,  // So we are able to consume MS BitNet I2_S quants
         GGML_TYPE_MXFP4     = 39,  // so we are compatible with mainline
         GGML_TYPE_Q1_0_G128 = 41,  // Bonsai 1-bit quants
@@ -484,6 +486,7 @@ extern "C" {
         GGML_TYPE_IQ5_K_R4  = 340,
         GGML_TYPE_IQ4_KS_R4 = 344,
         GGML_TYPE_IQ5_KS_R4 = 352,
+        GGML_TYPE_MXFP4_R8  = 353,
         GGML_TYPE_Q8_K_R16  = 397,
         GGML_TYPE_Q8_KV_R8  = 398,
         GGML_TYPE_Q8_K_R8   = 399,
@@ -582,6 +585,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ5_K_R4  = 333, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ4_KS_R4 = 337, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ5_KS_R4 = 341, // except 1d tensors
+        GGML_FTYPE_MOSTLY_MXFP4_R8  = 342, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q8_K_R16  = 397, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q8_KV_R8  = 398, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q8_K_R8   = 399, // except 1d tensors
@@ -711,6 +715,7 @@ extern "C" {
         GGML_OP_HC_POST,
         GGML_OP_MASK_TO_IDX,
         GGML_OP_LATENT_ATTN,
+        GGML_OP_DS4_COMP,
 
         GGML_OP_COUNT,
     };
@@ -1943,6 +1948,13 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * c);
 
+    GGML_API struct ggml_tensor * ggml_get_rows_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            bool                  same_type,
+            bool                  dim0);
+
     // a TD  [n_embd, ne1,    ne2,    ne3]
     // b TS  [n_embd, n_rows, ne02,   ne03] | ne02 == ne2, ne03 == ne3
     // c I64 [n_rows, ne11,   ne12,   1]    | c[i] in [0, ne1)
@@ -2689,6 +2701,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * mask,
             int                   max_row_size);
+
+    GGML_API struct ggml_tensor * ggml_ds4_comp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * idx,
+            int                   ratio,
+            int                   type);
 
 
     // custom operators

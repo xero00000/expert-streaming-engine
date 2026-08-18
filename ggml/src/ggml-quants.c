@@ -4011,7 +4011,7 @@ void quantize_row_q8_K(const float * restrict x, void * restrict y, int64_t k) {
 #endif
 }
 
-//===================================== Dot ptoducts =================================
+//===================================== Dot products =================================
 
 //
 // Helper functions
@@ -4385,7 +4385,7 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         __m128 p2_d = _mm_mul_ps( d_2_3, p2 );
         __m128 p3_d = _mm_mul_ps( d_2_3, p3 );
 
-        // Acummulate
+        // Accumulate
         acc_0 = _mm_add_ps(p0_d, acc_0);
         acc_1 = _mm_add_ps(p1_d, acc_1);
         acc_2 = _mm_add_ps(p2_d, acc_2);
@@ -4552,7 +4552,7 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
         __m128 p2_d = __lsx_vfmul_s( d_2_3, p2 );
         __m128 p3_d = __lsx_vfmul_s( d_2_3, p3 );
 
-        // Acummulate
+        // Accumulate
         acc_0 = __lsx_vfadd_s(p0_d, acc_0);
         acc_1 = __lsx_vfadd_s(p1_d, acc_1);
         acc_2 = __lsx_vfadd_s(p2_d, acc_2);
@@ -10976,7 +10976,7 @@ void ggml_vec_dot_iq3_s_q8_K (int n, float * restrict s, size_t bs, const void *
             idx.vec[0] = _mm256_or_si256(idx.vec[0], _mm256_cvtepi16_epi32(_mm256_castsi256_si128(idx_l)));
             idx.vec[1] = _mm256_or_si256(idx.vec[1], _mm256_cvtepi16_epi32(_mm256_extractf128_si256(idx_l, 1)));
 
-            // At leat on my CPU (Ryzen 7950X), using _mm256_i32gather_epi32 is slower than _mm256_set_epi32. Strange.
+            // At least on my CPU (Ryzen 7950X), using _mm256_i32gather_epi32 is slower than _mm256_set_epi32. Strange.
             //const __m256i q2_1 = _mm256_i32gather_epi32((const int *)iq3s_grid, idx.vec[0], 4);
             //const __m256i q2_2 = _mm256_i32gather_epi32((const int *)iq3s_grid, idx.vec[1], 4);
             const __m256i q2_1 = _mm256_set_epi32(
@@ -11273,7 +11273,7 @@ void ggml_vec_dot_iq3_s_q8_K (int n, float * restrict s, size_t bs, const void *
             idx.vec[0] = __lasx_xvor_v(idx.vec[0], lasx_ext16_32(lasx_extracti128(idx_l, 0)));
             idx.vec[1] = __lasx_xvor_v(idx.vec[1], lasx_ext16_32(lasx_extracti128(idx_l, 1)));
 
-            // At leat on my CPU (Ryzen 7950X), using _mm256_i32gather_epi32 is slower than _mm256_set_epi32. Strange.
+            // At least on my CPU (Ryzen 7950X), using _mm256_i32gather_epi32 is slower than _mm256_set_epi32. Strange.
             //const __m256i q2_1 = _mm256_i32gather_epi32((const int *)iq3s_grid, idx.vec[0], 4);
             //const __m256i q2_2 = _mm256_i32gather_epi32((const int *)iq3s_grid, idx.vec[1], 4);
             const __m256i q2_1 = lasx_set_w(
@@ -14269,7 +14269,7 @@ void iq1s_process_1block(int block_size, const float * xb, const float * weight,
     // With just 3 allowed quant values (-1, 0, 1), we can search exhaustively for the two
     // boundaries that split the weights xb[i] into 3 groups. To do so, we sort the weights
     // in ascending order, compute Si = sum[weight[j] xb[j], j = 0...i] and
-    // Wi = sum[weight[j], j = 0...i], and use these to quckly get get the optimum scale
+    // Wi = sum[weight[j], j = 0...i], and use these to quickly get the optimum scale
     // for each possible and score for each split.
     int * idx = (int *)(pairs + 1);
     for (int j = 0; j < block_size; ++j) {
@@ -14485,7 +14485,7 @@ void iq1m_process_1block(const float * xb, const float * weight, int8_t * L, flo
     // With just 3 allowed quant values (-1, 0, 1), we can search exhaustively for the two
     // boundaries that split the weights xb[i] into 3 groups. To do so, we sort the weights
     // in ascending order, compute Si = sum[weight[j] xb[j], j = 0...i] and
-    // Wi = sum[weight[j], j = 0...i], and use these to quckly get get the optimum scale
+    // Wi = sum[weight[j], j = 0...i], and use these to quickly get the optimum scale
     // for each possible and score for each split.
     int * idx = (int *)(pairs + 1);
     for (int j = 0; j < block_size; ++j) {
@@ -15504,6 +15504,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
             } break;
         case GGML_TYPE_MXFP4: break;
+        case GGML_TYPE_MXFP4_R8: break;
         case GGML_TYPE_Q6_0: break;
         case GGML_TYPE_IQ2_K: break;
         case GGML_TYPE_IQ2_KS: break;
@@ -15578,4 +15579,109 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
     }
 
     return true;
+}
+
+
+// ====================== Maple / mainline ternary TQ1_0 / TQ2_0 ======================
+
+void quantize_row_tq2_0_ref(const float * GGML_RESTRICT x, block_tq2_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    for (int64_t i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK_K; j++) {
+            amax = MAX(amax, fabsf(x[j]));
+        }
+        const float d = amax;
+        const float id = d ? 1.0f/d : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (size_t j = 0; j < sizeof(y->qs); j += 32) {
+            for (size_t m = 0; m < 32; ++m) {
+                uint8_t q = 0;
+                for (size_t n = 0; n < 4; ++n) {
+                    int xi = (int) lroundf(x[m + n*32] * id) + 1; // -1,0,1 -> 0,1,2
+                    q += (xi & 3) << (2*n);
+                }
+                y[i].qs[j + m] = q;
+            }
+            x += 4*32;
+        }
+    }
+}
+
+void quantize_row_tq1_0_ref(const float * GGML_RESTRICT x, block_tq1_0 * GGML_RESTRICT y, int64_t k) {
+    // Minimal stub: pack as zeros with unit scale (TQ1 not used by Maple packs we ship).
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        memset(&y[i], 0, sizeof(block_tq1_0));
+        y[i].d = GGML_FP32_TO_FP16(1.0f);
+        x += QK_K;
+    }
+}
+
+void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (size_t j = 0; j < sizeof(x->qs); j += 32) {
+            for (size_t l = 0; l < 4; ++l) {
+                for (size_t m = 0; m < 32; ++m) {
+                    int8_t q = (x[i].qs[j + m] >> (l*2)) & 3;
+                    *y++ = (float) (q - 1) * d;
+                }
+            }
+        }
+    }
+}
+
+void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (size_t j = 0; j < sizeof(x->qs) - sizeof(x->qs) % 32; j += 32) {
+            for (size_t n = 0; n < 5; ++n) {
+                for (size_t m = 0; m < 32; ++m) {
+                    uint8_t q = x[i].qs[j + m] * pow3[n];
+                    int16_t xi = ((uint16_t) q * 3) >> 8;
+                    *y++ = (float) (xi - 1) * d;
+                }
+            }
+        }
+        for (size_t j = sizeof(x->qs) - sizeof(x->qs) % 32; j < sizeof(x->qs); j += 16) {
+            for (size_t n = 0; n < 5; ++n) {
+                for (size_t m = 0; m < 16; ++m) {
+                    uint8_t q = x[i].qs[j + m] * pow3[n];
+                    int16_t xi = ((uint16_t) q * 3) >> 8;
+                    *y++ = (float) (xi - 1) * d;
+                }
+            }
+        }
+        for (size_t n = 0; n < 4; ++n) {
+            for (size_t j = 0; j < sizeof(x->qh); ++j) {
+                uint8_t q = x[i].qh[j] * pow3[n];
+                int16_t xi = ((uint16_t) q * 3) >> 8;
+                *y++ = (float) (xi - 1) * d;
+            }
+        }
+    }
+}
+
+size_t quantize_tq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ1_0, n_per_row);
+    quantize_row_tq1_0_ref(src, (block_tq1_0 *) dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ2_0, n_per_row);
+    quantize_row_tq2_0_ref(src, (block_tq2_0 *) dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
 }

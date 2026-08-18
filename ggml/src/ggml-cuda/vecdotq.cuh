@@ -33,6 +33,8 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
+#define VDR_TQ2_0_Q8_1_MMVQ 1
+
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
@@ -562,6 +564,33 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
     }
 
     return d6 * sumf_d;
+}
+
+static __device__ __forceinline__ float vec_dot_tq2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_tq2_0 * bq = (const block_tq2_0 *) vbq + kbx;
+
+    // tq2_0: QK_K=256, one fp16 scale, 2-bit ternary codes.
+    // Packing: element e -> byte = 32*(e/128)+(e%32), lane = (e/32)%4.
+    // Chunk iqs (0..7) covers 32 elements: byte_base = 32*(iqs/4), lane = iqs%4.
+#ifdef GGML_CUDA_F16
+    const float d = __half2float(bq->d);
+#else
+    const float d = __half2float(bq->d);
+#endif
+    const int byte_base = 32 * (iqs >> 2);
+    const int lane      = iqs & 3;
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const int code = (bq->qs[byte_base + j] >> (2 * lane)) & 0x3;
+        const int sym  = code - 1; // {-1,0,0,+1} for codes 0..3 (2 unused as 0)
+        sumi += bq8_1_chunk->qs[j] * sym;
+    }
+
+    return sumi * (d * __low2float(bq8_1_chunk->ds));
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(

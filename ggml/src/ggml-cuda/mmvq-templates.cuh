@@ -21,6 +21,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q5_1   : return vec_dot_q5_1_q8_1;
         case GGML_TYPE_Q6_0   : return vec_dot_q6_0_q8_1;
         case GGML_TYPE_Q8_0   : return vec_dot_q8_0_q8_1;
+        case GGML_TYPE_TQ2_0  : return vec_dot_tq2_0_q8_1;
         case GGML_TYPE_Q2_K   : return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K   : return vec_dot_q3_K_q8_1;
         case GGML_TYPE_Q4_K   : return vec_dot_q4_K_q8_1;
@@ -48,6 +49,7 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q5_1    : return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_Q6_0    : return VDR_Q6_0_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0    : return VDR_Q8_0_Q8_1_MMVQ;
+        case GGML_TYPE_TQ2_0   : return VDR_TQ2_0_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K    : return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K    : return VDR_Q3_K_Q8_1_MMVQ;
         case GGML_TYPE_Q4_K    : return VDR_Q4_K_Q8_1_MMVQ;
@@ -464,6 +466,7 @@ extern void mul_mat_vec_q5_0_q8_1_cuda(const mmvq_args & args, cudaStream_t stre
 extern void mul_mat_vec_q5_1_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_q6_0_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_q8_0_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
+extern void mul_mat_vec_tq2_0_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_q2_K_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_q3_K_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_q4_K_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
