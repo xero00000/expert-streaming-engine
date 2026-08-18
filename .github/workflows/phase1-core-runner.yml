@@ -8,10 +8,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: phase1-turbo-core-runner
-  cancel-in-progress: false
-
 jobs:
   apply-test-and-publish:
     runs-on: ubuntu-latest
