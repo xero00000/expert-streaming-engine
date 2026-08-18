@@ -4,14 +4,16 @@ on:
   push:
     branches:
       - ese-unified
+      - main
+      - "phase1/**"
   pull_request:
     paths:
       - "ese"
       - "tools/**"
       - "tests/**"
-      - "docs/ESE_*.md"
-      - "docs/PORT_ROADMAP.md"
-      - "docs/BRANCH_POLICY.md"
+      - "scripts/**"
+      - "docs/**"
+      - "THIRD_PARTY_PORTS.md"
       - "README.md"
       - "CMakeLists.txt"
       - "ggml/**"
@@ -50,6 +52,19 @@ jobs:
         run: |
           ./ese --help
           ./ese doctor --json
+
+  turbo-kv-reference:
+    name: Turbo KV CPU reference
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: bash -n scripts/*.sh
+
+      - name: Build and test Turbo4/Turbo8 reference
+        run: bash scripts/test-turbo-kv.sh
 
   cpu-build:
     name: Native CPU server build
