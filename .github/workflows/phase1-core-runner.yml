@@ -1,9 +1,9 @@
 name: Phase 1 Turbo KV core runner
 
 on:
-  push:
+  pull_request:
     branches:
-      - phase1/turbo-kv-foundation
+      - chunked-gdn-port
 
 permissions:
   contents: write
