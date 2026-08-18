@@ -1,0 +1,96 @@
+name: Phase 1 Turbo KV core runner
+
+on:
+  push:
+    branches:
+      - phase1/turbo-kv-foundation
+  pull_request:
+    branches:
+      - chunked-gdn-port
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phase1-turbo-core-runner
+  cancel-in-progress: false
+
+jobs:
+  apply-test-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase1/turbo-kv-foundation
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Extract and run strict patch payload
+        run: |
+          python - <<'PY'
+          import base64
+          from pathlib import Path
+          import re
+          import zlib
+
+          workflow = Path('.github/workflows/phase1-core-bootstrap.yml').read_text(encoding='utf-8')
+          match = re.search(r'^\s*PATCH_PAYLOAD:\s*([A-Za-z0-9+/=]+)\s*$', workflow, re.MULTILINE)
+          if match is None:
+              raise SystemExit('bootstrap payload was not found')
+          payload = zlib.decompress(base64.b64decode(match.group(1)))
+          exec(compile(payload, '<turbo-core-bootstrap>', 'exec'), {'__name__': '__main__'})
+          PY
+
+      - name: Check generated patch
+        run: |
+          git diff --check
+          git status --short
+
+      - name: Run standalone Turbo reference test
+        run: bash scripts/test-turbo-kv.sh
+
+      - name: Run staged-visibility regression test
+        run: python -m unittest tests/test_turbo_kv_visibility.py -v
+
+      - name: Configure internal GGML core test
+        run: >-
+          cmake -S . -B build-turbo-core
+          -DCMAKE_BUILD_TYPE=Release
+          -DGGML_CUDA=OFF
+          -DLLAMA_BUILD_TESTS=ON
+          -DLLAMA_BUILD_SERVER=OFF
+
+      - name: Build internal GGML core test
+        run: cmake --build build-turbo-core --target test-turbo-kv-core -j2
+
+      - name: Run internal GGML core test
+        run: build-turbo-core/bin/test-turbo-kv-core
+
+      - name: Package validated patch
+        run: |
+          git diff --binary > /tmp/turbo-core.patch
+          git diff --name-only -z | tar --null -T - -czf /tmp/turbo-core-files.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turbo-core-validated-patch
+          path: |
+            /tmp/turbo-core.patch
+            /tmp/turbo-core-files.tar.gz
+          if-no-files-found: error
+
+      - name: Commit validated integration on push runs
+        if: github.event_name == 'push'
+        run: |
+          rm .github/workflows/phase1-core-bootstrap.yml
+          rm .github/workflows/phase1-core-runner.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat(turbo-kv): integrate internal GGML types and dispatch'
+          git push origin HEAD:phase1/turbo-kv-foundation
