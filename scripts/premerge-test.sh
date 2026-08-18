@@ -208,9 +208,11 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   fi
 fi
 
-run_shell_gate "shell syntax" "bash -n ese scripts/*.sh" || true
+# `ese` is a Python entry point, not a shell script. Shell parsers only inspect
+# shell files; the launcher is validated by the Python compile/help/doctor gates.
+run_shell_gate "shell syntax" "bash -n scripts/*.sh" || true
 if command -v shellcheck >/dev/null 2>&1; then
-  run_shell_gate "shellcheck" "shellcheck ese scripts/*.sh" || true
+  run_shell_gate "shellcheck" "shellcheck scripts/*.sh" || true
 else
   warn "shellcheck is not installed; shell syntax was still checked"
 fi
