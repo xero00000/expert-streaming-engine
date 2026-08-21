@@ -40,6 +40,135 @@ std::vector<float> make_updates() {
     return values;
 }
 
+std::vector<float> make_attention_values(int rows, float phase) {
+    std::vector<float> values(GGML_TURBO_KV_BLOCK_ELEMENTS * rows);
+    for (size_t i = 0; i < values.size(); ++i) {
+        values[i] = 0.7f * std::sin(float(i) * 0.037f + phase) +
+            0.3f * std::cos(float(i) * 0.091f - phase);
+    }
+    return values;
+}
+
+void check_flash_attention(
+        int device,
+        ggml_type type,
+        ggml_turbo_kv_format format,
+        const char * name) {
+    constexpr int64_t width = GGML_TURBO_KV_BLOCK_ELEMENTS;
+    constexpr int64_t key_rows = 256;
+    constexpr int64_t query_rows = 2;
+    constexpr int64_t query_heads = 2;
+    constexpr int64_t mask_rows = GGML_PAD(query_rows, GGML_KQ_MASK_PAD);
+    const float scale = 1.0f / std::sqrt(float(width));
+    const float softcap = 4.0f;
+
+    const std::vector<float> keys = make_attention_values(key_rows, 0.2f);
+    const std::vector<float> values = make_attention_values(key_rows, 1.1f);
+    std::vector<float> queries(width * query_rows * query_heads);
+    for (int64_t head = 0; head < query_heads; ++head) {
+        const std::vector<float> head_queries = make_attention_values(query_rows, -0.4f + 0.7f * head);
+        std::copy(head_queries.begin(), head_queries.end(), queries.begin() + head * width * query_rows);
+    }
+    std::vector<float> mask_f32(key_rows * mask_rows, 0.0f);
+    for (int64_t query = 0; query < query_rows; ++query) {
+        for (int64_t key = 0; key < key_rows; ++key) {
+            mask_f32[query * key_rows + key] = -0.015f * float((key + 3 * query) % 17);
+        }
+    }
+    std::vector<ggml_fp16_t> mask_f16(mask_f32.size());
+    ggml_fp32_to_fp16_row(mask_f32.data(), mask_f16.data(), mask_f32.size());
+    std::vector<uint8_t> encoded_keys(ggml_turbo_kv_encoded_size(format, keys.size()));
+    std::vector<uint8_t> encoded_values(ggml_turbo_kv_encoded_size(format, values.size()));
+    require(ggml_turbo_kv_quantize_reference(
+                format, keys.data(), keys.size(), encoded_keys.data(), encoded_keys.size()) == GGML_TURBO_KV_STATUS_OK,
+            std::string(name) + ": CPU key encode");
+    require(ggml_turbo_kv_quantize_reference(
+                format, values.data(), values.size(), encoded_values.data(), encoded_values.size()) == GGML_TURBO_KV_STATUS_OK,
+            std::string(name) + ": CPU value encode");
+
+    std::vector<float> decoded_keys(keys.size());
+    std::vector<float> decoded_values(values.size());
+    require(ggml_turbo_kv_dequantize_reference(
+                format, encoded_keys.data(), encoded_keys.size(), decoded_keys.data(), decoded_keys.size()) == GGML_TURBO_KV_STATUS_OK,
+            std::string(name) + ": CPU key decode");
+    require(ggml_turbo_kv_dequantize_reference(
+                format, encoded_values.data(), encoded_values.size(), decoded_values.data(), decoded_values.size()) == GGML_TURBO_KV_STATUS_OK,
+            std::string(name) + ": CPU value decode");
+
+    std::vector<float> expected(width * query_rows * query_heads);
+    for (int64_t head = 0; head < query_heads; ++head) {
+        for (int64_t query = 0; query < query_rows; ++query) {
+            float logits[key_rows];
+            float max_logit = -INFINITY;
+            for (int64_t key = 0; key < key_rows; ++key) {
+                float dot = 0.0f;
+                for (int64_t column = 0; column < width; ++column) {
+                    dot += queries[head * width * query_rows + query * width + column] *
+                        decoded_keys[key * width + column];
+                }
+                const float capped = softcap * std::tanh(dot * scale / softcap);
+                logits[key] = capped + ggml_fp16_to_fp32(mask_f16[query * key_rows + key]);
+                max_logit = std::max(max_logit, logits[key]);
+            }
+            float denominator = 0.0f;
+            for (float & logit : logits) {
+                logit = std::exp(logit - max_logit);
+                denominator += logit;
+            }
+            for (int64_t column = 0; column < width; ++column) {
+                float output = 0.0f;
+                for (int64_t key = 0; key < key_rows; ++key) {
+                    output += logits[key] / denominator * decoded_values[key * width + column];
+                }
+                expected[query * width * query_heads + head * width + column] = output;
+            }
+        }
+    }
+
+    ggml_init_params params = {
+        /* .mem_size = */ 4 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+    ggml_context * context = ggml_init(params);
+    require(context != nullptr, std::string(name) + ": attention context");
+    ggml_tensor * q = ggml_new_tensor_4d(context, GGML_TYPE_F32, width, query_rows, query_heads, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(context, type, width, key_rows, 1, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(context, type, width, key_rows, 1, 1);
+    ggml_tensor * mask = ggml_new_tensor_4d(context, GGML_TYPE_F16, key_rows, mask_rows, 1, 1);
+    ggml_tensor * attention = ggml_flash_attn_ext(context, q, k, v, mask, scale, 0.0f, softcap);
+
+    ggml_backend_t backend = ggml_backend_cuda_init(device, nullptr, nullptr);
+    require(backend != nullptr, std::string(name) + ": attention CUDA backend");
+    require(ggml_backend_supports_op(backend, attention), std::string(name) + ": CUDA Flash Attention support");
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(context, backend);
+    require(buffer != nullptr, std::string(name) + ": attention device allocation");
+    ggml_backend_tensor_set(q, queries.data(), 0, queries.size() * sizeof(float));
+    ggml_backend_tensor_set(k, encoded_keys.data(), 0, encoded_keys.size());
+    ggml_backend_tensor_set(v, encoded_values.data(), 0, encoded_values.size());
+    ggml_backend_tensor_set(mask, mask_f16.data(), 0, mask_f16.size() * sizeof(ggml_fp16_t));
+
+    ggml_cgraph * graph = ggml_new_graph(context);
+    ggml_build_forward_expand(graph, attention);
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            std::string(name) + ": CUDA Flash Attention graph compute");
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> actual(expected.size());
+    ggml_backend_tensor_get(attention, actual.data(), 0, actual.size() * sizeof(float));
+    float max_error = 0.0f;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(std::isfinite(actual[i]), std::string(name) + ": finite attention output");
+        max_error = std::max(max_error, std::fabs(actual[i] - expected[i]));
+    }
+    require(max_error <= 1.0e-3f, std::string(name) + ": attention matches decoded CPU reference");
+    std::cout << name << " attention device=" << device << " max_error=" << max_error << "\n";
+
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(backend);
+    ggml_free(context);
+}
+
 void check_format(
         int device,
         ggml_type type,
@@ -150,7 +279,9 @@ int main() {
         check_format(device, GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, GGML_TYPE_I64, "turbo4_0");
         check_format(device, GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, GGML_TYPE_I32, "turbo8_0");
         check_format(device, GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, GGML_TYPE_I64, "turbo8_0");
+        check_flash_attention(device, GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, "turbo4_0");
+        check_flash_attention(device, GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, "turbo8_0");
     }
-    std::cout << "PASS: native CUDA Turbo4/Turbo8 row codecs\n";
+    std::cout << "PASS: native CUDA Turbo4/Turbo8 row codecs and Flash Attention bridge\n";
     return 0;
 }

@@ -15,6 +15,7 @@ ESE is MIT licensed and derives from `ik_llama.cpp` / `llama.cpp`. Selective ext
   - `ggml/src/ggml-turbo-kv-internal.h`
   - `ggml/src/ggml-cuda/turbo-kv.cu`
   - `ggml/src/ggml-cuda/turbo-kv.cuh`
+  - `ggml/src/ggml-cuda/fattn.cu`
   - `tests/test-turbo-kv.cpp`
   - `tests/test-turbo-kv-cuda.cpp`
   - `scripts/test-turbo-kv.sh`
@@ -36,6 +37,8 @@ ESE-specific changes:
 - explicit size/alignment/overflow validation;
 - non-finite input rejection;
 - native CUDA row encode/decode using the accepted CPU reference tables;
+- device-native Turbo-to-F16 staging for the existing CUDA Flash Attention
+  path, with a stream-pool temporary bound of two bytes per staged element;
 - exact CPU/CUDA encoded-byte parity and no host fallback;
 - no registration as a public GGML/KV type yet;
 - no import of incomplete CPU stub paths for Turbo2, Turbo3, or TCQ.

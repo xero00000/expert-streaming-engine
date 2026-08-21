@@ -307,3 +307,53 @@ void ggml_cuda_turbo_kv_get_rows(
         launch_get_rows<8>(src0, src1, dst, ctx.stream());
     }
 }
+
+template<int format>
+static __global__ void k_turbo_dequantize_f16(
+        const void * src,
+        half * dst,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+        size_t nb1, size_t nb2, size_t nb3) {
+    constexpr int qk = GGML_TURBO_KV_BLOCK_ELEMENTS;
+    const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total = ne0 * ne1 * ne2 * ne3;
+    if (index >= total) return;
+
+    const int64_t i3 = index / (ne0 * ne1 * ne2);
+    const int64_t i2 = (index / (ne0 * ne1)) % ne2;
+    const int64_t i1 = (index / ne0) % ne1;
+    const int64_t i0 = index % ne0;
+    const char * row = static_cast<const char *>(src) + i1 * nb1 + i2 * nb2 + i3 * nb3;
+    const void * block = row + (i0 / qk) * turbo_block_bytes<format>();
+
+    float value = 0.0f;
+    for (int column = 0; column < qk; ++column) {
+        value += d_turbo_rotation_inverse[(i0 % qk) * qk + column] *
+            turbo_centroid<format>(turbo_index<format>(block, column));
+    }
+    dst[index] = __float2half(value * turbo_scale<format>(block));
+}
+
+void ggml_cuda_turbo_kv_dequantize_f16(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        void * dst) {
+    ggml_cuda_turbo_kv_ensure_tables();
+    GGML_ASSERT(src->type == GGML_TYPE_TURBO4_0 || src->type == GGML_TYPE_TURBO8_0);
+    GGML_ASSERT(src->ne[0] % GGML_TURBO_KV_BLOCK_ELEMENTS == 0);
+
+    const int64_t total = ggml_nelements(src);
+    constexpr int threads = 128;
+    const int blocks = int((total + threads - 1) / threads);
+    if (src->type == GGML_TYPE_TURBO4_0) {
+        k_turbo_dequantize_f16<4><<<blocks, threads, 0, ctx.stream()>>>(
+            src->data, static_cast<half *>(dst),
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+            src->nb[1], src->nb[2], src->nb[3]);
+    } else {
+        k_turbo_dequantize_f16<8><<<blocks, threads, 0, ctx.stream()>>>(
+            src->data, static_cast<half *>(dst),
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+            src->nb[1], src->nb[2], src->nb[3]);
+    }
+}
