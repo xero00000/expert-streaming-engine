@@ -9645,6 +9645,97 @@ uint64_t llama_model_n_params(const struct llama_model * model) {
     return nparams;
 }
 
+void llama_model_resource_bytes(
+        const struct llama_model * model,
+        uint64_t * dense_bytes,
+        uint64_t * expert_bytes) {
+    if (dense_bytes) {
+        *dense_bytes = model ? model->expert_index.dense_bytes : 0;
+    }
+    if (expert_bytes) {
+        *expert_bytes = model ? model->expert_index.deferred_bytes : 0;
+    }
+    if (model && model->expert_index.empty() && dense_bytes) {
+        *dense_bytes = llama_model_size(model);
+    }
+}
+
+uint64_t llama_model_largest_expert_component(const struct llama_model * model) {
+    uint64_t largest = 0;
+    if (!model) {
+        return largest;
+    }
+    for (const auto & item : model->expert_index.descriptors) {
+        largest = std::max(largest, item.second->bytes());
+    }
+    return largest;
+}
+
+uint64_t llama_model_kv_bytes(
+        const struct llama_model * model,
+        enum ggml_type type_k,
+        enum ggml_type type_v,
+        enum ggml_type indexer_type_k,
+        uint32_t context,
+        int32_t mla_attention,
+        uint32_t slots,
+        bool flash_attention) {
+    if (!model || context == 0 || slots == 0) {
+        return 0;
+    }
+    uint64_t total = 0;
+    for (int il = 0; il < model->hparams.n_layer; ++il) {
+        const int64_t block_k = ggml_blck_size(type_k);
+        const int64_t block_v = ggml_blck_size(type_v);
+        if (block_k <= 0 || block_v <= 0 ||
+                model->hparams.n_embd_head_k(il) % block_k != 0 ||
+                model->hparams.n_embd_head_v(il) % block_v != 0) {
+            return 0;
+        }
+        const uint64_t bytes = model->cache_size(
+            il, type_k, type_v, indexer_type_k, context,
+            mla_attention, (int) slots, flash_attention);
+        if (bytes > UINT64_MAX - total) {
+            return UINT64_MAX;
+        }
+        total += bytes;
+    }
+    return total;
+}
+
+size_t llama_model_device_count(const struct llama_model * model) {
+    return model ? model->devices.size() : 0;
+}
+
+bool llama_model_device_memory(
+        const struct llama_model * model,
+        size_t device_index,
+        int32_t * device_id,
+        uint64_t * free_bytes,
+        uint64_t * total_bytes) {
+    if (!model || device_index >= model->devices.size() || !device_id || !free_bytes || !total_bytes) {
+        return false;
+    }
+    const int id = model->devices[device_index];
+    *device_id = id;
+    size_t free = 0;
+    size_t total = 0;
+#if defined(GGML_USE_CUDA)
+    ggml_backend_cuda_get_device_memory(id, &free, &total);
+#elif defined(GGML_USE_SYCL)
+    ggml_backend_sycl_get_device_memory(id, &free, &total);
+#elif defined(GGML_USE_VULKAN)
+    ggml_backend_vk_get_device_memory(id, &free, &total);
+#elif defined(GGML_USE_CANN)
+    ggml_backend_cann_get_device_memory(id, &free, &total);
+#else
+    return false;
+#endif
+    *free_bytes = free;
+    *total_bytes = total;
+    return true;
+}
+
 struct ggml_tensor * llama_get_model_tensor(struct llama_model * model, const char * name) {
     auto it = std::find_if(model->tensors_by_name.begin(), model->tensors_by_name.end(),
             [name](const std::pair<std::string, struct ggml_tensor *> & it) {

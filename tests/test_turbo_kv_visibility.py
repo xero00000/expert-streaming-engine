@@ -26,8 +26,10 @@ class TurboKVVisibilityTests(unittest.TestCase):
 
     def test_launcher_cache_choices_remain_stable(self) -> None:
         source = (ROOT / "tools/ese.py").read_text(encoding="utf-8")
+        match = re.search(r"KNOWN_KV_TYPES\s*=\s*\((?P<body>.*?)\)", source, re.DOTALL)
+        self.assertIsNotNone(match, "launcher KV choices were not found")
         for tier in ("turbo1", "turbo2", "turbo3", "turbo4", "turbo8", "tcq"):
-            self.assertNotIn(f'"{tier}"', source)
+            self.assertNotIn(f'"{tier}"', match.group("body"))
 
 
 if __name__ == "__main__":

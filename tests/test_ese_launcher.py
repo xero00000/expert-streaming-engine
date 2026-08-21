@@ -100,6 +100,27 @@ class LauncherTests(unittest.TestCase):
         policy, _ = select_policy(moe_model(), hardware(20))
         self.assertEqual(policy, "cache")
 
+    def test_launcher_delegates_limits_to_native_controller(self) -> None:
+        plan = build_launch_plan(
+            model=moe_model(),
+            hardware=hardware(7, 9, ram_available=47),
+            binary=Path("/server"),
+            policy="auto",
+            context=128 * 1024,
+            reserve_vram=GIB,
+        )
+        expected = {
+            "--memory-policy": "auto",
+            "--max-ram": f"{47 * GIB}B",
+            "--reserve-vram": f"{GIB}B",
+            "--min-kv-quality": "turbo4",
+            "--max-context": str(128 * 1024),
+            "--resource-preference": "balanced",
+        }
+        for flag, value in expected.items():
+            position = plan.arguments.index(flag)
+            self.assertEqual(plan.arguments[position + 1], value)
+
     def test_hybrid_policy_uses_supported_cpu_moe_flag(self) -> None:
         plan = build_launch_plan(
             model=moe_model(),

@@ -227,6 +227,9 @@ llama_test(test-transient-module-manager)
 llama_build(test-spec-tuner.cpp)
 llama_test(test-spec-tuner)
 
+llama_build(test-resource-planner.cpp)
+llama_test(test-resource-planner)
+
 llama_build(test-mapped-draft.cpp)
 llama_test(test-mapped-draft)
 

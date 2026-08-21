@@ -374,6 +374,13 @@ WIP
 | `--expert-vram-cache-mib N` | Set the adaptive expert VRAM cache capacity per device | 0 (disabled) | The effective capacity is additionally reduced to preserve the configured live free-memory reserve on each device. |
 | `--expert-vram-reserve-mib N` | Keep at least N MiB free outside the expert VRAM cache | 0 | Applied independently to each device when cache slots are allocated. |
 | `--expert-cache-min-observations N` | Minimum route observations before VRAM admission | 2 | Admission also uses route prediction, recent reuse, load cost, and deterministic eviction cost. |
+| `--memory-policy auto\|resident\|cache\|stream` | Enable the native global resource controller | disabled (legacy tuning) | `hybrid` is accepted as a compatibility alias for `cache`. The controller becomes the authority for the settings below. |
+| `--max-ram SIZE` | Bound planned host memory | detected/unlimited | Accepts bytes, KiB, MiB, or GiB. Includes dense/expert weights, expert/prompt caches, I/O staging, and CPU KV/workspace. |
+| `--reserve-vram SIZE` | Preserve a safety reserve on every selected GPU | 0 | The reserve survives steady-state KV/expert allocations and transient MTP/mmproj admission. |
+| `--min-kv-quality QUALITY` | Set the lowest controller-selectable KV tier | turbo4 | `turbo1`, `turbo2`, `turbo3`, `turbo4`, `turbo8`, `q8`, or `f16`. Incompatible tiers are unavailable; the floor is never crossed. |
+| `--max-context TOKENS` | Cap controller-selected context | requested/model context | Accepts K and M binary suffixes. The solved value uses the runtime's exact KV alignment. |
+| `--resource-preference balanced\|latency\|throughput` | Choose the deterministic context/quality tradeoff | balanced | Balanced preserves requested context when possible; latency favors quality; throughput favors context. |
+| `--resource-plan-json` | Request explicit plan JSON output | off | A plan is always printed when the controller is enabled; this flag documents machine-readable intent for wrappers. `/props` returns the same object. |
 | `-no-ooae` | Disable offload only active experts | - | See `-ooae` |
 | `-smf16, --split-mode-f16` | Use f16 for data exchange between GPUs | 1 | [PR 1087](https://github.com/ikawrakow/ik_llama.cpp/pull/1087) |
 | `-smf32, --split-mode-f32` | Use f32 for data exchange between GPUs | 0 | [PR 1087](https://github.com/ikawrakow/ik_llama.cpp/pull/1087) |

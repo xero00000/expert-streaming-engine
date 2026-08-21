@@ -93,11 +93,15 @@ jobs:
           --target test-transient-module-manager test-spec-tuner test-mapped-draft
           -j2
 
+      - name: Build Phase 4 global resource-controller test
+        run: cmake --build build-turbo-core --target test-resource-planner -j2
+
       - name: Run Phase 3 controller and speculation tests
         run: |
           build-turbo-core/bin/test-transient-module-manager
           build-turbo-core/bin/test-spec-tuner
           build-turbo-core/bin/test-mapped-draft
+          build-turbo-core/bin/test-resource-planner
 
   expert-cache-sanitizers:
     name: Expert cache ASAN and UBSAN
@@ -136,6 +140,9 @@ jobs:
           --target test-transient-module-manager test-spec-tuner test-mapped-draft
           -j2
 
+      - name: Build Phase 4 sanitizer test
+        run: cmake --build build-expert-sanitizers --target test-resource-planner -j2
+
       - name: Run Phase 3 tests with sanitizers
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
@@ -144,6 +151,7 @@ jobs:
           build-expert-sanitizers/bin/test-transient-module-manager
           build-expert-sanitizers/bin/test-spec-tuner
           build-expert-sanitizers/bin/test-mapped-draft
+          build-expert-sanitizers/bin/test-resource-planner
 
   cpu-build:
     name: Native CPU server build
@@ -185,7 +193,9 @@ jobs:
             --expert-ram-cache-mib --expert-ram-staging-mib \
             --expert-storage-backend --expert-sidecar-only \
             --expert-vram-cache-mib --expert-vram-reserve-mib \
-            --expert-cache-min-observations; do
+            --expert-cache-min-observations \
+            --memory-policy --max-ram --reserve-vram \
+            --min-kv-quality --max-context --resource-preference; do
             if ! grep -Fq -- "$flag" native-help.txt; then
               echo "Required native option is missing: $flag"
               echo "--- llama-server --help ---"

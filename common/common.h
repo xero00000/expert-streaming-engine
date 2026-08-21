@@ -458,6 +458,15 @@ struct gpt_params {
     int64_t transient_vram_reserve_mib = 0;
     int64_t transient_mtp_mib = 0;          // measured MTP companion allocation
     int64_t transient_mmproj_mib = 0;       // measured multimodal projector allocation
+    std::string memory_policy = "";         // empty keeps legacy independent tuning
+    uint64_t max_ram_bytes = 0;             // global native-controller RAM ceiling
+    uint64_t reserve_vram_bytes = 0;        // safety reserve on every selected GPU
+    std::string min_kv_quality = "turbo4";
+    uint32_t max_context = 0;
+    std::string resource_preference = "balanced";
+    bool resource_plan_json = false;
+    std::string resolved_resource_plan_json;
+    ggml_type resolved_resource_kv_type = GGML_TYPE_COUNT;
     int expert_cache_min_observations = 2;
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
     bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)

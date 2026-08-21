@@ -936,6 +936,35 @@ int main(int argc, char ** argv) {
             }}}
         };
 
+        if (!ctx_server.params_base.resolved_resource_plan_json.empty()) {
+            const json resource_plan = json::parse(ctx_server.params_base.resolved_resource_plan_json);
+            auto & gauges = all_metrics_def["gauge"];
+            gauges.push_back({
+                {"name", "resource_context_tokens"},
+                {"help", "Context capacity selected by the global resource controller."},
+                {"value", resource_plan.at("context")},
+            });
+            gauges.push_back({
+                {"name", "resource_ram_planned_bytes"},
+                {"help", "RAM bytes committed by the global resource plan."},
+                {"value", resource_plan.at("ram_planned_bytes")},
+            });
+            gauges.push_back({
+                {"name", "resource_transient_capacity_bytes"},
+                {"help", "Shared transient-module capacity selected by the global resource controller."},
+                {"value", resource_plan.at("transient_capacity_bytes")},
+            });
+            for (const auto & device : resource_plan.at("devices")) {
+                const int device_id = device.at("id");
+                const std::string device_name = device_id < 0 ? "host" : std::to_string(device_id);
+                gauges.push_back({
+                    {"name", "resource_device_" + device_name + "_headroom_bytes"},
+                    {"help", "Uncommitted bytes above the configured reserve on this device."},
+                    {"value", device.at("headroom_bytes")},
+                });
+            }
+        }
+
         std::stringstream prometheus;
 
         for (const auto & el : all_metrics_def.items()) {
@@ -1096,6 +1125,10 @@ int main(int argc, char ** argv) {
             { "cors_proxy_enabled",          ctx_server.params_base.webui_mcp_proxy},
 
         };
+
+        if (!ctx_server.params_base.resolved_resource_plan_json.empty()) {
+            data["resource_plan"] = json::parse(ctx_server.params_base.resolved_resource_plan_json);
+        }
 
         if (ctx_server.params_base.use_jinja) {
             if (!tmpl_tools.empty()) {
