@@ -1,10 +1,18 @@
 #include "llama-kv-tier-policy.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <string>
 #include <vector>
+
+// CMake's default Release build defines NDEBUG; policy gates must still run.
+#undef assert
+#define assert(condition) do { if (!(condition)) { \
+    std::cerr << "FAILED: " << #condition << " (" << __FILE__ << ':' << __LINE__ << ")\n"; \
+    std::abort(); \
+} } while (0)
 
 static void test_static_map() {
     std::vector<llama_kv_tier_assignment> tiers;

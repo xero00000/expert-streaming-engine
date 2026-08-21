@@ -423,7 +423,7 @@ static __global__ void k_turbo_set_rows(
     const int64_t i00 = base % ne00;
     const int64_t i12 = i03 % ne12;
     const int64_t i11 = i02 % ne11;
-    const int64_t dst_row = src1[i01 * s10 + i11 * s11 + i12 * s12];
+    const int64_t dst_row = src1 ? src1[i01 * s10 + i11 * s11 + i12 * s12] : i01;
     if (dst_row < 0) return;
 
     const float * src_block = src0 + i01 * s01 + i02 * s02 + i03 * s03 + i00;
@@ -458,7 +458,7 @@ static __global__ void k_turbo_tcq_set_rows(
     const int64_t i00 = base % ne00;
     const int64_t i12 = i03 % ne12;
     const int64_t i11 = i02 % ne11;
-    const int64_t dst_row = src1[i01 * s10 + i11 * s11 + i12 * s12];
+    const int64_t dst_row = src1 ? src1[i01 * s10 + i11 * s11 + i12 * s12] : i01;
     if (dst_row < 0) return;
 
     const float * src_block = src0 + i01 * s01 + i02 * s02 + i03 * s03 + i00;
@@ -676,6 +676,67 @@ void ggml_cuda_turbo_kv_set_rows(
         else if (format == 3) launch_set_rows<3, int32_t>(src0, src1, dst, ctx.stream());
         else if (format == 4) launch_set_rows<4, int32_t>(src0, src1, dst, ctx.stream());
         else launch_set_rows<8, int32_t>(src0, src1, dst, ctx.stream());
+    }
+}
+
+template<int format>
+static void launch_quantize(
+        const ggml_tensor * src,
+        ggml_tensor * dst,
+        cudaStream_t stream) {
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src, dst));
+    GGML_ASSERT(src->ne[0] % GGML_TURBO_KV_BLOCK_ELEMENTS == 0);
+    GGML_ASSERT(src->nb[0] == sizeof(float));
+
+    constexpr int qk = GGML_TURBO_KV_BLOCK_ELEMENTS;
+    const int64_t total_blocks = ggml_nelements(src) / qk;
+    if constexpr (format <= 8) {
+        constexpr int threads = 64;
+        const int blocks = int((total_blocks + threads - 1) / threads);
+        k_turbo_set_rows<format, int32_t><<<blocks, threads, 0, stream>>>(
+            static_cast<const float *>(src->data), nullptr, dst->data,
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3], 0, 0,
+            src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float),
+            0, 0, 0, dst->nb[1], dst->nb[2], dst->nb[3]);
+    } else if constexpr (format == 11) {
+        k_turbo_tcq_set_rows<11, 1, 8, ggml_turbo1_tcq_block, int32_t>
+            <<<static_cast<int>(total_blocks), 1 << 8, 0, stream>>>(
+                static_cast<const float *>(src->data), nullptr, dst->data,
+                src->ne[0], src->ne[1], src->ne[2], src->ne[3], 0, 0,
+                src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float),
+                0, 0, 0, dst->nb[1], dst->nb[2], dst->nb[3]);
+    } else if constexpr (format == 12) {
+        k_turbo_tcq_set_rows<12, 2, 8, ggml_turbo2_tcq_block, int32_t>
+            <<<static_cast<int>(total_blocks), 1 << 8, 0, stream>>>(
+                static_cast<const float *>(src->data), nullptr, dst->data,
+                src->ne[0], src->ne[1], src->ne[2], src->ne[3], 0, 0,
+                src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float),
+                0, 0, 0, dst->nb[1], dst->nb[2], dst->nb[3]);
+    } else {
+        k_turbo_tcq_set_rows<13, 3, 9, ggml_turbo3_tcq_block, int32_t>
+            <<<static_cast<int>(total_blocks), 1 << 9, 0, stream>>>(
+                static_cast<const float *>(src->data), nullptr, dst->data,
+                src->ne[0], src->ne[1], src->ne[2], src->ne[3], 0, 0,
+                src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float),
+                0, 0, 0, dst->nb[1], dst->nb[2], dst->nb[3]);
+    }
+}
+
+void ggml_cuda_turbo_kv_quantize(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        ggml_tensor * dst) {
+    ggml_cuda_turbo_kv_ensure_tables();
+    switch (turbo_format_for_type(dst->type)) {
+        case 2:  launch_quantize<2>(src, dst, ctx.stream()); break;
+        case 3:  launch_quantize<3>(src, dst, ctx.stream()); break;
+        case 4:  launch_quantize<4>(src, dst, ctx.stream()); break;
+        case 8:  launch_quantize<8>(src, dst, ctx.stream()); break;
+        case 11: launch_quantize<11>(src, dst, ctx.stream()); break;
+        case 12: launch_quantize<12>(src, dst, ctx.stream()); break;
+        case 13: launch_quantize<13>(src, dst, ctx.stream()); break;
+        default: GGML_ABORT("%s: unsupported destination type %s\n", __func__, ggml_type_name(dst->type));
     }
 }
 

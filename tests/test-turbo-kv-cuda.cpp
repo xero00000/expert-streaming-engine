@@ -221,14 +221,17 @@ void check_format(
     require(context != nullptr, std::string(name) + ": context");
 
     ggml_tensor * base = ggml_new_tensor_2d(context, type, width, base_rows);
+    ggml_tensor * copy_base = ggml_new_tensor_2d(context, type, width, update_rows);
     ggml_tensor * source = ggml_new_tensor_2d(context, GGML_TYPE_F32, width, update_rows);
     ggml_tensor * indices = ggml_new_tensor_1d(context, index_type, update_rows);
     ggml_tensor * stored = ggml_set_rows(context, base, source, indices);
+    ggml_tensor * copied = ggml_cpy(context, source, copy_base);
     ggml_tensor * decoded = index_type == GGML_TYPE_I32 ? ggml_get_rows(context, stored, indices) : nullptr;
 
     ggml_backend_t backend = ggml_backend_cuda_init(device, nullptr, nullptr);
     require(backend != nullptr, std::string(name) + ": CUDA backend");
     require(ggml_backend_supports_op(backend, stored), std::string(name) + ": CUDA SET_ROWS support");
+    require(ggml_backend_supports_op(backend, copied), std::string(name) + ": CUDA CPY quantize support");
     if (decoded != nullptr) {
         require(ggml_backend_supports_op(backend, decoded), std::string(name) + ": CUDA GET_ROWS support");
     }
@@ -249,6 +252,7 @@ void check_format(
 
     ggml_cgraph * graph = ggml_new_graph(context);
     ggml_build_forward_expand(graph, decoded != nullptr ? decoded : stored);
+    ggml_build_forward_expand(graph, copied);
     require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             std::string(name) + ": CUDA graph compute");
     ggml_backend_synchronize(backend);
@@ -266,6 +270,10 @@ void check_format(
                         expected.data() + encoded_row_bytes,
                         encoded_row_bytes) == 0,
             std::string(name) + ": row 2 GPU bytes match CPU reference");
+
+    std::vector<uint8_t> copied_bytes(expected.size());
+    ggml_backend_tensor_get(copy_base, copied_bytes.data(), 0, copied_bytes.size());
+    require(copied_bytes == expected, std::string(name) + ": CPY GPU bytes match CPU reference");
 
     float max_error = 0.0f;
     if (decoded != nullptr) {

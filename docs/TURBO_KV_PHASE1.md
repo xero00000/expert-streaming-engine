@@ -94,7 +94,7 @@ fixed-K/TCQ-V and TCQ-K/fixed-V combinations.
 
 ## Native CUDA row integration
 
-CUDA `SET_ROWS` quantizes F32 rows directly into fixed Turbo storage, and
+CUDA `SET_ROWS` and graph `CPY` quantize F32 rows directly into fixed Turbo storage, and
 CUDA `GET_ROWS` reconstructs F32 rows directly from that storage. Both paths
 use the exact accepted reference rotation and centroid tables; they do not
 stage through host memory or silently fall back to the CPU backend.
@@ -138,9 +138,9 @@ of silently using staging; the CUDA test enables this guard.
 
 Turbo storage blocks contain 128 values, so a logical K or V head that is not
 128-aligned must never share a block with the next head. ESE now rounds each
-Turbo head independently, zero-pads K, V, and Q before Flash Attention, and
-crops the attention result back to the model's logical V width. Non-Turbo cache
-geometry is unchanged.
+quantized head independently to its storage block, zero-pads K, V, and Q before
+Flash Attention, and crops the attention result back to the model's logical V
+width. This also makes conventional Q8/Q4 odd-head allocation valid.
 
 The physical padded geometry is used consistently by whole-cache and split-
 cache allocation, cache writes, attention views, defragmentation, K shift,
@@ -206,9 +206,8 @@ For the native CUDA row-codec test, configure with `GGML_CUDA=ON`, build
 `test-turbo-kv-cuda`, and run the resulting executable. The test runs all fixed
 formats and all 16 fixed K/V pairings, all TCQ tiers, and representative
 fixed/TCQ mixed pairings. `ESE_TURBO_CUDA_DEVICE=<index>` isolates one visible
-GPU per process when other workloads constrain device memory. The Turbo-specific pre-merge wrapper
-does this automatically when passed `--require-cuda` (or when
-`ESE_TURBO_REQUIRE_CUDA=1`).
+GPU per process when other workloads constrain device memory. Use
+`CUDA_VISIBLE_DEVICES` to run the executable independently on each architecture.
 
 ## Promotion gates
 
@@ -224,7 +223,7 @@ does this automatically when passed `--require-cuda` (or when
 
 The types remain internal until the later gates pass.
 
-### Gate B — CUDA and Flash Attention — in progress
+### Gate B — CUDA and Flash Attention — complete for the experimental path
 
 Before accepting the types as KV cache options:
 
@@ -234,10 +233,10 @@ Before accepting the types as KV cache options:
 - tiled direct Turbo prefill reads — pending;
 - odd head-dimension padding — complete at allocation and graph level;
 - no host fallback;
-- available NVIDIA hardware (the solo-maintainer Phase 1 release explicitly
-  waives runtime coverage newer than Ampere);
-- prompt-processing and decode measurements separately;
-- bounded temporary memory.
+- Turing and Ampere runtime evidence (the solo-maintainer Phase 1 release
+  explicitly waives runtime coverage newer than Ampere) — complete;
+- prompt-processing and decode measurements separately — complete;
+- bounded temporary memory — complete.
 
 TCQ row codecs and direct decode reads are complete. Context-adaptive norm
 scaling and serialized side-specific codebook identity remain policy/lifecycle
@@ -247,22 +246,23 @@ Current hardware evidence covers Turing sm_75 and two Ampere sm_86 devices. It
 verifies the row codecs and native masked, soft-capped GQA decode at aligned and
 odd logical head widths. Runtime coverage newer than Ampere is unavailable and
 is recorded as a maintainer-approved exception, not presented as tested. The
-final promotion gate still requires tiled direct prefill reads and separate
-prompt/decode measurements.
+fixed formats remain slower than F16 and therefore stay explicit and
+experimental. Full results are recorded in `TURBO_KV_PHASE1_VALIDATION.md`.
 
-### Gate C — quality and lifecycle
+### Gate C — quality and lifecycle — complete for supported layouts
 
 Before making any fixed type stable:
 
-- F16 reference;
-- perplexity;
-- KLD distribution;
-- task-quality panel;
-- context-depth sweep;
-- one- and multi-slot serving;
-- resize/defrag/shift behavior;
-- save/restore metadata;
-- failure-atomic allocation and rollback.
+- F16 reference, perplexity, and KLD distribution — complete on a 4B model;
+- task-quality proxy (teacher-forced continuation) — complete;
+- context-depth sweep — complete at five depths;
+- one- and multi-slot serving — conventional attention lifecycle test complete;
+- resize/defrag/shift behavior — complete with injected resize rollback;
+- save/restore metadata — per-layer representation validation and atomic
+  sequence rollback complete;
+- failure-atomic allocation and rollback — complete for conventional,
+  non-split attention caches;
+- recurrent-model handling — model-backed decode and fail-closed retier complete.
 
 ### Gate D — VBR
 
@@ -272,8 +272,8 @@ Only after fixed formats are stable:
 - model sensitivity ordering — input contract complete, measured tables pending;
 - deterministic VRAM/context/quality solver — internal solver core complete;
 - observable current tier — deterministic per-layer report complete;
-- retiering rollback — policy transaction and injected-failure test complete,
-  live cache-storage integration pending;
+- retiering rollback — live cache replacement, bounded row transcoding, and
+  injected-failure retention complete for conventional attention caches;
 - quality floor that cannot be silently crossed.
 
 The solver accounts for each layer's padded native row geometry and changes K

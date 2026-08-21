@@ -172,6 +172,8 @@ int main() {
             "Turbo8 rounds each head to the next 128-value block");
     require(llama_kv_head_dim_for_type(GGML_TYPE_TURBO1_TCQ, 96) == 128,
             "Turbo1-TCQ pads a 96-wide head independently");
+    require(llama_kv_head_dim_for_type(GGML_TYPE_Q8_0, 48) == 64,
+            "Q8 cache padding prevents blocks from straddling 48-wide heads");
     require(llama_kv_gqa_dim_for_type(GGML_TYPE_TURBO4_0, 96, 3) == 384,
             "Turbo GQA padding does not cross head boundaries");
 

@@ -9,6 +9,7 @@
 #include "ggml.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
+#include "ggml-turbo-kv.h"
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -38,6 +39,7 @@
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/tsembd.cuh"
+#include "ggml-cuda/turbo-kv.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/conv-transpose-1d.cuh"
@@ -4910,6 +4912,11 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q8_0) {
                     return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && ggml_cuda_turbo_kv_type_supported(src1_type)) {
+                    return op->src[0]->ne[0] % GGML_TURBO_KV_BLOCK_ELEMENTS == 0 &&
+                           op->src[0]->nb[0] == sizeof(float) &&
+                           ggml_are_same_shape(op->src[0], op->src[1]);
                 }
                 if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F32) {
                     return true;

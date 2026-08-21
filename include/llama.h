@@ -947,6 +947,34 @@ extern "C" {
     //   - explicitly with llama_kv_cache_update()
     LLAMA_API void llama_kv_cache_defrag(struct llama_context * ctx);
 
+    // Experimental mixed-tier KV observability and live retiering. Turbo/TCQ
+    // names remain absent from the normal CLI cache parser until Phase 1 gates
+    // pass. Retiering is failure-atomic: false leaves the original cache and
+    // its sequence metadata unchanged.
+    struct llama_kv_cache_layer_types {
+        enum ggml_type type_k;
+        enum ggml_type type_v;
+    };
+
+    LLAMA_API uint32_t llama_kv_cache_layer_count(const struct llama_context * ctx);
+
+    LLAMA_API uint32_t llama_kv_cache_size(const struct llama_context * ctx);
+
+    LLAMA_API bool llama_kv_cache_get_layer_types(
+            const struct llama_context * ctx,
+            struct llama_kv_cache_layer_types * types,
+            uint32_t capacity);
+
+    LLAMA_API bool llama_kv_cache_retier(
+            struct llama_context * ctx,
+            const enum ggml_type * type_k_layers,
+            const enum ggml_type * type_v_layers,
+            uint32_t n_layers);
+
+    // Resize the storage while preserving every occupied cell. The requested
+    // size must respect backend padding and cannot exceed the context limit.
+    LLAMA_API bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size);
+
     // Apply the KV cache updates (such as K-shifts, defragmentation, etc.)
     // Positive return values does not mean a fatal error, but rather a warning.
     //    0 - success

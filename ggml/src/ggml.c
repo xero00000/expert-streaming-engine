@@ -11792,11 +11792,14 @@ static void ggml_compute_forward_dup_same_cont(
     const int ith = params->ith; // thread index
     const int nth = params->nth; // number of threads
 
-    // parallelize by elements
-    const int ne = ggml_nelements(dst);
-    const int dr = (ne + nth - 1) / nth;
-    const int ie0 = dr * ith;
-    const int ie1 = MIN(ie0 + dr, ne);
+    // Parallelize by stored blocks. For quantized tensors, nelements counts
+    // scalar values while type_size is the size of an entire block; combining
+    // the two would copy blck_size times beyond the tensor bounds.
+    GGML_ASSERT(ggml_nbytes(dst) == ggml_nbytes(src0));
+    const int64_t n_blocks = ggml_nbytes(dst) / ggml_type_size(dst->type);
+    const int64_t dr = (n_blocks + nth - 1) / nth;
+    const int64_t ie0 = dr * ith;
+    const int64_t ie1 = MIN(ie0 + dr, n_blocks);
 
     if (ie0 < ie1) {
         memcpy(

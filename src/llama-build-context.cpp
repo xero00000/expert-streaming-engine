@@ -421,9 +421,13 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
                 }
             }
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_k_src, view_k_dst));
+            // Defrag moves toward lower cache indices, so a source range can
+            // overlap its destination. Stage through graph-owned storage: the
+            // CPU quantized copy path uses memcpy and cannot safely handle an
+            // overlapping in-place copy.
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_dup(ctx0, view_k_src), view_k_dst));
             if (view_v_src && view_v_dst) {
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_dup(ctx0, view_v_src), view_v_dst));
             }
 
             // DSA lightning-indexer key cache: move the indexer keys alongside k_l. Each cell's
@@ -441,7 +445,7 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
                         head_size, nm,
                         ggml_row_size(kv_self.kr_l[il]->type, head_size),
                         ggml_row_size(kv_self.kr_l[il]->type, head_size*id));
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_kr_src, view_kr_dst));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_dup(ctx0, view_kr_src), view_kr_dst));
             }
         }
 
@@ -892,8 +896,13 @@ void llm_build_context::llm_build_kv_store(
         const int64_t cache_head_k = kv.k_l[il]->ne[0];
         GGML_ASSERT(cache_head_k >= n_embd_head_k);
         if (cache_head_k > n_embd_head_k) {
+            // k_cur is commonly flattened as [head_dim * heads, tokens].
+            // Reshape first so padding is applied independently to every head
+            // instead of once at the end of the flattened GQA row.
+            k_cur = ggml_reshape_3d(ctx, k_cur, n_embd_head_k, n_head_kv, n_tokens);
             k_cur = ggml_pad(ctx, k_cur, cache_head_k - n_embd_head_k, 0, 0, 0);
         }
+        k_cur = ggml_reshape_2d(ctx, k_cur, cache_head_k, n_tokens*n_head_kv);
         const size_t k_row_size = ggml_row_size(kv.k_l[il]->type, cache_head_k);
         ggml_tensor * k_cache_view = ggml_view_2d(ctx, kv.k_l[il], cache_head_k, n_tokens*n_head_kv,
                 k_row_size, k_row_size*n_head_kv*kv_head);
@@ -913,10 +922,13 @@ void llm_build_context::llm_build_kv_store(
             const int64_t cache_head_v = cache_v_gqa / n_head_kv;
             GGML_ASSERT(cache_v_gqa % n_head_kv == 0 && cache_head_v >= logical_head_v);
             if (cache_head_v > logical_head_v) {
+                v_cur = ggml_reshape_3d(ctx, v_cur, logical_head_v, n_head_kv, n_tokens);
                 v_cur = ggml_pad(ctx, v_cur, cache_head_v - logical_head_v, 0, 0, 0);
             }
-            v_cache_view = ggml_view_1d(ctx, kv.v_l[il], n_tokens*cache_v_gqa,
-                    kv_head*ggml_row_size(kv.v_l[il]->type, cache_v_gqa));
+            v_cur = ggml_reshape_2d(ctx, v_cur, cache_head_v, n_tokens*n_head_kv);
+            const size_t v_row_size = ggml_row_size(kv.v_l[il]->type, cache_head_v);
+            v_cache_view = ggml_view_2d(ctx, kv.v_l[il], cache_head_v, n_tokens*n_head_kv,
+                    v_row_size, kv_head*v_row_size*n_head_kv);
             lctx.cache_copies[2*il+1].step = ggml_row_size(kv.v_l[il]->type, cache_v_gqa);
         } else {
             // note: the V cache is transposed for legacy non-FA layouts
@@ -3167,6 +3179,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 if (cache_head_k > n_embd_head_k) {
                     Kcur = ggml_pad(ctx0, Kcur, cache_head_k - n_embd_head_k, 0, 0, 0);
                 }
+                Kcur = ggml_reshape_2d(ctx0, Kcur, cache_head_k, n_tokens*n_head_kv);
                 const size_t k_row_size = ggml_row_size(split_kl->type, cache_head_k);
                 ggml_tensor * k_cache_view = ggml_view_2d(ctx0, split_kl, cache_head_k, n_tokens*n_head_kv,
                         k_row_size, k_row_size*n_head_kv*kv_head);
@@ -3183,8 +3196,10 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     if (cache_head_v > n_embd_head_v) {
                         Vcur = ggml_pad(ctx0, Vcur, cache_head_v - n_embd_head_v, 0, 0, 0);
                     }
-                    v_cache_view = ggml_view_1d(ctx0, split_vl, n_tokens*cache_v_gqa,
-                            kv_head*ggml_row_size(split_vl->type, cache_v_gqa));
+                    Vcur = ggml_reshape_2d(ctx0, Vcur, cache_head_v, n_tokens*n_head_kv);
+                    const size_t v_row_size = ggml_row_size(split_vl->type, cache_head_v);
+                    v_cache_view = ggml_view_2d(ctx0, split_vl, cache_head_v, n_tokens*n_head_kv,
+                            v_row_size, kv_head*v_row_size*n_head_kv);
                     lctx.cache_copies[idx+1].step = ggml_row_size(split_vl->type, cache_v_gqa);
                 } else {
                     // note: the V cache is transposed when not using flash attention

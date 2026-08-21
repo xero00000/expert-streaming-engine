@@ -95,11 +95,14 @@ The internal policy core now builds strict independent K/V maps, rejects
 out-of-range and overlapping assignments, accounts for padded Turbo rows, and
 feeds the existing first/last layer overrides into one deterministic plan. An
 experimental C API accepts complete K and V layer arrays independently without
-adding Turbo/TCQ names to the public CLI parser. Checkpoint records already
-carry the actual type and row size for every layer. Live resize remains staged.
-The policy transition layer
-now prepares every change before a non-failing publish and has injected-failure
-rollback coverage; cache-storage integration is still in progress.
+adding Turbo/TCQ names to the public CLI parser. Checkpoint records carry the
+actual type and row size for every layer. Live retiering now prepares a full
+replacement cache, converts occupied rows with bounded per-head host staging,
+and publishes only after every conversion succeeds. Injected conversion
+failure, multi-slot continuation, resize, shift, defrag, and representation-aware
+checkpoint rollback are covered on a conventional attention model. A model-
+backed recurrent test decodes successfully and proves retiering fails closed;
+hybrid, transposed, MLA, and split layouts remain explicitly unsupported.
 
 ### Dynamic VBR
 
