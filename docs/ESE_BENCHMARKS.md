@@ -2,6 +2,101 @@
 
 These measurements are retained as engineering evidence for promoted settings. They are not normalized across projects and are not promises for other hardware.
 
+## v0.1.0 candidate: Qwen3.6 35B-A3B MoE
+
+Measured on 2026-08-21 from commit `6c4d7d9db7eff21a1faa9a548486343743638b98`.
+ESE identified 40 blocks, 256 experts, and the `qwen35moe` architecture. The
+18,178,317,280-byte mixed-Q2K imatrix GGUF contains 34,660,610,688 total
+parameters with about 3B active parameters per token. The runtime reports its
+quantization class as `Q4_K - Medium`.
+
+| Component | Configuration |
+| --- | --- |
+| Model | Qwen3.6 35B-A3B mixed-Q2K imatrix GGUF |
+| Model SHA-256 | `9b9bdc97b9a4c84dfbd92a9dca78a2905f9181bbb49e0e2d4d1f26b30ff9438c` |
+| CPU / RAM | Ryzen 9 5950X, 16 cores / 32 threads; 46 GiB RAM |
+| GPUs | RTX 3060 Ti + RTX 2080 SUPER + RTX 3080; layer split `31/31/38` |
+| Driver / CUDA | NVIDIA 595.84; CUDA 13.2 build toolkit |
+| Model storage | ST4000VX016-3CV104 SATA, Btrfs |
+| Build | GCC/G++ 12.4, CUDA architectures `75;86`, ESE build 4817 |
+
+Command (the absolute model path is shortened to `$MODEL`):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 ./llama-bench \
+  -m "$MODEL" -p 512,2048 -n 128 -b 1024 -ub 512 \
+  -ctk q8_0 -ctv q8_0 -t 8 -ngl 999 \
+  -sm layer -ts 31/31/38 -fa 1 -r 5 -w 1 -o json
+```
+
+All 40 layers were GPU-resident with fused MoE enabled. Five measured
+repetitions followed one warmup:
+
+| Workload | Mean | Median | Minimum | Std. dev. |
+| --- | ---: | ---: | ---: | ---: |
+| 512-token prompt processing | 1,504.41 tok/s | 1,612.46 tok/s | 1,063.13 tok/s | 246.75 |
+| 2,048-token prompt processing | 1,581.07 tok/s | 1,583.32 tok/s | 1,568.04 tok/s | 9.30 |
+| 128-token generation | 118.02 tok/s | 116.59 tok/s | 114.96 tok/s | 3.13 |
+
+The first measured 512-token repetition was the low outlier; the other four
+were 1,607–1,623 tok/s. Startup from the external SATA model store is excluded
+from these steady-state measurements. `ese plan` selected `resident` because
+the 16.93 GiB file fit within the safe share of 24.22 GiB detected free VRAM.
+
+## v0.1.0 candidate: Qwen3.5 27B dense
+
+Measured on 2026-08-21 from commit `6c4d7d9db7eff21a1faa9a548486343743638b98`
+(clean native sources; release-document changes did not affect the benchmark binary).
+This is a dense-model, all-GPU throughput baseline for the consolidated release,
+not an expert-streaming result.
+
+| Component | Configuration |
+| --- | --- |
+| Model | Qwen3.5 27B Q4_K_M, 26,895,998,464 parameters, 16,536,406,016 bytes |
+| Model SHA-256 | `3445102e9cde5d562508642c100a2f5ac3368a5a3f748442811d7a95daee3bec` |
+| CPU / RAM | Ryzen 9 5950X, 16 cores / 32 threads; 46 GiB RAM |
+| GPU 0 | RTX 3060 Ti, 8 GiB, `sm_86` |
+| GPU 1 | RTX 2080 SUPER, 8 GiB, `sm_75` |
+| GPU 2 | RTX 3080, 10 GiB, `sm_86` |
+| Driver / CUDA | NVIDIA 595.84; CUDA 13.2 build toolkit |
+| Storage | WDC WDS100T2B0C-00PXH0 NVMe |
+| Build | GCC/G++ 12.4, CUDA architectures `75;86`, ESE build 4817 |
+
+Command (the absolute model path is shortened to `$MODEL`):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 ./llama-bench \
+  -m "$MODEL" -p 512,2048 -n 128 -b 1024 -ub 512 \
+  -ctk q8_0 -ctv q8_0 -t 8 -ngl 999 \
+  -sm layer -ts 31/31/38 -fa 1 -r 5 -w 1 -o json
+```
+
+Five measured repetitions followed one warmup:
+
+| Workload | Mean | Median | Minimum | Std. dev. |
+| --- | ---: | ---: | ---: | ---: |
+| 512-token prompt processing | 660.60 tok/s | 672.64 tok/s | 609.80 tok/s | 28.42 |
+| 2,048-token prompt processing | 666.03 tok/s | 666.75 tok/s | 663.65 tok/s | 1.58 |
+| 128-token generation | 26.78 tok/s | 26.74 tok/s | 26.72 tok/s | 0.08 |
+
+### Live resource-controller check
+
+The same model was started through `ese serve` with a 65,536-token context,
+one slot, F16 KV, all 66 layers on the GPUs, and an explicit 1 GiB reserve on
+each device. The native controller selected the same plan on repeated input,
+the server became ready in about 12 seconds, and `/props` plus `/metrics`
+reported the selected plan. After the model, 4 GiB KV cache, and compute buffers
+were allocated, `nvidia-smi` reported:
+
+| Device | VRAM used | VRAM free | Required reserve |
+| --- | ---: | ---: | ---: |
+| RTX 3060 Ti | 6,586 MiB | 1,257 MiB | 1,024 MiB |
+| RTX 2080 SUPER | 6,636 MiB | 1,151 MiB | 1,024 MiB |
+| RTX 3080 | 8,202 MiB | 1,673 MiB | 1,024 MiB |
+
+This verifies the release controller's reserve invariant on the available
+Turing and Ampere hardware. It does not claim Ada-or-newer coverage.
+
 ## GPT-OSS 120B F16
 
 Reference machine:

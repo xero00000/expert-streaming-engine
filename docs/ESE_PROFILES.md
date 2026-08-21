@@ -136,7 +136,8 @@ This sets `LLAMA_EXPERT_PREFETCH_TAIL=4`. The fired top-k stays first; the extra
 
 ## KV selection
 
-Automatic selection deliberately uses only existing native types:
+The launcher's explicit `--kv` selector deliberately exposes stable native
+types only:
 
 - `q8_0` for the normal path;
 - `q4_0` when context exceeds 131K or detected usable VRAM is very low.
@@ -149,7 +150,10 @@ Override directly:
 ./ese serve MODEL.gguf --kv q4_0
 ```
 
-VBR/Turbo/TCQ is not exposed until its kernels, quality measurements, and lifecycle tests pass.
+The native resource controller can select checked internal Turbo tiers while
+respecting `--min-kv-quality`; incompatible model geometry removes a tier from
+consideration instead of falling back. Turbo/TCQ names remain absent from the
+legacy public cache-type parser until their remaining promotion gates pass.
 
 ## Multi-GPU split
 
@@ -169,9 +173,10 @@ Override after measuring a better model-specific split:
 
 Each participating device has its own capacity and reserve. Expert uploads use
 dedicated transfer streams and event dependencies, while placement follows the
-normal graph/tensor split. The Phase 2 acceptance matrix exercises one, two,
-and three GPUs; the implementation remains validation-pending until that
-runtime evidence is attached.
+normal graph/tensor split. The Phase 2 acceptance matrix passed on one, two,
+and three GPUs across Turing and Ampere. Ada-or-newer runtime coverage is
+explicitly not claimed because suitable hardware is unavailable to the solo
+maintainer.
 
 ## Context and reserve
 

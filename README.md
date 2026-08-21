@@ -1,179 +1,200 @@
 # Expert Streaming Engine
 
-Run sparse Mixture-of-Experts models on machines where the full model does not fit comfortably in VRAM—and, with deferred experts, where the expert set can exceed the safe system-RAM budget.
+[![CI](https://github.com/xero00000/expert-streaming-engine/actions/workflows/ese-ci.yml/badge.svg?branch=main)](https://github.com/xero00000/expert-streaming-engine/actions/workflows/ese-ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/xero00000/expert-streaming-engine)](https://github.com/xero00000/expert-streaming-engine/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-ESE is a focused `ik_llama.cpp`/`llama.cpp` fork with one transparent launcher and four native execution policies:
+Run sparse Mixture-of-Experts GGUF models when the full model does not fit in
+VRAM—and, with deferred experts, when it cannot safely remain resident in RAM.
 
-- **resident** — normal GPU offload when the model fits;
-- **hybrid** — dense tensors on GPU, routed experts on CPU, with an optional MoE tail retained on GPU;
-- **cache** — bounded RAM expert leases feeding an adaptive per-device VRAM cache;
-- **stream** — the same bounded hierarchy with deferred expert residency and explicit storage I/O.
+Expert Streaming Engine (ESE) is a Linux-focused `ik_llama.cpp`/`llama.cpp`
+fork. It combines a transparent `ese` launcher with a native global resource
+controller and a bounded `NVMe → RAM → VRAM` expert hierarchy. The result is a
+normal `llama-server` and OpenAI-compatible API with explicit memory limits,
+observable decisions, and no hidden backend or precision fallback.
 
-The launcher never replaces the native runtime. `ese plan` prints the exact environment and `llama-server` command before anything runs.
+## Quick start
 
-The native Phase 4 controller is the final authority for memory decisions. A
-direct invocation can use the same declarative interface:
-
-```bash
-llama-server -m /models/model.gguf \
-  --memory-policy auto --max-ram 40GiB --reserve-vram 1GiB \
-  --min-kv-quality turbo4 --max-context 128K --metrics
-```
-
-Before accepting requests it prints a reproducible JSON allocation plan. The
-same plan is available from `/props`, with capacity/headroom gauges in
-`/metrics`. See [Phase 4 controller](docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md).
-
-## Start here
-
-Requirements: Linux, Python 3.10+, CMake, a C++ compiler, and optionally CUDA.
+Requirements: Linux, Python 3.10+, CMake, a C++ compiler, and optionally an
+NVIDIA CUDA toolchain.
 
 ```bash
-git clone https://github.com/xero00000/expert-streaming-engine
+git clone https://github.com/xero00000/expert-streaming-engine.git
 cd expert-streaming-engine
 
 ./ese doctor
-./ese build
+./ese build                    # auto-detect CUDA; use --backend cpu to force CPU
+./ese plan /models/model.gguf  # inspect the complete command without running it
 ./ese serve /models/model.gguf
 ```
 
-Inspect a launch without starting the server:
+The server listens on `http://127.0.0.1:8080` by default. Check it with:
 
 ```bash
-./ese plan /models/model.gguf
+curl http://127.0.0.1:8080/health
 ```
 
-Force a policy:
+Split GGUFs are supported: pass any correctly named shard and ESE validates the
+complete set before launch.
 
-```bash
-./ese serve /models/model.gguf --policy resident
-./ese serve /models/model.gguf --policy hybrid
-./ese serve /models/model.gguf --policy cache
-./ese serve /models/model.gguf --policy stream
-```
+## Four execution policies
 
-Pass any native option after `--`:
+`auto` is recommended. ESE inspects GGUF metadata, all model shards, available
+host RAM, and current per-GPU VRAM before choosing a native policy.
 
-```bash
-./ese serve /models/model.gguf -c 131072 -- --jinja --metrics
-```
-
-The default API address is `http://127.0.0.1:8080`.
-
-## What auto mode does
-
-`ese` reads scalar GGUF metadata, validates and totals split shards, checks available RAM and NVIDIA VRAM, and selects the least complicated safe path.
-
-| Policy | Selected when | Native mechanism |
+| Policy | Use it when | Execution path |
 | --- | --- | --- |
-| `resident` | The model fits safely in free VRAM, or is dense | `-ngl 99`, with native `--fit` when needed |
-| `hybrid` | Selected explicitly for static CPU/GPU MoE placement | `--cpu-moe`, optionally `--n-cpu-moe N` |
-| `cache` | A MoE fits RAM but not VRAM | bounded RAM leases plus adaptive per-device VRAM residency |
-| `stream` | A MoE exceeds the safe RAM budget | the same controller plus `--defer-experts` and `pread` by default |
-
-On multiple NVIDIA GPUs, the launcher derives `--tensor-split` from currently free VRAM. Every decision includes a readable reason and can be emitted as JSON.
+| `resident` | The model fits safely in VRAM, or is dense | Normal GPU offload and native fit |
+| `hybrid` | You want static CPU/GPU MoE placement | Dense tensors on GPU; experts on CPU; optional GPU MoE tail |
+| `cache` | Sparse weights fit RAM but not VRAM | Bounded RAM leases feeding adaptive per-device VRAM caches |
+| `stream` | Sparse weights exceed the safe RAM budget | Deferred expert storage feeding the same bounded cache hierarchy |
 
 ```bash
-./ese plan /models/model.gguf --json
+./ese serve MODEL.gguf --policy auto
+./ese serve MODEL.gguf --policy hybrid --gpu-resident-moe 6
+./ese serve MODEL.gguf --policy cache --expert-ram-cache 4GiB
+./ese serve MODEL.gguf --policy stream --expert-storage-backend pread
 ```
+
+Use `./ese plan MODEL.gguf --json` for machine-readable launcher output. Pass
+native `llama-server` options after `--`:
+
+```bash
+./ese serve MODEL.gguf -c 131072 -- --jinja --metrics
+```
+
+## Native memory controller
+
+The launcher discovers hardware and supplies limits; the native runtime makes
+the final allocation decision from real model geometry. Direct native launches
+can use the same interface:
+
+```bash
+build/bin/llama-server -m MODEL.gguf \
+  --memory-policy auto \
+  --max-ram 40GiB \
+  --reserve-vram 1GiB \
+  --min-kv-quality turbo4 \
+  --max-context 128K \
+  --metrics
+```
+
+Before accepting requests, the runtime prints one deterministic JSON plan that
+accounts for:
+
+- dense and routed-expert weights;
+- bounded expert RAM and per-device VRAM caches;
+- KV quality, context, slots, batch, and graph workspace;
+- prompt cache and disk-I/O staging;
+- MTP/draft and multimodal transient modules;
+- a safety reserve on every selected GPU.
+
+The same object is returned by `/props`; `/metrics` reports the selected
+context, planned RAM, transient capacity, and per-device headroom. Requested
+storage backends and KV quality floors fail closed instead of silently falling
+back. Plan transitions use prepare/commit/rollback semantics.
+
+## How data moves
+
+```text
+GGUF shards on NVMe
+        │
+        ▼
+checked expert descriptors ──► bounded RAM leases
+                                      │
+                                      ▼
+                              adaptive GPU caches
+                                      │
+          ┌───────────────────────────┼───────────────────────────┐
+          ▼                           ▼                           ▼
+      resident                    cache/stream                 transient
+    model tensors              routed MoE experts           MTP / mmproj
+          └───────────────────────────┬───────────────────────────┘
+                                      ▼
+                         llama-server / OpenAI API
+```
+
+Every cache has a configured capacity. Expert uploads use dedicated CUDA
+transfer streams and event-scoped readiness; in-flight leases cannot be
+evicted. Multi-GPU placement and reserves are accounted per device.
 
 ## Useful commands
 
 ```bash
-./ese doctor
-./ese build
+./ese doctor --json
 ./ese build --backend cuda --clean
 ./ese plan MODEL.gguf --json
 ./ese serve MODEL.gguf --dry-run
-./ese serve MODEL.gguf --kv q4_0 -c 262144
+./ese serve MODEL.gguf --slots 2 -c 131072
 ./ese serve MODEL.gguf --tensor-split 46,54
-./ese serve MODEL.gguf --policy hybrid --gpu-resident-moe 6
-./ese serve MODEL.gguf --policy cache --expert-ram-cache 2GiB
-./ese serve MODEL.gguf --policy stream --gpu-resident-moe 6
+./ese serve MODEL.gguf --reserve-vram 2GiB
 ```
 
-Run `./ese <command> --help` for the complete interface.
+Run `./ese <command> --help` for the complete stable launcher interface. The
+full native option reference remains available through
+`build/bin/llama-server --help`.
 
-## Architecture
+## Validation status
 
-```text
-                              ESE
-                               │
-                    GGUF metadata + hardware
-                               │
-                    native memory controller
-        ┌──────────────┬────────┴───────┬──────────────┐
-        │              │                │              │
-     resident        hybrid           cache          stream
-        │              │                │              │
- GPU/native fit  static CPU MoE   bounded RAM →  deferred storage
-                  + GPU tail       adaptive VRAM  → RAM → VRAM
-        └──────────────┴────────┬───────┴──────────────┘
-                               │
-                     llama-server / OpenAI API
-```
+The merged desktop path is covered by Python surface tests, native release
+tests, ASAN/UBSAN lifecycle tests, CPU server builds, and model-backed CUDA
+validation.
 
-The native controller now coordinates the bounded
-`NVMe/model shards → RAM cache → VRAM cache` hierarchy with KV, workspace,
-prompt cache, MTP/mmproj capacity, and per-device reserves. The launcher is a
-compatibility and hardware-setup layer rather than the final policy owner.
+| Area | Current evidence |
+| --- | --- |
+| Expert hierarchy | mmap/pread parity, forced eviction, sanitizer coverage, and 1/2/3-GPU execution |
+| CUDA hardware | RTX 2080 SUPER (`sm_75`), RTX 3060 Ti (`sm_86`), and RTX 3080 (`sm_86`) |
+| Global controller | CPU plus real Turing+Ampere three-GPU model load with explicit 1 GiB reserves |
+| Transient/speculation | CPU, Turing, Ampere, and model-backed image→text module swapping |
+| Turbo KV foundation | CPU/CUDA codecs, direct attention paths, lifecycle tests, and quality sweeps |
 
-See [Architecture](docs/ESE_ARCHITECTURE.md) for invariants and component boundaries.
+Ada-or-newer runtime coverage is not claimed: suitable hardware is unavailable
+to the solo maintainer. Those architecture-specific gates remain future work;
+the runtime must still fail closed rather than inventing a synthetic pass.
 
-## Current native capabilities
+The Android/QNN port remains a separate draft until it receives physical-device
+build, parity, memory, and thermal evidence.
 
-- deferred expert storage with mmap, pread, and native io_uring backends;
-- route-aware top-k page-cache prefetch and optional router-logit-tail staging;
-- immutable checked expert descriptors spanning GGUF shards;
-- fixed-arena RAM caching with lease-scoped lifetime and mmap/pread/io_uring sources;
-- adaptive per-device VRAM caching with hysteresis, topology-aware placement,
-  dedicated transfer streams, event-scoped readiness, and structured telemetry;
-- deterministic native global planning with exact policy/context/KV/cache/
-  transient decisions, failure-atomic transition hooks, plan JSON, and metrics;
-- CPU MoE with a selected final MoE tail resident on GPU;
-- multi-GPU tensor splitting;
-- DeepSeek V4 Flash integration work;
-- DSpark, native MTP, and model-specific speculative paths on the integration line;
-- Maple/DeepGrove architecture and native TQ2_0 CPU/CUDA paths;
-- CUDA sparse/grouped MoE work, MXFP4 support, Flash Attention, and existing quantized KV types;
-- standard `llama-server`, CLI, conversion, and API compatibility inherited upstream.
+## Reference performance
 
-The expert hierarchy is implemented behind explicit native flags and the
-`cache`/`stream` presets. Hardware evidence is tracked in
-[Phase 2 validation](docs/PHASE2_EXPERT_CACHE_VALIDATION.md); the global budget
-and lifecycle contract is documented in the
-[Phase 4 controller guide](docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md).
+On the consolidated v0.1.0 candidate, a Qwen3.6 35B-A3B MoE reached median
+throughput of 1,612.46 tok/s for 512-token prompt processing, 1,583.32 tok/s
+for 2,048-token prompt processing, and 116.59 tok/s for 128-token generation
+across an RTX 3060 Ti, RTX 2080 SUPER, and RTX 3080.
 
-## Verified reference result
+The consolidated v0.1.0 candidate ran a Qwen3.5 27B Q4_K_M dense model across
+an RTX 3060 Ti, RTX 2080 SUPER, and RTX 3080. Five-run averages were 660.60
+tok/s for 512-token prompt processing, 666.03 tok/s for 2,048-token prompt
+processing, and 26.78 tok/s for 128-token generation. A live 65,536-context
+server also retained more than its declared 1 GiB reserve on every GPU.
 
-The retained ESE benchmark record includes GPT-OSS 120B F16 GGUF (about 61 GiB) on dual Ampere GPUs with 18 GiB combined VRAM, a Ryzen 9 5950X, about 47 GiB usable DDR4, and NVMe storage:
-
-| Workload | Recorded result |
-| --- | ---: |
-| Warm prefill | about 139–141 tok/s |
-| Short-context decode | about 11.5 tok/s |
-| Decode near 22K filled context | about 8.9 tok/s |
-| Deferred-mmap startup | about 13–16 s |
-| 27K needle retrieval | pass |
-
-These are machine- and configuration-specific measurements, not universal promises. Method and promoted settings are summarized in [Benchmarks](docs/ESE_BENCHMARKS.md).
+The earlier GPT-OSS 120B F16 expert-streaming record remains available: about
+139–141 tok/s warm prefill and 11.5 tok/s short-context decode on the same CPU
+class and NVMe storage. These are machine- and configuration-specific
+engineering records, not universal performance promises. See
+[reference benchmarks](docs/ESE_BENCHMARKS.md) for exact commands, model hash,
+hardware, repetition statistics, cold/warm behavior, and ablations.
 
 ## Documentation
 
 - [Profiles and tuning](docs/ESE_PROFILES.md)
-- [Architecture](docs/ESE_ARCHITECTURE.md)
-- [Benchmarks](docs/ESE_BENCHMARKS.md)
-- [Port roadmap and acceptance gates](docs/PORT_ROADMAP.md)
-- [Branch policy](docs/BRANCH_POLICY.md)
-- [Native build documentation](docs/build.md)
+- [Global resource controller](docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md)
+- [Architecture and invariants](docs/ESE_ARCHITECTURE.md)
+- [Expert-cache validation](docs/PHASE2_EXPERT_CACHE_VALIDATION.md)
+- [Turbo KV Phase 1 validation](docs/TURBO_KV_PHASE1_VALIDATION.md)
+- [Reference benchmarks](docs/ESE_BENCHMARKS.md)
+- [Port roadmap](docs/PORT_ROADMAP.md)
+- [Native build guide](docs/build.md)
 - [Native parameter reference](docs/parameters.md)
-- [Speculative decoding](docs/speculative.md)
-- [Phase 4 global resource controller](docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md)
+- [Contributing](CONTRIBUTING.md)
 
-## Branch policy
+## Scope and lineage
 
-`ese-unified` is the proposed consolidated core. It is based on the newer DeepSeek/Maple integration line rather than the older public default. Android/QNN remains a separate platform port until it passes the same parity and lifecycle gates. Historical experiment branches are retained as source references until their unique commits are tagged.
+ESE prioritizes bounded memory, reproducibility, and correctness over a single
+best benchmark. Experimental formats remain internal until their quality and
+lifecycle gates pass. General desktop work targets `main`; platform and
+research branches remain isolated until their own validation is complete.
 
-## License and lineage
-
-MIT licensed. ESE is derived from `ik_llama.cpp`, which is derived from `llama.cpp`. Imported or adapted features must retain their original attribution and license notices. The roadmap pins the analyzed `buun-llama-cpp` revision before any code-level port.
+ESE is MIT licensed. It derives from `ik_llama.cpp`, which derives from
+`llama.cpp`; imported work retains its original attribution and license
+notices.

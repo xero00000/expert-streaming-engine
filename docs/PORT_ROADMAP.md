@@ -28,26 +28,26 @@ A tree SHA and a commit SHA are recorded separately. Every code port must pin th
 | Route-aware page-cache prefetch | Integrated | opt-in mmap hint for `cache` / `stream` |
 | CPU MoE plus optional GPU-resident tail | Integrated | `hybrid` / `cache` / `stream` |
 | One startup interface | Integrated | `ese doctor/build/plan/serve` |
-| GGUF-aware startup policy | Foundation | standard-library planner |
+| GGUF-aware startup policy | Integrated | launcher discovery plus native global controller |
 | DeepSeek V4, DSpark, MTP integration-line work | Integrated | native options remain available |
 | Maple/TQ2_0 CPU and CUDA work | Integrated | integration-line native path |
 | Fixed Turbo2/3/4/8 CPU + CUDA row codecs | Foundation | checked internal ABI, exact-byte parity, no host fallback |
 | Fixed Turbo2/3/4/8 CUDA Flash Attention | Foundation | direct compressed decode reads; device-only F16 staging remains for prefill |
 | Fixed Turbo2/3/4/8 per-head padding | Foundation | odd K/V heads padded independently; logical output width restored |
 | Turbo1/2/3-TCQ CPU + CUDA | Foundation | substantive Viterbi references, signed FWHT, O(1) state lookup, direct decode reads |
-| Adaptive VRAM MoE cache | Validation pending | Phase 2 implementation complete; 1/2/3-GPU runtime gate remains |
-| Multi-GPU expert-parallel cache | Validation pending | graph/tensor-distributed matrix in Phase 2 / issue #5 |
-| Core Turbo KV types, CUDA, TCQ, and VBR | Phase 1 released | issue #4 closed; internal promotion gates remain explicit |
+| Adaptive VRAM MoE cache | Validated | Phase 2 / issue #5; bounded churn and 1/2/3-GPU runtime matrix |
+| Multi-GPU expert-parallel cache | Validated | Turing/Ampere graph/tensor-distributed matrix in Phase 2 |
+| Core Turbo KV types, CUDA, TCQ, and VBR | Phase 1 complete | issue #4 closed; included in the consolidated v0.1.0 |
 | Transient mmproj/MTP sharing | Validated | Phase 3 / issue #6; real Qwen image→text swap |
 | Adaptive MTP depth / mapped vocabulary | Validated | Phase 3 / issue #6; CPU, Turing, Ampere, five workload panels |
 | Global dynamic resource controller | Implemented and locally validated | Phase 4 / issue #7 |
 
 ## Phase 1 — KV ladder, TCQ, and VBR
 
-Phase 1 was merged and released as `v0.1.0`. The release establishes the
-checked internal foundation described below; it does not waive the later
-promotion gates for formats that intentionally remain absent from the public
-cache-type parser.
+Phase 1 was merged for the consolidated `v0.1.0`. It establishes the checked
+internal foundation described below; it does not waive the later promotion
+gates for formats that intentionally remain absent from the public cache-type
+parser.
 
 ### Fixed Turbo codecs
 
@@ -130,11 +130,10 @@ model sensitivity tables and live cache-storage retiering remain in progress.
 
 ## Phase 2 — One NVMe → RAM → VRAM expert hierarchy
 
-The native hierarchy and the `cache`/`stream` launcher presets are implemented
-on the Phase 2 branch. CPU/storage parity, forced churn, compile, server, and
-sanitizer gates pass. The one-, two-, and three-GPU Turing/Ampere runtime
-matrix remains the final pre-merge gate; Ada-or-newer coverage has a documented
-solo-maintainer hardware exception. See
+The native hierarchy and the `cache`/`stream` launcher presets are merged on
+`main`. CPU/storage parity, forced churn, compile, server, sanitizer, and the
+one-, two-, and three-GPU Turing/Ampere runtime matrix pass. Ada-or-newer
+coverage has a documented solo-maintainer hardware exception. See
 `docs/PHASE2_EXPERT_CACHE_VALIDATION.md`.
 
 ### Common expert descriptor
