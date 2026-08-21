@@ -40,6 +40,8 @@ endif()
 add_library(llama
             ../include/llama.h
             llama.cpp
+            llama-kv-tier-policy.h
+            llama-kv-tier-policy.cpp
             llama-spec-features.cpp
             llama-spec-features-dflash.cpp
             llama-dflash.cpp

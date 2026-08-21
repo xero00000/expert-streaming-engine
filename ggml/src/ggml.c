@@ -1698,6 +1698,28 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 4,
     },
+    [GGML_TYPE_TURBO2_0] = {
+        .type_name                = "turbo2_0",
+        .blck_size                = GGML_TURBO_KV_BLOCK_ELEMENTS,
+        .type_size                = sizeof(struct ggml_turbo2_block),
+        .is_quantized             = true,
+        .to_float                 = ggml_turbo2_to_float,
+        .from_float               = ggml_turbo2_from_float,
+        .from_float_ref           = ggml_turbo2_from_float,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .type_name                = "turbo3_0",
+        .blck_size                = GGML_TURBO_KV_BLOCK_ELEMENTS,
+        .type_size                = sizeof(struct ggml_turbo3_block),
+        .is_quantized             = true,
+        .to_float                 = ggml_turbo3_to_float,
+        .from_float               = ggml_turbo3_from_float,
+        .from_float_ref           = ggml_turbo3_from_float,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
     [GGML_TYPE_TURBO4_0] = {
         .type_name                = "turbo4_0",
         .blck_size                = GGML_TURBO_KV_BLOCK_ELEMENTS,
@@ -1717,6 +1739,39 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = ggml_turbo8_to_float,
         .from_float               = ggml_turbo8_from_float,
         .from_float_ref           = ggml_turbo8_from_float,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
+    [GGML_TYPE_TURBO1_TCQ] = {
+        .type_name                = "turbo1_tcq",
+        .blck_size                = GGML_TURBO_KV_BLOCK_ELEMENTS,
+        .type_size                = sizeof(struct ggml_turbo1_tcq_block),
+        .is_quantized             = true,
+        .to_float                 = ggml_turbo1_tcq_to_float,
+        .from_float               = ggml_turbo1_tcq_from_float,
+        .from_float_ref           = ggml_turbo1_tcq_from_float,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
+    [GGML_TYPE_TURBO2_TCQ] = {
+        .type_name                = "turbo2_tcq",
+        .blck_size                = GGML_TURBO_KV_BLOCK_ELEMENTS,
+        .type_size                = sizeof(struct ggml_turbo2_tcq_block),
+        .is_quantized             = true,
+        .to_float                 = ggml_turbo2_tcq_to_float,
+        .from_float               = ggml_turbo2_tcq_from_float,
+        .from_float_ref           = ggml_turbo2_tcq_from_float,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
+    [GGML_TYPE_TURBO3_TCQ] = {
+        .type_name                = "turbo3_tcq",
+        .blck_size                = GGML_TURBO_KV_BLOCK_ELEMENTS,
+        .type_size                = sizeof(struct ggml_turbo3_tcq_block),
+        .is_quantized             = true,
+        .to_float                 = ggml_turbo3_tcq_to_float,
+        .from_float               = ggml_turbo3_tcq_from_float,
+        .from_float_ref           = ggml_turbo3_tcq_from_float,
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
@@ -11737,11 +11792,14 @@ static void ggml_compute_forward_dup_same_cont(
     const int ith = params->ith; // thread index
     const int nth = params->nth; // number of threads
 
-    // parallelize by elements
-    const int ne = ggml_nelements(dst);
-    const int dr = (ne + nth - 1) / nth;
-    const int ie0 = dr * ith;
-    const int ie1 = MIN(ie0 + dr, ne);
+    // Parallelize by stored blocks. For quantized tensors, nelements counts
+    // scalar values while type_size is the size of an entire block; combining
+    // the two would copy blck_size times beyond the tensor bounds.
+    GGML_ASSERT(ggml_nbytes(dst) == ggml_nbytes(src0));
+    const int64_t n_blocks = ggml_nbytes(dst) / ggml_type_size(dst->type);
+    const int64_t dr = (n_blocks + nth - 1) / nth;
+    const int64_t ie0 = dr * ith;
+    const int64_t ie1 = MIN(ie0 + dr, n_blocks);
 
     if (ie0 < ie1) {
         memcpy(
@@ -30793,8 +30851,13 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ2_KT:  result = quantize_iq2_kt (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ3_KT:  result = quantize_iq3_kt (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ4_KT:  result = quantize_iq4_kt (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
+        case GGML_TYPE_TURBO2_0: result = ggml_turbo2_quantize_rows(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO3_0: result = ggml_turbo3_quantize_rows(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO4_0: result = ggml_turbo4_quantize_rows(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO8_0: result = ggml_turbo8_quantize_rows(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO1_TCQ: result = ggml_turbo1_tcq_quantize_rows(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO2_TCQ: result = ggml_turbo2_tcq_quantize_rows(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO3_TCQ: result = ggml_turbo3_tcq_quantize_rows(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ1_0:     result = quantize_tq1_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ2_0:     result = quantize_tq2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q1_0_G128: result = quantize_q1_0_g128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;

@@ -264,8 +264,13 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         case GGML_TYPE_Q8_0:
             get_rows_cuda<QK8_0, QR8_0, dequantize_q8_0>(src0, src1, dst, src0_d, src1_i32, dst_d, stream);
             break;
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_TURBO8_0:
+        case GGML_TYPE_TURBO1_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO3_TCQ:
             ggml_cuda_turbo_kv_get_rows(ctx, src0, src1, dst);
             break;
         default:

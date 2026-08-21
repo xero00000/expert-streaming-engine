@@ -3,7 +3,7 @@
 
 /*
  * Immutable reference tables shared with native backends. The rotation tables
- * are row-major 128x128 matrices; centroid counts are 16 and 256 respectively.
+ * are row-major 128x128 matrices; centroid counts are 4, 8, 16, and 256.
  */
 #ifdef __cplusplus
 extern "C" {
@@ -11,8 +11,15 @@ extern "C" {
 
 const float * ggml_turbo_kv_rotation_forward();
 const float * ggml_turbo_kv_rotation_inverse();
+const float * ggml_turbo_kv_centroids2();
+const float * ggml_turbo_kv_centroids3();
 const float * ggml_turbo_kv_centroids4();
 const float * ggml_turbo_kv_centroids8();
+const float * ggml_turbo_kv_tcq_signs1();
+const float * ggml_turbo_kv_tcq_signs2();
+const float * ggml_turbo_kv_tcq_codebook1();
+const float * ggml_turbo_kv_tcq_codebook2();
+const float * ggml_turbo_kv_tcq_codebook3();
 
 #ifdef __cplusplus
 }

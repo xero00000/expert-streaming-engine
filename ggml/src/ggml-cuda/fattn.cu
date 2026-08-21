@@ -18,6 +18,7 @@
 #include "ggml-turbo-kv.h"
 
 #include <cstdint>
+#include <cstdlib>
 
 #define FATTN_KQ_STRIDE 256
 
@@ -34,7 +35,10 @@ static inline bool is_pascal_mla_absorbed_decode(const ggml_tensor * Q, const gg
 }
 
 static inline bool is_turbo_kv_type(ggml_type type) {
-    return type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO8_0;
+    return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 ||
+           type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO8_0 ||
+           type == GGML_TYPE_TURBO1_TCQ || type == GGML_TYPE_TURBO2_TCQ ||
+           type == GGML_TYPE_TURBO3_TCQ;
 }
 
 static ggml_tensor turbo_f16_staging_tensor(const ggml_tensor * src, half * data) {
@@ -52,6 +56,13 @@ static void ggml_cuda_flash_attn_ext_turbo(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     GGML_ASSERT(is_turbo_kv_type(K->type) || is_turbo_kv_type(V->type));
+
+    if (ggml_cuda_turbo_kv_fattn_is_supported(dst)) {
+        ggml_cuda_turbo_kv_flash_attn(ctx, dst);
+        return;
+    }
+    GGML_ASSERT(!std::getenv("GGML_TURBO_KV_REQUIRE_NATIVE_FATTN") &&
+        "requested native Turbo Flash Attention path is unavailable for this shape");
 
     ggml_cuda_pool_alloc<half> k_data(ctx.pool());
     ggml_cuda_pool_alloc<half> v_data(ctx.pool());
@@ -236,6 +247,9 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
         if ((is_turbo_kv_type(K->type) && K->ne[0] % GGML_TURBO_KV_BLOCK_ELEMENTS != 0) ||
             (is_turbo_kv_type(V->type) && V->ne[0] % GGML_TURBO_KV_BLOCK_ELEMENTS != 0)) {
             return false;
+        }
+        if (ggml_cuda_turbo_kv_fattn_is_supported(dst)) {
+            return true;
         }
         ggml_tensor local_K = turbo_f16_staging_tensor(K, nullptr);
         ggml_tensor local_V = turbo_f16_staging_tensor(V, nullptr);

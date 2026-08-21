@@ -213,6 +213,14 @@ llama_target_and_test(test-autorelease.cpp        LABEL "model")
 llama_build(test-turbo-kv-core.cpp)
 llama_test(test-turbo-kv-core)
 
+llama_build(test-turbo-kv-policy.cpp)
+llama_test(test-turbo-kv-policy)
+
+# Requires a caller-supplied GGUF model; exercised by the Phase 1 validation script.
+llama_build(test-turbo-kv-lifecycle.cpp)
+llama_build(test-turbo-kv-quality.cpp)
+llama_build(test-turbo-kv-recurrent.cpp)
+
 if (GGML_CUDA)
     llama_build(test-turbo-kv-cuda.cpp)
     llama_test(test-turbo-kv-cuda)
@@ -222,4 +230,3 @@ endif()
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
-

@@ -9,6 +9,7 @@
 #include "ggml.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
+#include "ggml-turbo-kv.h"
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -38,6 +39,7 @@
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/tsembd.cuh"
+#include "ggml-cuda/turbo-kv.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/conv-transpose-1d.cuh"
@@ -4869,8 +4871,13 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
                     case GGML_TYPE_TURBO4_0:
                     case GGML_TYPE_TURBO8_0:
+                    case GGML_TYPE_TURBO1_TCQ:
+                    case GGML_TYPE_TURBO2_TCQ:
+                    case GGML_TYPE_TURBO3_TCQ:
                         return true;
                     case GGML_TYPE_I32:
                         return op->src[0]->type == op->type;
@@ -4883,7 +4890,10 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                 return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                        op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
                        op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
-                       op->type == GGML_TYPE_TURBO4_0 || op->type == GGML_TYPE_TURBO8_0) &&
+                       op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 ||
+                       op->type == GGML_TYPE_TURBO4_0 || op->type == GGML_TYPE_TURBO8_0 ||
+                       op->type == GGML_TYPE_TURBO1_TCQ || op->type == GGML_TYPE_TURBO2_TCQ ||
+                       op->type == GGML_TYPE_TURBO3_TCQ) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
@@ -4902,6 +4912,11 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q8_0) {
                     return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && ggml_cuda_turbo_kv_type_supported(src1_type)) {
+                    return op->src[0]->ne[0] % GGML_TURBO_KV_BLOCK_ELEMENTS == 0 &&
+                           op->src[0]->nb[0] == sizeof(float) &&
+                           ggml_are_same_shape(op->src[0], op->src[1]);
                 }
                 if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F32) {
                     return true;

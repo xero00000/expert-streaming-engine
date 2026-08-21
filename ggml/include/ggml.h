@@ -430,8 +430,13 @@ extern "C" {
         GGML_TYPE_Q1_0_G128 = 41,  // Bonsai 1-bit quants
         //
         //
+        GGML_TYPE_TURBO3_0 = 43,  // internal Phase 1 CPU reference; not a public KV-cache option
         GGML_TYPE_TURBO4_0 = 44,  // internal Phase 1 CPU reference; not a public KV-cache option
+        GGML_TYPE_TURBO2_0 = 45,  // internal Phase 1 CPU reference; not a public KV-cache option
+        GGML_TYPE_TURBO3_TCQ = 46, // internal Phase 1 TCQ reference; not a public KV-cache option
+        GGML_TYPE_TURBO2_TCQ = 47, // internal Phase 1 TCQ reference; not a public KV-cache option
         GGML_TYPE_TURBO8_0 = 48,  // internal Phase 1 CPU reference; not a public KV-cache option
+        GGML_TYPE_TURBO1_TCQ = 52, // internal Phase 1 TCQ reference; not a public KV-cache option
         GGML_TYPE_Q8_0_X4 = 97,
         GGML_TYPE_Q8_1_X4 = 98,
         GGML_TYPE_Q8_2_X4 = 99,

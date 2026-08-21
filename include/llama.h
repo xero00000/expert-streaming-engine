@@ -479,6 +479,15 @@ extern "C" {
         int32_t n_v_first;
         int32_t n_v_last;
 
+        // Exact per-layer cache types [EXPERIMENTAL]. A null pointer with a
+        // zero count leaves that side on the base/edge policy. Otherwise the
+        // count must equal the model's attention-layer count. The arrays are
+        // consumed during llama_new_context_with_model and need not outlive it.
+        const enum ggml_type * type_k_layers;
+        const enum ggml_type * type_v_layers;
+        uint32_t n_type_k_layers;
+        uint32_t n_type_v_layers;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool logits_all;  // the llama_decode() call computes all logits, not just the last one (DEPRECATED - set llama_batch.logits instead)
         bool embeddings;  // if true, extract embeddings (together with logits)
@@ -937,6 +946,34 @@ extern "C" {
     //   - lazily on next llama_decode()
     //   - explicitly with llama_kv_cache_update()
     LLAMA_API void llama_kv_cache_defrag(struct llama_context * ctx);
+
+    // Experimental mixed-tier KV observability and live retiering. Turbo/TCQ
+    // names remain absent from the normal CLI cache parser until Phase 1 gates
+    // pass. Retiering is failure-atomic: false leaves the original cache and
+    // its sequence metadata unchanged.
+    struct llama_kv_cache_layer_types {
+        enum ggml_type type_k;
+        enum ggml_type type_v;
+    };
+
+    LLAMA_API uint32_t llama_kv_cache_layer_count(const struct llama_context * ctx);
+
+    LLAMA_API uint32_t llama_kv_cache_size(const struct llama_context * ctx);
+
+    LLAMA_API bool llama_kv_cache_get_layer_types(
+            const struct llama_context * ctx,
+            struct llama_kv_cache_layer_types * types,
+            uint32_t capacity);
+
+    LLAMA_API bool llama_kv_cache_retier(
+            struct llama_context * ctx,
+            const enum ggml_type * type_k_layers,
+            const enum ggml_type * type_v_layers,
+            uint32_t n_layers);
+
+    // Resize the storage while preserving every occupied cell. The requested
+    // size must respect backend padding and cannot exceed the context limit.
+    LLAMA_API bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size);
 
     // Apply the KV cache updates (such as K-shifts, defragmentation, etc.)
     // Positive return values does not mean a fatal error, but rather a warning.
