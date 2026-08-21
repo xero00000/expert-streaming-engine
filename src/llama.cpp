@@ -21,6 +21,7 @@
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
 #include "llama-quantize.h"
+#include "llama-kv-padding.h"
 
 #include "unicode.h"
 
@@ -1656,6 +1657,14 @@ static bool llama_kv_cache_init(
 
     const struct llama_hparams & hparams = model.hparams;
 
+    if (!cparams.flash_attn &&
+            (llama_kv_type_is_turbo(type_k) || llama_kv_type_is_turbo(type_v) ||
+             llama_kv_type_is_turbo(type_k_first) || llama_kv_type_is_turbo(type_k_last) ||
+             llama_kv_type_is_turbo(type_v_first) || llama_kv_type_is_turbo(type_v_last))) {
+        LLAMA_LOG_ERROR("%s: Turbo KV cache types require Flash Attention\n", __func__);
+        return false;
+    }
+
     const int64_t  n_layer = model.mtp ? hparams.n_layer
                                        : hparams.n_layer - hparams.nextn_predict_layers;
 
@@ -1944,6 +1953,20 @@ static bool llama_kv_cache_init(
                 LLAMA_LOG_INFO("================= Setting V-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_v));
             }
 
+            const uint32_t n_embd_head_k_alloc = llama_kv_head_dim_for_type(
+                    this_type_k, n_embd_head_k);
+            const uint32_t n_embd_head_v_alloc = !cache.v_trans
+                ? llama_kv_head_dim_for_type(this_type_v, n_embd_head_v)
+                : n_embd_head_v;
+            const uint32_t n_embd_v_row_alloc = n_embd_head_v_alloc * n_head_kv;
+            v_ne = int64_t(n_embd_v_row_alloc) * kv_size;
+
+            if (n_embd_head_k_alloc != n_embd_head_k || n_embd_head_v_alloc != (uint32_t) n_embd_head_v) {
+                LLAMA_LOG_INFO("%s: layer %d Turbo KV head padding: K %u -> %u, V %d -> %u\n",
+                        __func__, i, n_embd_head_k, n_embd_head_k_alloc,
+                        n_embd_head_v, n_embd_head_v_alloc);
+            }
+
             if (model.arch == LLM_ARCH_OPENPANGU) {
                 // MLA-latent cache: k_l holds [ckv_norm 512 | roped k_pe 64] per position.
                 // The value-side latent is rederived from k_l per graph; no persistent V store.
@@ -1952,7 +1975,7 @@ static bool llama_kv_cache_init(
             } else if (is_dsv4_k_only) {
                 k = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k, n_head_kv*kv_size);
             } else {
-                k = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k, n_head_kv*kv_size);
+                k = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k_alloc, n_head_kv*kv_size);
                 v = ggml_new_tensor_1d(ctx, this_type_v, v_ne);
             }
 
@@ -2000,7 +2023,7 @@ static bool llama_kv_cache_init(
                         LLAMA_LOG_DEBUG("K_cache(%d, %d): using %d instead of %ld heads\n",
                                 i, is, nhead_kv, extra_K->splits[is]->ne[1]/n_embd_head_k);
                     }
-                    split_k_l.tensor_splits[is] = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k, nhead_kv * kv_size);
+                    split_k_l.tensor_splits[is] = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k_alloc, nhead_kv * kv_size);
                     auto split_name = k_name + '.' + std::to_string(is);
                     ggml_set_name(split_k_l.tensor_splits[is], split_name.c_str());
                     mem_split[is] += ggml_nbytes(split_k_l.tensor_splits[is]);
@@ -2011,7 +2034,10 @@ static bool llama_kv_cache_init(
                 for (int is = 0; is < extra_V->n_device; ++is) {
                     auto split = extra_V->splits[is];
                     if (!split) continue;
-                    split_v_l.tensor_splits[is] = ggml_new_tensor_1d(ctx, this_type_v, split->ne[1] * kv_size);
+                    GGML_ASSERT(split->ne[1] % n_embd_head_v == 0);
+                    const int nhead_v = split->ne[1] / n_embd_head_v;
+                    split_v_l.tensor_splits[is] = ggml_new_tensor_1d(
+                            ctx, this_type_v, int64_t(n_embd_head_v_alloc) * nhead_v * kv_size);
                     auto split_name = v_name + '.' + std::to_string(is);
                     ggml_set_name(split_v_l.tensor_splits[is], split_name.c_str());
                     mem_split[is] += ggml_nbytes(split_v_l.tensor_splits[is]);
@@ -10122,7 +10148,6 @@ struct llama_data_write {
         // Iterate and write all the keys first, each row is a cell
         // Get whole range at a time
         for (uint32_t il = 0; il < n_layer; ++il) {
-            const uint32_t n_embd_k_gqa = llama_kv_k_row_embd(ctx->model, hparams, il);
             const uint32_t n_embd_head_qk_rope = hparams.n_rot;
             const uint32_t kv_lora_rank = hparams.n_lora_kv;
             const bool has_k_cache = kv_self.k_l[il] != nullptr && need_kv;
@@ -10134,7 +10159,7 @@ struct llama_data_write {
             // Write row size of key
             const uint64_t k_size_row = has_k_cache
                 ? ((ctx->cparams.mla_attn == 0)
-                    ? ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa)
+                    ? ggml_row_size(kv_self.k_l[il]->type, kv_self.k_l[il]->ne[0]) * hparams.n_head_kv(il)
                     : ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope))
                 : 0;
             write(&k_size_row, sizeof(k_size_row));
@@ -10153,7 +10178,6 @@ struct llama_data_write {
 
         if (v_state == 0) {
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = llama_kv_v_row_embd(ctx->model, hparams, il);
                 const bool has_v_cache = kv_self.v_l[il] != nullptr && need_kv;
 
                 // Write value type
@@ -10161,7 +10185,9 @@ struct llama_data_write {
                 write(&v_type_i, sizeof(v_type_i));
 
                 // Write row size of value
-                const uint64_t v_size_row = has_v_cache ? ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa) : 0;
+                const uint64_t v_size_row = has_v_cache
+                    ? ggml_row_size(kv_self.v_l[il]->type, kv_self.v_l[il]->ne[0] / kv_self.size)
+                    : 0;
                 write(&v_size_row, sizeof(v_size_row));
 
                 if (!has_v_cache) {
@@ -10589,18 +10615,24 @@ struct llama_data_read {
         auto kv = is_recurrent ? nullptr : get_kv_cache_split_tensor(tensor, ctx->model.layers[il]);
         auto kv_extra = kv ? (ggml_split_tensor_t *)kv->extra : nullptr;
         GGML_ASSERT(extra && (is_recurrent || kv_extra));
-        auto ne = kv ? kv->ne[1] : tensor->ne[0];
-        size_t sum_ne = 0;
+        const size_t cache_rows = is_recurrent ? 0 : ctx->kv_self.size;
+        GGML_ASSERT(is_recurrent || cache_rows > 0);
+        GGML_ASSERT(is_recurrent || ggml_nbytes(tensor) % cache_rows == 0);
+        const size_t full_row_size = is_recurrent
+            ? ggml_row_size(tensor->type, tensor->ne[0])
+            : ggml_nbytes(tensor) / cache_rows;
         size_t sum_split_row_size = 0;
-        GGML_ASSERT(row_size == ggml_row_size(tensor->type, ne));
+        GGML_ASSERT(row_size == full_row_size);
         for (int id = 0; id < extra->n_device; ++id) {
             auto split = extra->splits[id];
             auto kv_split = kv_extra ? kv_extra->splits[id] : nullptr;
             GGML_ASSERT((split && (kv_split || is_recurrent)) || (!split && !kv_split));
             if (!split) continue;
             GGML_ASSERT(split->type == tensor->type);
-            auto ne_split = kv_split ? kv_split->ne[1] : split->ne[0];
-            auto split_row_size = ggml_row_size(tensor->type, ne_split);
+            GGML_ASSERT(is_recurrent || ggml_nbytes(split) % cache_rows == 0);
+            const size_t split_row_size = is_recurrent
+                ? ggml_row_size(tensor->type, split->ne[0])
+                : ggml_nbytes(split) / cache_rows;
             aux.resize(split_row_size*nrows);
             auto src = data + sum_split_row_size;
             auto dst = aux.data();
@@ -10610,10 +10642,8 @@ struct llama_data_read {
                 src += row_size;
             }
             ggml_backend_tensor_set(split, aux.data(), head*split_row_size, nrows*split_row_size);
-            sum_ne += ne_split;
             sum_split_row_size += split_row_size;
         }
-        GGML_ASSERT(sum_ne == ne);
         GGML_ASSERT(sum_split_row_size == row_size);
     }
 
@@ -10742,7 +10772,6 @@ struct llama_data_read {
 
         // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
         for (uint32_t il = 0; il < n_layer; ++il) {
-            const uint32_t n_embd_k_gqa = llama_kv_k_row_embd(ctx->model, hparams, il);
             const uint32_t n_embd_head_qk_rope = hparams.n_rot;
             const uint32_t kv_lora_rank = hparams.n_lora_kv;
             const bool has_k_cache = kv_self.k_l[il] != nullptr && need_kv;
@@ -10774,7 +10803,9 @@ struct llama_data_read {
                 }
                 continue;
             }
-            const size_t k_size_row = (ctx->cparams.mla_attn == 0) ? ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa) : ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope);
+            const size_t k_size_row = (ctx->cparams.mla_attn == 0)
+                ? ggml_row_size(kv_self.k_l[il]->type, kv_self.k_l[il]->ne[0]) * hparams.n_head_kv(il)
+                : ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope);
             if (k_size_row != k_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
                 return false;
@@ -10792,7 +10823,6 @@ struct llama_data_read {
 
         if (v_state == 0) {
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = llama_kv_v_row_embd(ctx->model, hparams, il);
                 const bool has_v_cache = kv_self.v_l[il] != nullptr && need_kv;
 
                 // Read type of value
@@ -10821,7 +10851,8 @@ struct llama_data_read {
                     }
                     continue;
                 }
-                const size_t v_size_row = ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa);
+                const size_t v_size_row = ggml_row_size(
+                        kv_self.v_l[il]->type, kv_self.v_l[il]->ne[0] / kv_self.size);
                 if (v_size_row != v_size_row_ref) {
                     LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
                     return false;
@@ -11211,14 +11242,26 @@ struct llama_data_write_buffer : llama_data_write {
             get_tensor_data_split(ptr, tensor, aux_buffer, offset, size);
         } else {
             auto kv = get_kv_cache_split_tensor(tensor, model.layers[il]);
-            get_tensor_data_split(ptr, tensor, kv, aux_buffer, offset, size);
+            const uint32_t n_head_kv = model.hparams.n_head_kv(il);
+            uint32_t cache_rows;
+            if (tensor->ne[1] > 1) {
+                GGML_ASSERT(tensor->ne[1] % n_head_kv == 0);
+                cache_rows = tensor->ne[1] / n_head_kv;
+            } else {
+                const uint32_t cache_v_gqa = llama_kv_gqa_dim_for_type(
+                        tensor->type, model.hparams.n_embd_head_v(il), n_head_kv);
+                GGML_ASSERT(cache_v_gqa > 0 && tensor->ne[0] % cache_v_gqa == 0);
+                cache_rows = tensor->ne[0] / cache_v_gqa;
+            }
+            get_tensor_data_split(ptr, tensor, kv, aux_buffer, offset, size, cache_rows);
         }
     }
 
     static void get_tensor_data_split(uint8_t * ptr, const ggml_tensor * tensor, const ggml_tensor * kv,
-            std::vector<uint8_t> & aux_buffer, size_t offset, size_t size) {
-        auto ne = kv->ne[1];
-        auto full_row_size = ggml_row_size(tensor->type, ne);
+            std::vector<uint8_t> & aux_buffer, size_t offset, size_t size, size_t cache_rows) {
+        GGML_ASSERT(cache_rows > 0);
+        GGML_ASSERT(ggml_nbytes(tensor) % cache_rows == 0);
+        const size_t full_row_size = ggml_nbytes(tensor) / cache_rows;
         GGML_ASSERT(offset % full_row_size == 0);
         GGML_ASSERT(size   % full_row_size == 0);
         auto first_row = offset / full_row_size;
@@ -11234,7 +11277,8 @@ struct llama_data_write_buffer : llama_data_write {
             GGML_ASSERT((split && kv_split) || (!split && !kv_split));
             if (!split) continue;
             GGML_ASSERT(split->type == tensor->type);
-            auto split_row_size = ggml_row_size(tensor->type, kv_split->ne[1]);
+            GGML_ASSERT(ggml_nbytes(split) % cache_rows == 0);
+            const size_t split_row_size = ggml_nbytes(split) / cache_rows;
             auto split_size = split_row_size * num_rows;
             if (split_size > aux_buffer.size()) aux_buffer.resize(split_size);
             ggml_backend_tensor_get(split, aux_buffer.data(), first_row*split_row_size, split_size);
@@ -11354,9 +11398,26 @@ struct llama_data_write_file : llama_data_write {
             }
             return;
         }
-        auto kv = get_kv_cache_split_tensor(tensor, model.layers[il]);
         temp_buffer.resize(size);
-        llama_data_write_buffer::get_tensor_data_split(temp_buffer.data(), tensor, kv, aux_buffer, offset, size);
+        if (model.hparams.recurrent_layer_arr[il]) {
+            llama_data_write_buffer::get_tensor_data_split(
+                    temp_buffer.data(), tensor, aux_buffer, offset, size);
+        } else {
+            auto kv = get_kv_cache_split_tensor(tensor, model.layers[il]);
+            const uint32_t n_head_kv = model.hparams.n_head_kv(il);
+            uint32_t cache_rows;
+            if (tensor->ne[1] > 1) {
+                GGML_ASSERT(tensor->ne[1] % n_head_kv == 0);
+                cache_rows = tensor->ne[1] / n_head_kv;
+            } else {
+                const uint32_t cache_v_gqa = llama_kv_gqa_dim_for_type(
+                        tensor->type, model.hparams.n_embd_head_v(il), n_head_kv);
+                GGML_ASSERT(cache_v_gqa > 0 && tensor->ne[0] % cache_v_gqa == 0);
+                cache_rows = tensor->ne[0] / cache_v_gqa;
+            }
+            llama_data_write_buffer::get_tensor_data_split(
+                    temp_buffer.data(), tensor, kv, aux_buffer, offset, size, cache_rows);
+        }
     }
 
     size_t get_size_written() override {

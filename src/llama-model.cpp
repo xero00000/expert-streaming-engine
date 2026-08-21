@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-kv-padding.h"
 #include "llama-cparams.h"
 
 #include <map>
@@ -2330,8 +2331,12 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
         return size;
     }
 
-    auto n_head_kv = hparams.n_head_kv(il);
-    auto k_size = ggml_row_size(type_k, hparams.n_embd_head_k(il)) * n_head_kv*kv_size;
-    auto v_size = ggml_row_size(type_v, hparams.n_embd_v_gqa(il)) * kv_size;
+    const uint32_t n_head_kv = hparams.n_head_kv(il);
+    const uint32_t head_k = llama_kv_head_dim_for_type(type_k, hparams.n_embd_head_k(il));
+    const uint32_t head_v = flash_attn
+        ? llama_kv_head_dim_for_type(type_v, hparams.n_embd_head_v(il))
+        : hparams.n_embd_head_v(il);
+    const size_t k_size = ggml_row_size(type_k, head_k) * n_head_kv * kv_size;
+    const size_t v_size = ggml_row_size(type_v, head_v * n_head_kv) * kv_size;
     return k_size + v_size;
 }

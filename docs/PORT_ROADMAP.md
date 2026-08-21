@@ -33,6 +33,7 @@ A tree SHA and a commit SHA are recorded separately. Every code port must pin th
 | Maple/TQ2_0 CPU and CUDA work | Integrated | integration-line native path |
 | Turbo4/Turbo8 CPU + CUDA row codecs | Foundation | checked internal ABI, exact-byte parity, no host fallback |
 | Turbo4/Turbo8 CUDA Flash Attention bridge | Foundation | device-only F16 staging; fused reads still pending |
+| Turbo4/Turbo8 per-head padding | Foundation | odd K/V heads padded independently; logical output width restored |
 | Adaptive VRAM MoE cache | Planned | Phase 2 / issue #5 |
 | Multi-GPU expert-parallel cache | Planned | Phase 2 / issue #5 |
 | Core Turbo KV types, CUDA, TCQ, and VBR | In progress | Phase 1 / issue #4 |
@@ -51,8 +52,8 @@ Next, integrate fixed formats in stages:
 1. complete core type traits and checked dispatch;
 2. serialization and numeric type-ID compatibility;
 3. CUDA encode/decode — row codec complete;
-4. Flash Attention compatibility bridge — complete; fused reads and
-   unusual-head-dimension padding remain;
+4. Flash Attention compatibility bridge — complete, including unusual-head-
+   dimension padding; fused reads remain;
 5. lifecycle and quality validation;
 6. only then expose stable cache flags.
 
