@@ -4,7 +4,7 @@ ESE is a performance-oriented inference fork, but correctness and bounded memory
 
 ## Before opening a change
 
-1. Base general work on `ese-unified`.
+1. Base general work on `main`.
 2. Keep Android/QNN work on its platform branch unless the change is backend-neutral.
 3. Run:
 
@@ -15,6 +15,10 @@ python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 4. For CUDA changes, record the GPU architecture and prove the intended kernel/path executed.
+
+If a requested architecture is unavailable, document the hardware limitation
+and the exact evidence that was run. Do not replace missing physical-hardware
+coverage with a synthetic pass.
 
 ## Pull-request scope
 
@@ -65,6 +69,18 @@ Also include:
 - bounded-memory trace;
 - cold-cache behavior.
 
+### Global resource-controller changes
+
+Also include:
+
+- the complete plan JSON for identical repeated inputs;
+- host RAM and every participating device's free/planned/reserve bytes;
+- one- and multi-slot lifecycle coverage;
+- the selected context, KV quality, expert capacities, and transient capacity;
+- a below-floor precision rejection and an unavailable-backend rejection;
+- injected prepare/commit failure with rollback to the prior logical plan;
+- ASAN/UBSAN coverage for the modified planner or lifecycle path.
+
 ## Performance reports
 
 Provide:
@@ -110,6 +126,8 @@ Do not merge an external fork wholesale. Port the smallest coherent layer that s
 - No feature is called complete based on compilation alone.
 - Defaults are promoted from repeated workloads, not one best run.
 - Native options remain available; the `ese` launcher must print what it selects.
+- The native controller, not the launcher, is the final allocation authority.
+- A declared per-device reserve must survive steady-state and transient work.
 
 ## Documentation
 

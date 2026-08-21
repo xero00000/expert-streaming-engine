@@ -948,7 +948,7 @@ def _make_parser() -> argparse.ArgumentParser:
         prog="ese",
         description="One front door for resident, hybrid, cached, and disk-streamed ESE inference.",
     )
-    parser.add_argument("--version", action="version", version="ese unified launcher 0.2")
+    parser.add_argument("--version", action="version", version="ese 0.1.0")
     commands = parser.add_subparsers(dest="command", required=True)
 
     doctor = commands.add_parser("doctor", help="inspect build tools, RAM, and GPUs")
