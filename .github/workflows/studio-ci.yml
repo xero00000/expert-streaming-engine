@@ -1,0 +1,137 @@
+name: ESE Studio CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - "studio/**"
+      - "telemetry/**"
+      - "benchmarks/**"
+      - "COMMUNITY_BENCHMARKS.md"
+      - "scripts/publish-community-benchmarks.mjs"
+      - ".github/workflows/studio-ci.yml"
+      - ".github/workflows/publish-community-benchmarks.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ese-studio-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  studio:
+    name: Studio frontend, Rust, and Linux packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: studio
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux desktop build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libwebkit2gtk-4.1-dev
+          libayatana-appindicator3-dev
+          librsvg2-dev
+          desktop-file-utils
+          patchelf
+          rpm
+          xvfb
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri
+
+      - name: Install locked frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check installer shell syntax
+        run: |
+          bash -n install.sh scripts/install-local.sh
+          ./install.sh --check
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Test Rust backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build DEB and RPM packages
+        run: pnpm tauri build
+
+      - name: Install and smoke-test DEB package
+        run: |
+          sudo dpkg -i src-tauri/target/release/bundle/deb/*.deb
+          test -x /usr/bin/ese-studio
+          desktop-file-validate "/usr/share/applications/ESE Studio.desktop"
+          set +e
+          WEBKIT_DISABLE_DMABUF_RENDERER=1 xvfb-run -a timeout 8s /usr/bin/ese-studio
+          status=$?
+          set -e
+          test "$status" -eq 0 -o "$status" -eq 124
+
+      - name: Inspect RPM package contents
+        run: |
+          rpm -qpl src-tauri/target/release/bundle/rpm/*.rpm | grep -F /usr/bin/ese-studio
+          rpm -qpl src-tauri/target/release/bundle/rpm/*.rpm | grep -F ".desktop"
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ese-studio-linux-packages
+          path: |
+            studio/src-tauri/target/release/bundle/deb/*.deb
+            studio/src-tauri/target/release/bundle/rpm/*.rpm
+          if-no-files-found: error
+
+  collector:
+    name: Benchmark collector and publisher
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: telemetry/collector
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: telemetry/collector/package-lock.json
+
+      - name: Install locked collector dependencies
+        run: npm ci
+
+      - name: Check bindings, types, tests, and Worker bundle
+        run: npm run check
+
+      - name: Verify committed community benchmark rendering
+        working-directory: .
+        run: |
+          node scripts/publish-community-benchmarks.mjs
+          git diff --exit-code -- COMMUNITY_BENCHMARKS.md

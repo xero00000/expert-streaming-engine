@@ -1,0 +1,81 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-studio:
+    name: Build and publish Linux Studio packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches Studio version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          expected="${RELEASE_TAG#v}"
+          package_version="$(node -p "require('./studio/package.json').version")"
+          tauri_version="$(node -p "require('./studio/src-tauri/tauri.conf.json').version")"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' studio/src-tauri/Cargo.toml | head -n1)"
+          test "$package_version" = "$expected"
+          test "$tauri_version" = "$expected"
+          test "$cargo_version" = "$expected"
+
+      - name: Install Linux desktop build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libwebkit2gtk-4.1-dev
+          libayatana-appindicator3-dev
+          librsvg2-dev
+          desktop-file-utils
+          patchelf
+          rpm
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri
+
+      - name: Build packages
+        working-directory: studio
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm tauri build
+
+      - name: Prepare checksummed assets
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir release-assets
+          cp studio/src-tauri/target/release/bundle/deb/*.deb "release-assets/ese-studio_${version}_amd64.deb"
+          cp studio/src-tauri/target/release/bundle/rpm/*.rpm "release-assets/ese-studio-${version}-1.x86_64.rpm"
+          cd release-assets
+          sha256sum -- *.deb *.rpm > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          notes="docs/releases/${RELEASE_TAG}.md"
+          test -f "$notes"
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Expert Streaming Engine ${RELEASE_TAG}" \
+            --notes-file "$notes"
