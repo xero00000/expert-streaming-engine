@@ -99,6 +99,10 @@ struct server_task {
     bool infill = false;
     bool embedding = false;
 
+    // A transient residency lease is acquired by the scheduler immediately
+    // before launch and held by the slot for the complete request lifetime.
+    uint64_t transient_lease = 0;
+
     server_task() = default;
     server_task(server_task_type type) : type(type) {}
 

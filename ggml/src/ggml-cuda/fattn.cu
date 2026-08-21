@@ -14,8 +14,11 @@
 #include "fattn-new-mma.cuh"
 #include "fattn.cuh"
 #include "dsa_attn.cuh"
+#include "turbo-kv.cuh"
+#include "ggml-turbo-kv.h"
 
 #include <cstdint>
+#include <cstdlib>
 
 #define FATTN_KQ_STRIDE 256
 
@@ -29,6 +32,58 @@ static inline bool mma_better_than_turing(const int cc) {
 // is_supported check cannot drift.
 static inline bool is_pascal_mla_absorbed_decode(const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V) {
     return Q->ne[1] <= 8 && K->ne[0] == 576 && V->ne[0] == 512;
+}
+
+static inline bool is_turbo_kv_type(ggml_type type) {
+    return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 ||
+           type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO8_0 ||
+           type == GGML_TYPE_TURBO1_TCQ || type == GGML_TYPE_TURBO2_TCQ ||
+           type == GGML_TYPE_TURBO3_TCQ;
+}
+
+static ggml_tensor turbo_f16_staging_tensor(const ggml_tensor * src, half * data) {
+    ggml_tensor result = *src;
+    result.type = GGML_TYPE_F16;
+    result.data = data;
+    result.nb[0] = sizeof(half);
+    for (int dimension = 1; dimension < GGML_MAX_DIMS; ++dimension) {
+        result.nb[dimension] = result.nb[dimension - 1] * result.ne[dimension - 1];
+    }
+    return result;
+}
+
+static void ggml_cuda_flash_attn_ext_turbo(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    GGML_ASSERT(is_turbo_kv_type(K->type) || is_turbo_kv_type(V->type));
+
+    if (ggml_cuda_turbo_kv_fattn_is_supported(dst)) {
+        ggml_cuda_turbo_kv_flash_attn(ctx, dst);
+        return;
+    }
+    GGML_ASSERT(!std::getenv("GGML_TURBO_KV_REQUIRE_NATIVE_FATTN") &&
+        "requested native Turbo Flash Attention path is unavailable for this shape");
+
+    ggml_cuda_pool_alloc<half> k_data(ctx.pool());
+    ggml_cuda_pool_alloc<half> v_data(ctx.pool());
+    ggml_tensor local_K = *K;
+    ggml_tensor local_V = *V;
+
+    if (is_turbo_kv_type(K->type)) {
+        k_data.alloc(ggml_nelements(K));
+        ggml_cuda_turbo_kv_dequantize_f16(ctx, K, k_data.get());
+        local_K = turbo_f16_staging_tensor(K, k_data.get());
+    }
+    if (is_turbo_kv_type(V->type)) {
+        v_data.alloc(ggml_nelements(V));
+        ggml_cuda_turbo_kv_dequantize_f16(ctx, V, v_data.get());
+        local_V = turbo_f16_staging_tensor(V, v_data.get());
+    }
+
+    ggml_tensor local_dst = *dst;
+    local_dst.src[1] = &local_K;
+    local_dst.src[2] = &local_V;
+    ggml_cuda_flash_attn_ext(ctx, &local_dst);
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -68,6 +123,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             dst = &local_dst;
         }
         dst = &local_dst;
+    }
+
+    if (is_turbo_kv_type(dst->src[1]->type) || is_turbo_kv_type(dst->src[2]->type)) {
+        ggml_cuda_flash_attn_ext_turbo(ctx, dst);
+        return;
     }
 
     // On AMD the tile kernels perform poorly, use the vec kernel instead:
@@ -182,6 +242,22 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int32_t precision = KQV->op_params[3];
     const int32_t n_swa = KQV->op_params[4];
+
+    if (is_turbo_kv_type(K->type) || is_turbo_kv_type(V->type)) {
+        if ((is_turbo_kv_type(K->type) && K->ne[0] % GGML_TURBO_KV_BLOCK_ELEMENTS != 0) ||
+            (is_turbo_kv_type(V->type) && V->ne[0] % GGML_TURBO_KV_BLOCK_ELEMENTS != 0)) {
+            return false;
+        }
+        if (ggml_cuda_turbo_kv_fattn_is_supported(dst)) {
+            return true;
+        }
+        ggml_tensor local_K = turbo_f16_staging_tensor(K, nullptr);
+        ggml_tensor local_V = turbo_f16_staging_tensor(V, nullptr);
+        ggml_tensor local_dst = *dst;
+        local_dst.src[1] = is_turbo_kv_type(K->type) ? &local_K : dst->src[1];
+        local_dst.src[2] = is_turbo_kv_type(V->type) ? &local_V : dst->src[2];
+        return ggml_cuda_fattn_is_supported(ctx, &local_dst);
+    }
     if (cc >= CC_OFFSET_AMD) {
         return precision == GGML_PREC_DEFAULT ? ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)
                                               : ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);

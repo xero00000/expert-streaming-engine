@@ -2,11 +2,12 @@
 
 Run sparse Mixture-of-Experts models on machines where the full model does not fit comfortably in VRAM—and, with deferred experts, where the expert set can exceed the safe system-RAM budget.
 
-ESE is a focused `ik_llama.cpp`/`llama.cpp` fork with one transparent launcher and three native execution policies:
+ESE is a focused `ik_llama.cpp`/`llama.cpp` fork with one transparent launcher and four native execution policies:
 
 - **resident** — normal GPU offload when the model fits;
 - **hybrid** — dense tensors on GPU, routed experts on CPU, with an optional MoE tail retained on GPU;
-- **stream** — hybrid execution plus deferred mmap expert residency and route-aware page-cache prefetch.
+- **cache** — bounded RAM expert leases feeding an adaptive per-device VRAM cache;
+- **stream** — the same bounded hierarchy with deferred expert residency and explicit storage I/O.
 
 The launcher never replaces the native runtime. `ese plan` prints the exact environment and `llama-server` command before anything runs.
 
@@ -34,6 +35,7 @@ Force a policy:
 ```bash
 ./ese serve /models/model.gguf --policy resident
 ./ese serve /models/model.gguf --policy hybrid
+./ese serve /models/model.gguf --policy cache
 ./ese serve /models/model.gguf --policy stream
 ```
 
@@ -52,8 +54,9 @@ The default API address is `http://127.0.0.1:8080`.
 | Policy | Selected when | Native mechanism |
 | --- | --- | --- |
 | `resident` | The model fits safely in free VRAM, or is dense | `-ngl 99`, with native `--fit` when needed |
-| `hybrid` | A MoE fits RAM but not VRAM | `--cpu-moe`, optionally `--n-cpu-moe N` |
-| `stream` | A MoE exceeds the safe RAM budget | `--defer-experts` plus CPU MoE and route prefetch |
+| `hybrid` | Selected explicitly for static CPU/GPU MoE placement | `--cpu-moe`, optionally `--n-cpu-moe N` |
+| `cache` | A MoE fits RAM but not VRAM | bounded RAM leases plus adaptive per-device VRAM residency |
+| `stream` | A MoE exceeds the safe RAM budget | the same controller plus `--defer-experts` and `pread` by default |
 
 On multiple NVIDIA GPUs, the launcher derives `--tensor-split` from currently free VRAM. Every decision includes a readable reason and can be emitted as JSON.
 
@@ -72,6 +75,7 @@ On multiple NVIDIA GPUs, the launcher derives `--tensor-split` from currently fr
 ./ese serve MODEL.gguf --kv q4_0 -c 262144
 ./ese serve MODEL.gguf --tensor-split 46,54
 ./ese serve MODEL.gguf --policy hybrid --gpu-resident-moe 6
+./ese serve MODEL.gguf --policy cache --expert-ram-cache 2GiB
 ./ese serve MODEL.gguf --policy stream --gpu-resident-moe 6
 ```
 
@@ -85,25 +89,32 @@ Run `./ese <command> --help` for the complete interface.
                     GGUF metadata + hardware
                                │
                          memory planner
-              ┌────────────────┼───────────────┐
-              │                │                │
-           resident          hybrid           stream
-              │                │                │
-       GPU/native fit    CPU MoE + GPU     deferred mmap
-                         dense/tail         + route prefetch
-              └────────────────┴───────────────┘
+        ┌──────────────┬────────┴───────┬──────────────┐
+        │              │                │              │
+     resident        hybrid           cache          stream
+        │              │                │              │
+ GPU/native fit  static CPU MoE   bounded RAM →  deferred storage
+                  + GPU tail       adaptive VRAM  → RAM → VRAM
+        └──────────────┴────────┬───────┴──────────────┘
                                │
                      llama-server / OpenAI API
 ```
 
-The current engine has static hybrid placement and a specialized disk-backed stream path. A unified bounded `NVMe → RAM cache → VRAM cache` controller is the next native phase; it is not mislabeled as already complete.
+This Phase 2 branch implements the unified bounded
+`NVMe/model shards → RAM cache → VRAM cache` controller. Its CPU/storage,
+sanitizer, and compile gates pass; merge remains gated on the documented
+one-, two-, and three-GPU Turing/Ampere runtime matrix.
 
 See [Architecture](docs/ESE_ARCHITECTURE.md) for invariants and component boundaries.
 
 ## Current native capabilities
 
-- deferred-mmap expert storage;
+- deferred expert storage with mmap, pread, and native io_uring backends;
 - route-aware top-k page-cache prefetch and optional router-logit-tail staging;
+- immutable checked expert descriptors spanning GGUF shards;
+- fixed-arena RAM caching with lease-scoped lifetime and mmap/pread/io_uring sources;
+- adaptive per-device VRAM caching with hysteresis, topology-aware placement,
+  dedicated transfer streams, event-scoped readiness, and structured telemetry;
 - CPU MoE with a selected final MoE tail resident on GPU;
 - multi-GPU tensor splitting;
 - DeepSeek V4 Flash integration work;
@@ -112,7 +123,11 @@ See [Architecture](docs/ESE_ARCHITECTURE.md) for invariants and component bounda
 - CUDA sparse/grouped MoE work, MXFP4 support, Flash Attention, and existing quantized KV types;
 - standard `llama-server`, CLI, conversion, and API compatibility inherited upstream.
 
-The adaptive MoE cache, expert-parallel cache distribution, VBR, Turbo KV, and TCQ ideas from `buun-llama-cpp` are tracked as native ports with explicit parity, memory, quality, and lifecycle gates. They are **not** advertised as completed flags in this branch. See [Port roadmap](docs/PORT_ROADMAP.md).
+The expert hierarchy is implemented behind explicit native flags and the
+`cache`/`stream` presets, with its final hardware acceptance evidence tracked
+in [Phase 2 validation](docs/PHASE2_EXPERT_CACHE_VALIDATION.md). VBR, transient
+modules, and the global controller retain their separate quality and lifecycle
+gates in the [Port roadmap](docs/PORT_ROADMAP.md).
 
 ## Verified reference result
 

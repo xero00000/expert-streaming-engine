@@ -60,6 +60,9 @@ struct llama_cparams {
     float thresh_experts;
     bool mtp;
     int  worst_graph_tokens;
+    uint64_t expert_vram_cache_bytes;
+    uint64_t expert_vram_reserve_bytes;
+    uint32_t expert_cache_min_observations;
 
     enum ggml_type reduce_type;
     enum ggml_type graph_attn_precision;

@@ -4,14 +4,16 @@ on:
   push:
     branches:
       - ese-unified
+      - main
+      - "phase1/**"
   pull_request:
     paths:
       - "ese"
       - "tools/**"
       - "tests/**"
-      - "docs/ESE_*.md"
-      - "docs/PORT_ROADMAP.md"
-      - "docs/BRANCH_POLICY.md"
+      - "scripts/**"
+      - "docs/**"
+      - "THIRD_PARTY_PORTS.md"
       - "README.md"
       - "CMakeLists.txt"
       - "ggml/**"
@@ -51,6 +53,98 @@ jobs:
           ./ese --help
           ./ese doctor --json
 
+  turbo-kv-reference:
+    name: Turbo KV CPU reference
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: bash -n scripts/*.sh
+
+      - name: Build and test Turbo4/Turbo8 reference
+        run: bash scripts/test-turbo-kv.sh
+
+
+      - name: Configure internal GGML Turbo type test
+        run: >-
+          cmake -S . -B build-turbo-core
+          -DCMAKE_BUILD_TYPE=Release
+          -DGGML_CUDA=OFF
+          -DLLAMA_BUILD_TESTS=ON
+          -DLLAMA_BUILD_SERVER=OFF
+
+      - name: Build internal GGML Turbo type test
+        run: cmake --build build-turbo-core --target test-turbo-kv-core -j2
+
+      - name: Run internal GGML Turbo type test
+        run: build-turbo-core/bin/test-turbo-kv-core
+
+      - name: Build checked expert cache test
+        run: cmake --build build-turbo-core --target test-expert-cache -j2
+
+      - name: Run checked expert cache test
+        run: build-turbo-core/bin/test-expert-cache
+
+      - name: Build Phase 3 controller and speculation tests
+        run: >-
+          cmake --build build-turbo-core
+          --target test-transient-module-manager test-spec-tuner test-mapped-draft
+          -j2
+
+      - name: Run Phase 3 controller and speculation tests
+        run: |
+          build-turbo-core/bin/test-transient-module-manager
+          build-turbo-core/bin/test-spec-tuner
+          build-turbo-core/bin/test-mapped-draft
+
+  expert-cache-sanitizers:
+    name: Expert cache ASAN and UBSAN
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Clang sanitizers
+        env:
+          CC: clang
+          CXX: clang++
+        run: >-
+          cmake -S . -B build-expert-sanitizers
+          -DCMAKE_BUILD_TYPE=Debug
+          -DGGML_CUDA=OFF
+          -DLLAMA_BUILD_TESTS=ON
+          -DLLAMA_BUILD_SERVER=OFF
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize=function -fno-omit-frame-pointer"
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=function -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build checked expert cache test
+        run: cmake --build build-expert-sanitizers --target test-expert-cache -j2
+
+      - name: Run checked expert cache test with sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: build-expert-sanitizers/bin/test-expert-cache
+
+      - name: Build Phase 3 sanitizer tests
+        run: >-
+          cmake --build build-expert-sanitizers
+          --target test-transient-module-manager test-spec-tuner test-mapped-draft
+          -j2
+
+      - name: Run Phase 3 tests with sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          build-expert-sanitizers/bin/test-transient-module-manager
+          build-expert-sanitizers/bin/test-spec-tuner
+          build-expert-sanitizers/bin/test-mapped-draft
+
   cpu-build:
     name: Native CPU server build
     runs-on: ubuntu-latest
@@ -86,7 +180,12 @@ jobs:
           fi
 
           echo "llama-server --help exit code: ${help_rc}"
-          for flag in --fit --cpu-moe --n-cpu-moe --defer-experts; do
+          for flag in \
+            --fit --cpu-moe --n-cpu-moe --defer-experts \
+            --expert-ram-cache-mib --expert-ram-staging-mib \
+            --expert-storage-backend --expert-sidecar-only \
+            --expert-vram-cache-mib --expert-vram-reserve-mib \
+            --expert-cache-min-observations; do
             if ! grep -Fq -- "$flag" native-help.txt; then
               echo "Required native option is missing: $flag"
               echo "--- llama-server --help ---"

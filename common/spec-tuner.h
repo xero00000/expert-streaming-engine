@@ -34,18 +34,19 @@ struct spec_tuner {
     double   epsilon    = 0.15;  // 15% explore, 85% exploit
 
     int      configured_n_max = 0;
-    int      dflash_min_samples_per_arm = 3;
-    int      dflash_recovery_probe_interval = 128;
-    double   dflash_quarantine_ratio = 0.90;
-    std::vector<bool> dflash_quarantined;
-    int      dflash_probe_cursor = 0;
-    bool     dflash_last_exploratory = false;
-    bool     dflash_last_recovery_probe = false;
+    int      target_only_min_samples_per_arm = 3;
+    int      target_only_recovery_probe_interval = 128;
+    double   target_only_quarantine_ratio = 0.90;
+    std::vector<bool> target_only_quarantined;
+    int      target_only_probe_cursor = 0;
+    bool     target_only_last_exploratory = false;
+    bool     target_only_last_recovery_probe = false;
     uint64_t n_target_only_selections = 0;
-    uint64_t n_dflash_selections = 0;
+    uint64_t n_speculative_selections = 0;
     uint64_t n_exploratory_selections = 0;
     uint64_t n_quarantines = 0;
     uint64_t n_recovery_probes = 0;
+    std::string last_retune_reason;
 
     // task-change detection (per-call)
     // If tuner goes bad for 30 consecutive calls, reset the tuner.
@@ -81,11 +82,13 @@ struct spec_tuner {
 
     void write_best(common_params_speculative & params) const;
 
-    bool has_dflash_target_only_arm() const {
-        return enabled && spec_type == COMMON_SPECULATIVE_TYPE_DFLASH && configured_n_max > 0;
+    bool has_target_only_arm() const {
+        return enabled &&
+            (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH || spec_type == COMMON_SPECULATIVE_TYPE_MTP) &&
+            configured_n_max > 0;
     }
 
 private:
-    int select_dflash_arm(spec_tuner_coord & coord);
-    void update_dflash_quarantine();
+    int select_target_only_arm(spec_tuner_coord & coord);
+    void update_target_only_quarantine();
 };

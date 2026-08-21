@@ -284,6 +284,12 @@ extern "C" {
         LLAMA_SPLIT_MODE_GRAPH   = 3, // splits computations across GPUs
     };
 
+    enum llama_expert_storage_backend {
+        LLAMA_EXPERT_STORAGE_MMAP = 0,
+        LLAMA_EXPERT_STORAGE_PREAD = 1,
+        LLAMA_EXPERT_STORAGE_IO_URING = 2,
+    };
+
     enum llama_mtp_op_type {
         MTP_OP_NONE             = 0,
         MTP_OP_WARMUP           = 1,
@@ -433,6 +439,10 @@ extern "C" {
         bool dry_run;       // skip loading tensors
         bool flash_attn;
         bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
+        bool expert_sidecar_only; // fail instead of reading original expert tensors outside the lease hierarchy
+        uint64_t expert_ram_cache_bytes;   // bounded resident expert bytes, 0 disables the RAM tier
+        uint64_t expert_ram_staging_bytes; // reusable miss staging bound, 0 selects a bounded default
+        enum llama_expert_storage_backend expert_storage_backend;
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -447,7 +457,6 @@ extern "C" {
         uint32_t n_threads_batch;   // number of threads to use for batch processing
         int32_t  max_extra_alloc;   // Max. additional VRAM the scheduler is allowed to allocate
         int32_t  worst_case_tokens; // number of tokens to use when reserving worst case graphs
-
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
         enum llama_attention_type    attention_type;    // attention type to use for embeddings
@@ -478,6 +487,15 @@ extern "C" {
         int32_t n_k_last;
         int32_t n_v_first;
         int32_t n_v_last;
+
+        // Exact per-layer cache types [EXPERIMENTAL]. A null pointer with a
+        // zero count leaves that side on the base/edge policy. Otherwise the
+        // count must equal the model's attention-layer count. The arrays are
+        // consumed during llama_new_context_with_model and need not outlive it.
+        const enum ggml_type * type_k_layers;
+        const enum ggml_type * type_v_layers;
+        uint32_t n_type_k_layers;
+        uint32_t n_type_v_layers;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool logits_all;  // the llama_decode() call computes all logits, not just the last one (DEPRECATED - set llama_batch.logits instead)
@@ -515,6 +533,9 @@ extern "C" {
         void *              abort_callback_data;
         void *              offload_policy;
         void *              cuda_params;
+        uint64_t expert_vram_cache_bytes;   // per-device adaptive expert cache bound
+        uint64_t expert_vram_reserve_bytes; // per-device reserve that cache allocation must preserve
+        uint32_t expert_cache_min_observations; // route observations before GPU admission
     };
 
     // model quantization parameters
@@ -937,6 +958,34 @@ extern "C" {
     //   - lazily on next llama_decode()
     //   - explicitly with llama_kv_cache_update()
     LLAMA_API void llama_kv_cache_defrag(struct llama_context * ctx);
+
+    // Experimental mixed-tier KV observability and live retiering. Turbo/TCQ
+    // names remain absent from the normal CLI cache parser until Phase 1 gates
+    // pass. Retiering is failure-atomic: false leaves the original cache and
+    // its sequence metadata unchanged.
+    struct llama_kv_cache_layer_types {
+        enum ggml_type type_k;
+        enum ggml_type type_v;
+    };
+
+    LLAMA_API uint32_t llama_kv_cache_layer_count(const struct llama_context * ctx);
+
+    LLAMA_API uint32_t llama_kv_cache_size(const struct llama_context * ctx);
+
+    LLAMA_API bool llama_kv_cache_get_layer_types(
+            const struct llama_context * ctx,
+            struct llama_kv_cache_layer_types * types,
+            uint32_t capacity);
+
+    LLAMA_API bool llama_kv_cache_retier(
+            struct llama_context * ctx,
+            const enum ggml_type * type_k_layers,
+            const enum ggml_type * type_v_layers,
+            uint32_t n_layers);
+
+    // Resize the storage while preserving every occupied cell. The requested
+    // size must respect backend padding and cannot exceed the context limit.
+    LLAMA_API bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size);
 
     // Apply the KV cache updates (such as K-shifts, defragmentation, etc.)
     // Positive return values does not mean a fatal error, but rather a warning.

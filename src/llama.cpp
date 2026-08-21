@@ -21,6 +21,9 @@
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
 #include "llama-quantize.h"
+#include "llama-kv-padding.h"
+#include "llama-kv-tier-policy.h"
+#include "llama-mapped-draft.h"
 
 #include "unicode.h"
 
@@ -961,6 +964,30 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
 }
 
 llama_model::~llama_model() {
+    if (expert_ram_cache) {
+        const auto stats = expert_ram_cache->stats();
+        LLAMA_LOG_INFO("expert_cache_stats: {\"level\":\"ram\",\"capacity_bytes\":%llu,"
+                "\"resident_bytes\":%llu,\"peak_resident_bytes\":%llu,\"hits\":%llu,"
+                "\"misses\":%llu,\"evictions\":%llu,\"rejected_admissions\":%llu,"
+                "\"pinned_capacity_failures\":%llu,\"active_leases\":%llu,"
+                "\"staging_waits\":%llu,\"staging_wait_ns\":%llu,\"storage_read_ns\":%llu,"
+                "\"bytes_mmap\":%llu,\"bytes_pread\":%llu,\"bytes_io_uring\":%llu}\n",
+                (unsigned long long) stats.capacity_bytes,
+                (unsigned long long) stats.resident_bytes,
+                (unsigned long long) stats.peak_resident_bytes,
+                (unsigned long long) stats.hits,
+                (unsigned long long) stats.misses,
+                (unsigned long long) stats.evictions,
+                (unsigned long long) stats.rejected_admissions,
+                (unsigned long long) stats.pinned_capacity_failures,
+                (unsigned long long) stats.active_leases,
+                (unsigned long long) stats.staging_waits,
+                (unsigned long long) stats.staging_wait_ns,
+                (unsigned long long) stats.storage_read_ns,
+                (unsigned long long) stats.bytes_read[size_t(llama_expert_cache::read_backend::mmap)],
+                (unsigned long long) stats.bytes_read[size_t(llama_expert_cache::read_backend::pread)],
+                (unsigned long long) stats.bytes_read[size_t(llama_expert_cache::read_backend::io_uring)]);
+    }
     for (struct ggml_context * ctx : ctxs) {
         ggml_free(ctx);
     }
@@ -975,6 +1002,45 @@ llama_model::~llama_model() {
     while (!lora_adapters.empty()) {
         llama_lora_adapter_free(*lora_adapters.begin());
     }
+}
+
+struct llama_expert_lease_handle {
+    llama_expert_cache::ram_cache::lease lease;
+    explicit llama_expert_lease_handle(llama_expert_cache::ram_cache::lease value) : lease(std::move(value)) {}
+};
+
+static bool llama_expert_lease_acquire(
+        void * user_data,
+        int layer,
+        int expert,
+        int component,
+        ggml_backend_expert_lease * output) {
+    auto * model = static_cast<llama_model *>(user_data);
+    if (!model || !model->expert_ram_cache || !output || layer < 0 || expert < 0 || component < 0 || component > 5) {
+        return false;
+    }
+    const llama_expert_cache::expert_key key = {
+        uint32_t(layer),
+        uint32_t(expert),
+        llama_expert_cache::component(component),
+    };
+    const auto found = model->expert_index.descriptors.find(key);
+    if (found == model->expert_index.descriptors.end()) return false;
+    try {
+        auto handle = std::unique_ptr<llama_expert_lease_handle>(
+                new llama_expert_lease_handle(model->expert_ram_cache->acquire(found->second)));
+        output->data = handle->lease.data();
+        output->size = handle->lease.size();
+        output->handle = handle.release();
+        return true;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_WARN("%s: %s\n", __func__, error.what());
+        return false;
+    }
+}
+
+static void llama_expert_lease_release(void *, void * handle) {
+    delete static_cast<llama_expert_lease_handle *>(handle);
 }
 
 static size_t llama_get_device_count(const llama_model & model, int initial_count = 1) {
@@ -1650,7 +1716,11 @@ static bool llama_kv_cache_init(
                           int32_t    n_k_first,
                           int32_t    n_k_last,
                           int32_t    n_v_first,
-                          int32_t    n_v_last) {
+                          int32_t    n_v_last,
+                    const ggml_type * type_k_layers,
+                    const ggml_type * type_v_layers,
+                          uint32_t    n_type_k_layers,
+                          uint32_t    n_type_v_layers) {
     const llama_model & model = ctx->model;
     const llama_cparams & cparams = ctx->cparams;
 
@@ -1658,6 +1728,71 @@ static bool llama_kv_cache_init(
 
     const int64_t  n_layer = model.mtp ? hparams.n_layer
                                        : hparams.n_layer - hparams.nextn_predict_layers;
+
+    std::vector<llama_kv_tier_override> tier_overrides;
+    const auto add_edge_override = [&](llama_kv_side side, ggml_type type, int32_t count, bool last) {
+        const ggml_type base = side == llama_kv_side::key ? type_k : type_v;
+        if (model.arch == LLM_ARCH_OPENPANGU || count <= 0 || type == base) {
+            return;
+        }
+        const uint32_t begin = last ? uint32_t(n_layer - count) : 0;
+        const uint32_t end   = last ? uint32_t(n_layer) : uint32_t(count);
+        tier_overrides.push_back({ side, begin, end, type });
+    };
+    const auto invalid_count = [n_layer](int32_t count) {
+        return count < -1 || count > n_layer;
+    };
+    if (invalid_count(n_k_first) || invalid_count(n_k_last) ||
+            invalid_count(n_v_first) || invalid_count(n_v_last)) {
+        LLAMA_LOG_ERROR("%s: mixed KV edge count exceeds the model layer range\n", __func__);
+        return false;
+    }
+    add_edge_override(llama_kv_side::key,   type_k_first, n_k_first, false);
+    add_edge_override(llama_kv_side::key,   type_k_last,  n_k_last,  true);
+    add_edge_override(llama_kv_side::value, type_v_first, n_v_first, false);
+    add_edge_override(llama_kv_side::value, type_v_last,  n_v_last,  true);
+
+    const auto add_explicit_map = [&](llama_kv_side side, const ggml_type * types, uint32_t count) {
+        if (types == nullptr) {
+            return count == 0;
+        }
+        if (count != uint32_t(n_layer)) {
+            return false;
+        }
+        for (uint32_t layer = 0; layer < count; ++layer) {
+            tier_overrides.push_back({ side, layer, layer + 1, types[layer] });
+        }
+        return true;
+    };
+    if (!add_explicit_map(llama_kv_side::key, type_k_layers, n_type_k_layers) ||
+            !add_explicit_map(llama_kv_side::value, type_v_layers, n_type_v_layers)) {
+        LLAMA_LOG_ERROR("%s: explicit mixed KV map count must equal the model layer count\n", __func__);
+        return false;
+    }
+
+    std::vector<llama_kv_tier_assignment> tier_plan;
+    std::string tier_error;
+    if (!llama_kv_build_static_tier_map(uint32_t(n_layer), type_k, type_v,
+                tier_overrides, tier_plan, tier_error)) {
+        LLAMA_LOG_ERROR("%s: invalid mixed KV tier map: %s\n", __func__, tier_error.c_str());
+        return false;
+    }
+    if (!cparams.flash_attn) {
+        for (const auto & tier : tier_plan) {
+            if (llama_kv_type_is_turbo(tier.key) || llama_kv_type_is_turbo(tier.value)) {
+                LLAMA_LOG_ERROR("%s: Turbo KV cache types require Flash Attention\n", __func__);
+                return false;
+            }
+        }
+    }
+
+    if (!tier_overrides.empty()) {
+        LLAMA_LOG_INFO("%s: static mixed-tier KV plan (%zu overrides):\n", __func__, tier_overrides.size());
+        for (int64_t layer = 0; layer < n_layer; ++layer) {
+            LLAMA_LOG_INFO("  layer %2lld: K=%s, V=%s\n", (long long) layer,
+                    ggml_type_name(tier_plan[layer].key), ggml_type_name(tier_plan[layer].value));
+        }
+    }
 
     cache.has_shift = false;
 
@@ -1922,29 +2057,42 @@ static bool llama_kv_cache_init(
                 split_cache_i = false;
             }
             int n_embd_head_v = hparams.n_embd_head_v(i);
-            auto this_type_k = type_k;
-            if (model.arch != LLM_ARCH_OPENPANGU && type_k_first != type_k && n_k_first > 0 && i < n_k_first) {
-                this_type_k = type_k_first;
-            }
-            if (model.arch != LLM_ARCH_OPENPANGU && type_k_last != type_k && n_k_last > 0 && i >= n_layer - n_k_last) {
-                this_type_k = type_k_last;
-            }
+            auto this_type_k = tier_plan[i].key;
             if (this_type_k != type_k) {
                 LLAMA_LOG_INFO("================= Setting K-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_k));
             }
             int64_t v_ne = int64_t(n_embd_v_row)*kv_size;
-            auto this_type_v = type_v;
-            if (model.arch != LLM_ARCH_OPENPANGU && type_v_first != type_v && n_v_first > 0 && i < n_v_first) {
-                this_type_v = type_v_first;
-            }
-            if (model.arch != LLM_ARCH_OPENPANGU && type_v_last != type_v && n_v_last > 0 && i >= n_layer - n_v_last) {
-                this_type_v = type_v_last;
-            }
+            auto this_type_v = tier_plan[i].value;
             if (this_type_v != type_v) {
                 LLAMA_LOG_INFO("================= Setting V-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_v));
             }
 
-            if (model.arch == LLM_ARCH_OPENPANGU) {
+            uint32_t n_embd_head_k_alloc = n_embd_head_k;
+            uint32_t n_embd_head_v_alloc = n_embd_head_v;
+            if (cache.recurrent) {
+                // Recurrent caches hold one convolution and SSM state per slot;
+                // they are not attention heads and must not pass through head
+                // padding/accounting. Live retiering rejects these caches.
+                k = ggml_new_tensor_1d(ctx, this_type_k, int64_t(hparams.n_embd_k_s()) * kv_size);
+                v = ggml_new_tensor_1d(ctx, this_type_v, int64_t(hparams.n_embd_v_s()) * kv_size);
+            } else {
+                n_embd_head_k_alloc = llama_kv_head_dim_for_type(this_type_k, n_embd_head_k);
+                n_embd_head_v_alloc = !cache.v_trans
+                    ? llama_kv_head_dim_for_type(this_type_v, n_embd_head_v)
+                    : n_embd_head_v;
+                const uint32_t n_embd_v_row_alloc = n_embd_head_v_alloc * n_head_kv;
+                v_ne = int64_t(n_embd_v_row_alloc) * kv_size;
+
+                if (n_embd_head_k_alloc != n_embd_head_k || n_embd_head_v_alloc != (uint32_t) n_embd_head_v) {
+                    LLAMA_LOG_INFO("%s: layer %d quantized KV head padding: K %u -> %u, V %d -> %u\n",
+                            __func__, i, n_embd_head_k, n_embd_head_k_alloc,
+                            n_embd_head_v, n_embd_head_v_alloc);
+                }
+            }
+
+            if (cache.recurrent) {
+                // Allocated above using recurrent state dimensions.
+            } else if (model.arch == LLM_ARCH_OPENPANGU) {
                 // MLA-latent cache: k_l holds [ckv_norm 512 | roped k_pe 64] per position.
                 // The value-side latent is rederived from k_l per graph; no persistent V store.
                 const int64_t n_lat = (int64_t) hparams.n_lora_kv + hparams.n_rot;   // 576
@@ -1952,7 +2100,7 @@ static bool llama_kv_cache_init(
             } else if (is_dsv4_k_only) {
                 k = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k, n_head_kv*kv_size);
             } else {
-                k = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k, n_head_kv*kv_size);
+                k = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k_alloc, n_head_kv*kv_size);
                 v = ggml_new_tensor_1d(ctx, this_type_v, v_ne);
             }
 
@@ -2000,7 +2148,7 @@ static bool llama_kv_cache_init(
                         LLAMA_LOG_DEBUG("K_cache(%d, %d): using %d instead of %ld heads\n",
                                 i, is, nhead_kv, extra_K->splits[is]->ne[1]/n_embd_head_k);
                     }
-                    split_k_l.tensor_splits[is] = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k, nhead_kv * kv_size);
+                    split_k_l.tensor_splits[is] = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k_alloc, nhead_kv * kv_size);
                     auto split_name = k_name + '.' + std::to_string(is);
                     ggml_set_name(split_k_l.tensor_splits[is], split_name.c_str());
                     mem_split[is] += ggml_nbytes(split_k_l.tensor_splits[is]);
@@ -2011,7 +2159,10 @@ static bool llama_kv_cache_init(
                 for (int is = 0; is < extra_V->n_device; ++is) {
                     auto split = extra_V->splits[is];
                     if (!split) continue;
-                    split_v_l.tensor_splits[is] = ggml_new_tensor_1d(ctx, this_type_v, split->ne[1] * kv_size);
+                    GGML_ASSERT(split->ne[1] % n_embd_head_v == 0);
+                    const int nhead_v = split->ne[1] / n_embd_head_v;
+                    split_v_l.tensor_splits[is] = ggml_new_tensor_1d(
+                            ctx, this_type_v, int64_t(n_embd_head_v_alloc) * nhead_v * kv_size);
                     auto split_name = v_name + '.' + std::to_string(is);
                     ggml_set_name(split_v_l.tensor_splits[is], split_name.c_str());
                     mem_split[is] += ggml_nbytes(split_v_l.tensor_splits[is]);
@@ -2081,6 +2232,95 @@ static bool llama_kv_cache_init(
 #endif
 
     return true;
+}
+
+static bool llama_kv_cache_transcode_head_row(
+        const ggml_tensor * source,
+        ggml_tensor * destination,
+        size_t source_offset,
+        size_t destination_offset,
+        uint32_t source_values,
+        uint32_t destination_values,
+        uint32_t logical_values,
+        std::vector<uint8_t> & source_bytes,
+        std::vector<uint8_t> & destination_bytes,
+        std::vector<float> & source_float,
+        std::vector<float> & destination_float) {
+    const size_t source_size = ggml_row_size(source->type, source_values);
+    const size_t destination_size = ggml_row_size(destination->type, destination_values);
+    source_bytes.resize(source_size);
+    destination_bytes.resize(destination_size);
+    ggml_backend_tensor_get(source, source_bytes.data(), source_offset, source_size);
+
+    if (source->type == destination->type && source_values == destination_values) {
+        ggml_backend_tensor_set(destination, source_bytes.data(), destination_offset, source_size);
+        return true;
+    }
+
+    const auto source_traits = ggml_internal_get_type_traits(source->type);
+    const auto destination_traits = ggml_internal_get_type_traits(destination->type);
+    if ((source->type != GGML_TYPE_F32 && source_traits.to_float == nullptr) ||
+            (destination->type != GGML_TYPE_F32 && destination_traits.from_float == nullptr)) {
+        LLAMA_LOG_ERROR("%s: no host transcode path for %s -> %s\n", __func__,
+                ggml_type_name(source->type), ggml_type_name(destination->type));
+        return false;
+    }
+
+    source_float.resize(source_values);
+    destination_float.assign(destination_values, 0.0f);
+    if (source->type == GGML_TYPE_F32) {
+        memcpy(source_float.data(), source_bytes.data(), source_values * sizeof(float));
+    } else {
+        source_traits.to_float(source_bytes.data(), source_float.data(), source_values);
+    }
+    std::copy_n(source_float.begin(), std::min({ logical_values, source_values, destination_values }),
+            destination_float.begin());
+    if (destination->type == GGML_TYPE_F32) {
+        memcpy(destination_bytes.data(), destination_float.data(), destination_values * sizeof(float));
+    } else {
+        destination_traits.from_float(destination_float.data(), destination_bytes.data(), destination_values);
+    }
+    ggml_backend_tensor_set(destination, destination_bytes.data(), destination_offset, destination_size);
+    return true;
+}
+
+static void llama_kv_cache_swap_storage(llama_kv_cache & left, llama_kv_cache & right) {
+    using std::swap;
+    swap(left.has_shift, right.has_shift);
+    swap(left.do_defrag, right.do_defrag);
+    swap(left.do_copy, right.do_copy);
+    swap(left.recurrent, right.recurrent);
+    swap(left.hybrid, right.hybrid);
+    swap(left.v_trans, right.v_trans);
+    swap(left.s_l_position_strict, right.s_l_position_strict);
+    swap(left.head, right.head);
+    swap(left.size, right.size);
+    swap(left.used, right.used);
+    swap(left.n, right.n);
+    swap(left.type_k, right.type_k);
+    swap(left.type_v, right.type_v);
+    swap(left.cells, right.cells);
+    swap(left.k_l, right.k_l);
+    swap(left.v_l, right.v_l);
+    swap(left.s_l, right.s_l);
+    swap(left.kr_l, right.kr_l);
+    swap(left.save_per_step_ssm, right.save_per_step_ssm);
+    swap(left.split_k_l, right.split_k_l);
+    swap(left.split_v_l, right.split_v_l);
+    swap(left.split_s_l, right.split_s_l);
+    swap(left.replicated_k_l, right.replicated_k_l);
+    swap(left.ctxs, right.ctxs);
+    swap(left.bufs, right.bufs);
+}
+
+static int64_t llama_kv_retier_failure_row() {
+    const char * value = getenv("ESE_TURBO_RETIER_FAIL_AFTER_ROWS");
+    if (value == nullptr || value[0] == '\0') {
+        return -1;
+    }
+    char * end = nullptr;
+    const long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && parsed >= 0 ? parsed : -1;
 }
 
 // find an empty slot of size "n_tokens" in the cache
@@ -5303,10 +5543,13 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 throw std::runtime_error(error_msg);
             }
         }
-        if (params.defer_experts && params.use_mmap) {
+        if ((params.defer_experts && params.use_mmap) || params.expert_ram_cache_bytes > 0) {
 #ifdef __linux__
             ml.build_expert_tensor_index(model.hparams);
 #else
+            if (params.expert_ram_cache_bytes > 0) {
+                throw std::runtime_error("the bounded expert RAM cache currently requires Linux");
+            }
             LLAMA_LOG_WARN("%s: deferred expert loading is only supported on Linux; ignoring defer_experts\n", __func__);
 #endif
         }
@@ -5338,6 +5581,77 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             params.progress_callback, params.progress_callback_user_data
         )) {
             return -2;
+        }
+
+        if (!params.dry_run && model.hparams.mtp_use_ordered_embeddings) {
+            if (model.mtp_centroids == nullptr || model.mtp_token_ordering == nullptr) {
+                throw std::runtime_error(
+                    "mapped draft vocabulary requested by model metadata, but centroid/map tensors are missing");
+            }
+            std::string ordering_error;
+            if (!llama_mapped_draft_token_ordering_valid(
+                    model.mtp_token_ordering, model.hparams.n_vocab, &ordering_error)) {
+                throw std::runtime_error(ordering_error);
+            }
+        }
+
+        model.expert_index = std::move(ml.expert_tensor_index);
+        model.expert_sidecar_only = params.expert_sidecar_only;
+        if (params.expert_sidecar_only && params.expert_ram_cache_bytes == 0) {
+            throw std::runtime_error("--expert-sidecar-only requires a non-zero expert RAM cache");
+        }
+        if (params.expert_ram_cache_bytes > 0) {
+            if (model.expert_index.descriptors.empty()) {
+                throw std::runtime_error("expert RAM cache requested but no lease-compatible expert descriptors were found");
+            }
+            uint64_t largest_component = 0;
+            for (const auto & item : model.expert_index.descriptors) {
+                largest_component = std::max(largest_component, item.second->bytes());
+            }
+            if (largest_component > params.expert_ram_cache_bytes) {
+                throw std::runtime_error(format(
+                        "expert RAM cache capacity (%llu bytes) cannot hold the largest expert component (%llu bytes)",
+                        (unsigned long long) params.expert_ram_cache_bytes,
+                        (unsigned long long) largest_component));
+            }
+            uint64_t staging_bytes = params.expert_ram_staging_bytes;
+            if (staging_bytes == 0) {
+                staging_bytes = std::max<uint64_t>(
+                        largest_component,
+                        std::min<uint64_t>(params.expert_ram_cache_bytes, 64ULL*1024ULL*1024ULL));
+            }
+            if (staging_bytes > params.expert_ram_cache_bytes) {
+                throw std::runtime_error("expert RAM staging capacity cannot exceed expert RAM cache capacity");
+            }
+            if (staging_bytes < largest_component) {
+                throw std::runtime_error(format(
+                        "expert RAM staging capacity (%llu bytes) cannot hold the largest expert component (%llu bytes)",
+                        (unsigned long long) staging_bytes,
+                        (unsigned long long) largest_component));
+            }
+
+            llama_expert_cache::read_backend backend = llama_expert_cache::read_backend::pread;
+            switch (params.expert_storage_backend) {
+                case LLAMA_EXPERT_STORAGE_MMAP: backend = llama_expert_cache::read_backend::mmap; break;
+                case LLAMA_EXPERT_STORAGE_PREAD: backend = llama_expert_cache::read_backend::pread; break;
+                case LLAMA_EXPERT_STORAGE_IO_URING: backend = llama_expert_cache::read_backend::io_uring; break;
+                default: throw std::runtime_error("invalid expert storage backend");
+            }
+            std::vector<std::shared_ptr<const llama_expert_cache::source>> sources;
+            sources.reserve(model.expert_index.sources.size());
+            for (const auto & source : model.expert_index.sources) {
+                sources.push_back(std::make_shared<llama_expert_cache::file_source>(
+                        source.id, source.identity, source.path, backend));
+            }
+            model.expert_ram_cache.reset(new llama_expert_cache::ram_cache({
+                params.expert_ram_cache_bytes,
+                staging_bytes,
+            }, std::move(sources)));
+            LLAMA_LOG_INFO("%s: bounded expert RAM cache enabled: %.1f MiB resident, %.1f MiB staging, backend=%s, descriptors=%zu\n",
+                    __func__, params.expert_ram_cache_bytes/1024.0/1024.0, staging_bytes/1024.0/1024.0,
+                    params.expert_storage_backend == LLAMA_EXPERT_STORAGE_MMAP ? "mmap" :
+                    params.expert_storage_backend == LLAMA_EXPERT_STORAGE_IO_URING ? "io_uring" : "pread",
+                    model.expert_index.descriptors.size());
         }
 
         // ---- populate reload registry ONLY when hot-swap is requested ----
@@ -6343,6 +6657,12 @@ static void llama_graph_compute(
         ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
         ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
+        ggml_backend_cpu_set_expert_lease_callbacks(
+                lctx.backend_cpu,
+                lctx.model.expert_ram_cache ? llama_expert_lease_acquire : nullptr,
+                lctx.model.expert_ram_cache ? llama_expert_lease_release : nullptr,
+                const_cast<llama_model *>(&lctx.model),
+                lctx.model.expert_sidecar_only);
     }
 
     ggml_backend_sched_graph_compute_async(lctx.sched, gf);
@@ -6365,6 +6685,12 @@ static void llama_graph_compute_sched(
         ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
         ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
+        ggml_backend_cpu_set_expert_lease_callbacks(
+                lctx.backend_cpu,
+                lctx.model.expert_ram_cache ? llama_expert_lease_acquire : nullptr,
+                lctx.model.expert_ram_cache ? llama_expert_lease_release : nullptr,
+                const_cast<llama_model *>(&lctx.model),
+                lctx.model.expert_sidecar_only);
     }
 
     ggml_backend_sched_graph_compute_async(sched, gf);
@@ -6711,6 +7037,16 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         auto & prev = cparams.mtp_op_type == MTP_OP_NONE ? lctx.prev : lctx.prev_mtp;
+        // A prompt may be split into one-token microbatches.  Preserve its
+        // CPU-MoE scheduling policy and enable the bounded VRAM cache only for
+        // a true single-token decode API call.
+        const bool active_expert_decode = n_tokens_all == 1;
+        if (lctx.active_expert_decode != active_expert_decode) {
+            lctx.prev.reset();
+            lctx.prev_mtp.reset();
+            lctx.active_expert_decode = active_expert_decode;
+        }
+        ggml_backend_sched_set_active_expert_decode(lctx.sched, active_expert_decode);
         ggml_cgraph * gf = nullptr;
         if (!lctx.can_reuse_graph(u_batch)) {
             lctx.reset_scheduler();
@@ -7261,8 +7597,8 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     // number of cells moved
     uint32_t n_moves = 0;
 
-    // each move requires 6*n_layer tensors (see build_defrag)
-    //   - source view, destination view, copy operation
+    // each move requires 8*n_layer tensors (see build_defrag)
+    //   - source view, temporary duplicate, destination view, copy operation
     //   - x2 for keys and values
     //const uint32_t max_moves = model.max_nodes()/(6*n_layer);
     // TODO: tmp fix https://github.com/ggerganov/llama.cpp/issues/6685#issuecomment-2057579516
@@ -7270,7 +7606,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     // (src view, dst view, copy), so budget 9*n_layer per move when the indexer cache is present.
     const bool has_dsa_indexer_defrag =
         lctx.model.arch == LLM_ARCH_GLM_DSA && !kv_self.kr_l.empty();
-    const uint32_t tensors_per_move = has_dsa_indexer_defrag ? 9 : 6;
+    const uint32_t tensors_per_move = has_dsa_indexer_defrag ? 12 : 8;
     const uint32_t max_moves = (lctx.model.max_nodes(1) - 2*n_layer)/(tensors_per_move*n_layer);
 
     // determine which KV cells to move where
@@ -7836,6 +8172,10 @@ struct llama_model_params llama_model_default_params() {
         /*.dry_run                     =*/ false,
         /*.flash_attn                  =*/ true,
         /*.defer_experts               =*/ false,
+        /*.expert_sidecar_only         =*/ false,
+        /*.expert_ram_cache_bytes      =*/ 0,
+        /*.expert_ram_staging_bytes    =*/ 0,
+        /*.expert_storage_backend      =*/ LLAMA_EXPERT_STORAGE_PREAD,
     };
 
 #ifdef GGML_USE_METAL
@@ -7883,6 +8223,10 @@ struct llama_context_params llama_context_default_params() {
         /*.n_last_k                    =*/ -1,
         /*.n_first_v                   =*/ -1,
         /*.n_last_v                    =*/ -1,
+        /*.type_k_layers               =*/ nullptr,
+        /*.type_v_layers               =*/ nullptr,
+        /*.n_type_k_layers             =*/ 0,
+        /*.n_type_v_layers             =*/ 0,
         /*.logits_all                  =*/ false,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
@@ -7914,6 +8258,9 @@ struct llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
         /*.offload_policy              =*/ nullptr,
         /*.cuda_params                 =*/ nullptr,
+        /*.expert_vram_cache_bytes     =*/ 0,
+        /*.expert_vram_reserve_bytes   =*/ 0,
+        /*.expert_cache_min_observations =*/ 2,
     };
 
     return result;
@@ -8420,6 +8767,9 @@ struct llama_context * llama_init_from_model(
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
     cparams.worst_graph_tokens = params.worst_case_tokens;
+    cparams.expert_vram_cache_bytes = params.expert_vram_cache_bytes;
+    cparams.expert_vram_reserve_bytes = params.expert_vram_reserve_bytes;
+    cparams.expert_cache_min_observations = params.expert_cache_min_observations;
 
     cparams.reduce_type      = params.type_reduce;
     cparams.graph_attn_precision = params.type_graph_attn;
@@ -8795,7 +9145,9 @@ struct llama_context * llama_init_from_model(
 
         if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, params.idx_type_k, kv_size, cparams.offload_kqv,
                     params.type_k_first, params.type_k_last, params.type_v_first, params.type_v_last,
-                    params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last)) {
+                    params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last,
+                    params.type_k_layers, params.type_v_layers,
+                    params.n_type_k_layers, params.n_type_v_layers)) {
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);
             return nullptr;
@@ -8894,6 +9246,22 @@ struct llama_context * llama_init_from_model(
             pipeline_parallel = false;
 #endif
             ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);
+            auto configure_expert_hierarchy = [&] {
+                ggml_backend_sched_set_expert_cache_capacity(
+                        ctx->sched,
+                        cparams.expert_vram_cache_bytes,
+                        cparams.expert_vram_reserve_bytes,
+                        cparams.expert_cache_min_observations);
+                if (model->expert_ram_cache) {
+                    ggml_backend_sched_set_expert_lease_callbacks(
+                            ctx->sched,
+                            llama_expert_lease_acquire,
+                            llama_expert_lease_release,
+                            model,
+                            model->expert_sidecar_only);
+                }
+            };
+            configure_expert_hierarchy();
 
             if (pipeline_parallel) {
                 LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(ctx->sched));
@@ -8917,7 +9285,9 @@ struct llama_context * llama_init_from_model(
             {
                 if (pipeline_parallel) {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                    ggml_backend_sched_free(ctx->sched);
                     ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
+                    configure_expert_hierarchy();
                     gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
                 }
                 if (!gf_success) {
@@ -9914,6 +10284,217 @@ int32_t llama_kv_cache_update(struct llama_context * ctx) {
     return llama_kv_cache_update_internal(*ctx);
 }
 
+uint32_t llama_kv_cache_layer_count(const struct llama_context * ctx) {
+    return ctx == nullptr ? 0 : uint32_t(ctx->kv_self.k_l.size());
+}
+
+uint32_t llama_kv_cache_size(const struct llama_context * ctx) {
+    return ctx == nullptr ? 0 : ctx->kv_self.size;
+}
+
+bool llama_kv_cache_get_layer_types(
+        const struct llama_context * ctx,
+        struct llama_kv_cache_layer_types * types,
+        uint32_t capacity) {
+    if (ctx == nullptr || types == nullptr || capacity < ctx->kv_self.k_l.size()) {
+        return false;
+    }
+    for (uint32_t layer = 0; layer < ctx->kv_self.k_l.size(); ++layer) {
+        types[layer].type_k = ctx->kv_self.k_l[layer] == nullptr
+            ? GGML_TYPE_COUNT : ctx->kv_self.k_l[layer]->type;
+        types[layer].type_v = layer >= ctx->kv_self.v_l.size() || ctx->kv_self.v_l[layer] == nullptr
+            ? GGML_TYPE_COUNT : ctx->kv_self.v_l[layer]->type;
+    }
+    return true;
+}
+
+static bool llama_kv_cache_replace(
+        struct llama_context * ctx,
+        const enum ggml_type * type_k_layers,
+        const enum ggml_type * type_v_layers,
+        uint32_t n_layers,
+        uint32_t target_size) {
+    if (ctx == nullptr || n_layers == 0 || n_layers != ctx->kv_self.k_l.size() ||
+            (type_k_layers == nullptr && type_v_layers == nullptr) || target_size == 0) {
+        LLAMA_LOG_ERROR("%s: invalid layer map\n", __func__);
+        return false;
+    }
+
+    auto & current = ctx->kv_self;
+    const auto & model = ctx->model;
+    if (current.recurrent || current.hybrid || current.v_trans || model.is_mla_model() ||
+            model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_OPENPANGU ||
+            !current.split_k_l.empty() || !current.split_v_l.empty() ||
+            !current.split_s_l.empty() || !current.replicated_k_l.empty()) {
+        LLAMA_LOG_ERROR("%s: live retiering is not supported for recurrent, transposed, MLA, or split KV layouts\n", __func__);
+        return false;
+    }
+
+    std::vector<ggml_type> target_k(n_layers, current.type_k);
+    std::vector<ggml_type> target_v(n_layers, current.type_v);
+    bool changed = target_size != current.size;
+    for (uint32_t layer = 0; layer < n_layers; ++layer) {
+        if (current.k_l[layer] != nullptr) {
+            target_k[layer] = type_k_layers == nullptr ? current.k_l[layer]->type : type_k_layers[layer];
+            changed |= target_k[layer] != current.k_l[layer]->type;
+        }
+        if (layer < current.v_l.size() && current.v_l[layer] != nullptr) {
+            target_v[layer] = type_v_layers == nullptr ? current.v_l[layer]->type : type_v_layers[layer];
+            changed |= target_v[layer] != current.v_l[layer]->type;
+        }
+    }
+    if (!changed) {
+        return true;
+    }
+
+    if (target_size > ctx->cparams.n_ctx ||
+            target_size % llama_kv_cache_get_padding(ctx->cparams) != 0) {
+        LLAMA_LOG_ERROR("%s: target size %u exceeds the context limit or backend padding contract\n",
+                __func__, target_size);
+        return false;
+    }
+    if (target_size < current.size) {
+        for (uint32_t cell = target_size; cell < current.size; ++cell) {
+            if (current.cells[cell].pos >= 0) {
+                LLAMA_LOG_ERROR("%s: target size %u would discard occupied cell %u\n",
+                        __func__, target_size, cell);
+                return false;
+            }
+        }
+    }
+
+    llama_synchronize(ctx);
+    if (llama_kv_cache_update_internal(*ctx) != 0) {
+        LLAMA_LOG_ERROR("%s: failed to settle pending KV updates\n", __func__);
+        return false;
+    }
+    llama_synchronize(ctx);
+    ctx->reset_scheduler();
+
+    llama_kv_cache prepared;
+    if (!llama_kv_cache_init(prepared, ctx, current.type_k, current.type_v,
+                ctx->cparams.idx_type_k, target_size, ctx->cparams.offload_kqv,
+                current.type_k, current.type_k, current.type_v, current.type_v,
+                -1, -1, -1, -1,
+                target_k.data(), target_v.data(), n_layers, n_layers)) {
+        LLAMA_LOG_ERROR("%s: target cache allocation failed; original cache retained\n", __func__);
+        return false;
+    }
+
+    const auto & hparams = model.hparams;
+    const int64_t fail_after = llama_kv_retier_failure_row();
+    int64_t migrated_rows = 0;
+    size_t peak_staging = 0;
+    std::vector<uint8_t> source_bytes;
+    std::vector<uint8_t> destination_bytes;
+    std::vector<float> source_float;
+    std::vector<float> destination_float;
+
+    const auto migrate = [&](const ggml_tensor * source, ggml_tensor * destination,
+            uint32_t logical_head, uint32_t head_count, uint32_t cell) -> bool {
+        const uint32_t source_head = uint32_t(source->ne[0] / (source->ne[1] == 1 ? current.size * head_count : 1));
+        const uint32_t destination_head = uint32_t(destination->ne[0] /
+                (destination->ne[1] == 1 ? prepared.size * head_count : 1));
+        const size_t source_head_bytes = ggml_row_size(source->type, source_head);
+        const size_t destination_head_bytes = ggml_row_size(destination->type, destination_head);
+        for (uint32_t head = 0; head < head_count; ++head) {
+            if (migrated_rows == fail_after) {
+                LLAMA_LOG_WARN("%s: injected failure after %lld rows; original cache retained\n",
+                        __func__, (long long) migrated_rows);
+                return false;
+            }
+            const size_t source_offset = (size_t(cell) * head_count + head) * source_head_bytes;
+            const size_t destination_offset = (size_t(cell) * head_count + head) * destination_head_bytes;
+            if (!llama_kv_cache_transcode_head_row(source, destination,
+                        source_offset, destination_offset, source_head, destination_head,
+                        logical_head, source_bytes, destination_bytes, source_float, destination_float)) {
+                return false;
+            }
+            ++migrated_rows;
+            peak_staging = std::max(peak_staging,
+                    source_bytes.capacity() + destination_bytes.capacity() +
+                    (source_float.capacity() + destination_float.capacity()) * sizeof(float));
+        }
+        return true;
+    };
+
+    for (uint32_t layer = 0; layer < n_layers; ++layer) {
+        if ((current.k_l[layer] == nullptr) != (prepared.k_l[layer] == nullptr) ||
+                (layer < current.v_l.size() && current.v_l[layer] != nullptr) !=
+                (layer < prepared.v_l.size() && prepared.v_l[layer] != nullptr)) {
+            LLAMA_LOG_ERROR("%s: target cache geometry changed at layer %u\n", __func__, layer);
+            return false;
+        }
+        if (current.k_l[layer] == nullptr) {
+            continue;
+        }
+        const uint32_t head_count = hparams.n_head_kv(layer);
+        for (uint32_t cell = 0; cell < current.size; ++cell) {
+            if (current.cells[cell].pos < 0) {
+                continue;
+            }
+            if (!migrate(current.k_l[layer], prepared.k_l[layer],
+                        hparams.n_embd_head_k(layer), head_count, cell)) {
+                return false;
+            }
+            if (layer < current.v_l.size() && current.v_l[layer] != nullptr &&
+                    !migrate(current.v_l[layer], prepared.v_l[layer],
+                        hparams.n_embd_head_v(layer), head_count, cell)) {
+                return false;
+            }
+        }
+    }
+
+    const uint32_t retained_cells = std::min(current.size, prepared.size);
+    std::copy_n(current.cells.begin(), retained_cells, prepared.cells.begin());
+    prepared.head = current.head < prepared.size ? current.head : 0;
+    prepared.used = current.used;
+    prepared.n = std::min(current.n, prepared.size);
+    prepared.has_shift = current.has_shift;
+    prepared.save_per_step_ssm = current.save_per_step_ssm;
+
+    // Publication cannot fail: all allocation and conversion work completed
+    // above. Releasing an in-memory checkpoint prevents it from retaining
+    // tensors owned by the old representation.
+    current.ckpt.release();
+    prepared.ckpt.release();
+    llama_kv_cache_swap_storage(current, prepared);
+    ctx->reset_scheduler();
+    for (auto & copy : ctx->cache_copies) copy = {};
+    for (auto & copy : ctx->dsa_cache_copies) copy = {};
+    for (auto & copy : ctx->openpangu_cache_copies) copy = {};
+    for (auto & copy : ctx->openpangu_cache_copies_mtp) copy = {};
+
+    LLAMA_LOG_INFO("%s: committed %lld bounded row migrations (peak host staging %.2f KiB)\n",
+            __func__, (long long) migrated_rows, peak_staging / 1024.0);
+    return true;
+}
+
+bool llama_kv_cache_retier(
+        struct llama_context * ctx,
+        const enum ggml_type * type_k_layers,
+        const enum ggml_type * type_v_layers,
+        uint32_t n_layers) {
+    return llama_kv_cache_replace(ctx, type_k_layers, type_v_layers, n_layers,
+            ctx == nullptr ? 0 : ctx->kv_self.size);
+}
+
+bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size) {
+    if (ctx == nullptr || ctx->kv_self.k_l.empty()) {
+        return false;
+    }
+    const uint32_t n_layers = uint32_t(ctx->kv_self.k_l.size());
+    std::vector<ggml_type> type_k(n_layers, ctx->kv_self.type_k);
+    std::vector<ggml_type> type_v(n_layers, ctx->kv_self.type_v);
+    for (uint32_t layer = 0; layer < n_layers; ++layer) {
+        if (ctx->kv_self.k_l[layer] != nullptr) type_k[layer] = ctx->kv_self.k_l[layer]->type;
+        if (layer < ctx->kv_self.v_l.size() && ctx->kv_self.v_l[layer] != nullptr) {
+            type_v[layer] = ctx->kv_self.v_l[layer]->type;
+        }
+    }
+    return llama_kv_cache_replace(ctx, type_k.data(), type_v.data(), n_layers, size);
+}
+
 // deprecated
 size_t llama_get_state_size(struct llama_context * ctx) {
     return llama_state_get_size(ctx);
@@ -10122,7 +10703,6 @@ struct llama_data_write {
         // Iterate and write all the keys first, each row is a cell
         // Get whole range at a time
         for (uint32_t il = 0; il < n_layer; ++il) {
-            const uint32_t n_embd_k_gqa = llama_kv_k_row_embd(ctx->model, hparams, il);
             const uint32_t n_embd_head_qk_rope = hparams.n_rot;
             const uint32_t kv_lora_rank = hparams.n_lora_kv;
             const bool has_k_cache = kv_self.k_l[il] != nullptr && need_kv;
@@ -10134,7 +10714,7 @@ struct llama_data_write {
             // Write row size of key
             const uint64_t k_size_row = has_k_cache
                 ? ((ctx->cparams.mla_attn == 0)
-                    ? ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa)
+                    ? ggml_row_size(kv_self.k_l[il]->type, kv_self.k_l[il]->ne[0]) * hparams.n_head_kv(il)
                     : ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope))
                 : 0;
             write(&k_size_row, sizeof(k_size_row));
@@ -10153,7 +10733,6 @@ struct llama_data_write {
 
         if (v_state == 0) {
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = llama_kv_v_row_embd(ctx->model, hparams, il);
                 const bool has_v_cache = kv_self.v_l[il] != nullptr && need_kv;
 
                 // Write value type
@@ -10161,7 +10740,9 @@ struct llama_data_write {
                 write(&v_type_i, sizeof(v_type_i));
 
                 // Write row size of value
-                const uint64_t v_size_row = has_v_cache ? ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa) : 0;
+                const uint64_t v_size_row = has_v_cache
+                    ? ggml_row_size(kv_self.v_l[il]->type, kv_self.v_l[il]->ne[0] / kv_self.size)
+                    : 0;
                 write(&v_size_row, sizeof(v_size_row));
 
                 if (!has_v_cache) {
@@ -10589,18 +11170,24 @@ struct llama_data_read {
         auto kv = is_recurrent ? nullptr : get_kv_cache_split_tensor(tensor, ctx->model.layers[il]);
         auto kv_extra = kv ? (ggml_split_tensor_t *)kv->extra : nullptr;
         GGML_ASSERT(extra && (is_recurrent || kv_extra));
-        auto ne = kv ? kv->ne[1] : tensor->ne[0];
-        size_t sum_ne = 0;
+        const size_t cache_rows = is_recurrent ? 0 : ctx->kv_self.size;
+        GGML_ASSERT(is_recurrent || cache_rows > 0);
+        GGML_ASSERT(is_recurrent || ggml_nbytes(tensor) % cache_rows == 0);
+        const size_t full_row_size = is_recurrent
+            ? ggml_row_size(tensor->type, tensor->ne[0])
+            : ggml_nbytes(tensor) / cache_rows;
         size_t sum_split_row_size = 0;
-        GGML_ASSERT(row_size == ggml_row_size(tensor->type, ne));
+        GGML_ASSERT(row_size == full_row_size);
         for (int id = 0; id < extra->n_device; ++id) {
             auto split = extra->splits[id];
             auto kv_split = kv_extra ? kv_extra->splits[id] : nullptr;
             GGML_ASSERT((split && (kv_split || is_recurrent)) || (!split && !kv_split));
             if (!split) continue;
             GGML_ASSERT(split->type == tensor->type);
-            auto ne_split = kv_split ? kv_split->ne[1] : split->ne[0];
-            auto split_row_size = ggml_row_size(tensor->type, ne_split);
+            GGML_ASSERT(is_recurrent || ggml_nbytes(split) % cache_rows == 0);
+            const size_t split_row_size = is_recurrent
+                ? ggml_row_size(tensor->type, split->ne[0])
+                : ggml_nbytes(split) / cache_rows;
             aux.resize(split_row_size*nrows);
             auto src = data + sum_split_row_size;
             auto dst = aux.data();
@@ -10610,10 +11197,8 @@ struct llama_data_read {
                 src += row_size;
             }
             ggml_backend_tensor_set(split, aux.data(), head*split_row_size, nrows*split_row_size);
-            sum_ne += ne_split;
             sum_split_row_size += split_row_size;
         }
-        GGML_ASSERT(sum_ne == ne);
         GGML_ASSERT(sum_split_row_size == row_size);
     }
 
@@ -10742,7 +11327,6 @@ struct llama_data_read {
 
         // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
         for (uint32_t il = 0; il < n_layer; ++il) {
-            const uint32_t n_embd_k_gqa = llama_kv_k_row_embd(ctx->model, hparams, il);
             const uint32_t n_embd_head_qk_rope = hparams.n_rot;
             const uint32_t kv_lora_rank = hparams.n_lora_kv;
             const bool has_k_cache = kv_self.k_l[il] != nullptr && need_kv;
@@ -10774,7 +11358,9 @@ struct llama_data_read {
                 }
                 continue;
             }
-            const size_t k_size_row = (ctx->cparams.mla_attn == 0) ? ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa) : ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope);
+            const size_t k_size_row = (ctx->cparams.mla_attn == 0)
+                ? ggml_row_size(kv_self.k_l[il]->type, kv_self.k_l[il]->ne[0]) * hparams.n_head_kv(il)
+                : ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope);
             if (k_size_row != k_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
                 return false;
@@ -10792,7 +11378,6 @@ struct llama_data_read {
 
         if (v_state == 0) {
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = llama_kv_v_row_embd(ctx->model, hparams, il);
                 const bool has_v_cache = kv_self.v_l[il] != nullptr && need_kv;
 
                 // Read type of value
@@ -10821,7 +11406,8 @@ struct llama_data_read {
                     }
                     continue;
                 }
-                const size_t v_size_row = ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa);
+                const size_t v_size_row = ggml_row_size(
+                        kv_self.v_l[il]->type, kv_self.v_l[il]->ne[0] / kv_self.size);
                 if (v_size_row != v_size_row_ref) {
                     LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
                     return false;
@@ -11211,14 +11797,26 @@ struct llama_data_write_buffer : llama_data_write {
             get_tensor_data_split(ptr, tensor, aux_buffer, offset, size);
         } else {
             auto kv = get_kv_cache_split_tensor(tensor, model.layers[il]);
-            get_tensor_data_split(ptr, tensor, kv, aux_buffer, offset, size);
+            const uint32_t n_head_kv = model.hparams.n_head_kv(il);
+            uint32_t cache_rows;
+            if (tensor->ne[1] > 1) {
+                GGML_ASSERT(tensor->ne[1] % n_head_kv == 0);
+                cache_rows = tensor->ne[1] / n_head_kv;
+            } else {
+                const uint32_t cache_v_gqa = llama_kv_gqa_dim_for_type(
+                        tensor->type, model.hparams.n_embd_head_v(il), n_head_kv);
+                GGML_ASSERT(cache_v_gqa > 0 && tensor->ne[0] % cache_v_gqa == 0);
+                cache_rows = tensor->ne[0] / cache_v_gqa;
+            }
+            get_tensor_data_split(ptr, tensor, kv, aux_buffer, offset, size, cache_rows);
         }
     }
 
     static void get_tensor_data_split(uint8_t * ptr, const ggml_tensor * tensor, const ggml_tensor * kv,
-            std::vector<uint8_t> & aux_buffer, size_t offset, size_t size) {
-        auto ne = kv->ne[1];
-        auto full_row_size = ggml_row_size(tensor->type, ne);
+            std::vector<uint8_t> & aux_buffer, size_t offset, size_t size, size_t cache_rows) {
+        GGML_ASSERT(cache_rows > 0);
+        GGML_ASSERT(ggml_nbytes(tensor) % cache_rows == 0);
+        const size_t full_row_size = ggml_nbytes(tensor) / cache_rows;
         GGML_ASSERT(offset % full_row_size == 0);
         GGML_ASSERT(size   % full_row_size == 0);
         auto first_row = offset / full_row_size;
@@ -11234,7 +11832,8 @@ struct llama_data_write_buffer : llama_data_write {
             GGML_ASSERT((split && kv_split) || (!split && !kv_split));
             if (!split) continue;
             GGML_ASSERT(split->type == tensor->type);
-            auto split_row_size = ggml_row_size(tensor->type, kv_split->ne[1]);
+            GGML_ASSERT(ggml_nbytes(split) % cache_rows == 0);
+            const size_t split_row_size = ggml_nbytes(split) / cache_rows;
             auto split_size = split_row_size * num_rows;
             if (split_size > aux_buffer.size()) aux_buffer.resize(split_size);
             ggml_backend_tensor_get(split, aux_buffer.data(), first_row*split_row_size, split_size);
@@ -11354,9 +11953,26 @@ struct llama_data_write_file : llama_data_write {
             }
             return;
         }
-        auto kv = get_kv_cache_split_tensor(tensor, model.layers[il]);
         temp_buffer.resize(size);
-        llama_data_write_buffer::get_tensor_data_split(temp_buffer.data(), tensor, kv, aux_buffer, offset, size);
+        if (model.hparams.recurrent_layer_arr[il]) {
+            llama_data_write_buffer::get_tensor_data_split(
+                    temp_buffer.data(), tensor, aux_buffer, offset, size);
+        } else {
+            auto kv = get_kv_cache_split_tensor(tensor, model.layers[il]);
+            const uint32_t n_head_kv = model.hparams.n_head_kv(il);
+            uint32_t cache_rows;
+            if (tensor->ne[1] > 1) {
+                GGML_ASSERT(tensor->ne[1] % n_head_kv == 0);
+                cache_rows = tensor->ne[1] / n_head_kv;
+            } else {
+                const uint32_t cache_v_gqa = llama_kv_gqa_dim_for_type(
+                        tensor->type, model.hparams.n_embd_head_v(il), n_head_kv);
+                GGML_ASSERT(cache_v_gqa > 0 && tensor->ne[0] % cache_v_gqa == 0);
+                cache_rows = tensor->ne[0] / cache_v_gqa;
+            }
+            llama_data_write_buffer::get_tensor_data_split(
+                    temp_buffer.data(), tensor, kv, aux_buffer, offset, size, cache_rows);
+        }
     }
 
     size_t get_size_written() override {
@@ -11622,11 +12238,41 @@ static size_t llama_state_seq_set_data_internal(struct llama_context * ctx, llam
 }
 
 size_t llama_state_seq_set_data(struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id, llama_state_seq_flags flags) {
+    // Sequence restore used to remove or partially overwrite the destination
+    // before discovering incompatible per-layer KV metadata. Preserve the
+    // exact prior sequence so all parse, geometry, allocation, and backend
+    // failures are atomic from the caller's perspective.
+    std::vector<uint8_t> rollback_state;
+    try {
+        const size_t rollback_size = llama_state_seq_get_size(ctx, dest_seq_id, flags);
+        if (rollback_size > 0 && rollback_size != SIZE_MAX) {
+            rollback_state.resize(rollback_size);
+            llama_data_write_buffer rollback_writer(rollback_state.data(), rollback_state.size(), ctx->model);
+            if (llama_state_seq_get_data_internal(ctx, rollback_writer, dest_seq_id, flags) != rollback_state.size()) {
+                LLAMA_LOG_ERROR("%s: failed to capture rollback state\n", __func__);
+                return 0;
+            }
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error capturing rollback state: %s\n", __func__, err.what());
+        return 0;
+    }
+
     llama_data_read_buffer data_ctx(src, size);
     try {
         return llama_state_seq_set_data_internal(ctx, data_ctx, dest_seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state: %s\n", __func__, err.what());
+        if (!rollback_state.empty()) {
+            try {
+                llama_data_read_buffer rollback_reader(rollback_state.data(), rollback_state.size());
+                if (llama_state_seq_set_data_internal(ctx, rollback_reader, dest_seq_id, flags) != rollback_state.size()) {
+                    LLAMA_LOG_ERROR("%s: rollback state size mismatch\n", __func__);
+                }
+            } catch (const std::exception & rollback_err) {
+                LLAMA_LOG_ERROR("%s: failed to restore rollback state: %s\n", __func__, rollback_err.what());
+            }
+        }
         return 0;
     }
 }

@@ -9,7 +9,8 @@ The public model matches native capabilities:
 ```text
 resident  ordinary GPU offload / native fit
 hybrid    experts on CPU, dense tensors and an optional MoE tail on GPU
-stream    hybrid execution with deferred disk-backed experts
+cache     bounded RAM expert leases feeding adaptive per-device VRAM caches
+stream    the same hierarchy with deferred disk-backed experts
 ```
 
 All policies end in the same `llama-server` binary and API.
@@ -52,21 +53,32 @@ GGUF → dense/non-expert tensors → GPU(s)
 
 The conservative default is `--cpu-moe`. `--gpu-resident-moe N` converts a readable GGUF block count into `--n-cpu-moe BLOCKS-N`. This is static placement, not an adaptive VRAM expert cache.
 
-### Stream
+### Cache and stream
 
 ```text
-GGUF on NVMe
-      │
-      ├─ deferred mmap expert tensors
+GGUF shard extents (mmap / pread / io_uring)
+      │ checked immutable descriptors
       ▼
-OS page cache / host mappings
-      │
-router top-k + optional logit-tail advice
+fixed 64-byte-aligned RAM arena
+      │ lease-scoped expert components
       ▼
-CPU MoE + optional final GPU-resident MoE layers
+per-device adaptive VRAM cache
+      │ dedicated transfer stream + readiness events
+      ▼
+CUDA MoE decode
 ```
 
-The launcher sets `GGML_CUDA_NO_PINNED=1` so CPU MoE does not recreate a whole-model pinned allocation. `LLAMA_EXPERT_PREFETCH=1` activates ESE's route-aware `MADV_WILLNEED` path. `LLAMA_EXPERT_PREFETCH_TAIL=N` is optional because cold-cache A/B evidence is still required before making tail staging a default.
+`cache` defaults to mmap-backed sources when the model fits the safe RAM
+budget. `stream` selects `pread` and `--defer-experts` so correctness and the
+RAM bound do not depend on retaining all expert mappings. Both presets use the
+same native descriptor, lease, RAM, and VRAM controller. The older mmap
+page-cache prefetch remains an explicit optional optimization, not a required
+cache level.
+
+The launcher sets `GGML_CUDA_NO_PINNED=1` so CPU MoE does not recreate a
+whole-model pinned allocation. RAM capacity and reusable staging are separate
+bounds. VRAM capacity and safety reserve are enforced independently on every
+participating device, including the route-remap arena.
 
 ## Startup policy
 
@@ -74,20 +86,28 @@ Auto mode currently uses transparent conservative rules:
 
 1. A sparse model larger than 90% of available RAM selects `stream`.
 2. GPT-OSS exceeding the safe resident-memory budget selects `stream`.
-3. A MoE larger than 85% of free VRAM selects `hybrid` if RAM remains sufficient.
+3. A MoE larger than 85% of free VRAM selects `cache` if RAM remains sufficient.
 4. A model within 85% of free VRAM selects `resident`.
-5. Missing GPU telemetry defaults MoE models to `hybrid` and dense models to the native resident path.
+5. Missing GPU telemetry defaults MoE models to the bounded RAM cache and dense models to the native resident path.
 
 These are startup decisions, not hidden runtime migrations. `ese plan --json` exposes every input and output.
 
-## Target memory hierarchy
+## Native expert hierarchy and global-controller boundary
 
-The planned native resource controller will unify the current paths:
+Phase 2 implements the expert-specific hierarchy:
 
 ```text
-NVMe/model shards → bounded RAM expert cache → adaptive VRAM expert cache
-                                      ↘ KV / draft / workspace budget
+NVMe/model shards → bounded RAM expert cache → adaptive per-device VRAM cache
 ```
+
+Admission combines minimum observations, route frequency, prior-route
+prediction, reuse distance, and load cost. Deterministic eviction combines LRU
+age and ready-component cost. Upload and slot-reuse dependencies use CUDA
+events without a global compute-stream synchronization. Prompt-sized MoE work
+stays on the established CPU graph, where independent GPU work can overlap;
+single-token decode uses compact cache slots.
+
+Phase 4 will place this controller inside a global budget shared with:
 
 Budget participants will include:
 
@@ -103,7 +123,8 @@ I/O staging
 per-device safety reserve
 ```
 
-That controller is Phase 2/4 work, not a current launcher promise.
+That global rebalance policy is not yet a launcher promise; only the bounded
+expert hierarchy above is implemented in Phase 2.
 
 ## Design invariants
 

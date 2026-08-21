@@ -208,9 +208,39 @@ llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 
 
+
+# Phase 1 Turbo KV: internal type metadata and checked CPU dispatch.
+llama_build(test-turbo-kv-core.cpp)
+llama_test(test-turbo-kv-core)
+
+llama_build(test-turbo-kv-policy.cpp)
+llama_test(test-turbo-kv-policy)
+
+# Phase 2 expert hierarchy: checked descriptors and bounded lease lifetime.
+llama_build(test-expert-cache.cpp)
+llama_test(test-expert-cache)
+
+# Phase 3 transient residency: bounded, failure-atomic module transactions.
+llama_build(test-transient-module-manager.cpp)
+llama_test(test-transient-module-manager)
+
+llama_build(test-spec-tuner.cpp)
+llama_test(test-spec-tuner)
+
+llama_build(test-mapped-draft.cpp)
+llama_test(test-mapped-draft)
+
+# Requires a caller-supplied GGUF model; exercised by the Phase 1 validation script.
+llama_build(test-turbo-kv-lifecycle.cpp)
+llama_build(test-turbo-kv-quality.cpp)
+llama_build(test-turbo-kv-recurrent.cpp)
+
+if (GGML_CUDA)
+    llama_build(test-turbo-kv-cuda.cpp)
+    llama_test(test-turbo-kv-cuda)
+endif()
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
-
-

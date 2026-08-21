@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-arch.h"
 #include "llama-mmap.h"
+#include "llama-expert-io.h"
 #include "llama-vocab.h"
 #include "llama-hparams.h"
 
@@ -541,6 +542,12 @@ struct llama_model {
 
     // model memory mapped files
     llama_mmaps mappings;
+
+    // Phase 2 expert hierarchy. Descriptors survive the temporary model
+    // loader, and the bounded RAM tier owns all file-source handles it uses.
+    llama_expert_tensor_index expert_index;
+    std::unique_ptr<llama_expert_cache::ram_cache> expert_ram_cache;
+    bool expert_sidecar_only = false;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;

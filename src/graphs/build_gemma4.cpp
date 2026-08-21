@@ -1,4 +1,5 @@
 #include "../llama-build-context.h"
+#include "../llama-mapped-draft.h"
 #include "../llama-model.h"
 #include "../llama-context.h"
 
@@ -855,11 +856,40 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
     ggml_set_output(mtp_embd);
     ggml_build_forward_expand(gf, mtp_embd);
 
-    // E2B/E4B: The centroid/token-ordering tensors are kept in the GGUF for future use but
-    // not required for correct inference — the full-vocab matmul against the tied output
-    // weight still yields valid per-token logits.
-    auto logits = llm_build_context::llm_build_lora_mm(lctx, ctx0, model.output, cur);
-    cb(logits, "result_output", -1);
+    ggml_tensor * logits = nullptr;
+    const bool use_mapped_head =
+        hparams.mtp_use_ordered_embeddings &&
+        lctx.lora_adapters.empty() &&
+        llama_mapped_draft_head_valid(
+            n_vocab,
+            hparams.mtp_num_centroids,
+            hparams.mtp_centroid_top_k,
+            model.output,
+            model.mtp_centroids,
+            model.mtp_token_ordering,
+            cur);
+
+    if (use_mapped_head) {
+        // Frequency-ranked mapped draft head. The target still verifies with its
+        // untouched full vocabulary, so tokens outside this candidate set remain
+        // available and deterministic target output is unchanged.
+        const auto mapped = llama_build_mapped_draft_logits(
+            ctx0,
+            model.output,
+            model.mtp_centroids,
+            model.mtp_token_ordering,
+            cur,
+            n_vocab,
+            hparams.mtp_num_centroids,
+            hparams.mtp_centroid_top_k);
+        cb(mapped.centroid_logits, "mtp_centroid_logits", -1);
+        cb(mapped.candidate_ids, "mtp_draft_to_target_ids", -1);
+        logits = mapped.logits;
+        cb(logits, "result_output_mapped", -1);
+    } else {
+        logits = llm_build_context::llm_build_lora_mm(lctx, ctx0, model.output, cur);
+        cb(logits, "result_output", -1);
+    }
 
     ggml_build_forward_expand(gf, logits);
 
