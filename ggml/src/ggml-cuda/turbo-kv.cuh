@@ -13,3 +13,8 @@ void ggml_cuda_turbo_kv_set_rows(
         const ggml_tensor * src0,
         const ggml_tensor * src1,
         ggml_tensor * dst);
+
+void ggml_cuda_turbo_kv_dequantize_f16(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        void * dst);

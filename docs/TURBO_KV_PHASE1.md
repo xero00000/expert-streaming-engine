@@ -59,8 +59,24 @@ The CUDA graph test proves:
 - backend support for both graph operations;
 - independent table initialization on every visible CUDA device.
 
-This is row-codec infrastructure only. It does not yet make Turbo formats
-usable as a live KV cache because Flash Attention and lifecycle work remain.
+## CUDA Flash Attention compatibility bridge
+
+CUDA Flash Attention can now consume internal Turbo4/Turbo8 K and V tensors
+without a host round trip. The bridge dequantizes each compressed tensor into
+stream-ordered F16 device staging, then invokes the established CUDA Flash
+Attention implementation. This preserves that implementation's mask, GQA,
+softcap, and precision dispatch semantics while the direct fused Turbo tile
+readers are still being developed.
+
+The temporary device allocation is explicitly bounded at two bytes per staged
+element: at most `2 * (K elements + V elements)` bytes when both tensors are
+compressed. Storage comes from the CUDA stream pool and follows its stream
+lifetime; there is no CPU allocation, copy, or backend fallback.
+
+The CUDA graph test compares Turbo attention against the decoded CPU reference
+for a padded 256-token K/V extent. It exercises an F16 additive mask, two-query
+GQA, and logit softcap for both formats on every visible CUDA device, with a
+maximum absolute-error bound of `1e-3`.
 
 ## Deliberately not exposed yet
 
@@ -68,7 +84,7 @@ This slice does **not** add `turbo4` or `turbo8` to:
 
 - `--cache-type-k` or `--cache-type-v`;
 - `tools/ese.py`;
-- ROCm, Metal, Vulkan, or Flash Attention;
+- ROCm, Metal, or Vulkan;
 - server save/restore or cache lifecycle operations.
 
 The native KV parser remains an explicit whitelist, and a source-level regression test prevents the internal type names from being added accidentally. A registered storage type is still not a serving feature until backend execution, lifecycle behavior, and quality gates all pass.
@@ -129,15 +145,18 @@ The types remain internal until the later gates pass.
 Before accepting the types as KV cache options:
 
 - native encode/decode row kernels — complete;
-- native Flash Attention reads;
+- device-native Flash Attention compatibility bridge — complete;
+- fused direct Turbo reads — pending;
 - odd head-dimension padding;
 - no host fallback;
 - Ampere plus one newer NVIDIA architecture;
 - prompt-processing and decode measurements separately;
 - bounded temporary memory.
 
-Current hardware evidence covers Turing sm_75 and Ampere sm_86. The final
-promotion gate still requires Ampere plus one newer NVIDIA architecture.
+Current hardware evidence covers Turing sm_75 and Ampere sm_86. It verifies the
+row codecs and the masked, soft-capped GQA compatibility bridge. The final
+promotion gate still requires direct fused reads, odd-dimension padding,
+prompt/decode measurements, and Ampere plus one newer NVIDIA architecture.
 
 ### Gate C — quality and lifecycle
 
