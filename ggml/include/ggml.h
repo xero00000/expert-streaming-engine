@@ -839,6 +839,18 @@ extern "C" {
     // If it returns true, the computation is aborted
     typedef bool (*ggml_abort_callback)(void * data);
 
+    // A lease keeps one immutable expert component resident in bounded host RAM
+    // for the duration of a CPU kernel or asynchronous device upload.
+    struct ggml_expert_lease {
+        const void * data;
+        size_t size;
+        void * handle;
+    };
+    typedef bool (*ggml_expert_acquire_callback)(
+            void * user_data, int layer, int expert, int component,
+            struct ggml_expert_lease * lease);
+    typedef void (*ggml_expert_release_callback)(void * user_data, void * handle);
+
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggerganov/ggml/issues/287
     struct ggml_cplan {
@@ -853,6 +865,12 @@ extern "C" {
 
         // read-ahead selected MoE expert weights in the CPU matmul-id kernels
         bool moe_expert_prefetch;
+
+        // Optional bounded expert source used directly by CPU MoE kernels.
+        ggml_expert_acquire_callback expert_lease_acquire;
+        ggml_expert_release_callback expert_lease_release;
+        void * expert_lease_user_data;
+        bool expert_lease_required;
     };
 
     enum ggml_cgraph_eval_order {

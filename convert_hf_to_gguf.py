@@ -1626,17 +1626,16 @@ class LlamaModel(Model):
     def set_gguf_parameters(self):
         saved_intermediate_size = self.hparams.get("intermediate_size")
         saved_num_experts_per_tok = self.hparams.pop("num_experts_per_tok")
-        self.hparams["intermediate_size"] = self.hparams["prefix_dense_intermediate_size"]
+        self.hparams["intermediate_size"] = self.hparams.get("prefix_dense_intermediate_size", saved_intermediate_size)
         super().set_gguf_parameters()
         self.hparams["intermediate_size"] = saved_intermediate_size
         self.hparams["num_experts_per_tok"] = saved_num_experts_per_tok
+        self.gguf_writer.add_expert_used_count(saved_num_experts_per_tok)
+        logger.info(f"gguf: experts used count = {saved_num_experts_per_tok}")
         hparams = self.hparams
         self.gguf_writer.add_vocab_size(hparams["vocab_size"])
 
-        if "head_dim" in hparams:
-            rope_dim = hparams["head_dim"]
-        else:
-            rope_dim = hparams["hidden_size"] // hparams["num_attention_heads"]
+        rope_dim = hparams.get("head_dim") or hparams["hidden_size"] // hparams["num_attention_heads"]
         self.gguf_writer.add_rope_dimension_count(rope_dim)
 
         if self.hparams.get("rope_scaling") is not None and "factor" in self.hparams["rope_scaling"]:

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from tools.ese import (
+    ESEError,
     GIB,
     GPUInfo,
     HardwareInfo,
@@ -95,6 +96,10 @@ class LauncherTests(unittest.TestCase):
         policy, _ = select_policy(moe_model(70 * GIB), hardware(20, ram_available=48))
         self.assertEqual(policy, "stream")
 
+    def test_auto_uses_bounded_cache_when_moe_exceeds_vram(self) -> None:
+        policy, _ = select_policy(moe_model(), hardware(20))
+        self.assertEqual(policy, "cache")
+
     def test_hybrid_policy_uses_supported_cpu_moe_flag(self) -> None:
         plan = build_launch_plan(
             model=moe_model(),
@@ -126,13 +131,62 @@ class LauncherTests(unittest.TestCase):
             policy="stream",
             gpu_resident_moe=6,
             prefetch_tail=4,
+            expert_storage_backend="mmap",
         )
         self.assertEqual(plan.environment["GGML_CUDA_NO_PINNED"], "1")
         self.assertEqual(plan.environment["LLAMA_EXPERT_PREFETCH"], "1")
         self.assertEqual(plan.environment["LLAMA_EXPERT_PREFETCH_TAIL"], "4")
         self.assertIn("--defer-experts", plan.arguments)
+        self.assertIn("--expert-ram-cache-mib", plan.arguments)
+        self.assertIn("--expert-vram-cache-mib", plan.arguments)
+        self.assertIn("--expert-vram-reserve-mib", plan.arguments)
+        backend = plan.arguments.index("--expert-storage-backend")
+        self.assertEqual(plan.arguments[backend + 1], "mmap")
         position = plan.arguments.index("--n-cpu-moe")
         self.assertEqual(plan.arguments[position + 1], "30")
+
+    def test_cache_and_stream_share_bounded_native_hierarchy(self) -> None:
+        cache = build_launch_plan(
+            model=moe_model(),
+            hardware=hardware(7, 9, ram_available=47),
+            binary=Path("/server"),
+            policy="cache",
+            expert_ram_cache=768 * 1024**2,
+            expert_ram_staging=32 * 1024**2,
+            expert_vram_cache=256 * 1024**2,
+        )
+        self.assertNotIn("--defer-experts", cache.arguments)
+        self.assertIn("--cpu-moe", cache.arguments)
+        expected = {
+            "--expert-ram-cache-mib": "768",
+            "--expert-ram-staging-mib": "32",
+            "--expert-vram-cache-mib": "256",
+            "--expert-vram-reserve-mib": "1024",
+            "--expert-storage-backend": "mmap",
+            "--expert-cache-min-observations": "2",
+        }
+        for flag, value in expected.items():
+            position = cache.arguments.index(flag)
+            self.assertEqual(cache.arguments[position + 1], value)
+
+        stream = build_launch_plan(
+            model=moe_model(70 * GIB),
+            hardware=hardware(20, ram_available=48),
+            binary=Path("/server"),
+            policy="stream",
+        )
+        backend = stream.arguments.index("--expert-storage-backend")
+        self.assertEqual(stream.arguments[backend + 1], "pread")
+        self.assertNotIn("LLAMA_EXPERT_PREFETCH", stream.environment)
+
+        with self.assertRaises(ESEError):
+            build_launch_plan(
+                model=moe_model(),
+                hardware=hardware(20),
+                binary=Path("/server"),
+                policy="stream",
+                prefetch_tail=1,
+            )
 
     def test_dense_oversized_resident_plan_uses_native_fit(self) -> None:
         model = ModelInfo(

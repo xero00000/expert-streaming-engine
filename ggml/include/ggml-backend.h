@@ -103,6 +103,12 @@ extern "C" {
     GGML_API GGML_CALL bool ggml_backend_is_cpu                (ggml_backend_t backend);
     GGML_API           void ggml_backend_cpu_set_n_threads     (ggml_backend_t backend_cpu, int n_threads);
     GGML_API           void ggml_backend_cpu_set_moe_expert_prefetch(ggml_backend_t backend_cpu, bool enable);
+    GGML_API           void ggml_backend_cpu_set_expert_lease_callbacks(
+            ggml_backend_t backend_cpu,
+            ggml_expert_acquire_callback acquire,
+            ggml_expert_release_callback release,
+            void * user_data,
+            bool required);
     GGML_API           void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     // Create a backend buffer from an existing pointer
@@ -213,8 +219,28 @@ extern "C" {
     // enable or disable op offload for a given op
     GGML_API void                 ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off);
     GGML_API void                 ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off);
+    GGML_API void                 ggml_backend_sched_set_active_expert_decode(ggml_backend_sched_t sched, bool on_or_off);
     GGML_API void                 ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async);
     GGML_API void                 ggml_backend_sched_set_max_extra_alloc(ggml_backend_sched_t sched, int extra_alloc_MiB);
+
+    typedef struct ggml_expert_lease ggml_backend_expert_lease;
+    typedef ggml_expert_acquire_callback ggml_backend_expert_acquire_callback;
+    typedef ggml_expert_release_callback ggml_backend_expert_release_callback;
+
+    // Connect the scheduler's adaptive GPU tier to a bounded host/storage
+    // lease source. The scheduler retains each handle until a device event
+    // proves the corresponding asynchronous upload has completed.
+    GGML_API void ggml_backend_sched_set_expert_lease_callbacks(
+            ggml_backend_sched_t sched,
+            ggml_backend_expert_acquire_callback acquire,
+            ggml_backend_expert_release_callback release,
+            void * user_data,
+            bool required);
+    GGML_API void ggml_backend_sched_set_expert_cache_capacity(
+            ggml_backend_sched_t sched,
+            uint64_t bytes_per_device,
+            uint64_t reserve_bytes_per_device,
+            uint32_t minimum_observations);
 
     // prefetch mmap'd MoE expert weights into the page cache
     GGML_API bool                 ggml_backend_prefetch_init(int n_threads);

@@ -650,6 +650,7 @@ struct llama_context {
     struct Prev;
     std::unique_ptr<Prev> prev;
     std::unique_ptr<Prev> prev_mtp;
+    bool active_expert_decode = false;
     int32_t mtp_step_idx = 0;
     int32_t mtp_n_heads = 0;
 

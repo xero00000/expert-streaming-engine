@@ -2157,6 +2157,60 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.warmup = false;
         return true;
     }
+    if (arg == "--expert-ram-cache-mib") {
+        CHECK_ARG;
+        params.expert_ram_cache_mib = std::stoll(argv[i]);
+        if (params.expert_ram_cache_mib < 0) {
+            fprintf(stderr, "error: --expert-ram-cache-mib must be >= 0\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--expert-ram-staging-mib") {
+        CHECK_ARG;
+        params.expert_ram_staging_mib = std::stoll(argv[i]);
+        if (params.expert_ram_staging_mib < 0) {
+            fprintf(stderr, "error: --expert-ram-staging-mib must be >= 0\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--expert-storage-backend") {
+        CHECK_ARG;
+        params.expert_storage_backend = argv[i];
+        if (params.expert_storage_backend != "mmap" && params.expert_storage_backend != "pread" &&
+                params.expert_storage_backend != "io_uring") {
+            fprintf(stderr, "error: --expert-storage-backend must be mmap, pread, or io_uring\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--expert-sidecar-only") {
+        params.expert_sidecar_only = true;
+        return true;
+    }
+    if (arg == "--expert-vram-cache-mib" || arg == "--expert-vram-reserve-mib") {
+        CHECK_ARG;
+        const int64_t value = std::stoll(argv[i]);
+        if (value < 0) {
+            fprintf(stderr, "error: %s must be >= 0\n", arg.c_str());
+            invalid_param = true;
+        } else if (arg == "--expert-vram-cache-mib") {
+            params.expert_vram_cache_mib = value;
+        } else {
+            params.expert_vram_reserve_mib = value;
+        }
+        return true;
+    }
+    if (arg == "--expert-cache-min-observations") {
+        CHECK_ARG;
+        params.expert_cache_min_observations = std::stoi(argv[i]);
+        if (params.expert_cache_min_observations < 1) {
+            fprintf(stderr, "error: --expert-cache-min-observations must be >= 1\n");
+            invalid_param = true;
+        }
+        return true;
+    }
     if (arg == "--prefetch-experts") {
         params.prefetch_experts = true;
         return true;
@@ -3282,6 +3336,13 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ncmoe, --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
     options.push_back({ "*",           "       --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
+    options.push_back({ "*",           "       --expert-ram-cache-mib N", "bounded native RAM expert cache capacity in MiB (default: disabled)"});
+    options.push_back({ "*",           "       --expert-ram-staging-mib N", "bounded miss-staging capacity in MiB (default: max(largest expert component, min(cache, 64)))"});
+    options.push_back({ "*",           "       --expert-storage-backend NAME", "expert source backend: mmap, pread, or io_uring (default: pread)"});
+    options.push_back({ "*",           "       --expert-sidecar-only", "reject any expert read that bypasses the checked descriptor/lease hierarchy"});
+    options.push_back({ "*",           "       --expert-vram-cache-mib N", "per-device adaptive GPU expert-cache bound in MiB (default: disabled)"});
+    options.push_back({ "*",           "       --expert-vram-reserve-mib N", "VRAM that the expert cache must leave unallocated per device"});
+    options.push_back({ "*",           "       --expert-cache-min-observations N", "minimum routes before GPU-cache admission (default: 2)"});
     options.push_back({ "*",           "       --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
     options.push_back({ "*",           "       --prefetch-experts-threads N",
                                                                         "number of expert prefetch workers, tune to drive speed/type (default: auto)"});
@@ -4246,6 +4307,21 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.mtp             = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     mparams.flash_attn      = params.flash_attn;
     mparams.defer_experts   = params.defer_experts;
+    constexpr uint64_t mib = 1024ULL*1024ULL;
+    if (uint64_t(params.expert_ram_cache_mib) > UINT64_MAX/mib ||
+            uint64_t(params.expert_ram_staging_mib) > UINT64_MAX/mib) {
+        throw std::runtime_error("expert cache capacity overflows 64-bit bytes");
+    }
+    mparams.expert_ram_cache_bytes = uint64_t(params.expert_ram_cache_mib)*mib;
+    mparams.expert_ram_staging_bytes = uint64_t(params.expert_ram_staging_mib)*mib;
+    if (params.expert_storage_backend == "mmap") {
+        mparams.expert_storage_backend = LLAMA_EXPERT_STORAGE_MMAP;
+    } else if (params.expert_storage_backend == "io_uring") {
+        mparams.expert_storage_backend = LLAMA_EXPERT_STORAGE_IO_URING;
+    } else {
+        mparams.expert_storage_backend = LLAMA_EXPERT_STORAGE_PREAD;
+    }
+    mparams.expert_sidecar_only = params.expert_sidecar_only;
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {
@@ -4338,6 +4414,14 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.prefetch_experts  = params.prefetch_experts;
     cparams.prefetch_experts_threads = params.prefetch_experts_threads;
     cparams.max_extra_alloc   = params.max_extra_alloc_MiB;
+    constexpr uint64_t expert_mib = 1024ULL*1024ULL;
+    if (uint64_t(params.expert_vram_cache_mib) > UINT64_MAX/expert_mib ||
+            uint64_t(params.expert_vram_reserve_mib) > UINT64_MAX/expert_mib) {
+        throw std::runtime_error("expert VRAM capacity overflows 64-bit bytes");
+    }
+    cparams.expert_vram_cache_bytes = uint64_t(params.expert_vram_cache_mib)*expert_mib;
+    cparams.expert_vram_reserve_bytes = uint64_t(params.expert_vram_reserve_mib)*expert_mib;
+    cparams.expert_cache_min_observations = uint32_t(params.expert_cache_min_observations);
     cparams.mtp               = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     cparams.mtp_op_type      = MTP_OP_NONE;
 
@@ -5336,6 +5420,13 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "defer_experts: %s # default: false\n", params.defer_experts ? "true" : "false");
     fprintf(stream, "prefetch_experts: %s # default: false\n", params.prefetch_experts ? "true" : "false");
     fprintf(stream, "prefetch_experts_threads: %d # default: 0 (auto)\n", params.prefetch_experts_threads);
+    fprintf(stream, "expert_ram_cache_mib: %lld # default: 0 (disabled)\n", (long long) params.expert_ram_cache_mib);
+    fprintf(stream, "expert_ram_staging_mib: %lld # default: 0 (bounded auto)\n", (long long) params.expert_ram_staging_mib);
+    fprintf(stream, "expert_storage_backend: %s # default: pread\n", params.expert_storage_backend.c_str());
+    fprintf(stream, "expert_sidecar_only: %s # default: false\n", params.expert_sidecar_only ? "true" : "false");
+    fprintf(stream, "expert_vram_cache_mib: %lld # default: 0 (disabled)\n", (long long) params.expert_vram_cache_mib);
+    fprintf(stream, "expert_vram_reserve_mib: %lld # default: 0\n", (long long) params.expert_vram_reserve_mib);
+    fprintf(stream, "expert_cache_min_observations: %d # default: 2\n", params.expert_cache_min_observations);
     fprintf(stream, "max_extra_alloc: %d # default: 256\n", params.max_extra_alloc_MiB);
     fprintf(stream, "penalize_nl: %s # default: false\n", sparams.penalize_nl ? "true" : "false");
     fprintf(stream, "ppl_output_type: %d # default: 0\n", params.ppl_output_type);

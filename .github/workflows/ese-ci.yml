@@ -81,6 +81,43 @@ jobs:
       - name: Run internal GGML Turbo type test
         run: build-turbo-core/bin/test-turbo-kv-core
 
+      - name: Build checked expert cache test
+        run: cmake --build build-turbo-core --target test-expert-cache -j2
+
+      - name: Run checked expert cache test
+        run: build-turbo-core/bin/test-expert-cache
+
+  expert-cache-sanitizers:
+    name: Expert cache ASAN and UBSAN
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Clang sanitizers
+        env:
+          CC: clang
+          CXX: clang++
+        run: >-
+          cmake -S . -B build-expert-sanitizers
+          -DCMAKE_BUILD_TYPE=Debug
+          -DGGML_CUDA=OFF
+          -DLLAMA_BUILD_TESTS=ON
+          -DLLAMA_BUILD_SERVER=OFF
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build checked expert cache test
+        run: cmake --build build-expert-sanitizers --target test-expert-cache -j2
+
+      - name: Run checked expert cache test with sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: build-expert-sanitizers/bin/test-expert-cache
+
   cpu-build:
     name: Native CPU server build
     runs-on: ubuntu-latest
@@ -116,7 +153,12 @@ jobs:
           fi
 
           echo "llama-server --help exit code: ${help_rc}"
-          for flag in --fit --cpu-moe --n-cpu-moe --defer-experts; do
+          for flag in \
+            --fit --cpu-moe --n-cpu-moe --defer-experts \
+            --expert-ram-cache-mib --expert-ram-staging-mib \
+            --expert-storage-backend --expert-sidecar-only \
+            --expert-vram-cache-mib --expert-vram-reserve-mib \
+            --expert-cache-min-observations; do
             if ! grep -Fq -- "$flag" native-help.txt; then
               echo "Required native option is missing: $flag"
               echo "--- llama-server --help ---"

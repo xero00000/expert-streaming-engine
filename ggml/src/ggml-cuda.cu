@@ -4216,6 +4216,11 @@ GGML_CALL static const char * ggml_backend_cuda_name(ggml_backend_t backend) {
     return cuda_ctx->name.c_str();
 }
 
+GGML_CALL int ggml_backend_cuda_get_device(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    return ((ggml_backend_cuda_context *) backend->context)->device;
+}
+
 GGML_CALL static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 

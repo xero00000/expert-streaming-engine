@@ -18208,6 +18208,94 @@ static int ggml_compute_forward_mul_mat(
 
 // ggml_compute_forward_mul_mat_id
 
+struct ggml_cpu_expert_lease {
+    const char * data;
+    void * handle;
+};
+
+static bool ggml_cpu_expert_tensor_identity(const struct ggml_tensor * tensor, int * layer, int * component) {
+    const char * name = ggml_get_name(tensor);
+    int parsed_layer = -1;
+    if (!name || sscanf(name, "blk.%d.", &parsed_layer) != 1 || parsed_layer < 0) return false;
+
+    int parsed_component = -1;
+    if (strstr(name, "ffn_gate_up_exps")) parsed_component = 3;
+    else if (strstr(name, "ffn_gate_exps")) parsed_component = 0;
+    else if (strstr(name, "ffn_up_exps")) parsed_component = 1;
+    else if (strstr(name, "ffn_down_exps")) parsed_component = 2;
+    else if (strstr(name, "ffn_norm_exps")) parsed_component = 4;
+    else if (strstr(name, "ffn_exp_probs_b")) parsed_component = 5;
+    if (parsed_component < 0) return false;
+
+    *layer = parsed_layer;
+    *component = parsed_component;
+    return true;
+}
+
+static struct ggml_cpu_expert_lease ggml_cpu_expert_acquire(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * tensor,
+        int expert,
+        size_t expected_size) {
+    struct ggml_cpu_expert_lease result = { NULL, NULL };
+    const struct ggml_cplan * cplan = params->shared->cplan;
+    if (!cplan || !cplan->expert_lease_acquire) return result;
+
+    int layer = -1;
+    int component = -1;
+    struct ggml_expert_lease lease = { NULL, 0, NULL };
+    const bool identified = ggml_cpu_expert_tensor_identity(tensor, &layer, &component);
+    const bool acquired = identified && cplan->expert_lease_acquire(
+            cplan->expert_lease_user_data, layer, expert, component, &lease);
+    if (!acquired || !lease.data || !lease.handle || lease.size != expected_size) {
+        if (lease.handle && cplan->expert_lease_release) {
+            cplan->expert_lease_release(cplan->expert_lease_user_data, lease.handle);
+        }
+        if (cplan->expert_lease_required) {
+            GGML_ABORT("required expert lease unavailable or has invalid size");
+        }
+        return result;
+    }
+    result.data = (const char *) lease.data;
+    result.handle = lease.handle;
+    return result;
+}
+
+static void ggml_cpu_expert_release(
+        const struct ggml_compute_params * params,
+        struct ggml_cpu_expert_lease * lease) {
+    if (!lease->handle) return;
+    const struct ggml_cplan * cplan = params->shared->cplan;
+    GGML_ASSERT(cplan && cplan->expert_lease_release);
+    cplan->expert_lease_release(cplan->expert_lease_user_data, lease->handle);
+    lease->data = NULL;
+    lease->handle = NULL;
+}
+
+static void ggml_cpu_expert_up_gate_acquire(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0_1,
+        const struct ggml_tensor * src0_2,
+        int expert,
+        size_t expert_bytes,
+        struct ggml_cpu_expert_lease * lease_1,
+        struct ggml_cpu_expert_lease * lease_2,
+        const char ** data_1,
+        const char ** data_2) {
+    *lease_1 = ggml_cpu_expert_acquire(params, src0_1, expert, expert_bytes);
+    if (src0_2) {
+        *lease_2 = ggml_cpu_expert_acquire(params, src0_2, expert, expert_bytes);
+        *data_1 = lease_1->data ? lease_1->data : (const char *) src0_1->data + expert*expert_bytes;
+        *data_2 = lease_2->data ? lease_2->data : (const char *) src0_2->data + expert*expert_bytes;
+    } else {
+        lease_2->data = NULL;
+        lease_2->handle = NULL;
+        const char * merged = lease_1->data ? lease_1->data : (const char *) src0_1->data + expert*expert_bytes;
+        *data_2 = merged;
+        *data_1 = merged + expert_bytes/2;
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -18323,7 +18411,8 @@ static void ggml_compute_forward_mul_mat_id(
 
 #if GGML_USE_IQK_MULMAT
 #if defined GGML_EXPERT_CHUNKING
-    if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
+    if (ne13 == 1 && dst->type == GGML_TYPE_F32 &&
+            !(params->shared->cplan && params->shared->cplan->expert_lease_acquire)) {
         const void * wdata_mm    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size_mm = ggml_row_size(vec_dot_type, ne10);
 
@@ -18378,7 +18467,8 @@ IQK_MulMat_Not_Available0:;
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a*nb02;
+        struct ggml_cpu_expert_lease expert_lease = ggml_cpu_expert_acquire(params, src0, cur_a, nb02);
+        const char * src0_cur = expert_lease.data ? expert_lease.data : (const char *) src0->data + cur_a*nb02;
 
         const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
@@ -18393,6 +18483,7 @@ IQK_MulMat_Not_Available0:;
                        vec_dot_type, (const char *)wdata, row_size, ///ggml_type_size(vec_dot_type),
                        (float *)dst->data, nb1, nb2,
                        matrix_rows + cur_a*ne12, ith, nth)) goto IQK_MulMat_Not_Available;
+                ggml_cpu_expert_release(params, &expert_lease);
                 continue;
         }
 IQK_MulMat_Not_Available:;
@@ -18403,7 +18494,10 @@ IQK_MulMat_Not_Available:;
             int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
             src0_cur_start = (src0_cur_start % matmul_num_cols) ? src0_cur_start + matmul_num_cols - (src0_cur_start % matmul_num_cols): src0_cur_start;
             src0_cur_end   = (src0_cur_end % matmul_num_cols) ? src0_cur_end + matmul_num_cols - (src0_cur_end % matmul_num_cols): src0_cur_end;
-            if (src0_cur_start >= src0_cur_end) return;
+            if (src0_cur_start >= src0_cur_end) {
+                ggml_cpu_expert_release(params, &expert_lease);
+                return;
+            }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
@@ -18423,6 +18517,7 @@ IQK_MulMat_Not_Available:;
                 gemv(ne00, (float *)((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
                      (const char *) src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
             }
+            ggml_cpu_expert_release(params, &expert_lease);
             continue;
         }
 
@@ -18431,7 +18526,10 @@ IQK_MulMat_Not_Available:;
             int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
             src0_cur_start = (src0_cur_start % matmul_num_cols) ? src0_cur_start + matmul_num_cols - (src0_cur_start % matmul_num_cols): src0_cur_start;
             src0_cur_end   = (src0_cur_end % matmul_num_cols) ? src0_cur_end + matmul_num_cols - (src0_cur_end % matmul_num_cols): src0_cur_end;
-            if (src0_cur_start >= src0_cur_end) return;
+            if (src0_cur_start >= src0_cur_end) {
+                ggml_cpu_expert_release(params, &expert_lease);
+                return;
+            }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
@@ -18451,6 +18549,7 @@ IQK_MulMat_Not_Available:;
                 gemv(ne00, (float *)((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
                      (const char *) src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
             }
+            ggml_cpu_expert_release(params, &expert_lease);
             continue;
         }
 
@@ -18521,6 +18620,7 @@ IQK_MulMat_Not_Available:;
                 }
             }
         }
+        ggml_cpu_expert_release(params, &expert_lease);
     }
 
 #undef MMID_MATRIX_ROW
@@ -18686,14 +18786,14 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         last_acc = acc;
 
         const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
+        struct ggml_cpu_expert_lease lease_1 = { NULL, NULL };
+        struct ggml_cpu_expert_lease lease_2 = { NULL, NULL };
+        ggml_cpu_expert_up_gate_acquire(params, src0_1, src0_2, cur_a, nb02,
+                &lease_1, &lease_2, &src0_1_cur, &src0_2_cur);
         if (src0_2) {
-            src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
             up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
             gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
         } else {
-            src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_1_cur = src0_2_cur + nb02/2;
             if (up_b) {
                 GGML_ASSERT(!gate_b);
                 gate_b_cur = (const char *)up_b->data + cur_a*nb41;
@@ -18707,6 +18807,9 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                             up_b_cur, gate_b_cur,
                             (float *)dst->data, nb1, nb2,
                             matrix_rows + cur_a*ne12, limit, local_chunk, chunks_per_expert_ug)) GGML_ABORT("fatal error");
+
+        ggml_cpu_expert_release(params, &lease_2);
+        ggml_cpu_expert_release(params, &lease_1);
 
         chunk_id_ug = atomic_fetch_add(&params->shared->current_chunk, 1);
     }
@@ -18728,14 +18831,14 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         }
 
         const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
+        struct ggml_cpu_expert_lease lease_1 = { NULL, NULL };
+        struct ggml_cpu_expert_lease lease_2 = { NULL, NULL };
+        ggml_cpu_expert_up_gate_acquire(params, src0_1, src0_2, cur_a, nb02,
+                &lease_1, &lease_2, &src0_1_cur, &src0_2_cur);
         if (src0_2) {
-            src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
             up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
             gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
         } else {
-            src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_1_cur = src0_2_cur + nb02/2;
             if (up_b) {
                 GGML_ASSERT(!gate_b);
                 gate_b_cur = (const char *)up_b->data + cur_a*nb41;
@@ -18755,6 +18858,9 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                             up_b_cur, gate_b_cur,
                             (float *)dst->data, nb1, nb2,
                             matrix_rows + cur_a*ne12, limit, ith, nth)) GGML_ABORT("fatal error");
+
+        ggml_cpu_expert_release(params, &lease_2);
+        ggml_cpu_expert_release(params, &lease_1);
 
     }
 #endif
@@ -28185,10 +28291,9 @@ void ggml_build_backward_expand(struct ggml_context * ctx, struct ggml_cgraph * 
 }
 
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
-    void * ptr = *p;
-    ptr = (void *) GGML_PAD((uintptr_t) ptr, align);
-    *p = (void *) ((char *) ptr + size);
-    return ptr;
+    const uintptr_t ptr = GGML_PAD((uintptr_t) *p, align);
+    *p = (void *) (ptr + size);
+    return (void *) ptr;
 }
 
 static size_t ggml_graph_nbytes(size_t size, bool grads) {
