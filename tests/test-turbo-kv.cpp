@@ -55,6 +55,9 @@ uint64_t seeded_random_reference_hash(enum ggml_turbo_kv_format format) {
         case GGML_TURBO_KV_FORMAT_TURBO3: return UINT64_C(0xbb2e58919cbf83ea);
         case GGML_TURBO_KV_FORMAT_TURBO4: return UINT64_C(0x3f9a24373049e230);
         case GGML_TURBO_KV_FORMAT_TURBO8: return UINT64_C(0x222ac29fff58ee70);
+        case GGML_TURBO_KV_FORMAT_TURBO1_TCQ: return UINT64_C(0x2cbfd843d5bd9f7b);
+        case GGML_TURBO_KV_FORMAT_TURBO2_TCQ: return UINT64_C(0x83e594f141bb993c);
+        case GGML_TURBO_KV_FORMAT_TURBO3_TCQ: return UINT64_C(0xcbfaf9b6371dbd03);
     }
     return 0;
 }
@@ -130,12 +133,18 @@ void test_metadata() {
     static_assert(sizeof(ggml_turbo3_block) == GGML_TURBO3_BLOCK_BYTES, "Turbo3 size");
     static_assert(sizeof(ggml_turbo4_block) == GGML_TURBO4_BLOCK_BYTES, "Turbo4 size");
     static_assert(sizeof(ggml_turbo8_block) == GGML_TURBO8_BLOCK_BYTES, "Turbo8 size");
+    static_assert(sizeof(ggml_turbo1_tcq_block) == GGML_TURBO1_TCQ_BLOCK_BYTES, "Turbo1-TCQ size");
+    static_assert(sizeof(ggml_turbo2_tcq_block) == GGML_TURBO2_TCQ_BLOCK_BYTES, "Turbo2-TCQ size");
+    static_assert(sizeof(ggml_turbo3_tcq_block) == GGML_TURBO3_TCQ_BLOCK_BYTES, "Turbo3-TCQ size");
 
     require(ggml_turbo_kv_block_elements() == 128, "block element count");
     require(ggml_turbo_kv_block_bytes(GGML_TURBO_KV_FORMAT_TURBO2) == 40, "Turbo2 block bytes");
     require(ggml_turbo_kv_block_bytes(GGML_TURBO_KV_FORMAT_TURBO3) == 56, "Turbo3 block bytes");
     require(ggml_turbo_kv_block_bytes(GGML_TURBO_KV_FORMAT_TURBO4) == 66, "Turbo4 block bytes");
     require(ggml_turbo_kv_block_bytes(GGML_TURBO_KV_FORMAT_TURBO8) == 130, "Turbo8 block bytes");
+    require(ggml_turbo_kv_block_bytes(GGML_TURBO_KV_FORMAT_TURBO1_TCQ) == 20, "Turbo1-TCQ block bytes");
+    require(ggml_turbo_kv_block_bytes(GGML_TURBO_KV_FORMAT_TURBO2_TCQ) == 36, "Turbo2-TCQ block bytes");
+    require(ggml_turbo_kv_block_bytes(GGML_TURBO_KV_FORMAT_TURBO3_TCQ) == 52, "Turbo3-TCQ block bytes");
     require(std::abs(ggml_turbo_kv_bits_per_value(GGML_TURBO_KV_FORMAT_TURBO2) - 2.5) < 1.0e-12,
             "Turbo2 exact bits/value");
     require(std::abs(ggml_turbo_kv_bits_per_value(GGML_TURBO_KV_FORMAT_TURBO3) - 3.5) < 1.0e-12,
@@ -144,6 +153,12 @@ void test_metadata() {
             "Turbo4 exact bits/value");
     require(std::abs(ggml_turbo_kv_bits_per_value(GGML_TURBO_KV_FORMAT_TURBO8) - 8.125) < 1.0e-12,
             "Turbo8 exact bits/value");
+    require(std::abs(ggml_turbo_kv_bits_per_value(GGML_TURBO_KV_FORMAT_TURBO1_TCQ) - 1.25) < 1.0e-12,
+            "Turbo1-TCQ exact storage bits/value");
+    require(std::abs(ggml_turbo_kv_bits_per_value(GGML_TURBO_KV_FORMAT_TURBO2_TCQ) - 2.25) < 1.0e-12,
+            "Turbo2-TCQ exact storage bits/value");
+    require(std::abs(ggml_turbo_kv_bits_per_value(GGML_TURBO_KV_FORMAT_TURBO3_TCQ) - 3.25) < 1.0e-12,
+            "Turbo3-TCQ exact storage bits/value");
     require(ggml_turbo_kv_encoded_size(GGML_TURBO_KV_FORMAT_TURBO4, 384) == 198,
             "Turbo4 encoded size");
     require(ggml_turbo_kv_encoded_size(GGML_TURBO_KV_FORMAT_TURBO8, 384) == 390,
@@ -226,8 +241,11 @@ void test_round_trip_case(
     require_repeated_group_scales(format, first);
 
     if (name == "seeded-random") {
-        require(fnv1a64(first) == seeded_random_reference_hash(format),
-                name + ": encoded bytes match the pinned reference vector");
+        const uint64_t reference_hash = seeded_random_reference_hash(format);
+        if (reference_hash != 0) {
+            require(fnv1a64(first) == reference_hash,
+                    name + ": encoded bytes match the pinned reference vector");
+        }
     }
 
     require(ggml_turbo_kv_dequantize_reference(
@@ -278,6 +296,12 @@ int main() {
     test_round_trips(GGML_TURBO_KV_FORMAT_TURBO3, 0.08);
     test_round_trips(GGML_TURBO_KV_FORMAT_TURBO4, 0.03);
     test_round_trips(GGML_TURBO_KV_FORMAT_TURBO8, 0.0005);
+    test_zero(GGML_TURBO_KV_FORMAT_TURBO1_TCQ);
+    test_zero(GGML_TURBO_KV_FORMAT_TURBO2_TCQ);
+    test_zero(GGML_TURBO_KV_FORMAT_TURBO3_TCQ);
+    test_round_trips(GGML_TURBO_KV_FORMAT_TURBO1_TCQ, 0.35);
+    test_round_trips(GGML_TURBO_KV_FORMAT_TURBO2_TCQ, 0.10);
+    test_round_trips(GGML_TURBO_KV_FORMAT_TURBO3_TCQ, 0.03);
     std::cout << "PASS: Turbo KV CPU reference foundation\n";
     return 0;
 }

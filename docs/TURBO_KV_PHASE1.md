@@ -24,6 +24,17 @@ all four fixed Turbo formats:
 | Turbo4 | 128 | 66 | 4.125 | CPU reference + native CUDA row codec |
 | Turbo8 | 128 | 130 | 8.125 | CPU reference + native CUDA row codec |
 
+The TCQ foundation is also internal and experimental:
+
+| Format | Values/block | Bytes/block | Storage bits/value | Status |
+| --- | ---: | ---: | ---: | --- |
+| Turbo1-TCQ | 128 | 20 | 1.25 | CPU Viterbi reference + native CUDA path |
+| Turbo2-TCQ | 128 | 36 | 2.25 | CPU Viterbi reference + native CUDA path |
+| Turbo3-TCQ | 128 | 52 | 3.25 | CPU Viterbi reference + native CUDA path |
+
+Storage accounting includes the FP16 corrected norm and alignment byte. The
+raw trellis payloads are respectively 135, 262, and 390 bits per block.
+
 The implementation preserves the pinned design:
 
 1. deterministic Gaussian rotation generated from seed `42`;
@@ -47,11 +58,39 @@ source revision:
 | Turbo4 | `GGML_TYPE_TURBO4_0` | 44 |
 | Turbo2 | `GGML_TYPE_TURBO2_0` | 45 |
 | Turbo8 | `GGML_TYPE_TURBO8_0` | 48 |
+| Turbo3-TCQ | `GGML_TYPE_TURBO3_TCQ` | 46 |
+| Turbo2-TCQ | `GGML_TYPE_TURBO2_TCQ` | 47 |
+| Turbo1-TCQ | `GGML_TYPE_TURBO1_TCQ` | 52 |
 
 Core traits report each format's exact 128-value block geometry and storage
 size. `ggml_quantize_chunk` routes all four formats through the same checked
 deterministic CPU references used by the standalone tests. The integration
 test proves core output is byte-identical to the reference codec.
+
+## TCQ reference and native path
+
+The pinned CPU TCQ encoders and decoders are zero-fill stubs. ESE replaces
+them with complete free-initial-state right-shift trellises: `k=1,L=8`,
+`k=2,L=8`, and `k=3,L=9`. Each block is normalized, transformed by the pinned
+seed-42 sign/FWHT/sign rotation, Viterbi encoded, and norm-corrected before the
+scale is rounded to FP16. Decode reads the state for coordinate `t` from one
+little-endian `L`-bit window starting at `t*k`, so state lookup is O(1), then
+applies the inverse signed FWHT.
+
+The embedded default codebooks are the K-side trained constants from pinned
+commit `799e3995cd4f19aa9f6a3fa9fb5b4674422bf0ee` in
+`ggml/src/ggml-cuda/turbo-quant-cuda.cuh`. That source attributes the Turbo2
+and Turbo3 books to product-aware CUDA GLA training on FWHT-rotated
+Qwen3.5-27B KV activations, and the Turbo1 book to the provenance recorded in
+`turbo1_tcq_codebooks/PROVENANCE.md`. ESE intentionally uses one immutable
+book per tier until side-specific books and context scaling can be represented
+in serialized cache metadata without ambiguous decode behavior.
+
+CUDA implements the same signed FWHT and Viterbi contract and produces
+byte-identical blocks. Direct decode attention performs O(1) codebook-state
+reads in the rotated domain and inverse-FWHT reconstruction without a
+cache-sized temporary. Tests cover each TCQ tier, odd-width padding, and both
+fixed-K/TCQ-V and TCQ-K/fixed-V combinations.
 
 ## Native CUDA row integration
 
@@ -115,7 +154,7 @@ width case retains the mask, two-query GQA, softcap, and `1e-3` error gate.
 
 ## Deliberately not exposed yet
 
-This slice does **not** add `turbo2`, `turbo3`, `turbo4`, or `turbo8` to:
+This slice does **not** add any fixed Turbo or TCQ type to:
 
 - `--cache-type-k` or `--cache-type-v`;
 - `tools/ese.py`;
@@ -138,8 +177,9 @@ are not acceptable ESE correctness or fallback references. ESE therefore
 retains the pinned fixed-format storage geometry and Lloyd–Max centroids while
 providing complete Turbo2/Turbo3 quantize and dequantize references. Their core,
 CUDA row, padding, and direct decode-attention paths are covered by the same
-gates as Turbo4/Turbo8. TCQ remains unadvertised until its complete reference
-and native backend paths exist.
+gates as Turbo4/Turbo8. The substantive TCQ references and native CUDA paths
+now exist, but TCQ remains unadvertised until context scaling, policy,
+lifecycle, and quality gates pass.
 
 ## Tests
 
@@ -164,7 +204,9 @@ The test compiles the reference module independently and verifies:
 
 For the native CUDA row-codec test, configure with `GGML_CUDA=ON`, build
 `test-turbo-kv-cuda`, and run the resulting executable. The test runs all fixed
-formats and all 16 K/V pairings on every visible CUDA device. The Turbo-specific pre-merge wrapper
+formats and all 16 fixed K/V pairings, all TCQ tiers, and representative
+fixed/TCQ mixed pairings. `ESE_TURBO_CUDA_DEVICE=<index>` isolates one visible
+GPU per process when other workloads constrain device memory. The Turbo-specific pre-merge wrapper
 does this automatically when passed `--require-cuda` (or when
 `ESE_TURBO_REQUIRE_CUDA=1`).
 
@@ -176,7 +218,7 @@ does this automatically when passed `--require-cuda` (or when
 - checked tensor and row sizing;
 - checked quantize/dequantize dispatch;
 - deterministic core-vs-reference byte parity;
-- pinned numeric IDs 43, 44, 45, and 48;
+- pinned numeric IDs 43–48 and 52 for the fixed and TCQ formats;
 - compile-time block ABI assertions;
 - native and launcher visibility guards.
 
@@ -196,6 +238,10 @@ Before accepting the types as KV cache options:
   waives runtime coverage newer than Ampere);
 - prompt-processing and decode measurements separately;
 - bounded temporary memory.
+
+TCQ row codecs and direct decode reads are complete. Context-adaptive norm
+scaling and serialized side-specific codebook identity remain policy/lifecycle
+work and are not claimed complete.
 
 Current hardware evidence covers Turing sm_75 and two Ampere sm_86 devices. It
 verifies the row codecs and native masked, soft-capped GQA decode at aligned and

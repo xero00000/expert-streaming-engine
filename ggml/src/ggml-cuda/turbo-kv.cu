@@ -23,6 +23,11 @@ static __constant__ float d_turbo_centroids2[4];
 static __constant__ float d_turbo_centroids3[8];
 static __constant__ float d_turbo_centroids4[16];
 static __constant__ float d_turbo_centroids8[256];
+static __constant__ float d_turbo_tcq_signs1[128];
+static __constant__ float d_turbo_tcq_signs2[128];
+static __constant__ float d_turbo_tcq_codebook1[256];
+static __constant__ float d_turbo_tcq_codebook2[256];
+static __constant__ float d_turbo_tcq_codebook3[512];
 
 static void ggml_cuda_turbo_kv_ensure_tables() {
     static std::mutex mutex;
@@ -50,6 +55,16 @@ static void ggml_cuda_turbo_kv_ensure_tables() {
         d_turbo_centroids4, ggml_turbo_kv_centroids4(), 16 * sizeof(float)));
     CUDA_CHECK(cudaMemcpyToSymbol(
         d_turbo_centroids8, ggml_turbo_kv_centroids8(), 256 * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        d_turbo_tcq_signs1, ggml_turbo_kv_tcq_signs1(), 128 * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        d_turbo_tcq_signs2, ggml_turbo_kv_tcq_signs2(), 128 * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        d_turbo_tcq_codebook1, ggml_turbo_kv_tcq_codebook1(), 256 * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        d_turbo_tcq_codebook2, ggml_turbo_kv_tcq_codebook2(), 256 * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        d_turbo_tcq_codebook3, ggml_turbo_kv_tcq_codebook3(), 512 * sizeof(float)));
     initialized[device] = true;
 }
 
@@ -74,6 +89,31 @@ __device__ __forceinline__ float turbo_centroid<4>(int index) {
 template<>
 __device__ __forceinline__ float turbo_centroid<8>(int index) {
     return d_turbo_centroids8[index];
+}
+
+template<>
+__device__ __forceinline__ float turbo_centroid<11>(int index) {
+    return d_turbo_tcq_codebook1[index];
+}
+
+template<>
+__device__ __forceinline__ float turbo_centroid<12>(int index) {
+    return d_turbo_tcq_codebook2[index];
+}
+
+template<>
+__device__ __forceinline__ float turbo_centroid<13>(int index) {
+    return d_turbo_tcq_codebook3[index];
+}
+
+template<int K, int L>
+static __device__ __forceinline__ int turbo_tcq_state(const uint8_t * bits, int element) {
+    const int bit_position = element * K;
+    const int byte = bit_position / 8;
+    const int offset = bit_position % 8;
+    const uint16_t window = static_cast<uint16_t>(bits[byte]) |
+        (static_cast<uint16_t>(bits[byte + 1]) << 8);
+    return (window >> offset) & ((1 << L) - 1);
 }
 
 template<int format>
@@ -109,6 +149,21 @@ __device__ __forceinline__ int turbo_index<8>(const void * block, int element) {
     return static_cast<const ggml_turbo8_block *>(block)->qs[element];
 }
 
+template<>
+__device__ __forceinline__ int turbo_index<11>(const void * block, int element) {
+    return turbo_tcq_state<1, 8>(static_cast<const ggml_turbo1_tcq_block *>(block)->qs, element);
+}
+
+template<>
+__device__ __forceinline__ int turbo_index<12>(const void * block, int element) {
+    return turbo_tcq_state<2, 8>(static_cast<const ggml_turbo2_tcq_block *>(block)->qs, element);
+}
+
+template<>
+__device__ __forceinline__ int turbo_index<13>(const void * block, int element) {
+    return turbo_tcq_state<3, 9>(static_cast<const ggml_turbo3_tcq_block *>(block)->qs, element);
+}
+
 template<int format>
 static __device__ __forceinline__ float turbo_scale(const void * block);
 
@@ -132,6 +187,21 @@ __device__ __forceinline__ float turbo_scale<8>(const void * block) {
     return __half2float(__ushort_as_half(static_cast<const ggml_turbo8_block *>(block)->scale));
 }
 
+template<>
+__device__ __forceinline__ float turbo_scale<11>(const void * block) {
+    return __half2float(__ushort_as_half(static_cast<const ggml_turbo1_tcq_block *>(block)->scale));
+}
+
+template<>
+__device__ __forceinline__ float turbo_scale<12>(const void * block) {
+    return __half2float(__ushort_as_half(static_cast<const ggml_turbo2_tcq_block *>(block)->scale));
+}
+
+template<>
+__device__ __forceinline__ float turbo_scale<13>(const void * block) {
+    return __half2float(__ushort_as_half(static_cast<const ggml_turbo3_tcq_block *>(block)->scale));
+}
+
 template<int format>
 static __device__ __forceinline__ size_t turbo_block_bytes();
 
@@ -147,8 +217,71 @@ __device__ __forceinline__ size_t turbo_block_bytes<4>() { return GGML_TURBO4_BL
 template<>
 __device__ __forceinline__ size_t turbo_block_bytes<8>() { return GGML_TURBO8_BLOCK_BYTES; }
 
+template<>
+__device__ __forceinline__ size_t turbo_block_bytes<11>() { return GGML_TURBO1_TCQ_BLOCK_BYTES; }
+
+template<>
+__device__ __forceinline__ size_t turbo_block_bytes<12>() { return GGML_TURBO2_TCQ_BLOCK_BYTES; }
+
+template<>
+__device__ __forceinline__ size_t turbo_block_bytes<13>() { return GGML_TURBO3_TCQ_BLOCK_BYTES; }
+
 template<int format>
 static __device__ __forceinline__ int turbo_nearest(float value);
+
+template<int format>
+static __device__ __forceinline__ float turbo_forward_component(const float * input, int row) {
+    if constexpr (format <= 8) {
+        float result = 0.0f;
+        for (int column = 0; column < GGML_TURBO_KV_BLOCK_ELEMENTS; ++column) {
+            result += d_turbo_rotation_forward[row * GGML_TURBO_KV_BLOCK_ELEMENTS + column] * input[column];
+        }
+        return result;
+    } else {
+        float result = 0.0f;
+        for (int column = 0; column < GGML_TURBO_KV_BLOCK_ELEMENTS; ++column) {
+            const float hadamard = (__popc(static_cast<unsigned>(row & column)) & 1) ? -1.0f : 1.0f;
+            result += hadamard * d_turbo_tcq_signs1[column] * input[column];
+        }
+        return result * 0.08838834764831845f * d_turbo_tcq_signs2[row];
+    }
+}
+
+template<int format>
+static __device__ __forceinline__ float turbo_inverse_component(const float * input, int row) {
+    if constexpr (format <= 8) {
+        float result = 0.0f;
+        for (int column = 0; column < GGML_TURBO_KV_BLOCK_ELEMENTS; ++column) {
+            result += d_turbo_rotation_inverse[row * GGML_TURBO_KV_BLOCK_ELEMENTS + column] * input[column];
+        }
+        return result;
+    } else {
+        float result = 0.0f;
+        for (int column = 0; column < GGML_TURBO_KV_BLOCK_ELEMENTS; ++column) {
+            const float hadamard = (__popc(static_cast<unsigned>(row & column)) & 1) ? -1.0f : 1.0f;
+            result += hadamard * d_turbo_tcq_signs2[column] * input[column];
+        }
+        return result * 0.08838834764831845f * d_turbo_tcq_signs1[row];
+    }
+}
+
+template<int format>
+static __device__ __forceinline__ float turbo_decode_original(const void * block, int row) {
+    float result = 0.0f;
+    for (int column = 0; column < GGML_TURBO_KV_BLOCK_ELEMENTS; ++column) {
+        const float rotated = turbo_centroid<format>(turbo_index<format>(block, column));
+        if constexpr (format <= 8) {
+            result += d_turbo_rotation_inverse[row * GGML_TURBO_KV_BLOCK_ELEMENTS + column] * rotated;
+        } else {
+            const float hadamard = (__popc(static_cast<unsigned>(row & column)) & 1) ? -1.0f : 1.0f;
+            result += hadamard * d_turbo_tcq_signs2[column] * rotated;
+        }
+    }
+    if constexpr (format > 8) {
+        result *= 0.08838834764831845f * d_turbo_tcq_signs1[row];
+    }
+    return result * turbo_scale<format>(block);
+}
 
 template<>
 __device__ __forceinline__ int turbo_nearest<2>(float value) {
@@ -299,6 +432,140 @@ static __global__ void k_turbo_set_rows(
     turbo_store_block<format>(src_block, dst_block);
 }
 
+template<int format, int K, int L, typename Block, typename index_t>
+static __global__ void k_turbo_tcq_set_rows(
+        const float * src0,
+        const index_t * src1,
+        void * dst,
+        int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+        int64_t ne11, int64_t ne12,
+        int64_t s01, int64_t s02, int64_t s03,
+        int64_t s10, int64_t s11, int64_t s12,
+        int64_t nb1, int64_t nb2, int64_t nb3) {
+    constexpr int qk = GGML_TURBO_KV_BLOCK_ELEMENTS;
+    constexpr int states = 1 << L;
+    constexpr int low_states = 1 << (L - K);
+    constexpr int outputs = 1 << K;
+    constexpr int low_mask = low_states - 1;
+    const int64_t block_index = blockIdx.x;
+    const int64_t total_blocks = ne00 * ne01 * ne02 * ne03 / qk;
+    if (block_index >= total_blocks) return;
+
+    const int64_t base = block_index * qk;
+    const int64_t i03 = base / (ne00 * ne01 * ne02);
+    const int64_t i02 = (base / (ne00 * ne01)) % ne02;
+    const int64_t i01 = (base / ne00) % ne01;
+    const int64_t i00 = base % ne00;
+    const int64_t i12 = i03 % ne12;
+    const int64_t i11 = i02 % ne11;
+    const int64_t dst_row = src1[i01 * s10 + i11 * s11 + i12 * s12];
+    if (dst_row < 0) return;
+
+    const float * src_block = src0 + i01 * s01 + i02 * s02 + i03 * s03 + i00;
+    char * dst_row_ptr = static_cast<char *>(dst) + dst_row * nb1 + i02 * nb2 + i03 * nb3;
+    auto * dst_block = reinterpret_cast<Block *>(
+        dst_row_ptr + (i00 / qk) * turbo_block_bytes<format>());
+
+    __shared__ float values[qk];
+    __shared__ float cost[states];
+    __shared__ float next_cost[states];
+    __shared__ uint8_t predecessor[qk * low_states];
+    __shared__ uint8_t symbols[qk];
+    __shared__ float source_norm;
+    __shared__ int initial_state;
+
+    const int state_id = threadIdx.x;
+    if (state_id < qk) values[state_id] = src_block[state_id] * d_turbo_tcq_signs1[state_id];
+    __syncthreads();
+
+    if (state_id == 0) {
+        float norm_sq = 0.0f;
+        for (int i = 0; i < qk; ++i) norm_sq += values[i] * values[i];
+        source_norm = sqrtf(norm_sq);
+    }
+    __syncthreads();
+    if (state_id < qk) {
+        values[state_id] *= source_norm > 1.0e-10f ? 1.0f / source_norm : 0.0f;
+    }
+    __syncthreads();
+
+    for (int width = 1; width < qk; width *= 2) {
+        if (state_id < qk / 2) {
+            const int index = (state_id / width) * (2 * width) + (state_id % width);
+            const float a = values[index];
+            const float b = values[index + width];
+            values[index] = a + b;
+            values[index + width] = a - b;
+        }
+        __syncthreads();
+    }
+    if (state_id < qk) {
+        values[state_id] *= 0.08838834764831845f * d_turbo_tcq_signs2[state_id];
+    }
+    if (state_id < states) cost[state_id] = 0.0f;
+    __syncthreads();
+
+    for (int t = 0; t < qk; ++t) {
+        if (state_id < states) {
+            const int low = state_id & low_mask;
+            const int predecessor_base = low << K;
+            float best = cost[predecessor_base];
+            uint8_t best_output = 0;
+            for (int candidate = 1; candidate < outputs; ++candidate) {
+                const float candidate_cost = cost[predecessor_base | candidate];
+                if (candidate_cost < best) {
+                    best = candidate_cost;
+                    best_output = static_cast<uint8_t>(candidate);
+                }
+            }
+            if (state_id < low_states) predecessor[t * low_states + state_id] = best_output;
+            const float delta = values[t] - turbo_centroid<format>(state_id);
+            next_cost[state_id] = best + delta * delta;
+        }
+        __syncthreads();
+        if (state_id < states) cost[state_id] = next_cost[state_id];
+        __syncthreads();
+    }
+
+    if (state_id == 0) {
+        int state = 0;
+        for (int candidate = 1; candidate < states; ++candidate) {
+            if (cost[candidate] < cost[state]) state = candidate;
+        }
+        for (int t = qk - 1; t >= 0; --t) {
+            symbols[t] = static_cast<uint8_t>(state >> (L - K));
+            const int low = state & low_mask;
+            state = (low << K) | predecessor[t * low_states + low];
+        }
+        initial_state = state;
+
+        for (size_t i = 0; i < sizeof(dst_block->qs); ++i) dst_block->qs[i] = 0;
+        auto write_bits = [&](int position, uint32_t value, int count) {
+            for (int bit = 0; bit < count; ++bit) {
+                if ((value >> bit) & 1u) {
+                    dst_block->qs[(position + bit) / 8] |= static_cast<uint8_t>(1u << ((position + bit) % 8));
+                }
+            }
+        };
+        write_bits(0, static_cast<uint32_t>(initial_state >> K), L - K);
+        int bit_position = L - K;
+        for (int t = 0; t < qk; ++t) {
+            write_bits(bit_position, symbols[t], K);
+            bit_position += K;
+        }
+        dst_block->padding = 0;
+
+        float reconstructed_norm_sq = 0.0f;
+        for (int t = 0; t < qk; ++t) {
+            const float value = turbo_centroid<format>(turbo_tcq_state<K, L>(dst_block->qs, t));
+            reconstructed_norm_sq += value * value;
+        }
+        const float reconstructed_norm = sqrtf(reconstructed_norm_sq);
+        const float scale = reconstructed_norm > 1.0e-10f ? source_norm / reconstructed_norm : source_norm;
+        dst_block->scale = __half_as_ushort(__float2half_rn(scale));
+    }
+}
+
 template<int format>
 static __global__ void k_turbo_get_rows(
         const void * src0,
@@ -328,12 +595,7 @@ static __global__ void k_turbo_get_rows(
     const int element = i00 % qk;
     const void * block = src_row + block_index * turbo_block_bytes<format>();
 
-    float reconstructed = 0.0f;
-    for (int column = 0; column < qk; ++column) {
-        reconstructed += d_turbo_rotation_inverse[element * qk + column] *
-            turbo_centroid<format>(turbo_index<format>(block, column));
-    }
-    dst_row[i00] = reconstructed * turbo_scale<format>(block);
+    dst_row[i00] = turbo_decode_original<format>(block, element);
 }
 
 template<int format, typename index_t>
@@ -357,12 +619,34 @@ static void launch_set_rows(
         nb1, nb2, nb3);
 }
 
+template<int format, int K, int L, typename Block, typename index_t>
+static void launch_tcq_set_rows(
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst,
+        cudaStream_t stream) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+    constexpr int qk = GGML_TURBO_KV_BLOCK_ELEMENTS;
+    constexpr int states = 1 << L;
+    const int64_t total_blocks = ne00 * ne01 * ne02 * ne03 / qk;
+    if (total_blocks == 0) return;
+    k_turbo_tcq_set_rows<format, K, L, Block, index_t><<<static_cast<int>(total_blocks), states, 0, stream>>>(
+        static_cast<const float *>(src0->data), static_cast<const index_t *>(src1->data), dst->data,
+        ne00, ne01, ne02, ne03, ne11, ne12,
+        nb01 / sizeof(float), nb02 / sizeof(float), nb03 / sizeof(float),
+        nb10 / sizeof(index_t), nb11 / sizeof(index_t), nb12 / sizeof(index_t),
+        nb1, nb2, nb3);
+}
+
 static int turbo_format_for_type(ggml_type type) {
     switch (type) {
         case GGML_TYPE_TURBO2_0: return 2;
         case GGML_TYPE_TURBO3_0: return 3;
         case GGML_TYPE_TURBO4_0: return 4;
         case GGML_TYPE_TURBO8_0: return 8;
+        case GGML_TYPE_TURBO1_TCQ: return 11;
+        case GGML_TYPE_TURBO2_TCQ: return 12;
+        case GGML_TYPE_TURBO3_TCQ: return 13;
         default: return 0;
     }
 }
@@ -377,12 +661,18 @@ void ggml_cuda_turbo_kv_set_rows(
     GGML_ASSERT(format != 0);
 
     if (src1->type == GGML_TYPE_I64) {
-        if (format == 2) launch_set_rows<2, int64_t>(src0, src1, dst, ctx.stream());
+        if (format == 11) launch_tcq_set_rows<11, 1, 8, ggml_turbo1_tcq_block, int64_t>(src0, src1, dst, ctx.stream());
+        else if (format == 12) launch_tcq_set_rows<12, 2, 8, ggml_turbo2_tcq_block, int64_t>(src0, src1, dst, ctx.stream());
+        else if (format == 13) launch_tcq_set_rows<13, 3, 9, ggml_turbo3_tcq_block, int64_t>(src0, src1, dst, ctx.stream());
+        else if (format == 2) launch_set_rows<2, int64_t>(src0, src1, dst, ctx.stream());
         else if (format == 3) launch_set_rows<3, int64_t>(src0, src1, dst, ctx.stream());
         else if (format == 4) launch_set_rows<4, int64_t>(src0, src1, dst, ctx.stream());
         else launch_set_rows<8, int64_t>(src0, src1, dst, ctx.stream());
     } else {
-        if (format == 2) launch_set_rows<2, int32_t>(src0, src1, dst, ctx.stream());
+        if (format == 11) launch_tcq_set_rows<11, 1, 8, ggml_turbo1_tcq_block, int32_t>(src0, src1, dst, ctx.stream());
+        else if (format == 12) launch_tcq_set_rows<12, 2, 8, ggml_turbo2_tcq_block, int32_t>(src0, src1, dst, ctx.stream());
+        else if (format == 13) launch_tcq_set_rows<13, 3, 9, ggml_turbo3_tcq_block, int32_t>(src0, src1, dst, ctx.stream());
+        else if (format == 2) launch_set_rows<2, int32_t>(src0, src1, dst, ctx.stream());
         else if (format == 3) launch_set_rows<3, int32_t>(src0, src1, dst, ctx.stream());
         else if (format == 4) launch_set_rows<4, int32_t>(src0, src1, dst, ctx.stream());
         else launch_set_rows<8, int32_t>(src0, src1, dst, ctx.stream());
@@ -417,7 +707,10 @@ void ggml_cuda_turbo_kv_get_rows(
     if (format == 2) launch_get_rows<2>(src0, src1, dst, ctx.stream());
     else if (format == 3) launch_get_rows<3>(src0, src1, dst, ctx.stream());
     else if (format == 4) launch_get_rows<4>(src0, src1, dst, ctx.stream());
-    else launch_get_rows<8>(src0, src1, dst, ctx.stream());
+    else if (format == 8) launch_get_rows<8>(src0, src1, dst, ctx.stream());
+    else if (format == 11) launch_get_rows<11>(src0, src1, dst, ctx.stream());
+    else if (format == 12) launch_get_rows<12>(src0, src1, dst, ctx.stream());
+    else launch_get_rows<13>(src0, src1, dst, ctx.stream());
 }
 
 template<int format>
@@ -438,12 +731,7 @@ static __global__ void k_turbo_dequantize_f16(
     const char * row = static_cast<const char *>(src) + i1 * nb1 + i2 * nb2 + i3 * nb3;
     const void * block = row + (i0 / qk) * turbo_block_bytes<format>();
 
-    float value = 0.0f;
-    for (int column = 0; column < qk; ++column) {
-        value += d_turbo_rotation_inverse[(i0 % qk) * qk + column] *
-            turbo_centroid<format>(turbo_index<format>(block, column));
-    }
-    dst[index] = __float2half(value * turbo_scale<format>(block));
+    dst[index] = __float2half(turbo_decode_original<format>(block, i0 % qk));
 }
 
 void ggml_cuda_turbo_kv_dequantize_f16(
@@ -471,11 +759,23 @@ void ggml_cuda_turbo_kv_dequantize_f16(
             src->data, static_cast<half *>(dst),
             src->ne[0], src->ne[1], src->ne[2], src->ne[3],
             src->nb[1], src->nb[2], src->nb[3]);
-    } else {
+    } else if (format == 8) {
         k_turbo_dequantize_f16<8><<<blocks, threads, 0, ctx.stream()>>>(
             src->data, static_cast<half *>(dst),
             src->ne[0], src->ne[1], src->ne[2], src->ne[3],
             src->nb[1], src->nb[2], src->nb[3]);
+    } else if (format == 11) {
+        k_turbo_dequantize_f16<11><<<blocks, threads, 0, ctx.stream()>>>(
+            src->data, static_cast<half *>(dst),
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1], src->nb[2], src->nb[3]);
+    } else if (format == 12) {
+        k_turbo_dequantize_f16<12><<<blocks, threads, 0, ctx.stream()>>>(
+            src->data, static_cast<half *>(dst),
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1], src->nb[2], src->nb[3]);
+    } else {
+        k_turbo_dequantize_f16<13><<<blocks, threads, 0, ctx.stream()>>>(
+            src->data, static_cast<half *>(dst),
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1], src->nb[2], src->nb[3]);
     }
 }
 
@@ -529,10 +829,7 @@ static __global__ void k_turbo_flash_attn_direct(
     __shared__ float v_acc[qk];
     __shared__ float state[4]; // max, denominator, old-output rescale, new weight
 
-    float transformed_q = 0.0f;
-    for (int original = 0; original < qk; ++original) {
-        transformed_q += d_turbo_rotation_inverse[original * qk + element] * q[original];
-    }
+    const float transformed_q = turbo_forward_component<format_k>(q, element);
     q_rot[element] = transformed_q;
     v_acc[element] = 0.0f;
     if (element == 0) {
@@ -596,10 +893,7 @@ static __global__ void k_turbo_flash_attn_direct(
     products[element] = state[1] > 0.0f ? v_acc[element] / state[1] : 0.0f;
     __syncthreads();
 
-    float output = 0.0f;
-    for (int rotated = 0; rotated < qk; ++rotated) {
-        output += d_turbo_rotation_inverse[element * qk + rotated] * products[rotated];
-    }
+    const float output = turbo_inverse_component<format_v>(products, element);
     dst[((sequence * ne01 + query) * ne02 + head) * qk + element] = output;
 }
 
@@ -665,7 +959,10 @@ static void launch_turbo_flash_attn_for_v(
     if (format_v == 2) launch_turbo_flash_attn_direct<format_k, 2>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
     else if (format_v == 3) launch_turbo_flash_attn_direct<format_k, 3>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
     else if (format_v == 4) launch_turbo_flash_attn_direct<format_k, 4>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
-    else launch_turbo_flash_attn_direct<format_k, 8>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (format_v == 8) launch_turbo_flash_attn_direct<format_k, 8>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (format_v == 11) launch_turbo_flash_attn_direct<format_k, 11>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (format_v == 12) launch_turbo_flash_attn_direct<format_k, 12>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else launch_turbo_flash_attn_direct<format_k, 13>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
 }
 
 void ggml_cuda_turbo_kv_flash_attn(
@@ -690,5 +987,8 @@ void ggml_cuda_turbo_kv_flash_attn(
     if (format_k == 2) launch_turbo_flash_attn_for_v<2>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
     else if (format_k == 3) launch_turbo_flash_attn_for_v<3>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
     else if (format_k == 4) launch_turbo_flash_attn_for_v<4>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
-    else launch_turbo_flash_attn_for_v<8>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (format_k == 8) launch_turbo_flash_attn_for_v<8>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (format_k == 11) launch_turbo_flash_attn_for_v<11>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (format_k == 12) launch_turbo_flash_attn_for_v<12>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else launch_turbo_flash_attn_for_v<13>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
 }

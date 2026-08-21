@@ -268,6 +268,9 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_TURBO8_0:
+        case GGML_TYPE_TURBO1_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO3_TCQ:
             ggml_cuda_turbo_kv_get_rows(ctx, src0, src1, dst);
             break;
         default:

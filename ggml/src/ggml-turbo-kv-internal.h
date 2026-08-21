@@ -15,6 +15,11 @@ const float * ggml_turbo_kv_centroids2();
 const float * ggml_turbo_kv_centroids3();
 const float * ggml_turbo_kv_centroids4();
 const float * ggml_turbo_kv_centroids8();
+const float * ggml_turbo_kv_tcq_signs1();
+const float * ggml_turbo_kv_tcq_signs2();
+const float * ggml_turbo_kv_tcq_codebook1();
+const float * ggml_turbo_kv_tcq_codebook2();
+const float * ggml_turbo_kv_tcq_codebook3();
 
 #ifdef __cplusplus
 }

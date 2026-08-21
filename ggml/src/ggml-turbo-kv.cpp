@@ -8,8 +8,9 @@
  *
  * The pinned Turbo2/Turbo3 encoders were incomplete. ESE retains their fixed
  * storage geometry and centroid tables while providing complete deterministic
- * CPU references for every fixed Turbo tier. TCQ and VBR remain gated until
- * their complete reference and backend paths exist.
+ * CPU references for every fixed Turbo tier. ESE also supplies substantive
+ * TCQ references because the pinned CPU TCQ functions are stubs. Public
+ * exposure and VBR remain gated on policy, lifecycle, and quality evidence.
  */
 
 #include "ggml-turbo-kv.h"
@@ -35,6 +36,11 @@ static_assert(sizeof(ggml_turbo2_block) == GGML_TURBO2_BLOCK_BYTES, "unexpected 
 static_assert(sizeof(ggml_turbo3_block) == GGML_TURBO3_BLOCK_BYTES, "unexpected Turbo3 block padding");
 static_assert(sizeof(ggml_turbo4_block) == GGML_TURBO4_BLOCK_BYTES, "unexpected Turbo4 block padding");
 static_assert(sizeof(ggml_turbo8_block) == GGML_TURBO8_BLOCK_BYTES, "unexpected Turbo8 block padding");
+static_assert(sizeof(ggml_turbo1_tcq_block) == GGML_TURBO1_TCQ_BLOCK_BYTES, "unexpected Turbo1-TCQ block padding");
+static_assert(sizeof(ggml_turbo2_tcq_block) == GGML_TURBO2_TCQ_BLOCK_BYTES, "unexpected Turbo2-TCQ block padding");
+static_assert(sizeof(ggml_turbo3_tcq_block) == GGML_TURBO3_TCQ_BLOCK_BYTES, "unexpected Turbo3-TCQ block padding");
+
+#include "ggml-turbo-tcq-codebooks.inc"
 
 constexpr std::array<float, 4> kCentroids2 = {
     -0.133462f, -0.039994f, 0.039994f, 0.133462f,
@@ -444,6 +450,161 @@ void dequantize_turbo8(const ggml_turbo8_block & src, float * dst) {
     dequantize_indices(indices, fp16_to_fp32(src.scale), kCentroids8, dst);
 }
 
+void tcq_fwht(const std::array<float, kBlock> & input, std::array<float, kBlock> & output, bool inverse) {
+    std::array<float, kBlock> buffer{};
+    const auto & signs_first = inverse ? kTcqSigns2 : kTcqSigns1;
+    const auto & signs_second = inverse ? kTcqSigns1 : kTcqSigns2;
+    for (size_t i = 0; i < kBlock; ++i) {
+        buffer[i] = input[i] * signs_first[i];
+    }
+    for (size_t width = 1; width < kBlock; width *= 2) {
+        for (size_t base = 0; base < kBlock; base += 2 * width) {
+            for (size_t i = 0; i < width; ++i) {
+                const float a = buffer[base + i];
+                const float b = buffer[base + width + i];
+                buffer[base + i] = a + b;
+                buffer[base + width + i] = a - b;
+            }
+        }
+    }
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    for (size_t i = 0; i < kBlock; ++i) {
+        output[i] = buffer[i] * inv_sqrt_128 * signs_second[i];
+    }
+}
+
+template<int K, int L>
+int tcq_read_state(const uint8_t * bits, size_t element) {
+    const size_t bit_position = element * K;
+    const size_t byte = bit_position / 8;
+    const int offset = static_cast<int>(bit_position % 8);
+    const uint16_t window = static_cast<uint16_t>(bits[byte]) |
+        (static_cast<uint16_t>(bits[byte + 1]) << 8);
+    return (window >> offset) & ((1 << L) - 1);
+}
+
+void tcq_write_bits(uint8_t * bits, size_t position, uint32_t value, int count) {
+    for (int bit = 0; bit < count; ++bit) {
+        if ((value >> bit) & 1u) {
+            bits[(position + bit) / 8] |= static_cast<uint8_t>(1u << ((position + bit) % 8));
+        }
+    }
+}
+
+template<int K, int L, size_t N, typename Block>
+void quantize_tcq(
+        const float * src,
+        Block & dst,
+        const std::array<float, N> & codebook) {
+    static_assert(N == (size_t(1) << L), "TCQ codebook/state mismatch");
+    constexpr int states = 1 << L;
+    constexpr int low_states = 1 << (L - K);
+    constexpr int outputs = 1 << K;
+    constexpr int low_mask = low_states - 1;
+
+    float norm_sq = 0.0f;
+    for (size_t i = 0; i < kBlock; ++i) norm_sq += src[i] * src[i];
+    const float norm = std::sqrt(norm_sq);
+    const float inv_norm = norm > 1.0e-10f ? 1.0f / norm : 0.0f;
+
+    std::array<float, kBlock> normalized{};
+    for (size_t i = 0; i < kBlock; ++i) normalized[i] = src[i] * inv_norm;
+    std::array<float, kBlock> rotated{};
+    tcq_fwht(normalized, rotated, false);
+
+    std::array<float, states> cost{};
+    std::array<float, states> next_cost{};
+    std::array<uint8_t, kBlock * low_states> predecessor{};
+    for (size_t t = 0; t < kBlock; ++t) {
+        for (int state = 0; state < states; ++state) {
+            const int low = state & low_mask;
+            const int predecessor_base = low << K;
+            float best = cost[predecessor_base];
+            uint8_t best_output = 0;
+            for (int candidate = 1; candidate < outputs; ++candidate) {
+                const float candidate_cost = cost[predecessor_base | candidate];
+                if (candidate_cost < best) {
+                    best = candidate_cost;
+                    best_output = static_cast<uint8_t>(candidate);
+                }
+            }
+            if (state < low_states) predecessor[t * low_states + state] = best_output;
+            const float delta = rotated[t] - codebook[state];
+            next_cost[state] = best + delta * delta;
+        }
+        cost.swap(next_cost);
+    }
+
+    int state = 0;
+    for (int candidate = 1; candidate < states; ++candidate) {
+        if (cost[candidate] < cost[state]) state = candidate;
+    }
+    std::array<uint8_t, kBlock> symbols{};
+    for (size_t reverse = kBlock; reverse-- > 0;) {
+        symbols[reverse] = static_cast<uint8_t>(state >> (L - K));
+        const int low = state & low_mask;
+        const int prior_low_bits = predecessor[reverse * low_states + low];
+        state = (low << K) | prior_low_bits;
+    }
+
+    std::memset(dst.qs, 0, sizeof(dst.qs));
+    tcq_write_bits(dst.qs, 0, static_cast<uint32_t>(state >> K), L - K);
+    size_t bit_position = L - K;
+    for (uint8_t symbol : symbols) {
+        tcq_write_bits(dst.qs, bit_position, symbol, K);
+        bit_position += K;
+    }
+    dst.padding = 0;
+
+    float reconstructed_norm_sq = 0.0f;
+    for (size_t i = 0; i < kBlock; ++i) {
+        const float value = codebook[tcq_read_state<K, L>(dst.qs, i)];
+        reconstructed_norm_sq += value * value;
+    }
+    const float reconstructed_norm = std::sqrt(reconstructed_norm_sq);
+    dst.scale = fp32_to_fp16(reconstructed_norm > 1.0e-10f ? norm / reconstructed_norm : norm);
+}
+
+template<int K, int L, size_t N, typename Block>
+void dequantize_tcq(
+        const Block & src,
+        float * dst,
+        const std::array<float, N> & codebook) {
+    static_assert(N == (size_t(1) << L), "TCQ codebook/state mismatch");
+    std::array<float, kBlock> rotated{};
+    const float scale = fp16_to_fp32(src.scale);
+    for (size_t i = 0; i < kBlock; ++i) {
+        rotated[i] = codebook[tcq_read_state<K, L>(src.qs, i)] * scale;
+    }
+    std::array<float, kBlock> reconstructed{};
+    tcq_fwht(rotated, reconstructed, true);
+    std::copy(reconstructed.begin(), reconstructed.end(), dst);
+}
+
+void quantize_turbo1_tcq(const float * src, ggml_turbo1_tcq_block & dst) {
+    quantize_tcq<1, 8>(src, dst, kTcqCodebook1);
+}
+
+void quantize_turbo2_tcq(const float * src, ggml_turbo2_tcq_block & dst) {
+    quantize_tcq<2, 8>(src, dst, kTcqCodebook2);
+}
+
+void quantize_turbo3_tcq(const float * src, ggml_turbo3_tcq_block & dst) {
+    quantize_tcq<3, 9>(src, dst, kTcqCodebook3);
+}
+
+void dequantize_turbo1_tcq(const ggml_turbo1_tcq_block & src, float * dst) {
+    dequantize_tcq<1, 8>(src, dst, kTcqCodebook1);
+}
+
+void dequantize_turbo2_tcq(const ggml_turbo2_tcq_block & src, float * dst) {
+    dequantize_tcq<2, 8>(src, dst, kTcqCodebook2);
+}
+
+void dequantize_turbo3_tcq(const ggml_turbo3_tcq_block & src, float * dst) {
+    dequantize_tcq<3, 9>(src, dst, kTcqCodebook3);
+}
+
 bool multiplication_overflows(size_t left, size_t right) {
     return right != 0 && left > std::numeric_limits<size_t>::max() / right;
 }
@@ -466,6 +627,12 @@ size_t ggml_turbo_kv_block_bytes(enum ggml_turbo_kv_format format) {
             return sizeof(ggml_turbo4_block);
         case GGML_TURBO_KV_FORMAT_TURBO8:
             return sizeof(ggml_turbo8_block);
+        case GGML_TURBO_KV_FORMAT_TURBO1_TCQ:
+            return sizeof(ggml_turbo1_tcq_block);
+        case GGML_TURBO_KV_FORMAT_TURBO2_TCQ:
+            return sizeof(ggml_turbo2_tcq_block);
+        case GGML_TURBO_KV_FORMAT_TURBO3_TCQ:
+            return sizeof(ggml_turbo3_tcq_block);
     }
     return 0;
 }
@@ -512,6 +679,26 @@ const float * ggml_turbo_kv_centroids8(void) {
     return kCentroids8.data();
 }
 
+const float * ggml_turbo_kv_tcq_signs1(void) {
+    return kTcqSigns1.data();
+}
+
+const float * ggml_turbo_kv_tcq_signs2(void) {
+    return kTcqSigns2.data();
+}
+
+const float * ggml_turbo_kv_tcq_codebook1(void) {
+    return kTcqCodebook1.data();
+}
+
+const float * ggml_turbo_kv_tcq_codebook2(void) {
+    return kTcqCodebook2.data();
+}
+
+const float * ggml_turbo_kv_tcq_codebook3(void) {
+    return kTcqCodebook3.data();
+}
+
 enum ggml_turbo_kv_status ggml_turbo_kv_quantize_reference(
         enum ggml_turbo_kv_format format,
         const float * src,
@@ -549,11 +736,20 @@ enum ggml_turbo_kv_status ggml_turbo_kv_quantize_reference(
         for (size_t block = 0; block < blocks; ++block) {
             quantize_turbo4(src + block * kBlock, output[block]);
         }
-    } else {
+    } else if (format == GGML_TURBO_KV_FORMAT_TURBO8) {
         auto * output = static_cast<ggml_turbo8_block *>(dst);
         for (size_t block = 0; block < blocks; ++block) {
             quantize_turbo8(src + block * kBlock, output[block]);
         }
+    } else if (format == GGML_TURBO_KV_FORMAT_TURBO1_TCQ) {
+        auto * output = static_cast<ggml_turbo1_tcq_block *>(dst);
+        for (size_t block = 0; block < blocks; ++block) quantize_turbo1_tcq(src + block * kBlock, output[block]);
+    } else if (format == GGML_TURBO_KV_FORMAT_TURBO2_TCQ) {
+        auto * output = static_cast<ggml_turbo2_tcq_block *>(dst);
+        for (size_t block = 0; block < blocks; ++block) quantize_turbo2_tcq(src + block * kBlock, output[block]);
+    } else {
+        auto * output = static_cast<ggml_turbo3_tcq_block *>(dst);
+        for (size_t block = 0; block < blocks; ++block) quantize_turbo3_tcq(src + block * kBlock, output[block]);
     }
     return GGML_TURBO_KV_STATUS_OK;
 }
@@ -595,11 +791,20 @@ enum ggml_turbo_kv_status ggml_turbo_kv_dequantize_reference(
         for (size_t block = 0; block < blocks; ++block) {
             dequantize_turbo4(input[block], dst + block * kBlock);
         }
-    } else {
+    } else if (format == GGML_TURBO_KV_FORMAT_TURBO8) {
         const auto * input = static_cast<const ggml_turbo8_block *>(src);
         for (size_t block = 0; block < blocks; ++block) {
             dequantize_turbo8(input[block], dst + block * kBlock);
         }
+    } else if (format == GGML_TURBO_KV_FORMAT_TURBO1_TCQ) {
+        const auto * input = static_cast<const ggml_turbo1_tcq_block *>(src);
+        for (size_t block = 0; block < blocks; ++block) dequantize_turbo1_tcq(input[block], dst + block * kBlock);
+    } else if (format == GGML_TURBO_KV_FORMAT_TURBO2_TCQ) {
+        const auto * input = static_cast<const ggml_turbo2_tcq_block *>(src);
+        for (size_t block = 0; block < blocks; ++block) dequantize_turbo2_tcq(input[block], dst + block * kBlock);
+    } else {
+        const auto * input = static_cast<const ggml_turbo3_tcq_block *>(src);
+        for (size_t block = 0; block < blocks; ++block) dequantize_turbo3_tcq(input[block], dst + block * kBlock);
     }
     return GGML_TURBO_KV_STATUS_OK;
 }
@@ -729,6 +934,45 @@ size_t ggml_turbo3_quantize_rows(
 
 void ggml_turbo8_from_float(const float * src, void * dst, int64_t value_count) {
     adapter_from_float(GGML_TURBO_KV_FORMAT_TURBO8, src, dst, value_count);
+}
+
+void ggml_turbo1_tcq_to_float(const void * src, float * dst, int64_t value_count) {
+    adapter_to_float(GGML_TURBO_KV_FORMAT_TURBO1_TCQ, src, dst, value_count);
+}
+
+void ggml_turbo2_tcq_to_float(const void * src, float * dst, int64_t value_count) {
+    adapter_to_float(GGML_TURBO_KV_FORMAT_TURBO2_TCQ, src, dst, value_count);
+}
+
+void ggml_turbo3_tcq_to_float(const void * src, float * dst, int64_t value_count) {
+    adapter_to_float(GGML_TURBO_KV_FORMAT_TURBO3_TCQ, src, dst, value_count);
+}
+
+void ggml_turbo1_tcq_from_float(const float * src, void * dst, int64_t value_count) {
+    adapter_from_float(GGML_TURBO_KV_FORMAT_TURBO1_TCQ, src, dst, value_count);
+}
+
+void ggml_turbo2_tcq_from_float(const float * src, void * dst, int64_t value_count) {
+    adapter_from_float(GGML_TURBO_KV_FORMAT_TURBO2_TCQ, src, dst, value_count);
+}
+
+void ggml_turbo3_tcq_from_float(const float * src, void * dst, int64_t value_count) {
+    adapter_from_float(GGML_TURBO_KV_FORMAT_TURBO3_TCQ, src, dst, value_count);
+}
+
+size_t ggml_turbo1_tcq_quantize_rows(
+        const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    return adapter_quantize_rows(GGML_TURBO_KV_FORMAT_TURBO1_TCQ, src, dst, nrows, n_per_row, imatrix);
+}
+
+size_t ggml_turbo2_tcq_quantize_rows(
+        const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    return adapter_quantize_rows(GGML_TURBO_KV_FORMAT_TURBO2_TCQ, src, dst, nrows, n_per_row, imatrix);
+}
+
+size_t ggml_turbo3_tcq_quantize_rows(
+        const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    return adapter_quantize_rows(GGML_TURBO_KV_FORMAT_TURBO3_TCQ, src, dst, nrows, n_per_row, imatrix);
 }
 
 size_t ggml_turbo4_quantize_rows(

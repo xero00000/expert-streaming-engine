@@ -34,6 +34,7 @@ A tree SHA and a commit SHA are recorded separately. Every code port must pin th
 | Fixed Turbo2/3/4/8 CPU + CUDA row codecs | Foundation | checked internal ABI, exact-byte parity, no host fallback |
 | Fixed Turbo2/3/4/8 CUDA Flash Attention | Foundation | direct compressed decode reads; device-only F16 staging remains for prefill |
 | Fixed Turbo2/3/4/8 per-head padding | Foundation | odd K/V heads padded independently; logical output width restored |
+| Turbo1/2/3-TCQ CPU + CUDA | Foundation | substantive Viterbi references, signed FWHT, O(1) state lookup, direct decode reads |
 | Adaptive VRAM MoE cache | Planned | Phase 2 / issue #5 |
 | Multi-GPU expert-parallel cache | Planned | Phase 2 / issue #5 |
 | Core Turbo KV types, CUDA, TCQ, and VBR | In progress | Phase 1 / issue #4 |
@@ -78,6 +79,11 @@ Acceptance:
 ### TCQ codecs
 
 Port `turbo3_tcq`, `turbo2_tcq`, and `turbo1_tcq`, including codebook provenance, FWHT/sign rotation, Viterbi encode, O(1) decode, context-adaptive scale, and fused attention paths.
+
+The deterministic CPU references, embedded pinned codebooks, signed FWHT,
+free-initial-state Viterbi encoding, O(1) sliding-window state lookup, native
+CUDA row codecs, and direct decode-attention paths are complete. Context-
+adaptive scale policy and lifecycle metadata remain in progress.
 
 Acceptance additionally requires bit-exact CPU-reference decode, bounded temporary memory, KLD distribution rather than only a mean, and measured policy for compute-poor GPUs.
 

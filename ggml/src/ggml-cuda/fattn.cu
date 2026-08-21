@@ -36,7 +36,9 @@ static inline bool is_pascal_mla_absorbed_decode(const ggml_tensor * Q, const gg
 
 static inline bool is_turbo_kv_type(ggml_type type) {
     return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 ||
-           type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO8_0;
+           type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO8_0 ||
+           type == GGML_TYPE_TURBO1_TCQ || type == GGML_TYPE_TURBO2_TCQ ||
+           type == GGML_TYPE_TURBO3_TCQ;
 }
 
 static ggml_tensor turbo_f16_staging_tensor(const ggml_tensor * src, half * data) {
