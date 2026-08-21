@@ -12,12 +12,15 @@ This branch starts the first staged port from `buun-llama-cpp` without exposing 
 
 The commit and tree are recorded separately. A Git tree SHA is not a source revision by itself.
 
-## What this first slice implements
+## What the fixed-codec foundation implements
 
-The initial native foundation includes the two formats whose pinned CPU reference paths are substantive:
+The native foundation includes complete deterministic ESE CPU references for
+all four fixed Turbo formats:
 
 | Format | Values/block | Bytes/block | Exact bits/value | Status |
 | --- | ---: | ---: | ---: | --- |
+| Turbo2 | 128 | 40 | 2.5 | CPU reference + native CUDA row codec |
+| Turbo3 | 128 | 56 | 3.5 | CPU reference + native CUDA row codec |
 | Turbo4 | 128 | 66 | 4.125 | CPU reference + native CUDA row codec |
 | Turbo8 | 128 | 130 | 8.125 | CPU reference + native CUDA row codec |
 
@@ -35,18 +38,24 @@ ESE wraps the reference in a small checked C ABI. It validates alignment, sizes,
 
 ## Internal core integration
 
-Turbo4 and Turbo8 now have pinned internal GGML/GGUF numeric IDs matching the source revision:
+The fixed formats have pinned internal GGML/GGUF numeric IDs matching the
+source revision:
 
 | Format | Internal type | Numeric ID |
 | --- | --- | ---: |
+| Turbo3 | `GGML_TYPE_TURBO3_0` | 43 |
 | Turbo4 | `GGML_TYPE_TURBO4_0` | 44 |
+| Turbo2 | `GGML_TYPE_TURBO2_0` | 45 |
 | Turbo8 | `GGML_TYPE_TURBO8_0` | 48 |
 
-Core traits report the exact 128-value block geometry and 66/130-byte storage sizes. `ggml_quantize_chunk` routes both formats through the same checked deterministic CPU reference used by the standalone tests. The integration test proves core output is byte-identical to the reference codec.
+Core traits report each format's exact 128-value block geometry and storage
+size. `ggml_quantize_chunk` routes all four formats through the same checked
+deterministic CPU references used by the standalone tests. The integration
+test proves core output is byte-identical to the reference codec.
 
 ## Native CUDA row integration
 
-CUDA `SET_ROWS` quantizes F32 rows directly into Turbo4/Turbo8 storage, and
+CUDA `SET_ROWS` quantizes F32 rows directly into fixed Turbo storage, and
 CUDA `GET_ROWS` reconstructs F32 rows directly from that storage. Both paths
 use the exact accepted reference rotation and centroid tables; they do not
 stage through host memory or silently fall back to the CPU backend.
@@ -61,11 +70,11 @@ The CUDA graph test proves:
 
 ## CUDA Flash Attention integration
 
-CUDA Flash Attention can now consume internal Turbo4/Turbo8 K and V tensors
+CUDA Flash Attention can now consume internal fixed Turbo K and V tensors
 without a host round trip. Decode batches of up to eight queries use a native
-kernel that reads Turbo4/Turbo8 codes directly, rotates Q into the compressed
+kernel that reads compressed codes directly, rotates Q into the compressed
 domain, performs online softmax, accumulates V in the compressed domain, and
-inverse-rotates the result. It supports all four Turbo4/Turbo8 K/V pairings,
+inverse-rotates the result. It supports all 16 fixed-tier K/V pairings,
 masks, GQA, softcap, ALiBi slopes, multiple sequences, and attention sinks.
 This path allocates no cache-sized temporary buffer.
 
@@ -81,7 +90,7 @@ lifetime; there is no CPU allocation, copy, or backend fallback.
 
 The CUDA graph test requires the native path and compares Turbo attention against the decoded CPU reference
 for a padded 256-token K/V extent. It exercises an F16 additive mask, two-query
-GQA, logit softcap, all four K/V format pairings, and every visible CUDA device,
+GQA, logit softcap, all 16 K/V format pairings, and every visible CUDA device,
 with a maximum absolute-error bound of `1e-3`. Setting
 `GGML_TURBO_KV_REQUIRE_NATIVE_FATTN=1` makes an unsupported shape fail instead
 of silently using staging; the CUDA test enables this guard.
@@ -101,12 +110,12 @@ when Flash Attention is disabled because the legacy transposed-V layout is not
 a valid Turbo execution path.
 
 The CUDA graph test covers both a naturally aligned 128-wide head and a
-96-wide head padded to 128 for Turbo4 and Turbo8 on every visible GPU. The odd-
+96-wide head padded to 128 for every fixed format on every visible GPU. The odd-
 width case retains the mask, two-query GQA, softcap, and `1e-3` error gate.
 
 ## Deliberately not exposed yet
 
-This slice does **not** add `turbo4` or `turbo8` to:
+This slice does **not** add `turbo2`, `turbo3`, `turbo4`, or `turbo8` to:
 
 - `--cache-type-k` or `--cache-type-v`;
 - `tools/ese.py`;
@@ -115,7 +124,7 @@ This slice does **not** add `turbo4` or `turbo8` to:
 
 The native KV parser remains an explicit whitelist, and a source-level regression test prevents the internal type names from being added accidentally. A registered storage type is still not a serving feature until backend execution, lifecycle behavior, and quality gates all pass.
 
-## Why Turbo2, Turbo3, and TCQ are not copied in this slice
+## Why the pinned Turbo2/Turbo3 encoders were replaced
 
 At the pinned revision:
 
@@ -124,7 +133,13 @@ At the pinned revision:
 - Turbo3-TCQ and Turbo2-TCQ CPU paths are explicitly zero-fill stubs;
 - Turbo1-TCQ CPU decode is explicitly a stub.
 
-Those paths are useful as backend integration references, but they are not acceptable ESE correctness or fallback references. ESE will not advertise them until a complete reference and a proven native backend path exist.
+Those paths are useful as layout and backend integration references, but they
+are not acceptable ESE correctness or fallback references. ESE therefore
+retains the pinned fixed-format storage geometry and Lloyd–Max centroids while
+providing complete Turbo2/Turbo3 quantize and dequantize references. Their core,
+CUDA row, padding, and direct decode-attention paths are covered by the same
+gates as Turbo4/Turbo8. TCQ remains unadvertised until its complete reference
+and native backend paths exist.
 
 ## Tests
 
@@ -142,13 +157,14 @@ The test compiles the reference module independently and verifies:
 - non-finite input rejection;
 - exact zero round-trip;
 - deterministic byte encoding;
+- pinned FNV-1a hashes for seeded-random encoded reference vectors;
 - finite reconstruction;
 - norm preservation;
 - conservative normalized-MSE limits over impulse, ramp, sinusoid, and seeded-random vectors.
 
 For the native CUDA row-codec test, configure with `GGML_CUDA=ON`, build
-`test-turbo-kv-cuda`, and run the resulting executable. The test runs Turbo4
-and Turbo8 on every visible CUDA device. The Turbo-specific pre-merge wrapper
+`test-turbo-kv-cuda`, and run the resulting executable. The test runs all fixed
+formats and all 16 K/V pairings on every visible CUDA device. The Turbo-specific pre-merge wrapper
 does this automatically when passed `--require-cuda` (or when
 `ESE_TURBO_REQUIRE_CUDA=1`).
 
@@ -160,7 +176,7 @@ does this automatically when passed `--require-cuda` (or when
 - checked tensor and row sizing;
 - checked quantize/dequantize dispatch;
 - deterministic core-vs-reference byte parity;
-- pinned numeric IDs 44 and 48;
+- pinned numeric IDs 43, 44, 45, and 48;
 - compile-time block ABI assertions;
 - native and launcher visibility guards.
 
@@ -190,7 +206,7 @@ prompt/decode measurements.
 
 ### Gate C — quality and lifecycle
 
-Before making either type stable:
+Before making any fixed type stable:
 
 - F16 reference;
 - perplexity;

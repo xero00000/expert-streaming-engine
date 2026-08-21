@@ -1698,6 +1698,28 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 4,
     },
+    [GGML_TYPE_TURBO2_0] = {
+        .type_name                = "turbo2_0",
+        .blck_size                = GGML_TURBO_KV_BLOCK_ELEMENTS,
+        .type_size                = sizeof(struct ggml_turbo2_block),
+        .is_quantized             = true,
+        .to_float                 = ggml_turbo2_to_float,
+        .from_float               = ggml_turbo2_from_float,
+        .from_float_ref           = ggml_turbo2_from_float,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .type_name                = "turbo3_0",
+        .blck_size                = GGML_TURBO_KV_BLOCK_ELEMENTS,
+        .type_size                = sizeof(struct ggml_turbo3_block),
+        .is_quantized             = true,
+        .to_float                 = ggml_turbo3_to_float,
+        .from_float               = ggml_turbo3_from_float,
+        .from_float_ref           = ggml_turbo3_from_float,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
     [GGML_TYPE_TURBO4_0] = {
         .type_name                = "turbo4_0",
         .blck_size                = GGML_TURBO_KV_BLOCK_ELEMENTS,
@@ -30793,6 +30815,8 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ2_KT:  result = quantize_iq2_kt (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ3_KT:  result = quantize_iq3_kt (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ4_KT:  result = quantize_iq4_kt (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
+        case GGML_TYPE_TURBO2_0: result = ggml_turbo2_quantize_rows(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO3_0: result = ggml_turbo3_quantize_rows(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO4_0: result = ggml_turbo4_quantize_rows(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO8_0: result = ggml_turbo8_quantize_rows(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ1_0:     result = quantize_tq1_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

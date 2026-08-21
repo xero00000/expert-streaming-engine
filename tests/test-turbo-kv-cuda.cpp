@@ -302,30 +302,34 @@ int main() {
             "require native Turbo Flash Attention path");
     const int device_count = ggml_backend_cuda_get_device_count();
     require(device_count > 0, "CUDA device required");
+    struct format_spec {
+        ggml_type type;
+        ggml_turbo_kv_format format;
+        const char * name;
+    };
+    const format_spec formats[] = {
+        {GGML_TYPE_TURBO2_0, GGML_TURBO_KV_FORMAT_TURBO2, "turbo2_0"},
+        {GGML_TYPE_TURBO3_0, GGML_TURBO_KV_FORMAT_TURBO3, "turbo3_0"},
+        {GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, "turbo4_0"},
+        {GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, "turbo8_0"},
+    };
     for (int device = 0; device < device_count; ++device) {
-        check_format(device, GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, GGML_TYPE_I32, "turbo4_0");
-        check_format(device, GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, GGML_TYPE_I64, "turbo4_0");
-        check_format(device, GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, GGML_TYPE_I32, "turbo8_0");
-        check_format(device, GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, GGML_TYPE_I64, "turbo8_0");
-        check_flash_attention(device,
-                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4,
-                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, "turbo4_0", 128);
-        check_flash_attention(device,
-                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8,
-                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, "turbo8_0", 128);
-        check_flash_attention(device,
-                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4,
-                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, "turbo4_0-K/turbo8_0-V", 128);
-        check_flash_attention(device,
-                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8,
-                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, "turbo8_0-K/turbo4_0-V", 128);
-        check_flash_attention(device,
-                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4,
-                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, "turbo4_0", 96);
-        check_flash_attention(device,
-                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8,
-                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, "turbo8_0", 96);
+        for (const format_spec & spec : formats) {
+            check_format(device, spec.type, spec.format, GGML_TYPE_I32, spec.name);
+            check_format(device, spec.type, spec.format, GGML_TYPE_I64, spec.name);
+        }
+        for (const format_spec & key : formats) {
+            for (const format_spec & value : formats) {
+                const std::string name = std::string(key.name) + "-K/" + value.name + "-V";
+                check_flash_attention(device,
+                        key.type, key.format, value.type, value.format, name.c_str(), 128);
+            }
+        }
+        for (const format_spec & spec : formats) {
+            check_flash_attention(device,
+                    spec.type, spec.format, spec.type, spec.format, spec.name, 96);
+        }
     }
-    std::cout << "PASS: native CUDA Turbo4/Turbo8 row codecs and direct Flash Attention reads\n";
+    std::cout << "PASS: native CUDA fixed Turbo row codecs and direct Flash Attention reads\n";
     return 0;
 }

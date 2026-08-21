@@ -103,10 +103,19 @@ void check_type(
             std::string(expected_name) + ": core dispatch is byte-identical to reference");
 
     std::vector<float> decoded(source.size());
-    if (format == GGML_TURBO_KV_FORMAT_TURBO4) {
-        ggml_turbo4_to_float(through_core.data(), decoded.data(), decoded.size());
-    } else {
-        ggml_turbo8_to_float(through_core.data(), decoded.data(), decoded.size());
+    switch (format) {
+        case GGML_TURBO_KV_FORMAT_TURBO2:
+            ggml_turbo2_to_float(through_core.data(), decoded.data(), decoded.size());
+            break;
+        case GGML_TURBO_KV_FORMAT_TURBO3:
+            ggml_turbo3_to_float(through_core.data(), decoded.data(), decoded.size());
+            break;
+        case GGML_TURBO_KV_FORMAT_TURBO4:
+            ggml_turbo4_to_float(through_core.data(), decoded.data(), decoded.size());
+            break;
+        case GGML_TURBO_KV_FORMAT_TURBO8:
+            ggml_turbo8_to_float(through_core.data(), decoded.data(), decoded.size());
+            break;
     }
 
     require(std::all_of(decoded.begin(), decoded.end(), [](float value) {
@@ -126,14 +135,22 @@ void check_type(
 
 } // namespace
 
+static_assert(GGML_TYPE_TURBO2_0 == 45, "Turbo2 GGML/GGUF numeric ID changed");
+static_assert(GGML_TYPE_TURBO3_0 == 43, "Turbo3 GGML/GGUF numeric ID changed");
 static_assert(GGML_TYPE_TURBO4_0 == 44, "Turbo4 GGML/GGUF numeric ID changed");
 static_assert(GGML_TYPE_TURBO8_0 == 48, "Turbo8 GGML/GGUF numeric ID changed");
+static_assert(sizeof(ggml_turbo2_block) == GGML_TURBO2_BLOCK_BYTES, "Turbo2 ABI changed");
+static_assert(sizeof(ggml_turbo3_block) == GGML_TURBO3_BLOCK_BYTES, "Turbo3 ABI changed");
 static_assert(sizeof(ggml_turbo4_block) == GGML_TURBO4_BLOCK_BYTES, "Turbo4 ABI changed");
 static_assert(sizeof(ggml_turbo8_block) == GGML_TURBO8_BLOCK_BYTES, "Turbo8 ABI changed");
 
 int main() {
     require(llama_kv_head_dim_for_type(GGML_TYPE_F16, 96) == 96,
             "F16 head geometry remains unchanged");
+    require(llama_kv_head_dim_for_type(GGML_TYPE_TURBO2_0, 96) == 128,
+            "Turbo2 pads a 96-wide head independently");
+    require(llama_kv_head_dim_for_type(GGML_TYPE_TURBO3_0, 96) == 128,
+            "Turbo3 pads a 96-wide head independently");
     require(llama_kv_head_dim_for_type(GGML_TYPE_TURBO4_0, 96) == 128,
             "Turbo4 pads a 96-wide head independently");
     require(llama_kv_head_dim_for_type(GGML_TYPE_TURBO8_0, 129) == 256,
@@ -141,6 +158,18 @@ int main() {
     require(llama_kv_gqa_dim_for_type(GGML_TYPE_TURBO4_0, 96, 3) == 384,
             "Turbo GQA padding does not cross head boundaries");
 
+    check_type(
+        GGML_TYPE_TURBO2_0,
+        GGML_TURBO_KV_FORMAT_TURBO2,
+        "turbo2_0",
+        GGML_TURBO2_BLOCK_BYTES,
+        0.25);
+    check_type(
+        GGML_TYPE_TURBO3_0,
+        GGML_TURBO_KV_FORMAT_TURBO3,
+        "turbo3_0",
+        GGML_TURBO3_BLOCK_BYTES,
+        0.08);
     check_type(
         GGML_TYPE_TURBO4_0,
         GGML_TURBO_KV_FORMAT_TURBO4,
@@ -154,6 +183,6 @@ int main() {
         GGML_TURBO8_BLOCK_BYTES,
         0.0005);
 
-    std::cout << "PASS: internal GGML Turbo4/Turbo8 type integration\n";
+    std::cout << "PASS: internal GGML fixed Turbo type integration\n";
     return 0;
 }

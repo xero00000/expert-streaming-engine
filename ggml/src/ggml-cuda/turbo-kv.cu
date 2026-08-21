@@ -19,6 +19,8 @@
 
 static __device__ float d_turbo_rotation_forward[GGML_TURBO_KV_BLOCK_ELEMENTS * GGML_TURBO_KV_BLOCK_ELEMENTS];
 static __device__ float d_turbo_rotation_inverse[GGML_TURBO_KV_BLOCK_ELEMENTS * GGML_TURBO_KV_BLOCK_ELEMENTS];
+static __constant__ float d_turbo_centroids2[4];
+static __constant__ float d_turbo_centroids3[8];
 static __constant__ float d_turbo_centroids4[16];
 static __constant__ float d_turbo_centroids8[256];
 
@@ -41,6 +43,10 @@ static void ggml_cuda_turbo_kv_ensure_tables() {
     CUDA_CHECK(cudaMemcpyToSymbol(
         d_turbo_rotation_inverse, ggml_turbo_kv_rotation_inverse(), matrix_bytes));
     CUDA_CHECK(cudaMemcpyToSymbol(
+        d_turbo_centroids2, ggml_turbo_kv_centroids2(), 4 * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        d_turbo_centroids3, ggml_turbo_kv_centroids3(), 8 * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(
         d_turbo_centroids4, ggml_turbo_kv_centroids4(), 16 * sizeof(float)));
     CUDA_CHECK(cudaMemcpyToSymbol(
         d_turbo_centroids8, ggml_turbo_kv_centroids8(), 256 * sizeof(float)));
@@ -49,6 +55,16 @@ static void ggml_cuda_turbo_kv_ensure_tables() {
 
 template<int format>
 static __device__ __forceinline__ float turbo_centroid(int index);
+
+template<>
+__device__ __forceinline__ float turbo_centroid<2>(int index) {
+    return d_turbo_centroids2[index];
+}
+
+template<>
+__device__ __forceinline__ float turbo_centroid<3>(int index) {
+    return d_turbo_centroids3[index];
+}
 
 template<>
 __device__ __forceinline__ float turbo_centroid<4>(int index) {
@@ -62,6 +78,24 @@ __device__ __forceinline__ float turbo_centroid<8>(int index) {
 
 template<int format>
 static __device__ __forceinline__ int turbo_index(const void * block, int element);
+
+template<>
+__device__ __forceinline__ int turbo_index<2>(const void * block, int element) {
+    const auto * value = static_cast<const ggml_turbo2_block *>(block);
+    const auto & subblock = value->subblocks[element / GGML_TURBO_KV_SUBBLOCK_ELEMENTS];
+    const int local = element % GGML_TURBO_KV_SUBBLOCK_ELEMENTS;
+    return (subblock.qs[local / 4] >> ((local % 4) * 2)) & 0x03;
+}
+
+template<>
+__device__ __forceinline__ int turbo_index<3>(const void * block, int element) {
+    const auto * value = static_cast<const ggml_turbo3_block *>(block);
+    const auto & subblock = value->subblocks[element / GGML_TURBO_KV_SUBBLOCK_ELEMENTS];
+    const int local = element % GGML_TURBO_KV_SUBBLOCK_ELEMENTS;
+    const int low = (subblock.qs[local / 4] >> ((local % 4) * 2)) & 0x03;
+    const int high = (subblock.high[local / 8] >> (local % 8)) & 0x01;
+    return low | (high << 2);
+}
 
 template<>
 __device__ __forceinline__ int turbo_index<4>(const void * block, int element) {
@@ -79,6 +113,16 @@ template<int format>
 static __device__ __forceinline__ float turbo_scale(const void * block);
 
 template<>
+__device__ __forceinline__ float turbo_scale<2>(const void * block) {
+    return __half2float(__ushort_as_half(static_cast<const ggml_turbo2_block *>(block)->subblocks[0].scale));
+}
+
+template<>
+__device__ __forceinline__ float turbo_scale<3>(const void * block) {
+    return __half2float(__ushort_as_half(static_cast<const ggml_turbo3_block *>(block)->subblocks[0].scale));
+}
+
+template<>
 __device__ __forceinline__ float turbo_scale<4>(const void * block) {
     return __half2float(__ushort_as_half(static_cast<const ggml_turbo4_block *>(block)->scale));
 }
@@ -92,6 +136,12 @@ template<int format>
 static __device__ __forceinline__ size_t turbo_block_bytes();
 
 template<>
+__device__ __forceinline__ size_t turbo_block_bytes<2>() { return GGML_TURBO2_BLOCK_BYTES; }
+
+template<>
+__device__ __forceinline__ size_t turbo_block_bytes<3>() { return GGML_TURBO3_BLOCK_BYTES; }
+
+template<>
 __device__ __forceinline__ size_t turbo_block_bytes<4>() { return GGML_TURBO4_BLOCK_BYTES; }
 
 template<>
@@ -99,6 +149,30 @@ __device__ __forceinline__ size_t turbo_block_bytes<8>() { return GGML_TURBO8_BL
 
 template<int format>
 static __device__ __forceinline__ int turbo_nearest(float value);
+
+template<>
+__device__ __forceinline__ int turbo_nearest<2>(float value) {
+    int lo = 0;
+    int hi = 3;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (value < 0.5f * (d_turbo_centroids2[mid] + d_turbo_centroids2[mid + 1])) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
+
+template<>
+__device__ __forceinline__ int turbo_nearest<3>(float value) {
+    int lo = 0;
+    int hi = 7;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (value < 0.5f * (d_turbo_centroids3[mid] + d_turbo_centroids3[mid + 1])) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
 
 template<>
 __device__ __forceinline__ int turbo_nearest<4>(float value) {
@@ -157,7 +231,29 @@ static __device__ __forceinline__ void turbo_store_block(
     const float scale = reconstructed_norm > 1.0e-10f ? norm / reconstructed_norm : norm;
     const uint16_t scale_fp16 = __half_as_ushort(__float2half_rn(scale));
 
-    if constexpr (format == 4) {
+    if constexpr (format == 2) {
+        auto * output = static_cast<ggml_turbo2_block *>(dst);
+        for (int subblock = 0; subblock < 4; ++subblock) {
+            output->subblocks[subblock].scale = scale_fp16;
+            for (int i = 0; i < GGML_TURBO_KV_SUBBLOCK_ELEMENTS; i += 4) {
+                const int offset = subblock * GGML_TURBO_KV_SUBBLOCK_ELEMENTS + i;
+                output->subblocks[subblock].qs[i / 4] = indices[offset] |
+                    (indices[offset + 1] << 2) | (indices[offset + 2] << 4) | (indices[offset + 3] << 6);
+            }
+        }
+    } else if constexpr (format == 3) {
+        auto * output = static_cast<ggml_turbo3_block *>(dst);
+        for (int subblock = 0; subblock < 4; ++subblock) {
+            output->subblocks[subblock].scale = scale_fp16;
+            for (int i = 0; i < GGML_TURBO_KV_SUBBLOCK_ELEMENTS / 4; ++i) output->subblocks[subblock].qs[i] = 0;
+            for (int i = 0; i < GGML_TURBO_KV_SUBBLOCK_ELEMENTS / 8; ++i) output->subblocks[subblock].high[i] = 0;
+            for (int i = 0; i < GGML_TURBO_KV_SUBBLOCK_ELEMENTS; ++i) {
+                const int index = indices[subblock * GGML_TURBO_KV_SUBBLOCK_ELEMENTS + i];
+                output->subblocks[subblock].qs[i / 4] |= (index & 0x03) << ((i % 4) * 2);
+                output->subblocks[subblock].high[i / 8] |= ((index >> 2) & 0x01) << (i % 8);
+            }
+        }
+    } else if constexpr (format == 4) {
         auto * output = static_cast<ggml_turbo4_block *>(dst);
         output->scale = scale_fp16;
         for (int i = 0; i < qk; i += 2) {
@@ -261,20 +357,34 @@ static void launch_set_rows(
         nb1, nb2, nb3);
 }
 
+static int turbo_format_for_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TURBO2_0: return 2;
+        case GGML_TYPE_TURBO3_0: return 3;
+        case GGML_TYPE_TURBO4_0: return 4;
+        case GGML_TYPE_TURBO8_0: return 8;
+        default: return 0;
+    }
+}
+
 void ggml_cuda_turbo_kv_set_rows(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
         const ggml_tensor * src1,
         ggml_tensor * dst) {
     ggml_cuda_turbo_kv_ensure_tables();
-    const int format = dst->type == GGML_TYPE_TURBO4_0 ? 4 : 8;
-    GGML_ASSERT(dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO8_0);
+    const int format = turbo_format_for_type(dst->type);
+    GGML_ASSERT(format != 0);
 
     if (src1->type == GGML_TYPE_I64) {
-        if (format == 4) launch_set_rows<4, int64_t>(src0, src1, dst, ctx.stream());
+        if (format == 2) launch_set_rows<2, int64_t>(src0, src1, dst, ctx.stream());
+        else if (format == 3) launch_set_rows<3, int64_t>(src0, src1, dst, ctx.stream());
+        else if (format == 4) launch_set_rows<4, int64_t>(src0, src1, dst, ctx.stream());
         else launch_set_rows<8, int64_t>(src0, src1, dst, ctx.stream());
     } else {
-        if (format == 4) launch_set_rows<4, int32_t>(src0, src1, dst, ctx.stream());
+        if (format == 2) launch_set_rows<2, int32_t>(src0, src1, dst, ctx.stream());
+        else if (format == 3) launch_set_rows<3, int32_t>(src0, src1, dst, ctx.stream());
+        else if (format == 4) launch_set_rows<4, int32_t>(src0, src1, dst, ctx.stream());
         else launch_set_rows<8, int32_t>(src0, src1, dst, ctx.stream());
     }
 }
@@ -302,12 +412,12 @@ void ggml_cuda_turbo_kv_get_rows(
         ggml_tensor * dst) {
     ggml_cuda_turbo_kv_ensure_tables();
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    if (src0->type == GGML_TYPE_TURBO4_0) {
-        launch_get_rows<4>(src0, src1, dst, ctx.stream());
-    } else {
-        GGML_ASSERT(src0->type == GGML_TYPE_TURBO8_0);
-        launch_get_rows<8>(src0, src1, dst, ctx.stream());
-    }
+    const int format = turbo_format_for_type(src0->type);
+    GGML_ASSERT(format != 0);
+    if (format == 2) launch_get_rows<2>(src0, src1, dst, ctx.stream());
+    else if (format == 3) launch_get_rows<3>(src0, src1, dst, ctx.stream());
+    else if (format == 4) launch_get_rows<4>(src0, src1, dst, ctx.stream());
+    else launch_get_rows<8>(src0, src1, dst, ctx.stream());
 }
 
 template<int format>
@@ -341,13 +451,22 @@ void ggml_cuda_turbo_kv_dequantize_f16(
         const ggml_tensor * src,
         void * dst) {
     ggml_cuda_turbo_kv_ensure_tables();
-    GGML_ASSERT(src->type == GGML_TYPE_TURBO4_0 || src->type == GGML_TYPE_TURBO8_0);
+    const int format = turbo_format_for_type(src->type);
+    GGML_ASSERT(format != 0);
     GGML_ASSERT(src->ne[0] % GGML_TURBO_KV_BLOCK_ELEMENTS == 0);
 
     const int64_t total = ggml_nelements(src);
     constexpr int threads = 128;
     const int blocks = int((total + threads - 1) / threads);
-    if (src->type == GGML_TYPE_TURBO4_0) {
+    if (format == 2) {
+        k_turbo_dequantize_f16<2><<<blocks, threads, 0, ctx.stream()>>>(
+            src->data, static_cast<half *>(dst),
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1], src->nb[2], src->nb[3]);
+    } else if (format == 3) {
+        k_turbo_dequantize_f16<3><<<blocks, threads, 0, ctx.stream()>>>(
+            src->data, static_cast<half *>(dst),
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1], src->nb[2], src->nb[3]);
+    } else if (format == 4) {
         k_turbo_dequantize_f16<4><<<blocks, threads, 0, ctx.stream()>>>(
             src->data, static_cast<half *>(dst),
             src->ne[0], src->ne[1], src->ne[2], src->ne[3],
@@ -494,8 +613,7 @@ bool ggml_cuda_turbo_kv_fattn_is_supported(const ggml_tensor * dst) {
         q->ne[1] <= 8 &&
         k->ne[0] == GGML_TURBO_KV_BLOCK_ELEMENTS &&
         v->ne[0] == GGML_TURBO_KV_BLOCK_ELEMENTS &&
-        (k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO8_0) &&
-        (v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO8_0) &&
+        turbo_format_for_type(k->type) != 0 && turbo_format_for_type(v->type) != 0 &&
         k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2] && k->ne[3] == v->ne[3] &&
         q->ne[2] % k->ne[2] == 0 &&
         (!mask || (mask->type == GGML_TYPE_F16 &&
@@ -533,6 +651,23 @@ static void launch_turbo_flash_attn_direct(
     CUDA_CHECK(cudaGetLastError());
 }
 
+template<int format_k>
+static void launch_turbo_flash_attn_for_v(
+        int format_v,
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        float scale,
+        float max_bias,
+        float m0,
+        float m1,
+        uint32_t n_head_log2,
+        float logit_softcap) {
+    if (format_v == 2) launch_turbo_flash_attn_direct<format_k, 2>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (format_v == 3) launch_turbo_flash_attn_direct<format_k, 3>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (format_v == 4) launch_turbo_flash_attn_direct<format_k, 4>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else launch_turbo_flash_attn_direct<format_k, 8>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+}
+
 void ggml_cuda_turbo_kv_flash_attn(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst) {
@@ -550,10 +685,10 @@ void ggml_cuda_turbo_kv_flash_attn(
     const float m0 = powf(2.0f, -max_bias / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-    const bool k4 = dst->src[1]->type == GGML_TYPE_TURBO4_0;
-    const bool v4 = dst->src[2]->type == GGML_TYPE_TURBO4_0;
-    if (k4 && v4) launch_turbo_flash_attn_direct<4, 4>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
-    else if (k4)  launch_turbo_flash_attn_direct<4, 8>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
-    else if (v4)  launch_turbo_flash_attn_direct<8, 4>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
-    else          launch_turbo_flash_attn_direct<8, 8>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    const int format_k = turbo_format_for_type(dst->src[1]->type);
+    const int format_v = turbo_format_for_type(dst->src[2]->type);
+    if (format_k == 2) launch_turbo_flash_attn_for_v<2>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (format_k == 3) launch_turbo_flash_attn_for_v<3>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (format_k == 4) launch_turbo_flash_attn_for_v<4>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else launch_turbo_flash_attn_for_v<8>(format_v, ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
 }

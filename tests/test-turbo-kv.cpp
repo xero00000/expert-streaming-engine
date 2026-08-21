@@ -40,6 +40,49 @@ double normalized_mse(const std::vector<float> & expected, const std::vector<flo
     return signal > 0.0 ? error / signal : error;
 }
 
+uint64_t fnv1a64(const std::vector<uint8_t> & bytes) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (uint8_t byte : bytes) {
+        hash ^= byte;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+uint64_t seeded_random_reference_hash(enum ggml_turbo_kv_format format) {
+    switch (format) {
+        case GGML_TURBO_KV_FORMAT_TURBO2: return UINT64_C(0x0d3a9f213f83494a);
+        case GGML_TURBO_KV_FORMAT_TURBO3: return UINT64_C(0xbb2e58919cbf83ea);
+        case GGML_TURBO_KV_FORMAT_TURBO4: return UINT64_C(0x3f9a24373049e230);
+        case GGML_TURBO_KV_FORMAT_TURBO8: return UINT64_C(0x222ac29fff58ee70);
+    }
+    return 0;
+}
+
+void require_repeated_group_scales(
+        enum ggml_turbo_kv_format format,
+        const std::vector<uint8_t> & encoded) {
+    if (format != GGML_TURBO_KV_FORMAT_TURBO2 &&
+        format != GGML_TURBO_KV_FORMAT_TURBO3) {
+        return;
+    }
+
+    const size_t block_bytes = ggml_turbo_kv_block_bytes(format);
+    const size_t subblock_bytes = block_bytes / 4;
+    for (size_t block = 0; block < encoded.size() / block_bytes; ++block) {
+        uint16_t first_scale = 0;
+        std::memcpy(&first_scale, encoded.data() + block * block_bytes, sizeof(first_scale));
+        for (size_t subblock = 1; subblock < 4; ++subblock) {
+            uint16_t scale = 0;
+            std::memcpy(&scale,
+                    encoded.data() + block * block_bytes + subblock * subblock_bytes,
+                    sizeof(scale));
+            require(scale == first_scale,
+                    "Turbo2/Turbo3 repeat the group scale in every pinned subblock");
+        }
+    }
+}
+
 std::vector<float> make_impulse() {
     std::vector<float> values(GGML_TURBO_KV_BLOCK_ELEMENTS, 0.0f);
     values[0] = 1.0f;
@@ -83,12 +126,20 @@ std::vector<float> make_seeded_random() {
 }
 
 void test_metadata() {
+    static_assert(sizeof(ggml_turbo2_block) == GGML_TURBO2_BLOCK_BYTES, "Turbo2 size");
+    static_assert(sizeof(ggml_turbo3_block) == GGML_TURBO3_BLOCK_BYTES, "Turbo3 size");
     static_assert(sizeof(ggml_turbo4_block) == GGML_TURBO4_BLOCK_BYTES, "Turbo4 size");
     static_assert(sizeof(ggml_turbo8_block) == GGML_TURBO8_BLOCK_BYTES, "Turbo8 size");
 
     require(ggml_turbo_kv_block_elements() == 128, "block element count");
+    require(ggml_turbo_kv_block_bytes(GGML_TURBO_KV_FORMAT_TURBO2) == 40, "Turbo2 block bytes");
+    require(ggml_turbo_kv_block_bytes(GGML_TURBO_KV_FORMAT_TURBO3) == 56, "Turbo3 block bytes");
     require(ggml_turbo_kv_block_bytes(GGML_TURBO_KV_FORMAT_TURBO4) == 66, "Turbo4 block bytes");
     require(ggml_turbo_kv_block_bytes(GGML_TURBO_KV_FORMAT_TURBO8) == 130, "Turbo8 block bytes");
+    require(std::abs(ggml_turbo_kv_bits_per_value(GGML_TURBO_KV_FORMAT_TURBO2) - 2.5) < 1.0e-12,
+            "Turbo2 exact bits/value");
+    require(std::abs(ggml_turbo_kv_bits_per_value(GGML_TURBO_KV_FORMAT_TURBO3) - 3.5) < 1.0e-12,
+            "Turbo3 exact bits/value");
     require(std::abs(ggml_turbo_kv_bits_per_value(GGML_TURBO_KV_FORMAT_TURBO4) - 4.125) < 1.0e-12,
             "Turbo4 exact bits/value");
     require(std::abs(ggml_turbo_kv_bits_per_value(GGML_TURBO_KV_FORMAT_TURBO8) - 8.125) < 1.0e-12,
@@ -172,6 +223,12 @@ void test_round_trip_case(
                 GGML_TURBO_KV_STATUS_OK,
             name + ": second deterministic quantize");
     require(first == second, name + ": encoding is deterministic");
+    require_repeated_group_scales(format, first);
+
+    if (name == "seeded-random") {
+        require(fnv1a64(first) == seeded_random_reference_hash(format),
+                name + ": encoded bytes match the pinned reference vector");
+    }
 
     require(ggml_turbo_kv_dequantize_reference(
                 format, first.data(), first.size(), decoded.data(), decoded.size()) ==
@@ -186,12 +243,16 @@ void test_round_trip_case(
         ? std::abs(l2_norm(decoded) / source_norm - 1.0)
         : l2_norm(decoded);
 
-    std::cout << (format == GGML_TURBO_KV_FORMAT_TURBO4 ? "turbo4" : "turbo8")
+    std::cout << "turbo" << static_cast<int>(format)
               << " case=" << name
               << " bytes=" << bytes
               << " bits/value=" << ggml_turbo_kv_bits_per_value(format)
               << " nmse=" << nmse
-              << " norm_error=" << norm_error << "\n";
+              << " norm_error=" << norm_error;
+    if (name == "seeded-random") {
+        std::cout << " fnv1a64=0x" << std::hex << fnv1a64(first) << std::dec;
+    }
+    std::cout << "\n";
 
     require(nmse <= max_normalized_mse, name + ": normalized MSE threshold");
     require(norm_error <= max_norm_error, name + ": norm preservation threshold");
@@ -209,8 +270,12 @@ void test_round_trips(enum ggml_turbo_kv_format format, double max_nmse) {
 int main() {
     test_metadata();
     test_errors();
+    test_zero(GGML_TURBO_KV_FORMAT_TURBO2);
+    test_zero(GGML_TURBO_KV_FORMAT_TURBO3);
     test_zero(GGML_TURBO_KV_FORMAT_TURBO4);
     test_zero(GGML_TURBO_KV_FORMAT_TURBO8);
+    test_round_trips(GGML_TURBO_KV_FORMAT_TURBO2, 0.25);
+    test_round_trips(GGML_TURBO_KV_FORMAT_TURBO3, 0.08);
     test_round_trips(GGML_TURBO_KV_FORMAT_TURBO4, 0.03);
     test_round_trips(GGML_TURBO_KV_FORMAT_TURBO8, 0.0005);
     std::cout << "PASS: Turbo KV CPU reference foundation\n";

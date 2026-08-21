@@ -257,7 +257,8 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
-    } else if (dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO8_0) {
+    } else if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 ||
+               dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO8_0) {
         ggml_cuda_turbo_kv_set_rows(ctx, src0, src1, dst);
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));

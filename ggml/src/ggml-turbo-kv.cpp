@@ -6,14 +6,16 @@
  *   commit 799e3995cd4f19aa9f6a3fa9fb5b4674422bf0ee
  *   ggml/src/ggml-turbo-quant.c
  *
- * This file intentionally implements only the substantive CPU reference
- * formats from that revision: Turbo4 and Turbo8. Turbo2/Turbo3/TCQ/VBR remain
- * gated until their complete native reference and backend paths exist.
+ * The pinned Turbo2/Turbo3 encoders were incomplete. ESE retains their fixed
+ * storage geometry and centroid tables while providing complete deterministic
+ * CPU references for every fixed Turbo tier. TCQ and VBR remain gated until
+ * their complete reference and backend paths exist.
  */
 
 #include "ggml-turbo-kv.h"
 #include "ggml-turbo-kv-internal.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cmath>
@@ -29,8 +31,19 @@ constexpr size_t kMatrixElements = kBlock * kBlock;
 constexpr uint64_t kRotationSeed = 42;
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
+static_assert(sizeof(ggml_turbo2_block) == GGML_TURBO2_BLOCK_BYTES, "unexpected Turbo2 block padding");
+static_assert(sizeof(ggml_turbo3_block) == GGML_TURBO3_BLOCK_BYTES, "unexpected Turbo3 block padding");
 static_assert(sizeof(ggml_turbo4_block) == GGML_TURBO4_BLOCK_BYTES, "unexpected Turbo4 block padding");
 static_assert(sizeof(ggml_turbo8_block) == GGML_TURBO8_BLOCK_BYTES, "unexpected Turbo8 block padding");
+
+constexpr std::array<float, 4> kCentroids2 = {
+    -0.133462f, -0.039994f, 0.039994f, 0.133462f,
+};
+
+constexpr std::array<float, 8> kCentroids3 = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f,
+};
 
 constexpr std::array<float, 16> kCentroids4 = {
     -0.241556f, -0.182907f, -0.143047f, -0.111065f,
@@ -346,6 +359,77 @@ void dequantize_turbo4(const ggml_turbo4_block & src, float * dst) {
     dequantize_indices(indices, fp16_to_fp32(src.scale), kCentroids4, dst);
 }
 
+void quantize_turbo2(const float * src, ggml_turbo2_block & dst) {
+    std::array<uint8_t, kBlock> indices{};
+    float scale = 0.0f;
+    quantize_indices(src, kCentroids2, indices, scale);
+    const uint16_t scale_fp16 = fp32_to_fp16(scale);
+    for (size_t subblock = 0; subblock < 4; ++subblock) {
+        auto & output = dst.subblocks[subblock];
+        output.scale = scale_fp16;
+        const size_t offset = subblock * GGML_TURBO_KV_SUBBLOCK_ELEMENTS;
+        for (size_t i = 0; i < GGML_TURBO_KV_SUBBLOCK_ELEMENTS; i += 4) {
+            output.qs[i / 4] = static_cast<uint8_t>(
+                indices[offset + i] |
+                (indices[offset + i + 1] << 2) |
+                (indices[offset + i + 2] << 4) |
+                (indices[offset + i + 3] << 6));
+        }
+    }
+}
+
+void dequantize_turbo2(const ggml_turbo2_block & src, float * dst) {
+    std::array<float, kBlock> rotated{};
+    for (size_t subblock = 0; subblock < 4; ++subblock) {
+        const auto & input = src.subblocks[subblock];
+        const float scale = fp16_to_fp32(input.scale);
+        const size_t offset = subblock * GGML_TURBO_KV_SUBBLOCK_ELEMENTS;
+        for (size_t i = 0; i < GGML_TURBO_KV_SUBBLOCK_ELEMENTS; ++i) {
+            const uint8_t index = (input.qs[i / 4] >> ((i % 4) * 2)) & UINT8_C(0x03);
+            rotated[offset + i] = kCentroids2[index] * scale;
+        }
+    }
+    std::array<float, kBlock> reconstructed{};
+    matvec(rotation_tables().inverse, rotated, reconstructed);
+    std::copy(reconstructed.begin(), reconstructed.end(), dst);
+}
+
+void quantize_turbo3(const float * src, ggml_turbo3_block & dst) {
+    std::array<uint8_t, kBlock> indices{};
+    float scale = 0.0f;
+    quantize_indices(src, kCentroids3, indices, scale);
+    const uint16_t scale_fp16 = fp32_to_fp16(scale);
+    for (size_t subblock = 0; subblock < 4; ++subblock) {
+        auto & output = dst.subblocks[subblock];
+        output.scale = scale_fp16;
+        std::memset(output.qs, 0, sizeof(output.qs));
+        std::memset(output.high, 0, sizeof(output.high));
+        const size_t offset = subblock * GGML_TURBO_KV_SUBBLOCK_ELEMENTS;
+        for (size_t i = 0; i < GGML_TURBO_KV_SUBBLOCK_ELEMENTS; ++i) {
+            const uint8_t index = indices[offset + i];
+            output.qs[i / 4] |= static_cast<uint8_t>((index & UINT8_C(0x03)) << ((i % 4) * 2));
+            output.high[i / 8] |= static_cast<uint8_t>(((index >> 2) & 1u) << (i % 8));
+        }
+    }
+}
+
+void dequantize_turbo3(const ggml_turbo3_block & src, float * dst) {
+    std::array<float, kBlock> rotated{};
+    for (size_t subblock = 0; subblock < 4; ++subblock) {
+        const auto & input = src.subblocks[subblock];
+        const float scale = fp16_to_fp32(input.scale);
+        const size_t offset = subblock * GGML_TURBO_KV_SUBBLOCK_ELEMENTS;
+        for (size_t i = 0; i < GGML_TURBO_KV_SUBBLOCK_ELEMENTS; ++i) {
+            const uint8_t low = (input.qs[i / 4] >> ((i % 4) * 2)) & UINT8_C(0x03);
+            const uint8_t high = (input.high[i / 8] >> (i % 8)) & 1u;
+            rotated[offset + i] = kCentroids3[low | (high << 2)] * scale;
+        }
+    }
+    std::array<float, kBlock> reconstructed{};
+    matvec(rotation_tables().inverse, rotated, reconstructed);
+    std::copy(reconstructed.begin(), reconstructed.end(), dst);
+}
+
 void quantize_turbo8(const float * src, ggml_turbo8_block & dst) {
     std::array<uint8_t, kBlock> indices{};
     float scale = 0.0f;
@@ -374,6 +458,10 @@ size_t ggml_turbo_kv_block_elements(void) {
 
 size_t ggml_turbo_kv_block_bytes(enum ggml_turbo_kv_format format) {
     switch (format) {
+        case GGML_TURBO_KV_FORMAT_TURBO2:
+            return sizeof(ggml_turbo2_block);
+        case GGML_TURBO_KV_FORMAT_TURBO3:
+            return sizeof(ggml_turbo3_block);
         case GGML_TURBO_KV_FORMAT_TURBO4:
             return sizeof(ggml_turbo4_block);
         case GGML_TURBO_KV_FORMAT_TURBO8:
@@ -412,6 +500,14 @@ const float * ggml_turbo_kv_centroids4(void) {
     return kCentroids4.data();
 }
 
+const float * ggml_turbo_kv_centroids2(void) {
+    return kCentroids2.data();
+}
+
+const float * ggml_turbo_kv_centroids3(void) {
+    return kCentroids3.data();
+}
+
 const float * ggml_turbo_kv_centroids8(void) {
     return kCentroids8.data();
 }
@@ -442,7 +538,13 @@ enum ggml_turbo_kv_status ggml_turbo_kv_quantize_reference(
     }
 
     const size_t blocks = value_count / kBlock;
-    if (format == GGML_TURBO_KV_FORMAT_TURBO4) {
+    if (format == GGML_TURBO_KV_FORMAT_TURBO2) {
+        auto * output = static_cast<ggml_turbo2_block *>(dst);
+        for (size_t block = 0; block < blocks; ++block) quantize_turbo2(src + block * kBlock, output[block]);
+    } else if (format == GGML_TURBO_KV_FORMAT_TURBO3) {
+        auto * output = static_cast<ggml_turbo3_block *>(dst);
+        for (size_t block = 0; block < blocks; ++block) quantize_turbo3(src + block * kBlock, output[block]);
+    } else if (format == GGML_TURBO_KV_FORMAT_TURBO4) {
         auto * output = static_cast<ggml_turbo4_block *>(dst);
         for (size_t block = 0; block < blocks; ++block) {
             quantize_turbo4(src + block * kBlock, output[block]);
@@ -482,7 +584,13 @@ enum ggml_turbo_kv_status ggml_turbo_kv_dequantize_reference(
     }
 
     const size_t blocks = value_count / kBlock;
-    if (format == GGML_TURBO_KV_FORMAT_TURBO4) {
+    if (format == GGML_TURBO_KV_FORMAT_TURBO2) {
+        const auto * input = static_cast<const ggml_turbo2_block *>(src);
+        for (size_t block = 0; block < blocks; ++block) dequantize_turbo2(input[block], dst + block * kBlock);
+    } else if (format == GGML_TURBO_KV_FORMAT_TURBO3) {
+        const auto * input = static_cast<const ggml_turbo3_block *>(src);
+        for (size_t block = 0; block < blocks; ++block) dequantize_turbo3(input[block], dst + block * kBlock);
+    } else if (format == GGML_TURBO_KV_FORMAT_TURBO4) {
         const auto * input = static_cast<const ggml_turbo4_block *>(src);
         for (size_t block = 0; block < blocks; ++block) {
             dequantize_turbo4(input[block], dst + block * kBlock);
@@ -585,12 +693,38 @@ void ggml_turbo4_to_float(const void * src, float * dst, int64_t value_count) {
     adapter_to_float(GGML_TURBO_KV_FORMAT_TURBO4, src, dst, value_count);
 }
 
+void ggml_turbo2_to_float(const void * src, float * dst, int64_t value_count) {
+    adapter_to_float(GGML_TURBO_KV_FORMAT_TURBO2, src, dst, value_count);
+}
+
+void ggml_turbo3_to_float(const void * src, float * dst, int64_t value_count) {
+    adapter_to_float(GGML_TURBO_KV_FORMAT_TURBO3, src, dst, value_count);
+}
+
 void ggml_turbo8_to_float(const void * src, float * dst, int64_t value_count) {
     adapter_to_float(GGML_TURBO_KV_FORMAT_TURBO8, src, dst, value_count);
 }
 
 void ggml_turbo4_from_float(const float * src, void * dst, int64_t value_count) {
     adapter_from_float(GGML_TURBO_KV_FORMAT_TURBO4, src, dst, value_count);
+}
+
+void ggml_turbo2_from_float(const float * src, void * dst, int64_t value_count) {
+    adapter_from_float(GGML_TURBO_KV_FORMAT_TURBO2, src, dst, value_count);
+}
+
+void ggml_turbo3_from_float(const float * src, void * dst, int64_t value_count) {
+    adapter_from_float(GGML_TURBO_KV_FORMAT_TURBO3, src, dst, value_count);
+}
+
+size_t ggml_turbo2_quantize_rows(
+        const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    return adapter_quantize_rows(GGML_TURBO_KV_FORMAT_TURBO2, src, dst, nrows, n_per_row, imatrix);
+}
+
+size_t ggml_turbo3_quantize_rows(
+        const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    return adapter_quantize_rows(GGML_TURBO_KV_FORMAT_TURBO3, src, dst, nrows, n_per_row, imatrix);
 }
 
 void ggml_turbo8_from_float(const float * src, void * dst, int64_t value_count) {

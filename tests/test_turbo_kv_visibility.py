@@ -21,13 +21,13 @@ class TurboKVVisibilityTests(unittest.TestCase):
         )
         self.assertIsNotNone(match, "native KV-cache parser was not found")
         body = match.group("body")
-        self.assertNotIn("turbo4", body)
-        self.assertNotIn("turbo8", body)
+        for tier in ("turbo2", "turbo3", "turbo4", "turbo8"):
+            self.assertNotIn(tier, body)
 
     def test_launcher_cache_choices_remain_stable(self) -> None:
         source = (ROOT / "tools/ese.py").read_text(encoding="utf-8")
-        self.assertNotIn('"turbo4"', source)
-        self.assertNotIn('"turbo8"', source)
+        for tier in ("turbo2", "turbo3", "turbo4", "turbo8"):
+            self.assertNotIn(f'"{tier}"', source)
 
 
 if __name__ == "__main__":

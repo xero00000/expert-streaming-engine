@@ -31,9 +31,9 @@ A tree SHA and a commit SHA are recorded separately. Every code port must pin th
 | GGUF-aware startup policy | Foundation | standard-library planner |
 | DeepSeek V4, DSpark, MTP integration-line work | Integrated | native options remain available |
 | Maple/TQ2_0 CPU and CUDA work | Integrated | integration-line native path |
-| Turbo4/Turbo8 CPU + CUDA row codecs | Foundation | checked internal ABI, exact-byte parity, no host fallback |
-| Turbo4/Turbo8 CUDA Flash Attention | Foundation | direct compressed decode reads; device-only F16 staging remains for prefill |
-| Turbo4/Turbo8 per-head padding | Foundation | odd K/V heads padded independently; logical output width restored |
+| Fixed Turbo2/3/4/8 CPU + CUDA row codecs | Foundation | checked internal ABI, exact-byte parity, no host fallback |
+| Fixed Turbo2/3/4/8 CUDA Flash Attention | Foundation | direct compressed decode reads; device-only F16 staging remains for prefill |
+| Fixed Turbo2/3/4/8 per-head padding | Foundation | odd K/V heads padded independently; logical output width restored |
 | Adaptive VRAM MoE cache | Planned | Phase 2 / issue #5 |
 | Multi-GPU expert-parallel cache | Planned | Phase 2 / issue #5 |
 | Core Turbo KV types, CUDA, TCQ, and VBR | In progress | Phase 1 / issue #4 |
@@ -45,7 +45,9 @@ A tree SHA and a commit SHA are recorded separately. Every code port must pin th
 
 ### Fixed Turbo codecs
 
-The first completed slice provides checked deterministic CPU references for Turbo4 and Turbo8 without registering public cache types. See `docs/TURBO_KV_PHASE1.md`.
+The fixed-codec foundation provides checked deterministic CPU references for
+Turbo2, Turbo3, Turbo4, and Turbo8 without registering public cache types. See
+`docs/TURBO_KV_PHASE1.md`.
 
 Next, integrate fixed formats in stages:
 
@@ -58,7 +60,9 @@ Next, integrate fixed formats in stages:
 5. lifecycle and quality validation;
 6. only then expose stable cache flags.
 
-Turbo3 and Turbo2 require complete correctness references rather than the simplified/zero-fill CPU paths present at the pinned source revision.
+ESE replaces the pinned simplified/zero-fill Turbo2/Turbo3 encoders with
+complete deterministic references while retaining the pinned fixed storage
+layouts and centroid tables.
 
 Acceptance:
 
@@ -68,7 +72,8 @@ Acceptance:
 - F16-reference KLD and perplexity;
 - prompt-processing and decode measured separately;
 - context-depth and one/multi-slot coverage;
-- Ampere plus one newer NVIDIA architecture.
+- available NVIDIA architecture coverage, with explicit maintainer-approved
+  exceptions recorded for unavailable hardware.
 
 ### TCQ codecs
 
