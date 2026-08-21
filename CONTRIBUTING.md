@@ -16,6 +16,25 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 4. For CUDA changes, record the GPU architecture and prove the intended kernel/path executed.
 
+For ESE Studio or community benchmark changes, also run:
+
+```bash
+cd studio
+pnpm install --frozen-lockfile
+pnpm build
+cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml
+
+cd ../telemetry/collector
+npm ci
+npm run check
+```
+
+`npm run check` verifies generated Cloudflare binding types, compiles the
+collector, runs its isolated Worker/D1 tests, and creates a deployment bundle
+without publishing it. Do not use production telemetry credentials in tests.
+
 If a requested architecture is unavailable, document the hardware limitation
 and the exact evidence that was run. Do not replace missing physical-hardware
 coverage with a synthetic pass.
@@ -31,6 +50,26 @@ Prefer one independently testable capability per pull request. Avoid combining:
 - broad documentation cleanup.
 
 Small, reviewable ports are easier to validate and preserve across future ik/llama synchronization.
+
+The initial Studio foundation is intentionally delivered as one consolidated
+PR so its UI, Rust commands, installer, telemetry boundary, documentation, and
+CI land atomically. After that foundation merges, normal Studio changes should
+return to one independently testable capability per PR.
+
+## Studio evidence
+
+User-visible Studio changes should include the relevant evidence:
+
+- frontend production build and Rust tests;
+- one wide-window and one minimum-window UI pass without horizontal overflow;
+- keyboard operation and visible focus for changed controls;
+- a native package build for installer or desktop-integration changes;
+- a real GGUF and `llama-server` trial for discovery, launch, or sweep changes;
+- cancellation/resume evidence for downloads or long-running sweeps;
+- payload and export tests for changes crossing the telemetry privacy boundary.
+
+Automated tests can prove state and serialization behavior, but they do not
+replace a real model-backed run when a change affects inference or hardware.
 
 ## Required evidence
 

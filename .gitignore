@@ -162,3 +162,12 @@ a.out
 a.out.*
 .dev
 .github
+
+# ESE Studio / benchmark collector
+node_modules/
+.wrangler/
+.dev.vars
+wrangler.toml
+!/.github/
+!/.github/workflows/
+!/.github/workflows/*.yml

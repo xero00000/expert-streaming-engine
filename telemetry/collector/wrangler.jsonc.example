@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ese-benchmark-collector",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-21",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "logs": { "head_sampling_rate": 0.1 },
+    "traces": { "enabled": true, "head_sampling_rate": 0.01 }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ese-benchmarks",
+      "database_id": "replace-with-private-d1-database-id",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

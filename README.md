@@ -37,6 +37,62 @@ curl http://127.0.0.1:8080/health
 Split GGUFs are supported: pass any correctly named shard and ESE validates the
 complete set before launch.
 
+## ESE Studio
+
+`studio/` contains the new Linux desktop control center for model discovery,
+ESE planning/serving, configurable CLI apps in embedded terminal tabs, and
+verified configuration sweeps. Its installer checks required commands and
+system libraries and asks before installing missing packages:
+
+The [latest release](https://github.com/xero00000/expert-streaming-engine/releases/latest)
+provides x86-64 DEB and RPM packages plus `SHA256SUMS`. Verify the downloaded
+package, then install it with the native package manager:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS
+sudo apt install ./ese-studio_0.1.0_amd64.deb       # Debian / Ubuntu
+sudo dnf install ./ese-studio-0.1.0-1.x86_64.rpm   # Fedora / Nobara
+```
+
+Studio is the desktop control center; model serving still uses the `ese`
+launcher and locally built runtime from the Quick start above. To build Studio
+from source instead:
+
+```bash
+cd studio
+./install.sh --check  # read-only dependency preflight
+./install.sh          # confirm dependencies, then build a native package
+```
+
+Studio automatically discovers supported local agent CLIs from `PATH`, NVM,
+`~/.local/bin`, Cargo, Bun, and npm-global installs without replacing customized
+profiles. Endpoint-aware apps receive the active model URL, API key, model/GGUF
+identity, context, architecture, quantization, KV type, batch, and ubatch in
+their terminal environment. Hermes is additionally synchronized to the active
+`llamacpp` provider before `hermes chat` starts.
+
+The Model hub searches Hugging Face GGUF repositories, groups recognized
+quantizations and shards, and recommends the highest-quality quant that fits a
+conservative aggregate VRAM/RAM budget reported by `ese doctor`. Larger models
+remain selectable and are clearly marked for hybrid/cache or ESE streaming.
+Downloads are revision-pinned, disk-space checked, resumable, cancellable, and
+show live transferred bytes, speed, and ETA. Set `HF_TOKEN` (or
+`HUGGING_FACE_HUB_TOKEN`) in Studio's environment for gated or private models;
+tokens are never written to Studio TOML.
+
+Studio runs real health-checked completion trials, checkpoints every result,
+resumes interrupted matching sweeps, restores the previously active model, and
+can apply the verified context/KV/batch profile to future launches. Preview and
+measured states remain visibly distinct. See the [Studio guide](studio/README.md)
+and [architecture](docs/ESE_STUDIO_ARCHITECTURE.md).
+
+During first-run setup, users may optionally enable **Help improve ESE**. The
+same switch remains available in Settings and is off by default. Enabled
+installations automatically submit sanitized summaries only after verified
+sweeps. Raw submissions remain in a private collector; the public
+[community benchmark list](COMMUNITY_BENCHMARKS.md) contains grouped results
+only and suppresses groups with fewer than three samples.
+
 ## Four execution policies
 
 `auto` is recommended. ESE inspects GGUF metadata, all model shards, available
@@ -180,9 +236,12 @@ hardware, repetition statistics, cold/warm behavior, and ablations.
 - [Profiles and tuning](docs/ESE_PROFILES.md)
 - [Global resource controller](docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md)
 - [Architecture and invariants](docs/ESE_ARCHITECTURE.md)
+- [ESE Studio architecture](docs/ESE_STUDIO_ARCHITECTURE.md)
+- [ESE Studio release checklist](docs/ESE_STUDIO_RELEASE_CHECKLIST.md)
 - [Expert-cache validation](docs/PHASE2_EXPERT_CACHE_VALIDATION.md)
 - [Turbo KV Phase 1 validation](docs/TURBO_KV_PHASE1_VALIDATION.md)
 - [Reference benchmarks](docs/ESE_BENCHMARKS.md)
+- [Community benchmarks](COMMUNITY_BENCHMARKS.md)
 - [Port roadmap](docs/PORT_ROADMAP.md)
 - [Native build guide](docs/build.md)
 - [Native parameter reference](docs/parameters.md)

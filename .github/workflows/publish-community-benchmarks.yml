@@ -1,0 +1,37 @@
+name: Publish community benchmarks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 6 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.repository == 'xero00000/expert-streaming-engine'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download privacy-filtered aggregates
+        env:
+          EXPORT_URL: ${{ secrets.ESE_BENCHMARK_EXPORT_URL }}
+          EXPORT_TOKEN: ${{ secrets.ESE_BENCHMARK_EXPORT_TOKEN }}
+        run: |
+          test -n "$EXPORT_URL"
+          test -n "$EXPORT_TOKEN"
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $EXPORT_TOKEN" \
+            "${EXPORT_URL%/}/v1/export" \
+            --output benchmarks/community.json
+      - name: Render organized benchmark list
+        run: node scripts/publish-community-benchmarks.mjs
+      - name: Publish changed aggregates
+        run: |
+          git add benchmarks/community.json COMMUNITY_BENCHMARKS.md
+          git diff --cached --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "docs: update community benchmark aggregates"
+          git push

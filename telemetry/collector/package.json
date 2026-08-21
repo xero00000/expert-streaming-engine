@@ -1,0 +1,20 @@
+{
+  "name": "ese-benchmark-collector",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "typecheck": "wrangler types src/worker-configuration.d.ts --check && tsc --noEmit -p tsconfig.json && tsc --noEmit -p test/tsconfig.json",
+    "check": "npm run typecheck && npm test && wrangler deploy --dry-run",
+    "migrate:local": "wrangler d1 migrations apply ese-benchmarks --local",
+    "migrate:remote": "wrangler d1 migrations apply ese-benchmarks --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.0.0",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.125.0"
+  }
+}
