@@ -20,6 +20,13 @@ class NativeSurfaceTests(unittest.TestCase):
             "--expert-vram-cache-mib",
             "--expert-vram-reserve-mib",
             "--expert-cache-min-observations",
+            "--memory-policy",
+            "--max-ram",
+            "--reserve-vram",
+            "--min-kv-quality",
+            "--max-context",
+            "--resource-preference",
+            "--resource-plan-json",
         ):
             with self.subTest(flag=flag):
                 self.assertIn(flag, source)

@@ -93,6 +93,8 @@ add_library(${TARGET} STATIC
     regex-partial.h
     reasoning-budget.cpp
     reasoning-budget.h
+    resource-planner.cpp
+    resource-planner.h
     chat.cpp
     chat.h
     jinja/lexer.cpp

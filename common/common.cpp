@@ -16,6 +16,7 @@
 #include "llama.h"
 #include "chat.h"
 #include "json-schema-to-grammar.h"
+#include "resource-planner.h"
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
@@ -1753,6 +1754,63 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.transient_mmproj_mib = std::stoll(argv[i]);
         return true;
     }
+    if (arg == "--memory-policy") {
+        CHECK_ARG
+        common_memory_policy parsed;
+        params.memory_policy = argv[i];
+        if (!common_parse_memory_policy(params.memory_policy, parsed)) {
+            fprintf(stderr, "error: --memory-policy must be auto, resident, cache, hybrid, or stream\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--max-ram" || arg == "--reserve-vram") {
+        CHECK_ARG
+        uint64_t value = 0;
+        std::string error;
+        if (!common_parse_byte_size(argv[i], value, error)) {
+            fprintf(stderr, "error: %s: %s\n", arg.c_str(), error.c_str());
+            invalid_param = true;
+        } else if (arg == "--max-ram") {
+            params.max_ram_bytes = value;
+        } else {
+            params.reserve_vram_bytes = value;
+        }
+        return true;
+    }
+    if (arg == "--min-kv-quality") {
+        CHECK_ARG
+        common_kv_quality parsed;
+        params.min_kv_quality = argv[i];
+        if (!common_parse_kv_quality(params.min_kv_quality, parsed)) {
+            fprintf(stderr, "error: --min-kv-quality must be turbo1, turbo2, turbo3, turbo4, turbo8, q8, or f16\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--max-context") {
+        CHECK_ARG
+        std::string error;
+        if (!common_parse_token_count(argv[i], params.max_context, error) || params.max_context == 0) {
+            fprintf(stderr, "error: --max-context: %s\n", error.empty() ? "must be greater than zero" : error.c_str());
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--resource-preference") {
+        CHECK_ARG
+        common_resource_preference parsed;
+        params.resource_preference = argv[i];
+        if (!common_parse_resource_preference(params.resource_preference, parsed)) {
+            fprintf(stderr, "error: --resource-preference must be balanced, latency, or throughput\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--resource-plan-json") {
+        params.resource_plan_json = true;
+        return true;
+    }
     if (arg == "--mtmd-kq-type") {
         CHECK_ARG
         params.mtmd_kq_type = argv[i];
@@ -3340,6 +3398,13 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "server",      "       --transient-vram-reserve-mib N", "safety margin kept outside the transient-module capacity" });
     options.push_back({ "server",      "       --transient-mtp-mib N", "measured MTP companion allocation used for transient admission" });
     options.push_back({ "server",      "       --transient-mmproj-mib N", "measured multimodal projector allocation used for transient admission" });
+    options.push_back({ "server",      "       --memory-policy {auto,resident,cache,stream}", "enable the native global resource controller" });
+    options.push_back({ "server",      "       --max-ram SIZE", "controller RAM ceiling; accepts bytes, KiB, MiB, or GiB" });
+    options.push_back({ "server",      "       --reserve-vram SIZE", "safety reserve preserved on every selected GPU" });
+    options.push_back({ "server",      "       --min-kv-quality QUALITY", "lowest permitted KV quality (default: turbo4)" });
+    options.push_back({ "server",      "       --max-context TOKENS", "maximum context; accepts K or M suffixes" });
+    options.push_back({ "server",      "       --resource-preference {balanced,latency,throughput}", "controller tradeoff preference (default: balanced)" });
+    options.push_back({ "server",      "       --resource-plan-json", "emit the resolved allocation plan as one JSON object" });
     options.push_back({ "*",           "       --image-min-tokens N",   "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)"});
     options.push_back({ "*",           "       --image-max-tokens N",   "maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)" });
     options.push_back({ "*",           "       --mtmd-kq-type TYPE",    "data type for multimodality K*Q (default: %s)", params.mtmd_kq_type.c_str() });
@@ -4096,20 +4161,186 @@ std::string fs_get_cache_file(const std::string & filename) {
 }
 
 
+static ggml_type resource_quality_type(common_kv_quality quality) {
+    switch (quality) {
+        case COMMON_KV_QUALITY_TURBO1: return GGML_TYPE_TURBO1_TCQ;
+        case COMMON_KV_QUALITY_TURBO2: return GGML_TYPE_TURBO2_0;
+        case COMMON_KV_QUALITY_TURBO3: return GGML_TYPE_TURBO3_0;
+        case COMMON_KV_QUALITY_TURBO4: return GGML_TYPE_TURBO4_0;
+        case COMMON_KV_QUALITY_TURBO8: return GGML_TYPE_TURBO8_0;
+        case COMMON_KV_QUALITY_Q8:     return GGML_TYPE_Q8_0;
+        case COMMON_KV_QUALITY_F16:    return GGML_TYPE_F16;
+    }
+    return GGML_TYPE_COUNT;
+}
+
+static llama_model * common_load_model_for_params(
+        const gpt_params & params,
+        const llama_model_params & mparams) {
+    if (!params.hf_repo.empty() && !params.hf_file.empty()) {
+        return llama_load_model_from_hf(params.hf_repo.c_str(), params.hf_file.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
+    }
+    if (!params.model_url.empty()) {
+        return llama_load_model_from_url(params.model_url.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
+    }
+    return llama_model_load_from_file(params.model.c_str(), mparams);
+}
+
+static bool common_prepare_native_resource_plan(gpt_params & params, common_resource_plan & plan, std::string & error) {
+    common_memory_policy policy;
+    common_resource_preference preference;
+    common_kv_quality quality_floor;
+    common_resource_backend backend;
+    if (!common_parse_memory_policy(params.memory_policy, policy) ||
+            !common_parse_resource_preference(params.resource_preference, preference) ||
+            !common_parse_kv_quality(params.min_kv_quality, quality_floor) ||
+            !common_parse_resource_backend(params.expert_storage_backend, backend)) {
+        error = "invalid native resource-controller configuration";
+        return false;
+    }
+
+    gpt_params probe_params = params;
+    probe_params.dry_run = true;
+    probe_params.fit = false;
+    probe_params.n_gpu_layers = 0;
+    // Build the expert descriptor index during the metadata pass. Dry-run
+    // prevents page dropping or payload reads; the solved policy controls the
+    // real load below.
+    probe_params.defer_experts = true;
+    probe_params.expert_ram_cache_mib = 0;
+    probe_params.expert_vram_cache_mib = 0;
+    llama_model_params probe_mparams = common_model_params_to_llama(probe_params);
+    llama_model * probe = common_load_model_for_params(probe_params, probe_mparams);
+    if (!probe) {
+        error = "metadata-only resource probe failed";
+        return false;
+    }
+
+    common_resource_plan_input input;
+    input.requested_policy = policy;
+    input.preference = preference;
+    input.requested_backend = backend;
+    input.backend_available = true;
+    llama_model_resource_bytes(probe, &input.dense_ram_bytes, &input.expert_source_bytes);
+    input.model_is_moe = input.expert_source_bytes != 0;
+    input.max_ram_bytes = params.max_ram_bytes;
+    input.requested_expert_ram_bytes = input.expert_source_bytes;
+    input.min_expert_ram_bytes = llama_model_largest_expert_component(probe);
+    input.requested_aux_ram_bytes = params.cache_ram_mib > 0
+        ? uint64_t(params.cache_ram_mib)*1024ULL*1024ULL : 0;
+    input.requested_expert_vram_bytes_per_device = input.expert_source_bytes;
+    input.io_staging_bytes = params.expert_ram_staging_mib > 0
+        ? uint64_t(params.expert_ram_staging_mib)*1024ULL*1024ULL
+        : std::max<uint64_t>(input.min_expert_ram_bytes, 64ULL*1024ULL*1024ULL);
+    input.mtp_bytes = params.transient_mtp_mib > 0
+        ? uint64_t(params.transient_mtp_mib)*1024ULL*1024ULL : 0;
+    input.multimodal_bytes = params.transient_mmproj_mib > 0
+        ? uint64_t(params.transient_mmproj_mib)*1024ULL*1024ULL : 0;
+    input.require_draft = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+    input.transient_device = params.main_gpu;
+    input.requested_context = params.n_ctx > 0 ? (uint32_t) params.n_ctx
+        : params.max_context > 0 ? params.max_context : llama_n_ctx_train(probe);
+    input.max_context = params.max_context;
+    input.min_context = std::min<uint32_t>(512, input.requested_context);
+    input.context_alignment = params.flash_attn ? 256 : 32;
+    input.slots = std::max(1, params.n_parallel);
+    input.requested_batch = std::max(1, params.n_batch);
+    input.requested_ubatch = std::max(1, params.n_ubatch);
+    input.min_kv_quality = quality_floor;
+
+    constexpr uint32_t kv_sample_context = 4096;
+    for (int q = COMMON_KV_QUALITY_TURBO1; q <= COMMON_KV_QUALITY_F16; ++q) {
+        const auto type = resource_quality_type((common_kv_quality) q);
+        const uint64_t sample = llama_model_kv_bytes(
+            probe, type, type, GGML_TYPE_F16, kv_sample_context,
+            params.mla_attn, input.slots, params.flash_attn);
+        if (sample != 0 && sample != UINT64_MAX) {
+            input.kv_bytes_per_token[q] = (sample + kv_sample_context - 1)/kv_sample_context;
+        }
+    }
+
+    for (size_t i = 0; i < llama_model_device_count(probe); ++i) {
+        int32_t id = 0;
+        uint64_t free_bytes = 0;
+        uint64_t total_bytes = 0;
+        if (!llama_model_device_memory(probe, i, &id, &free_bytes, &total_bytes)) {
+            continue;
+        }
+        common_resource_device_input device;
+        device.id = id;
+        device.free_bytes = free_bytes;
+        device.reserve_bytes = params.reserve_vram_bytes;
+        device.graph_bytes = uint64_t(std::max(0, params.max_extra_alloc_MiB))*1024ULL*1024ULL;
+        input.devices.push_back(device);
+    }
+    if (input.devices.empty()) {
+        common_resource_device_input host;
+        host.id = -1;
+        host.free_bytes = params.max_ram_bytes;
+        host.dense_bytes = input.dense_ram_bytes;
+        host.graph_bytes = uint64_t(std::max(0, params.max_extra_alloc_MiB))*1024ULL*1024ULL;
+        input.devices.push_back(host);
+        input.transient_device = -1;
+        input.requested_expert_vram_bytes_per_device = 0;
+    }
+
+    const bool solved = common_resource_plan_solve(input, plan, error);
+    llama_free_model(probe);
+    if (!solved) {
+        return false;
+    }
+
+    constexpr uint64_t mib = 1024ULL*1024ULL;
+    params.n_ctx = (int32_t) plan.context;
+    params.n_batch = (int32_t) plan.batch;
+    params.n_ubatch = (int32_t) plan.ubatch;
+    params.cache_type_k = common_kv_quality_name(plan.kv_quality);
+    params.cache_type_v = params.cache_type_k;
+    params.resolved_resource_kv_type = resource_quality_type(plan.kv_quality);
+    params.expert_ram_cache_mib = (int64_t) ((plan.expert_ram_bytes + mib - 1)/mib);
+    params.cache_ram_mib = (int32_t) std::min<uint64_t>(INT32_MAX, plan.aux_ram_bytes/mib);
+    params.expert_ram_staging_mib = (int64_t) ((plan.io_staging_bytes + mib - 1)/mib);
+    params.defer_experts = plan.policy != COMMON_MEMORY_POLICY_RESIDENT && input.model_is_moe;
+    params.fit = !input.devices.empty() && input.devices.front().id >= 0;
+
+    uint64_t max_device_margin = params.reserve_vram_bytes;
+    for (const auto & device : plan.devices) {
+        max_device_margin = std::max(max_device_margin,
+            device.reserve_bytes + device.expert_cache_bytes + device.transient_bytes);
+    }
+    params.fit_margin = (int32_t) std::min<uint64_t>(INT32_MAX, (max_device_margin + mib - 1)/mib);
+    uint64_t min_expert_vram = UINT64_MAX;
+    for (const auto & device : plan.devices) {
+        min_expert_vram = std::min(min_expert_vram, device.expert_cache_bytes);
+    }
+    params.expert_vram_cache_mib = min_expert_vram == UINT64_MAX ? 0
+        : (int64_t) (min_expert_vram/mib);
+    params.expert_vram_reserve_mib = (int64_t) ((params.reserve_vram_bytes + mib - 1)/mib);
+    if (plan.transient_swap) {
+        params.transient_vram_reserve_mib = params.expert_vram_reserve_mib;
+        params.transient_vram_budget_mib = (int64_t)
+            ((plan.transient_capacity_bytes + params.reserve_vram_bytes + mib - 1)/mib);
+    }
+    return true;
+}
+
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
 
-    auto mparams = common_model_params_to_llama(params);
-
-    llama_model * model = nullptr;
-
-    if (!params.hf_repo.empty() && !params.hf_file.empty()) {
-        model = llama_load_model_from_hf(params.hf_repo.c_str(), params.hf_file.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
-    } else if (!params.model_url.empty()) {
-        model = llama_load_model_from_url(params.model_url.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
-    } else {
-        model = llama_model_load_from_file(params.model.c_str(), mparams);
+    if (!params.memory_policy.empty()) {
+        common_resource_plan resource_plan;
+        std::string error;
+        if (!common_prepare_native_resource_plan(params, resource_plan, error)) {
+            fprintf(stderr, "%s: error: resource planning failed: %s\n", __func__, error.c_str());
+            return iparams;
+        }
+        const std::string json_plan = common_resource_plan_json(resource_plan);
+        params.resolved_resource_plan_json = json_plan;
+        fprintf(stderr, "resource_plan: %s\n", json_plan.c_str());
     }
+
+    auto mparams = common_model_params_to_llama(params);
+    llama_model * model = common_load_model_for_params(params, mparams);
 
     if (model == NULL) {
         fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, params.model.c_str());
@@ -4300,8 +4531,10 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.fit             = params.fit;
     mparams.fit_margin      = params.fit_margin;
     mparams.worst_graph_tokens = params.worst_graph_tokens;
-    mparams.type_k          = kv_cache_type_from_str(params.cache_type_k);
-    mparams.type_v          = kv_cache_type_from_str(params.cache_type_v);
+    mparams.type_k          = params.resolved_resource_kv_type != GGML_TYPE_COUNT
+        ? params.resolved_resource_kv_type : kv_cache_type_from_str(params.cache_type_k);
+    mparams.type_v          = params.resolved_resource_kv_type != GGML_TYPE_COUNT
+        ? params.resolved_resource_kv_type : kv_cache_type_from_str(params.cache_type_v);
     mparams.idx_type_k      = kv_cache_type_from_str(params.indexer_cache_type_k);
     mparams.type_k_first    = kv_cache_type_from_str(params.type_k_first);
     mparams.type_k_last     = kv_cache_type_from_str(params.type_k_last );
@@ -4449,8 +4682,10 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.mtp               = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     cparams.mtp_op_type      = MTP_OP_NONE;
 
-    cparams.type_k = kv_cache_type_from_str(params.cache_type_k);
-    cparams.type_v = kv_cache_type_from_str(params.cache_type_v);
+    cparams.type_k = params.resolved_resource_kv_type != GGML_TYPE_COUNT
+        ? params.resolved_resource_kv_type : kv_cache_type_from_str(params.cache_type_k);
+    cparams.type_v = params.resolved_resource_kv_type != GGML_TYPE_COUNT
+        ? params.resolved_resource_kv_type : kv_cache_type_from_str(params.cache_type_v);
     cparams.idx_type_k = kv_cache_type_from_str(params.indexer_cache_type_k);
     cparams.type_reduce = ggml_type_from_str(params.reduce_type);
     cparams.type_graph_attn = ggml_type_from_str(params.graph_attn_precision);
@@ -5450,6 +5685,12 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "expert_sidecar_only: %s # default: false\n", params.expert_sidecar_only ? "true" : "false");
     fprintf(stream, "expert_vram_cache_mib: %lld # default: 0 (disabled)\n", (long long) params.expert_vram_cache_mib);
     fprintf(stream, "expert_vram_reserve_mib: %lld # default: 0\n", (long long) params.expert_vram_reserve_mib);
+    fprintf(stream, "memory_policy: %s # default: legacy tuning\n", params.memory_policy.c_str());
+    fprintf(stream, "max_ram_bytes: %llu # default: detected/unlimited\n", (unsigned long long) params.max_ram_bytes);
+    fprintf(stream, "reserve_vram_bytes: %llu # default: 0\n", (unsigned long long) params.reserve_vram_bytes);
+    fprintf(stream, "min_kv_quality: %s # default: turbo4\n", params.min_kv_quality.c_str());
+    fprintf(stream, "max_context: %u # default: requested context\n", params.max_context);
+    fprintf(stream, "resource_preference: %s # default: balanced\n", params.resource_preference.c_str());
     fprintf(stream, "expert_cache_min_observations: %d # default: 2\n", params.expert_cache_min_observations);
     fprintf(stream, "max_extra_alloc: %d # default: 256\n", params.max_extra_alloc_MiB);
     fprintf(stream, "penalize_nl: %s # default: false\n", sparams.penalize_nl ? "true" : "false");

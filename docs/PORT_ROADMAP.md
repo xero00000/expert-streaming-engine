@@ -40,7 +40,7 @@ A tree SHA and a commit SHA are recorded separately. Every code port must pin th
 | Core Turbo KV types, CUDA, TCQ, and VBR | Phase 1 released | issue #4 closed; internal promotion gates remain explicit |
 | Transient mmproj/MTP sharing | Validated | Phase 3 / issue #6; real Qwen image→text swap |
 | Adaptive MTP depth / mapped vocabulary | Validated | Phase 3 / issue #6; CPU, Turing, Ampere, five workload panels |
-| Global dynamic resource controller | Planned | Phase 4 / issue #7 |
+| Global dynamic resource controller | Implemented and locally validated | Phase 4 / issue #7 |
 
 ## Phase 1 — KV ladder, TCQ, and VBR
 
@@ -222,6 +222,15 @@ Target declarative interface:
 ```
 
 The runtime must print a reproducible allocation plan before serving and rebalance failure-atomically without silent precision or backend fallback.
+
+Implemented in `common/resource-planner.*` and the native model initialization
+path. A metadata-only probe supplies real dense/expert geometry, largest expert
+component, KV costs, format compatibility, and per-device memory. The solved
+plan drives native fit, context/KV types, expert tiers, prompt cache,
+batch/ubatch, and transient capacity. `/props` and `/metrics` expose the plan;
+release and sanitizer tests cover deterministic presets, multi-device bounds,
+one/two-slot lifecycle inputs, and rollback. See
+`docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md`.
 
 ## Phase 5 — Portability and release gates
 

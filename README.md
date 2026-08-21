@@ -11,6 +11,19 @@ ESE is a focused `ik_llama.cpp`/`llama.cpp` fork with one transparent launcher a
 
 The launcher never replaces the native runtime. `ese plan` prints the exact environment and `llama-server` command before anything runs.
 
+The native Phase 4 controller is the final authority for memory decisions. A
+direct invocation can use the same declarative interface:
+
+```bash
+llama-server -m /models/model.gguf \
+  --memory-policy auto --max-ram 40GiB --reserve-vram 1GiB \
+  --min-kv-quality turbo4 --max-context 128K --metrics
+```
+
+Before accepting requests it prints a reproducible JSON allocation plan. The
+same plan is available from `/props`, with capacity/headroom gauges in
+`/metrics`. See [Phase 4 controller](docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md).
+
 ## Start here
 
 Requirements: Linux, Python 3.10+, CMake, a C++ compiler, and optionally CUDA.
@@ -88,7 +101,7 @@ Run `./ese <command> --help` for the complete interface.
                                │
                     GGUF metadata + hardware
                                │
-                         memory planner
+                    native memory controller
         ┌──────────────┬────────┴───────┬──────────────┐
         │              │                │              │
      resident        hybrid           cache          stream
@@ -100,10 +113,10 @@ Run `./ese <command> --help` for the complete interface.
                      llama-server / OpenAI API
 ```
 
-This Phase 2 branch implements the unified bounded
-`NVMe/model shards → RAM cache → VRAM cache` controller. Its CPU/storage,
-sanitizer, and compile gates pass; merge remains gated on the documented
-one-, two-, and three-GPU Turing/Ampere runtime matrix.
+The native controller now coordinates the bounded
+`NVMe/model shards → RAM cache → VRAM cache` hierarchy with KV, workspace,
+prompt cache, MTP/mmproj capacity, and per-device reserves. The launcher is a
+compatibility and hardware-setup layer rather than the final policy owner.
 
 See [Architecture](docs/ESE_ARCHITECTURE.md) for invariants and component boundaries.
 
@@ -115,6 +128,8 @@ See [Architecture](docs/ESE_ARCHITECTURE.md) for invariants and component bounda
 - fixed-arena RAM caching with lease-scoped lifetime and mmap/pread/io_uring sources;
 - adaptive per-device VRAM caching with hysteresis, topology-aware placement,
   dedicated transfer streams, event-scoped readiness, and structured telemetry;
+- deterministic native global planning with exact policy/context/KV/cache/
+  transient decisions, failure-atomic transition hooks, plan JSON, and metrics;
 - CPU MoE with a selected final MoE tail resident on GPU;
 - multi-GPU tensor splitting;
 - DeepSeek V4 Flash integration work;
@@ -124,10 +139,10 @@ See [Architecture](docs/ESE_ARCHITECTURE.md) for invariants and component bounda
 - standard `llama-server`, CLI, conversion, and API compatibility inherited upstream.
 
 The expert hierarchy is implemented behind explicit native flags and the
-`cache`/`stream` presets, with its final hardware acceptance evidence tracked
-in [Phase 2 validation](docs/PHASE2_EXPERT_CACHE_VALIDATION.md). VBR, transient
-modules, and the global controller retain their separate quality and lifecycle
-gates in the [Port roadmap](docs/PORT_ROADMAP.md).
+`cache`/`stream` presets. Hardware evidence is tracked in
+[Phase 2 validation](docs/PHASE2_EXPERT_CACHE_VALIDATION.md); the global budget
+and lifecycle contract is documented in the
+[Phase 4 controller guide](docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md).
 
 ## Verified reference result
 
@@ -153,6 +168,7 @@ These are machine- and configuration-specific measurements, not universal promis
 - [Native build documentation](docs/build.md)
 - [Native parameter reference](docs/parameters.md)
 - [Speculative decoding](docs/speculative.md)
+- [Phase 4 global resource controller](docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md)
 
 ## Branch policy
 

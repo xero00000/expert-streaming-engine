@@ -700,6 +700,34 @@ extern "C" {
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
 
+    // Metadata-only resource estimates used by the native global planner.
+    // `llama_model_resource_bytes` separates routed expert source bytes from
+    // dense weights. `llama_model_kv_bytes` returns the complete KV allocation
+    // for the requested context and slot count without creating a context.
+    LLAMA_API void llama_model_resource_bytes(
+            const struct llama_model * model,
+            uint64_t * dense_bytes,
+            uint64_t * expert_bytes);
+    LLAMA_API uint64_t llama_model_largest_expert_component(const struct llama_model * model);
+
+    LLAMA_API uint64_t llama_model_kv_bytes(
+            const struct llama_model * model,
+            enum ggml_type type_k,
+            enum ggml_type type_v,
+            enum ggml_type indexer_type_k,
+            uint32_t context,
+            int32_t mla_attention,
+            uint32_t slots,
+            bool flash_attention);
+
+    LLAMA_API size_t llama_model_device_count(const struct llama_model * model);
+    LLAMA_API bool llama_model_device_memory(
+            const struct llama_model * model,
+            size_t device_index,
+            int32_t * device_id,
+            uint64_t * free_bytes,
+            uint64_t * total_bytes);
+
     // Get a llama model tensor
     LLAMA_API struct ggml_tensor * llama_get_model_tensor(struct llama_model * model, const char * name);
 

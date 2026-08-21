@@ -29,6 +29,18 @@ currently needed transient context resident. Enable it with
 measured peak allocations: include projector compute buffers in the multimodal
 number. A zero budget preserves the normal simultaneous-residency behavior.
 
+For one native memory decision across weights, KV, expert tiers, workspace,
+prompt cache, and transient modules, enable the global controller:
+
+```bash
+llama-server -m model.gguf --memory-policy auto --max-ram 40GiB \
+  --reserve-vram 1GiB --min-kv-quality turbo4 --max-context 128K
+```
+
+The resolved JSON plan is printed before serving and returned by `/props`.
+`--metrics` adds plan capacity/headroom gauges. See
+[`PHASE4_GLOBAL_RESOURCE_CONTROLLER.md`](../../docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md).
+
 ```
 usage: ./llama-server [options]
 

@@ -107,7 +107,7 @@ events without a global compute-stream synchronization. Prompt-sized MoE work
 stays on the established CPU graph, where independent GPU work can overlap;
 single-token decode uses compact cache slots.
 
-Phase 4 will place this controller inside a global budget shared with:
+Phase 4 places this controller inside a global budget shared with:
 
 Budget participants will include:
 
@@ -123,8 +123,11 @@ I/O staging
 per-device safety reserve
 ```
 
-That global rebalance policy is not yet a launcher promise; only the bounded
-expert hierarchy above is implemented in Phase 2.
+The native controller probes GGUF metadata, solves the allocation before the
+real load, and maps the result onto the existing expert, KV, fit, and transient
+implementations. The launcher supplies detected limits but is not the final
+policy authority. The complete plan is printed and exposed through server
+telemetry; transitions use a failure-atomic prepare/commit/rollback contract.
 
 ## Design invariants
 
