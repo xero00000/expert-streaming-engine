@@ -31,7 +31,7 @@ A tree SHA and a commit SHA are recorded separately. Every code port must pin th
 | GGUF-aware startup policy | Foundation | standard-library planner |
 | DeepSeek V4, DSpark, MTP integration-line work | Integrated | native options remain available |
 | Maple/TQ2_0 CPU and CUDA work | Integrated | integration-line native path |
-| Turbo4/Turbo8 CPU reference | Foundation | checked internal ABI and deterministic tests in Phase 1 |
+| Turbo4/Turbo8 CPU + CUDA row codecs | Foundation | checked internal ABI, exact-byte parity, no host fallback |
 | Adaptive VRAM MoE cache | Planned | Phase 2 / issue #5 |
 | Multi-GPU expert-parallel cache | Planned | Phase 2 / issue #5 |
 | Core Turbo KV types, CUDA, TCQ, and VBR | In progress | Phase 1 / issue #4 / PR #8 |
@@ -49,7 +49,7 @@ Next, integrate fixed formats in stages:
 
 1. complete core type traits and checked dispatch;
 2. serialization and numeric type-ID compatibility;
-3. CUDA encode/decode;
+3. CUDA encode/decode — row codec complete;
 4. Flash Attention reads and unusual-head-dimension padding;
 5. lifecycle and quality validation;
 6. only then expose stable cache flags.

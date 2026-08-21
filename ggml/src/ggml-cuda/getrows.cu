@@ -7,6 +7,7 @@
 
 #include "getrows.cuh"
 #include "dequantize.cuh"
+#include "turbo-kv.cuh"
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -262,6 +263,10 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             break;
         case GGML_TYPE_Q8_0:
             get_rows_cuda<QK8_0, QR8_0, dequantize_q8_0>(src0, src1, dst, src0_d, src1_i32, dst_d, stream);
+            break;
+        case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO8_0:
+            ggml_cuda_turbo_kv_get_rows(ctx, src0, src1, dst);
             break;
         default:
             // TODO: k-quants

@@ -12,7 +12,11 @@ ESE is MIT licensed and derives from `ik_llama.cpp` / `llama.cpp`. Selective ext
 - ESE adaptation:
   - `ggml/include/ggml-turbo-kv.h`
   - `ggml/src/ggml-turbo-kv.cpp`
+  - `ggml/src/ggml-turbo-kv-internal.h`
+  - `ggml/src/ggml-cuda/turbo-kv.cu`
+  - `ggml/src/ggml-cuda/turbo-kv.cuh`
   - `tests/test-turbo-kv.cpp`
+  - `tests/test-turbo-kv-cuda.cpp`
   - `scripts/test-turbo-kv.sh`
   - `docs/TURBO_KV_PHASE1.md`
 
@@ -31,6 +35,8 @@ ESE-specific changes:
 - deterministic thread-safe immutable initialization;
 - explicit size/alignment/overflow validation;
 - non-finite input rejection;
+- native CUDA row encode/decode using the accepted CPU reference tables;
+- exact CPU/CUDA encoded-byte parity and no host fallback;
 - no registration as a public GGML/KV type yet;
 - no import of incomplete CPU stub paths for Turbo2, Turbo3, or TCQ.
 

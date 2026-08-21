@@ -19,6 +19,14 @@ if [[ "$BUILD_JOBS" -gt 16 ]]; then
 fi
 
 TURBO_BUILD="$ROOT/.premerge-build/turbo-core"
+TURBO_CUDA_BUILD="$ROOT/.premerge-build/turbo-cuda"
+REQUIRE_TURBO_CUDA="${ESE_TURBO_REQUIRE_CUDA:-0}"
+
+for argument in "$@"; do
+    if [[ "$argument" == "--require-cuda" ]]; then
+        REQUIRE_TURBO_CUDA=1
+    fi
+done
 
 printf '%s\n' '== Turbo KV standalone reference =='
 bash scripts/test-turbo-kv.sh
@@ -35,6 +43,18 @@ cmake -S . -B "$TURBO_BUILD" \
     -DLLAMA_BUILD_SERVER=OFF
 cmake --build "$TURBO_BUILD" --target test-turbo-kv-core -j "$BUILD_JOBS"
 "$TURBO_BUILD/bin/test-turbo-kv-core"
+
+if [[ "$REQUIRE_TURBO_CUDA" == "1" ]]; then
+    printf '\n%s\n' '== Turbo KV native CUDA row codecs =='
+    rm -rf "$TURBO_CUDA_BUILD"
+    cmake -S . -B "$TURBO_CUDA_BUILD" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA=ON \
+        -DLLAMA_BUILD_TESTS=ON \
+        -DLLAMA_BUILD_SERVER=OFF
+    cmake --build "$TURBO_CUDA_BUILD" --target test-turbo-kv-cuda -j "$BUILD_JOBS"
+    "$TURBO_CUDA_BUILD/bin/test-turbo-kv-cuda"
+fi
 
 printf '\n%s\n' '== General ESE pre-merge gate =='
 exec bash scripts/premerge-test.sh "$@"

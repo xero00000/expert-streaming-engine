@@ -18,8 +18,8 @@ The initial native foundation includes the two formats whose pinned CPU referenc
 
 | Format | Values/block | Bytes/block | Exact bits/value | Status |
 | --- | ---: | ---: | ---: | --- |
-| Turbo4 | 128 | 66 | 4.125 | CPU reference implemented |
-| Turbo8 | 128 | 130 | 8.125 | CPU reference implemented |
+| Turbo4 | 128 | 66 | 4.125 | CPU reference + native CUDA row codec |
+| Turbo8 | 128 | 130 | 8.125 | CPU reference + native CUDA row codec |
 
 The implementation preserves the pinned design:
 
@@ -44,13 +44,31 @@ Turbo4 and Turbo8 now have pinned internal GGML/GGUF numeric IDs matching the so
 
 Core traits report the exact 128-value block geometry and 66/130-byte storage sizes. `ggml_quantize_chunk` routes both formats through the same checked deterministic CPU reference used by the standalone tests. The integration test proves core output is byte-identical to the reference codec.
 
+## Native CUDA row integration
+
+CUDA `SET_ROWS` quantizes F32 rows directly into Turbo4/Turbo8 storage, and
+CUDA `GET_ROWS` reconstructs F32 rows directly from that storage. Both paths
+use the exact accepted reference rotation and centroid tables; they do not
+stage through host memory or silently fall back to the CPU backend.
+
+The CUDA graph test proves:
+
+- exact encoded-byte parity with the CPU reference;
+- decoded-value parity within `2e-6`;
+- indexed row placement and untouched-row preservation;
+- backend support for both graph operations;
+- independent table initialization on every visible CUDA device.
+
+This is row-codec infrastructure only. It does not yet make Turbo formats
+usable as a live KV cache because Flash Attention and lifecycle work remain.
+
 ## Deliberately not exposed yet
 
 This slice does **not** add `turbo4` or `turbo8` to:
 
 - `--cache-type-k` or `--cache-type-v`;
 - `tools/ese.py`;
-- CUDA, ROCm, Metal, Vulkan, or Flash Attention;
+- ROCm, Metal, Vulkan, or Flash Attention;
 - server save/restore or cache lifecycle operations.
 
 The native KV parser remains an explicit whitelist, and a source-level regression test prevents the internal type names from being added accidentally. A registered storage type is still not a serving feature until backend execution, lifecycle behavior, and quality gates all pass.
@@ -86,7 +104,11 @@ The test compiles the reference module independently and verifies:
 - norm preservation;
 - conservative normalized-MSE limits over impulse, ramp, sinusoid, and seeded-random vectors.
 
-The test is intentionally backend-independent. Later CUDA work must compare its output and reconstruction against this CPU reference and prove the requested kernel executes without fallback.
+For the native CUDA row-codec test, configure with `GGML_CUDA=ON`, build
+`test-turbo-kv-cuda`, and run the resulting executable. The test runs Turbo4
+and Turbo8 on every visible CUDA device. The Turbo-specific pre-merge wrapper
+does this automatically when passed `--require-cuda` (or when
+`ESE_TURBO_REQUIRE_CUDA=1`).
 
 ## Promotion gates
 
@@ -102,17 +124,20 @@ The test is intentionally backend-independent. Later CUDA work must compare its 
 
 The types remain internal until the later gates pass.
 
-### Gate B — CUDA and Flash Attention
+### Gate B — CUDA and Flash Attention — in progress
 
 Before accepting the types as KV cache options:
 
-- native encode/decode kernels;
+- native encode/decode row kernels — complete;
 - native Flash Attention reads;
 - odd head-dimension padding;
 - no host fallback;
 - Ampere plus one newer NVIDIA architecture;
 - prompt-processing and decode measurements separately;
 - bounded temporary memory.
+
+Current hardware evidence covers Turing sm_75 and Ampere sm_86. The final
+promotion gate still requires Ampere plus one newer NVIDIA architecture.
 
 ### Gate C — quality and lifecycle
 
