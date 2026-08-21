@@ -268,12 +268,19 @@ Before making any fixed type stable:
 
 Only after fixed formats are stable:
 
-- explicit per-layer/per-side tier map;
-- model sensitivity ordering;
-- deterministic VRAM/context/quality solver;
-- observable current tier;
-- retiering rollback;
+- explicit per-layer/per-side tier map — internal strict map core complete;
+- model sensitivity ordering — input contract complete, measured tables pending;
+- deterministic VRAM/context/quality solver — internal solver core complete;
+- observable current tier — deterministic per-layer report complete;
+- retiering rollback — policy transaction and injected-failure test complete,
+  live cache-storage integration pending;
 - quality floor that cannot be silently crossed.
+
+The solver accounts for each layer's padded native row geometry and changes K
+and V independently. It stops before crossing the requested quality floor and
+reports when that means the requested VRAM budget cannot be met. Turbo/TCQ
+tiers remain absent from the public cache parser while live retiering and the
+quality panel are unfinished.
 
 ## Current user-facing status
 

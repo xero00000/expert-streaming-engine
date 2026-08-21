@@ -479,6 +479,15 @@ extern "C" {
         int32_t n_v_first;
         int32_t n_v_last;
 
+        // Exact per-layer cache types [EXPERIMENTAL]. A null pointer with a
+        // zero count leaves that side on the base/edge policy. Otherwise the
+        // count must equal the model's attention-layer count. The arrays are
+        // consumed during llama_new_context_with_model and need not outlive it.
+        const enum ggml_type * type_k_layers;
+        const enum ggml_type * type_v_layers;
+        uint32_t n_type_k_layers;
+        uint32_t n_type_v_layers;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool logits_all;  // the llama_decode() call computes all logits, not just the last one (DEPRECATED - set llama_batch.logits instead)
         bool embeddings;  // if true, extract embeddings (together with logits)

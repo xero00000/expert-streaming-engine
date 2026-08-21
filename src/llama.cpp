@@ -22,6 +22,7 @@
 #include "llama-dsv4.h"
 #include "llama-quantize.h"
 #include "llama-kv-padding.h"
+#include "llama-kv-tier-policy.h"
 
 #include "unicode.h"
 
@@ -1651,22 +1652,83 @@ static bool llama_kv_cache_init(
                           int32_t    n_k_first,
                           int32_t    n_k_last,
                           int32_t    n_v_first,
-                          int32_t    n_v_last) {
+                          int32_t    n_v_last,
+                    const ggml_type * type_k_layers,
+                    const ggml_type * type_v_layers,
+                          uint32_t    n_type_k_layers,
+                          uint32_t    n_type_v_layers) {
     const llama_model & model = ctx->model;
     const llama_cparams & cparams = ctx->cparams;
 
     const struct llama_hparams & hparams = model.hparams;
 
-    if (!cparams.flash_attn &&
-            (llama_kv_type_is_turbo(type_k) || llama_kv_type_is_turbo(type_v) ||
-             llama_kv_type_is_turbo(type_k_first) || llama_kv_type_is_turbo(type_k_last) ||
-             llama_kv_type_is_turbo(type_v_first) || llama_kv_type_is_turbo(type_v_last))) {
-        LLAMA_LOG_ERROR("%s: Turbo KV cache types require Flash Attention\n", __func__);
+    const int64_t  n_layer = model.mtp ? hparams.n_layer
+                                       : hparams.n_layer - hparams.nextn_predict_layers;
+
+    std::vector<llama_kv_tier_override> tier_overrides;
+    const auto add_edge_override = [&](llama_kv_side side, ggml_type type, int32_t count, bool last) {
+        const ggml_type base = side == llama_kv_side::key ? type_k : type_v;
+        if (model.arch == LLM_ARCH_OPENPANGU || count <= 0 || type == base) {
+            return;
+        }
+        const uint32_t begin = last ? uint32_t(n_layer - count) : 0;
+        const uint32_t end   = last ? uint32_t(n_layer) : uint32_t(count);
+        tier_overrides.push_back({ side, begin, end, type });
+    };
+    const auto invalid_count = [n_layer](int32_t count) {
+        return count < -1 || count > n_layer;
+    };
+    if (invalid_count(n_k_first) || invalid_count(n_k_last) ||
+            invalid_count(n_v_first) || invalid_count(n_v_last)) {
+        LLAMA_LOG_ERROR("%s: mixed KV edge count exceeds the model layer range\n", __func__);
+        return false;
+    }
+    add_edge_override(llama_kv_side::key,   type_k_first, n_k_first, false);
+    add_edge_override(llama_kv_side::key,   type_k_last,  n_k_last,  true);
+    add_edge_override(llama_kv_side::value, type_v_first, n_v_first, false);
+    add_edge_override(llama_kv_side::value, type_v_last,  n_v_last,  true);
+
+    const auto add_explicit_map = [&](llama_kv_side side, const ggml_type * types, uint32_t count) {
+        if (types == nullptr) {
+            return count == 0;
+        }
+        if (count != uint32_t(n_layer)) {
+            return false;
+        }
+        for (uint32_t layer = 0; layer < count; ++layer) {
+            tier_overrides.push_back({ side, layer, layer + 1, types[layer] });
+        }
+        return true;
+    };
+    if (!add_explicit_map(llama_kv_side::key, type_k_layers, n_type_k_layers) ||
+            !add_explicit_map(llama_kv_side::value, type_v_layers, n_type_v_layers)) {
+        LLAMA_LOG_ERROR("%s: explicit mixed KV map count must equal the model layer count\n", __func__);
         return false;
     }
 
-    const int64_t  n_layer = model.mtp ? hparams.n_layer
-                                       : hparams.n_layer - hparams.nextn_predict_layers;
+    std::vector<llama_kv_tier_assignment> tier_plan;
+    std::string tier_error;
+    if (!llama_kv_build_static_tier_map(uint32_t(n_layer), type_k, type_v,
+                tier_overrides, tier_plan, tier_error)) {
+        LLAMA_LOG_ERROR("%s: invalid mixed KV tier map: %s\n", __func__, tier_error.c_str());
+        return false;
+    }
+    if (!cparams.flash_attn) {
+        for (const auto & tier : tier_plan) {
+            if (llama_kv_type_is_turbo(tier.key) || llama_kv_type_is_turbo(tier.value)) {
+                LLAMA_LOG_ERROR("%s: Turbo KV cache types require Flash Attention\n", __func__);
+                return false;
+            }
+        }
+    }
+
+    if (!tier_overrides.empty()) {
+        LLAMA_LOG_INFO("%s: static mixed-tier KV plan (%zu overrides):\n", __func__, tier_overrides.size());
+        for (int64_t layer = 0; layer < n_layer; ++layer) {
+            LLAMA_LOG_INFO("  layer %2lld: K=%s, V=%s\n", (long long) layer,
+                    ggml_type_name(tier_plan[layer].key), ggml_type_name(tier_plan[layer].value));
+        }
+    }
 
     cache.has_shift = false;
 
@@ -1931,24 +1993,12 @@ static bool llama_kv_cache_init(
                 split_cache_i = false;
             }
             int n_embd_head_v = hparams.n_embd_head_v(i);
-            auto this_type_k = type_k;
-            if (model.arch != LLM_ARCH_OPENPANGU && type_k_first != type_k && n_k_first > 0 && i < n_k_first) {
-                this_type_k = type_k_first;
-            }
-            if (model.arch != LLM_ARCH_OPENPANGU && type_k_last != type_k && n_k_last > 0 && i >= n_layer - n_k_last) {
-                this_type_k = type_k_last;
-            }
+            auto this_type_k = tier_plan[i].key;
             if (this_type_k != type_k) {
                 LLAMA_LOG_INFO("================= Setting K-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_k));
             }
             int64_t v_ne = int64_t(n_embd_v_row)*kv_size;
-            auto this_type_v = type_v;
-            if (model.arch != LLM_ARCH_OPENPANGU && type_v_first != type_v && n_v_first > 0 && i < n_v_first) {
-                this_type_v = type_v_first;
-            }
-            if (model.arch != LLM_ARCH_OPENPANGU && type_v_last != type_v && n_v_last > 0 && i >= n_layer - n_v_last) {
-                this_type_v = type_v_last;
-            }
+            auto this_type_v = tier_plan[i].value;
             if (this_type_v != type_v) {
                 LLAMA_LOG_INFO("================= Setting V-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_v));
             }
@@ -7909,6 +7959,10 @@ struct llama_context_params llama_context_default_params() {
         /*.n_last_k                    =*/ -1,
         /*.n_first_v                   =*/ -1,
         /*.n_last_v                    =*/ -1,
+        /*.type_k_layers               =*/ nullptr,
+        /*.type_v_layers               =*/ nullptr,
+        /*.n_type_k_layers             =*/ 0,
+        /*.n_type_v_layers             =*/ 0,
         /*.logits_all                  =*/ false,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
@@ -8821,7 +8875,9 @@ struct llama_context * llama_init_from_model(
 
         if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, params.idx_type_k, kv_size, cparams.offload_kqv,
                     params.type_k_first, params.type_k_last, params.type_v_first, params.type_v_last,
-                    params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last)) {
+                    params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last,
+                    params.type_k_layers, params.type_v_layers,
+                    params.n_type_k_layers, params.n_type_v_layers)) {
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);
             return nullptr;

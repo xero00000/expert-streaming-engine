@@ -91,6 +91,16 @@ Acceptance additionally requires bit-exact CPU-reference decode, bounded tempora
 
 Before dynamic VBR, support an explicit per-layer/per-side map. K and V may use different tiers; every layer reports its type; checkpoints record tier metadata; resize and rollback tests pass.
 
+The internal policy core now builds strict independent K/V maps, rejects
+out-of-range and overlapping assignments, accounts for padded Turbo rows, and
+feeds the existing first/last layer overrides into one deterministic plan. An
+experimental C API accepts complete K and V layer arrays independently without
+adding Turbo/TCQ names to the public CLI parser. Checkpoint records already
+carry the actual type and row size for every layer. Live resize remains staged.
+The policy transition layer
+now prepares every change before a non-failing publish and has injected-failure
+rollback coverage; cache-storage integration is still in progress.
+
 ### Dynamic VBR
 
 Inputs:
@@ -104,6 +114,11 @@ model sensitivity order
 ```
 
 Transitions must be failure-atomic, preserve multi-slot behavior and checkpoints, never cross the declared floor, and have reproducible quality evidence.
+
+The deterministic solver core now consumes context, byte budget, quality
+floor, and a model-provided layer-side sensitivity order. It selects K and V
+independently and reports every layer plus actual and budgeted bytes. Measured
+model sensitivity tables and live cache-storage retiering remain in progress.
 
 ## Phase 2 — One NVMe → RAM → VRAM expert hierarchy
 
