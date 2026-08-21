@@ -12,6 +12,7 @@
  */
 
 #include "ggml-turbo-kv.h"
+#include "ggml-turbo-kv-internal.h"
 
 #include <array>
 #include <cstdlib>
@@ -397,6 +398,22 @@ size_t ggml_turbo_kv_encoded_size(enum ggml_turbo_kv_format format, size_t value
         return 0;
     }
     return blocks * block_bytes;
+}
+
+const float * ggml_turbo_kv_rotation_forward(void) {
+    return rotation_tables().forward.data();
+}
+
+const float * ggml_turbo_kv_rotation_inverse(void) {
+    return rotation_tables().inverse.data();
+}
+
+const float * ggml_turbo_kv_centroids4(void) {
+    return kCentroids4.data();
+}
+
+const float * ggml_turbo_kv_centroids8(void) {
+    return kCentroids8.data();
 }
 
 enum ggml_turbo_kv_status ggml_turbo_kv_quantize_reference(
