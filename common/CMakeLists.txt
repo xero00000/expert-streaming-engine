@@ -81,6 +81,8 @@ add_library(${TARGET} STATIC
     speculative.cpp
     spec-tuner.cpp
     spec-tuner.h
+    transient-module-manager.cpp
+    transient-module-manager.h
     unicode.cpp
     unicode.h
     ngram-mod.cpp

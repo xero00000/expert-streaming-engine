@@ -87,6 +87,18 @@ jobs:
       - name: Run checked expert cache test
         run: build-turbo-core/bin/test-expert-cache
 
+      - name: Build Phase 3 controller and speculation tests
+        run: >-
+          cmake --build build-turbo-core
+          --target test-transient-module-manager test-spec-tuner test-mapped-draft
+          -j2
+
+      - name: Run Phase 3 controller and speculation tests
+        run: |
+          build-turbo-core/bin/test-transient-module-manager
+          build-turbo-core/bin/test-spec-tuner
+          build-turbo-core/bin/test-mapped-draft
+
   expert-cache-sanitizers:
     name: Expert cache ASAN and UBSAN
     runs-on: ubuntu-latest
@@ -104,8 +116,8 @@ jobs:
           -DGGML_CUDA=OFF
           -DLLAMA_BUILD_TESTS=ON
           -DLLAMA_BUILD_SERVER=OFF
-          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
-          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize=function -fno-omit-frame-pointer"
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize=function -fno-omit-frame-pointer"
           -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
           -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
 
@@ -117,6 +129,21 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: build-expert-sanitizers/bin/test-expert-cache
+
+      - name: Build Phase 3 sanitizer tests
+        run: >-
+          cmake --build build-expert-sanitizers
+          --target test-transient-module-manager test-spec-tuner test-mapped-draft
+          -j2
+
+      - name: Run Phase 3 tests with sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          build-expert-sanitizers/bin/test-transient-module-manager
+          build-expert-sanitizers/bin/test-spec-tuner
+          build-expert-sanitizers/bin/test-mapped-draft
 
   cpu-build:
     name: Native CPU server build

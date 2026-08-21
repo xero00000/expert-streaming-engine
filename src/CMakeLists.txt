@@ -44,6 +44,8 @@ add_library(llama
             llama-expert-cache.cpp
             llama-kv-tier-policy.h
             llama-kv-tier-policy.cpp
+            llama-mapped-draft.h
+            llama-mapped-draft.cpp
             llama-spec-features.cpp
             llama-spec-features-dflash.cpp
             llama-dflash.cpp

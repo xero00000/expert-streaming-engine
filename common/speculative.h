@@ -63,6 +63,15 @@ struct common_speculative_metrics_stage_snapshot {
 
 struct common_speculative_metrics_snapshot {
     std::vector<common_speculative_metrics_stage_snapshot> stages;
+    bool tuner_enabled = false;
+    int tuner_current_depth = 0;
+    int tuner_best_depth = 0;
+    double tuner_net_tps_vs_no_speculation = 0.0;
+    uint64_t tuner_target_only_selections = 0;
+    uint64_t tuner_speculative_selections = 0;
+    uint64_t tuner_quarantines = 0;
+    uint64_t tuner_recovery_probes = 0;
+    std::string tuner_retune_reason;
 };
 
 // comma separated list of all types
@@ -242,6 +251,12 @@ void common_speculative_clear_sequence_kv(
     llama_seq_id seq_id);
 
 llama_context * common_speculative_get_companion_ctx(common_speculative * spec);
+
+// Releases/reconstructs the MTP companion context without unloading the target
+// model. Resume starts with empty MTP state; callers must force prompt warmup.
+bool common_speculative_suspend_mtp(common_speculative * spec);
+bool common_speculative_resume_mtp(common_speculative * spec);
+bool common_speculative_mtp_resident(const common_speculative * spec);
 
 int32_t common_speculative_on_target_seq_batch(
     common_speculative * spec,

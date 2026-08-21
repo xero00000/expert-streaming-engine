@@ -61,6 +61,46 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 bool server_verbose = false;
 bool server_log_json = true;
 
+static bool server_prompt_has_multimodal_data(const json & value) {
+    if (value.is_object()) {
+        if (value.contains("multimodal_data")) {
+            return true;
+        }
+        for (const auto & item : value.items()) {
+            if (server_prompt_has_multimodal_data(item.value())) {
+                return true;
+            }
+        }
+    } else if (value.is_array()) {
+        for (const auto & item : value) {
+            if (server_prompt_has_multimodal_data(item)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+struct server_transient_prompt_guard {
+    server_context & ctx;
+    uint64_t lease = 0;
+
+    server_transient_prompt_guard(server_context & ctx, bool multimodal) : ctx(ctx) {
+        if (!multimodal || !ctx.transient_enabled()) {
+            return;
+        }
+        std::string error;
+        lease = ctx.acquire_transient(true, error);
+        if (lease == 0) {
+            throw std::runtime_error("multimodal residency is temporarily unavailable: " + error);
+        }
+    }
+
+    ~server_transient_prompt_guard() {
+        ctx.release_transient(lease);
+    }
+};
+
 
 enum server_state {
     SERVER_STATE_LOADING_MODEL,  // Server is starting up, model not fully loaded yet
@@ -1108,6 +1148,8 @@ int main(int argc, char ** argv) {
                 std::vector<server_task> tasks;
 
                 const auto& prompt = data.at("prompt");
+                server_transient_prompt_guard transient_prompt(
+                    ctx_server, !files.empty() || server_prompt_has_multimodal_data(prompt));
 
                 // process prompt
                 std::vector<server_tokens> inputs;
@@ -1511,6 +1553,7 @@ int main(int argc, char ** argv) {
             }
         }
         auto vocab = llama_get_vocab(ctx_server.ctx);
+        server_transient_prompt_guard transient_prompt(ctx_server, server_prompt_has_multimodal_data(prompt));
         auto tokenized_prompts = tokenize_input_prompts(vocab, ctx_server.mctx, prompt, true, true);
         for (const auto& tokens : tokenized_prompts) {
             // this check is necessary for models that do not add BOS token to the input

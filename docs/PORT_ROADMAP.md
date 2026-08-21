@@ -38,8 +38,8 @@ A tree SHA and a commit SHA are recorded separately. Every code port must pin th
 | Adaptive VRAM MoE cache | Validation pending | Phase 2 implementation complete; 1/2/3-GPU runtime gate remains |
 | Multi-GPU expert-parallel cache | Validation pending | graph/tensor-distributed matrix in Phase 2 / issue #5 |
 | Core Turbo KV types, CUDA, TCQ, and VBR | Phase 1 released | issue #4 closed; internal promotion gates remain explicit |
-| Transient mmproj/MTP sharing | Planned | Phase 3 / issue #6 |
-| Adaptive MTP depth / mapped vocabulary | Planned | Phase 3 / issue #6 |
+| Transient mmproj/MTP sharing | Validated | Phase 3 / issue #6; real Qwen image→text swap |
+| Adaptive MTP depth / mapped vocabulary | Validated | Phase 3 / issue #6; CPU, Turing, Ampere, five workload panels |
 | Global dynamic resource controller | Planned | Phase 4 / issue #7 |
 
 ## Phase 1 — KV ladder, TCQ, and VBR
@@ -176,6 +176,12 @@ Acceptance:
 - cold/warm distributions and structured telemetry.
 
 ## Phase 3 — Transient modules and speculation
+
+Status: validated on issue #6. The failure-atomic controller, real server MTP/mmproj
+adapters, adaptive MTP target-only arm, mapped draft-head graph, focused tests,
+and structured telemetry are implemented. A Qwen 3.6 image request followed by
+text/MTP generation passed on Turing/Ampere hardware with no stale state; the five
+workload panels measured a 12.9% aggregate decode gain and 80.8% draft acceptance.
 
 ### General transient residency
 

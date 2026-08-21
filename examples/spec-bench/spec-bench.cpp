@@ -62,6 +62,15 @@ struct spec_bench_metrics_delta {
     int64_t t_begin_us = 0;
     int64_t t_draft_us = 0;
     int64_t t_accept_us = 0;
+    bool tuner_enabled = false;
+    int tuner_current_depth = 0;
+    int tuner_best_depth = 0;
+    double tuner_net_tps_vs_no_speculation = 0.0;
+    uint64_t tuner_target_only_selections = 0;
+    uint64_t tuner_speculative_selections = 0;
+    uint64_t tuner_quarantines = 0;
+    uint64_t tuner_recovery_probes = 0;
+    std::string tuner_retune_reason;
 };
 
 struct spec_bench_attempt_result {
@@ -470,6 +479,20 @@ static spec_bench_metrics_delta spec_bench_snapshot_delta(
         delta.stages.push_back(stage);
     }
 
+    delta.tuner_enabled = after.tuner_enabled;
+    delta.tuner_current_depth = after.tuner_current_depth;
+    delta.tuner_best_depth = after.tuner_best_depth;
+    delta.tuner_net_tps_vs_no_speculation = after.tuner_net_tps_vs_no_speculation;
+    delta.tuner_target_only_selections = after.tuner_target_only_selections >= before.tuner_target_only_selections
+        ? after.tuner_target_only_selections - before.tuner_target_only_selections : 0;
+    delta.tuner_speculative_selections = after.tuner_speculative_selections >= before.tuner_speculative_selections
+        ? after.tuner_speculative_selections - before.tuner_speculative_selections : 0;
+    delta.tuner_quarantines = after.tuner_quarantines >= before.tuner_quarantines
+        ? after.tuner_quarantines - before.tuner_quarantines : 0;
+    delta.tuner_recovery_probes = after.tuner_recovery_probes >= before.tuner_recovery_probes
+        ? after.tuner_recovery_probes - before.tuner_recovery_probes : 0;
+    delta.tuner_retune_reason = after.tuner_retune_reason;
+
     return delta;
 }
 
@@ -490,6 +513,19 @@ static void spec_bench_accumulate(spec_bench_summary & summary, const spec_bench
     summary.spec_delta.t_begin_us += result.spec_delta.t_begin_us;
     summary.spec_delta.t_draft_us += result.spec_delta.t_draft_us;
     summary.spec_delta.t_accept_us += result.spec_delta.t_accept_us;
+    summary.spec_delta.tuner_enabled = summary.spec_delta.tuner_enabled || result.spec_delta.tuner_enabled;
+    if (result.spec_delta.tuner_enabled) {
+        summary.spec_delta.tuner_current_depth = result.spec_delta.tuner_current_depth;
+        summary.spec_delta.tuner_best_depth = result.spec_delta.tuner_best_depth;
+        summary.spec_delta.tuner_net_tps_vs_no_speculation = result.spec_delta.tuner_net_tps_vs_no_speculation;
+        summary.spec_delta.tuner_target_only_selections += result.spec_delta.tuner_target_only_selections;
+        summary.spec_delta.tuner_speculative_selections += result.spec_delta.tuner_speculative_selections;
+        summary.spec_delta.tuner_quarantines += result.spec_delta.tuner_quarantines;
+        summary.spec_delta.tuner_recovery_probes += result.spec_delta.tuner_recovery_probes;
+        if (!result.spec_delta.tuner_retune_reason.empty()) {
+            summary.spec_delta.tuner_retune_reason = result.spec_delta.tuner_retune_reason;
+        }
+    }
 
     if (summary.spec_delta.stages.size() < result.spec_delta.stages.size()) {
         summary.spec_delta.stages.resize(result.spec_delta.stages.size());
@@ -578,6 +614,20 @@ static json spec_bench_metrics_json(const spec_bench_metrics_delta & delta) {
         stages.push_back(spec_bench_stage_json(stage));
     }
 
+    json tuner = nullptr;
+    if (delta.tuner_enabled) {
+        tuner = {
+            {"current_depth", delta.tuner_current_depth},
+            {"best_depth", delta.tuner_best_depth},
+            {"net_tps_vs_no_speculation", delta.tuner_net_tps_vs_no_speculation},
+            {"target_only_selections", delta.tuner_target_only_selections},
+            {"speculative_selections", delta.tuner_speculative_selections},
+            {"quarantines", delta.tuner_quarantines},
+            {"recovery_probes", delta.tuner_recovery_probes},
+            {"retune_reason", delta.tuner_retune_reason},
+        };
+    }
+
     return json{
         {"num_drafts", delta.num_drafts},
         {"accepted_drafts", delta.accepted_drafts},
@@ -589,6 +639,7 @@ static json spec_bench_metrics_json(const spec_bench_metrics_delta & delta) {
         {"t_begin_s", delta.t_begin_us / 1e6},
         {"t_draft_s", delta.t_draft_us / 1e6},
         {"t_accept_s", delta.t_accept_us / 1e6},
+        {"autotune", tuner},
         {"stages", stages},
     };
 }

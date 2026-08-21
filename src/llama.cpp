@@ -23,6 +23,7 @@
 #include "llama-quantize.h"
 #include "llama-kv-padding.h"
 #include "llama-kv-tier-policy.h"
+#include "llama-mapped-draft.h"
 
 #include "unicode.h"
 
@@ -5580,6 +5581,18 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             params.progress_callback, params.progress_callback_user_data
         )) {
             return -2;
+        }
+
+        if (!params.dry_run && model.hparams.mtp_use_ordered_embeddings) {
+            if (model.mtp_centroids == nullptr || model.mtp_token_ordering == nullptr) {
+                throw std::runtime_error(
+                    "mapped draft vocabulary requested by model metadata, but centroid/map tensors are missing");
+            }
+            std::string ordering_error;
+            if (!llama_mapped_draft_token_ordering_valid(
+                    model.mtp_token_ordering, model.hparams.n_vocab, &ordering_error)) {
+                throw std::runtime_error(ordering_error);
+            }
         }
 
         model.expert_index = std::move(ml.expert_tensor_index);

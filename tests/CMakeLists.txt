@@ -220,6 +220,16 @@ llama_test(test-turbo-kv-policy)
 llama_build(test-expert-cache.cpp)
 llama_test(test-expert-cache)
 
+# Phase 3 transient residency: bounded, failure-atomic module transactions.
+llama_build(test-transient-module-manager.cpp)
+llama_test(test-transient-module-manager)
+
+llama_build(test-spec-tuner.cpp)
+llama_test(test-spec-tuner)
+
+llama_build(test-mapped-draft.cpp)
+llama_test(test-mapped-draft)
+
 # Requires a caller-supplied GGUF model; exercised by the Phase 1 validation script.
 llama_build(test-turbo-kv-lifecycle.cpp)
 llama_build(test-turbo-kv-quality.cpp)

@@ -241,6 +241,8 @@ struct mtp_last_embd {
 struct common_speculative_state_mtp : public common_speculative_state {
     llama_context * ctx_tgt;
     llama_context * ctx_mtp = nullptr;
+    llama_model * model_mtp = nullptr;
+    llama_context_params cparams_mtp = {};
     int32_t mtp_heads_active = 0;
     // number of NextN heads the model carries, and the minimum head count the committed
     // context has been warmed with since position 0 (deeper heads' caches only hold valid
@@ -249,7 +251,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
     // the rest of the openPangu MTP state.
     int32_t n_heads_model = 1;
     int32_t mtp_warmed_heads = 0;
-    common_sampler * smpl;
+    common_sampler * smpl = nullptr;
 
     int32_t resolved_heads() const {
         return mtp_heads_active > 0 ? std::min(mtp_heads_active, n_heads_model) : n_heads_model;
@@ -264,10 +266,13 @@ struct common_speculative_state_mtp : public common_speculative_state {
             enum common_speculative_type type,
             llama_context * ctx_tgt,
             llama_context * ctx_mtp,
+            llama_context_params cparams_mtp,
             bool constant_draft_positions = false)
         : common_speculative_state(type)
         , ctx_tgt(ctx_tgt)
         , ctx_mtp(ctx_mtp)
+        , model_mtp(const_cast<llama_model *>(llama_get_model(ctx_mtp)))
+        , cparams_mtp(cparams_mtp)
         , constant_draft_positions(constant_draft_positions)
     {
         struct common_params_sampling sparams;
@@ -289,10 +294,52 @@ struct common_speculative_state_mtp : public common_speculative_state {
     }
 
     ~common_speculative_state_mtp() override {
-        common_sampler_free(smpl);
+        if (smpl) {
+            common_sampler_free(smpl);
+        }
         if (ctx_mtp) {
             llama_free(ctx_mtp);
         }
+    }
+
+    bool suspend() {
+        target_hidden_by_seq.clear();
+        draft_cache_by_seq.clear();
+        mtp_warmed_heads = 0;
+        if (smpl) {
+            common_sampler_free(smpl);
+            smpl = nullptr;
+        }
+        if (ctx_mtp) {
+            llama_free(ctx_mtp);
+            ctx_mtp = nullptr;
+        }
+        return true;
+    }
+
+    bool resume() {
+        if (ctx_mtp) {
+            return true;
+        }
+        ctx_mtp = llama_init_from_model(model_mtp, cparams_mtp);
+        if (!ctx_mtp) {
+            return false;
+        }
+        common_params_sampling sparams;
+        sparams.samplers_sequence = { llama_sampler_type::DIST };
+        smpl = common_sampler_init(model_mtp, sparams);
+        if (!smpl) {
+            llama_free(ctx_mtp);
+            ctx_mtp = nullptr;
+            return false;
+        }
+        llama_set_mtp_target_context(ctx_mtp, ctx_tgt);
+        n_embd = llama_mtp_state_n_embd(ctx_mtp);
+        n_heads_model = std::max(1, llama_model_n_nextn_layer(model_mtp));
+        target_hidden_by_seq.clear();
+        draft_cache_by_seq.clear();
+        mtp_warmed_heads = 0;
+        return true;
     }
 
     void begin(const llama_tokens & prompt) override {
@@ -316,6 +363,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
             llama_pos draft_base_pos,
             llama_seq_id seq_id,
             llama_tokens & result) override {
+
+        if (ctx_mtp == nullptr || smpl == nullptr) {
+            result.clear();
+            return;
+        }
 
         const llama_pos mtp_pos_max = llama_kv_cache_seq_pos_max(ctx_mtp, seq_id);
         const bool has_draft_base_pos = draft_base_pos >= 0;
@@ -1420,7 +1472,7 @@ common_speculative * common_speculative_init(
 
                 const bool use_constant_draft_positions = llama_model_is_gemma4_mtp_assistant(llama_get_model(ctx_mtp));
                 impls.push_back(std::make_unique<common_speculative_state_mtp>(
-                    config.type, ctx_tgt, ctx_mtp, use_constant_draft_positions));
+                    config.type, ctx_tgt, ctx_mtp, config.params.cparams_dft, use_constant_draft_positions));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
@@ -1554,16 +1606,19 @@ llama_tokens common_speculative_draft(
         auto & impl = spec->impls[i];
         const auto & runtime_stage = use_runtime_stage_overrides ? runtime_stages[i] : spec->configs[i].stage;
         common_params_speculative impl_params = common_speculative_get_runtime_params(spec->configs[i], params, runtime_stage);
-        if (spec->tuner && spec->tuner->enabled && impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+        if (spec->tuner && spec->tuner->has_target_only_arm() &&
+                (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH || impl->type == COMMON_SPECULATIVE_TYPE_MTP)) {
             impl_params.n_max = params.n_max;
         }
         result.clear();
 
-        if (spec->tuner && spec->tuner->has_dflash_target_only_arm() &&
-                impl->type == COMMON_SPECULATIVE_TYPE_DFLASH && impl_params.n_max == 0) {
+        if (spec->tuner && spec->tuner->has_target_only_arm() &&
+                (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH || impl->type == COMMON_SPECULATIVE_TYPE_MTP) &&
+                impl_params.n_max == 0) {
             spec->curr_impl = impl.get();
             spec->last_step_target_only = true;
-            LOG_DBG("%s: selected DFlash target-only arm\n", __func__);
+            LOG_DBG("%s: selected %s target-only arm\n", __func__,
+                    common_speculative_type_to_str(impl->type).c_str());
             break;
         }
 
@@ -1896,7 +1951,7 @@ common_speculative_draft_result common_speculative_draft_ex(
 }
 
 int common_speculative_get_configured_n_max(const common_speculative * spec) {
-    if (spec == nullptr || spec->tuner == nullptr || !spec->tuner->has_dflash_target_only_arm()) {
+    if (spec == nullptr || spec->tuner == nullptr || !spec->tuner->has_target_only_arm()) {
         return 0;
     }
     return spec->tuner->configured_n_max;
@@ -2812,6 +2867,37 @@ llama_context * common_speculative_get_companion_ctx(common_speculative * spec) 
     return nullptr;
 }
 
+bool common_speculative_suspend_mtp(common_speculative * spec) {
+    auto * state = common_speculative_get_mtp_state(spec);
+    if (state == nullptr) {
+        return true;
+    }
+    spec->checkpoint.clear();
+    spec->curr_impl = nullptr;
+    spec->last_n_drafted = 0;
+    spec->t_step_start_us = 0;
+    spec->last_step_target_only = false;
+    return state->suspend();
+}
+
+bool common_speculative_resume_mtp(common_speculative * spec) {
+    auto * state = common_speculative_get_mtp_state(spec);
+    if (state == nullptr) {
+        return true;
+    }
+    spec->checkpoint.clear();
+    spec->curr_impl = nullptr;
+    spec->last_n_drafted = 0;
+    spec->t_step_start_us = 0;
+    spec->last_step_target_only = false;
+    return state->resume();
+}
+
+bool common_speculative_mtp_resident(const common_speculative * spec) {
+    const auto * state = common_speculative_get_mtp_state(spec);
+    return state == nullptr || state->ctx_mtp != nullptr;
+}
+
 static int32_t mtp_accept_batch(
         common_speculative_state_mtp & state,
         const llama_batch & accepted_batch,
@@ -3012,6 +3098,21 @@ common_speculative_metrics_snapshot common_speculative_get_metrics_snapshot(cons
         stage.t_draft_us = impl->t_draft_us;
         stage.t_accept_us = impl->t_accept_us;
         snapshot.stages.push_back(std::move(stage));
+    }
+
+    if (spec->tuner && spec->tuner->enabled && !spec->tuner->coords.empty() &&
+            !spec->tuner->coords[0].arms.empty()) {
+        const auto & depth = spec->tuner->coords[0];
+        const int zero_idx = depth.find_nearest_arm(0.0f);
+        snapshot.tuner_enabled = true;
+        snapshot.tuner_current_depth = (int) depth.arms[depth.current_idx].value;
+        snapshot.tuner_best_depth = (int) depth.arms[depth.best_idx].value;
+        snapshot.tuner_net_tps_vs_no_speculation = depth.arms[depth.best_idx].Q - depth.arms[zero_idx].Q;
+        snapshot.tuner_target_only_selections = spec->tuner->n_target_only_selections;
+        snapshot.tuner_speculative_selections = spec->tuner->n_speculative_selections;
+        snapshot.tuner_quarantines = spec->tuner->n_quarantines;
+        snapshot.tuner_recovery_probes = spec->tuner->n_recovery_probes;
+        snapshot.tuner_retune_reason = spec->tuner->last_retune_reason;
     }
 
     return snapshot;

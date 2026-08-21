@@ -227,22 +227,24 @@ bool server_context::load_model(const gpt_params& params_) {
     const bool has_draft_model = params_base.speculative.has_dft();
     std::string & mmproj_path = params_base.mmproj.path;
     if (!mmproj_path.empty()) {
-        mtmd_context_params mparams = mtmd_context_params_default();
-        mparams.use_gpu = params_base.mmproj_use_gpu;
-        mparams.print_timings = false;
-        mparams.n_threads = params_base.n_threads_mtmd != -1 ? params_base.n_threads_mtmd
+        mctx_params = mtmd_context_params_default();
+        mctx_params.use_gpu = params_base.mmproj_use_gpu;
+        mctx_params.print_timings = false;
+        mctx_params.n_threads = params_base.n_threads_mtmd != -1 ? params_base.n_threads_mtmd
                              : params_base.n_threads_batch != -1 ? params_base.n_threads_batch
                                                                  : params_base.n_threads;
-        mparams.flash_attn_type = params_base.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
-        mparams.verbosity = params_base.verbosity > 0 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_INFO;
-        mparams.image_min_tokens = params_base.image_min_tokens;
-        mparams.image_max_tokens = params_base.image_max_tokens;
-        mctx = mtmd_init_from_file(mmproj_path.c_str(), model, mparams);
-        if (mctx == nullptr) {
-            LOG_ERROR("failed to load multimodal model, %s\n", mmproj_path.c_str());
-            return false;
+        mctx_params.flash_attn_type = params_base.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        mctx_params.verbosity = params_base.verbosity > 0 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_INFO;
+        mctx_params.image_min_tokens = params_base.image_min_tokens;
+        mctx_params.image_max_tokens = params_base.image_max_tokens;
+        if (params_base.transient_vram_budget_mib == 0) {
+            mctx = mtmd_init_from_file(mmproj_path.c_str(), model, mctx_params);
+            if (mctx == nullptr) {
+                LOG_ERROR("failed to load multimodal model, %s\n", mmproj_path.c_str());
+                return false;
+            }
+            LOG_INFO("loaded multimodal model, %s\n", mmproj_path.c_str());
         }
-        LOG_INFO("loaded multimodal model, %s\n", mmproj_path.c_str());
 
         //if (params.n_cache_reuse) {
         //    params_base.n_cache_reuse = 0;
@@ -304,6 +306,7 @@ void server_context::init() {
         slot.n_ctx = n_ctx_slot;
         slot.n_predict = params_base.n_predict;
         slot.mctx = mctx;
+        slot.transient_manager = transient_manager.get();
         slot.cache_tokens.has_mtmd = mctx != nullptr;
         slot.params.think_tokens = params_base.think_tokens;
         if (params_base.think_tokens.exclude) {
@@ -382,6 +385,119 @@ void server_context::init() {
 
     metrics.init();
 
+    if (params_base.transient_vram_budget_mib > 0) {
+        const int64_t budget_mib = params_base.transient_vram_budget_mib;
+        const int64_t reserve_mib = params_base.transient_vram_reserve_mib;
+        const int64_t mtp_mib = params_base.transient_mtp_mib;
+        const int64_t mmproj_mib = params_base.transient_mmproj_mib;
+        if (!params_base.has_mtp || params_base.mmproj.path.empty() || mtp_mib <= 0 || mmproj_mib <= 0 ||
+                reserve_mib < 0 || reserve_mib >= budget_mib) {
+            throw std::runtime_error("transient VRAM mode requires MTP, --mmproj, positive --transient-mtp-mib/--transient-mmproj-mib, and 0 <= reserve < budget");
+        }
+
+        for (auto & slot : slots) {
+            if (!common_speculative_suspend_mtp(slot.spec)) {
+                throw std::runtime_error("failed to suspend MTP while initializing transient residency");
+            }
+        }
+        llama_synchronize(ctx);
+
+        mctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model, mctx_params);
+        if (mctx == nullptr) {
+            for (auto & slot : slots) {
+                (void) common_speculative_resume_mtp(slot.spec);
+            }
+            throw std::runtime_error("failed to load multimodal model for transient residency");
+        }
+        for (auto & slot : slots) {
+            slot.mctx = mctx;
+            slot.cache_tokens.has_mtmd = true;
+        }
+
+        constexpr size_t mib = 1024ULL * 1024ULL;
+        transient_manager = std::make_unique<common_transient_module_manager>(
+            std::map<int, common_transient_device_budget>{{params_base.main_gpu, {
+                (size_t) budget_mib * mib,
+                (size_t) reserve_mib * mib,
+            }}});
+
+        common_transient_module_desc mtp_desc;
+        mtp_desc.id = "mtp";
+        mtp_desc.kind = COMMON_TRANSIENT_MODULE_MTP;
+        mtp_desc.device = params_base.main_gpu;
+        mtp_desc.bytes = (size_t) mtp_mib * mib;
+        mtp_desc.initially_resident = false;
+        mtp_desc.streams = {"server-decode"};
+        mtp_desc.quiesce = [this]() { llama_synchronize(ctx); return true; };
+        mtp_desc.deactivate = [this]() {
+            std::vector<server_slot *> suspended;
+            for (auto & slot : slots) {
+                if (!common_speculative_suspend_mtp(slot.spec)) {
+                    for (auto * prior : suspended) {
+                        (void) common_speculative_resume_mtp(prior->spec);
+                    }
+                    return false;
+                }
+                suspended.push_back(&slot);
+            }
+            return true;
+        };
+        mtp_desc.activate = [this]() {
+            std::vector<server_slot *> resumed;
+            for (auto & slot : slots) {
+                if (!common_speculative_resume_mtp(slot.spec)) {
+                    for (auto * prior : resumed) {
+                        (void) common_speculative_suspend_mtp(prior->spec);
+                    }
+                    return false;
+                }
+                resumed.push_back(&slot);
+            }
+            return true;
+        };
+
+        common_transient_module_desc mmproj_desc;
+        mmproj_desc.id = "multimodal";
+        mmproj_desc.kind = COMMON_TRANSIENT_MODULE_VISION;
+        mmproj_desc.device = params_base.main_gpu;
+        mmproj_desc.bytes = (size_t) mmproj_mib * mib;
+        mmproj_desc.initially_resident = true;
+        mmproj_desc.streams = {"server-multimodal"};
+        mmproj_desc.quiesce = [this]() { llama_synchronize(ctx); return true; };
+        mmproj_desc.deactivate = [this]() {
+            if (mctx != nullptr) {
+                mtmd_free(mctx);
+                mctx = nullptr;
+                for (auto & slot : slots) {
+                    slot.mctx = nullptr;
+                }
+            }
+            return true;
+        };
+        mmproj_desc.activate = [this]() {
+            mtmd_context * next = mtmd_init_from_file(params_base.mmproj.path.c_str(), model, mctx_params);
+            if (next == nullptr) {
+                return false;
+            }
+            mctx = next;
+            for (auto & slot : slots) {
+                slot.mctx = mctx;
+            }
+            return true;
+        };
+
+        std::string error;
+        if (!transient_manager->register_module(std::move(mtp_desc), &error) ||
+                !transient_manager->register_module(std::move(mmproj_desc), &error)) {
+            throw std::runtime_error("failed to configure transient residency: " + error);
+        }
+        for (auto & slot : slots) {
+            slot.transient_manager = transient_manager.get();
+        }
+        SRV_INF("transient VRAM residency enabled: budget=%lld MiB, reserve=%lld MiB, MTP=%lld MiB, multimodal=%lld MiB\n",
+            (long long) budget_mib, (long long) reserve_mib, (long long) mtp_mib, (long long) mmproj_mib);
+    }
+
     bool reuse_forced_off = false;
     if (llama_model_is_openpangu(model) && params_base.has_mtp &&
         (params_base.ctx_checkpoints_n > 0 || params_base.cache_ram_mib != 0)) {
@@ -452,6 +568,27 @@ void server_context::init() {
 
 }
 
+
+bool server_context::transient_enabled() const {
+    return transient_manager != nullptr;
+}
+
+uint64_t server_context::acquire_transient(bool multimodal, std::string & error) {
+    if (!transient_manager) {
+        return 0;
+    }
+    return transient_manager->acquire({multimodal ? "multimodal" : "mtp"}, false, &error);
+}
+
+void server_context::release_transient(uint64_t lease, bool success) {
+    if (lease == 0 || !transient_manager) {
+        return;
+    }
+    std::string error;
+    if (!transient_manager->release(lease, success, &error)) {
+        SRV_ERR("failed to release transient residency lease: %s\n", error.c_str());
+    }
+}
 
 void server_slot::prompt_save(server_prompt_cache& prompt_cache) const {
     assert(server_cached_prompt.data.size() == 0);
@@ -590,6 +727,9 @@ void server_slot::add_token_string(const completion_token_output& token) {
 }
 
 bool server_slot::can_speculate() const {
+    if (uses_mtp() && !common_speculative_mtp_resident(spec)) {
+        return false;
+    }
     return !spec_prompt_warmup_failed && (!!spec || uses_mtp());
 }
 
@@ -628,6 +768,12 @@ void server_slot::release() {
         t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
         command = SLOT_COMMAND_RELEASE;
         state = SLOT_STATE_IDLE;
+        if (task != nullptr && task->transient_lease != 0 && transient_manager != nullptr) {
+            std::string error;
+            if (!transient_manager->release(task->transient_lease, true, &error)) {
+                SLT_ERR(*this, "failed to release transient residency lease: %s\n", error.c_str());
+            }
+        }
         task.reset();
     }
     spec_target_only = false;
@@ -2830,6 +2976,18 @@ void server_context::process_single_task(server_task&& task) {
             }
         }
 
+        if (transient_manager != nullptr) {
+            std::string error;
+            task.transient_lease = acquire_transient(task.tokens.has_mtmd_data(), error);
+            if (task.transient_lease == 0) {
+                LOG_VERBOSE("transient module is currently unavailable; deferring task", {
+                    {"id_task", task.id}, {"error", error},
+                });
+                queue_tasks.defer(std::move(task));
+                break;
+            }
+        }
+
         slot->reset();
 
         slot->id_task = task.id;
@@ -2838,6 +2996,8 @@ void server_context::process_single_task(server_task&& task) {
         slot->embedding = task.embedding;
 
         if (!launch_slot_with_task(*slot, task)) {
+            release_transient(task.transient_lease, false);
+            task.transient_lease = 0;
             LOG_ERROR("error while launching slot", task.data);
             break;
         }
@@ -2927,6 +3087,33 @@ void server_context::process_single_task(server_task&& task) {
 
             { "slots",                           slots_data },
         };
+
+        if (transient_manager != nullptr) {
+            const auto transient = transient_manager->snapshot();
+            json modules = json::array();
+            for (const auto & module : transient.modules) {
+                modules.push_back({
+                    {"id", module.id},
+                    {"kind", (int) module.kind},
+                    {"device", module.device},
+                    {"bytes", module.bytes},
+                    {"resident", module.resident},
+                    {"pins", module.pins},
+                });
+            }
+            res.data["transient"] = {
+                {"transactions", transient.transactions},
+                {"swaps", transient.swaps},
+                {"rollbacks", transient.rollbacks},
+                {"failures", transient.failures},
+                {"oom_rejections", transient.oom_rejections},
+                {"bytes_moved", transient.bytes_moved},
+                {"swap_latency_us", transient.swap_latency_us},
+                {"last_failure", transient.last_failure},
+                {"resident_bytes", transient.resident_bytes},
+                {"modules", std::move(modules)},
+            };
+        }
 
         if (json_value(task.data, "reset_bucket", false)) {
             metrics.reset_bucket();
@@ -3566,7 +3753,7 @@ void server_context::add_sampled_tokens() {
                 slot.i_batch_dft.clear();
             } else {
                 if (slot.spec_target_only) {
-                    SLT_DBG(slot, "%s\n", "selected DFlash target-only arm: root-only target batch");
+                    SLT_DBG(slot, "%s\n", "selected target-only autotune arm: root-only target batch");
                 }
                 // keep track of total number of drafted tokens tested
                 slot.n_draft_total += draft.size();
@@ -4082,7 +4269,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past; // add offset to prompt
                     server_mtp_warmup mtp_media_warmup {
                         ctx,
-                        slot.uses_mtp() && slot.spec ? &slot : nullptr,
+                        slot.uses_mtp() && slot.spec && slot.can_speculate() ? &slot : nullptr,
                     };
                     mtmd_helper_eval_batch_callback mtp_media_callback =
                         mtp_media_warmup.slot ? server_mtp_media_warmup_callback : nullptr;
@@ -4699,7 +4886,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
     if (server_speculative_uses_target_features(params_base.speculative)) {
         for (auto & slot : slots) {
-            if (!slot.spec || !server_speculative_uses_target_features(slot.params.speculative)) {
+            if (!slot.spec || !slot.can_speculate() || !server_speculative_uses_target_features(slot.params.speculative)) {
                 continue;
             }
 

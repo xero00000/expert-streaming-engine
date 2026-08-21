@@ -1,6 +1,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "speculative.h"
+#include "transient-module-manager.h"
 #include "json-schema-to-grammar.h"
 #include <nlohmann/json_fwd.hpp>
 
@@ -152,6 +153,7 @@ struct server_slot {
 
     // multimodal
     mtmd_context* mctx = nullptr;
+    common_transient_module_manager * transient_manager = nullptr;
 
     // speculative decoding
     struct common_speculative * spec = nullptr;
@@ -254,6 +256,8 @@ struct server_context {
 
     // multimodal
     mtmd_context* mctx = nullptr;
+    mtmd_context_params mctx_params = mtmd_context_params_default();
+    std::unique_ptr<common_transient_module_manager> transient_manager;
 
     int32_t n_ctx; // total context for all clients / slots
 
@@ -288,6 +292,10 @@ struct server_context {
     bool load_model(const gpt_params& params_);
 
     void init();
+
+    bool transient_enabled() const;
+    uint64_t acquire_transient(bool multimodal, std::string & error);
+    void release_transient(uint64_t lease, bool success = true);
 
     std::vector<llama_token> tokenize(const json& json_prompt, bool add_special) const;
 

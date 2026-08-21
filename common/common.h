@@ -454,6 +454,10 @@ struct gpt_params {
     bool expert_sidecar_only = false;
     int64_t expert_vram_cache_mib = 0; // explicit per-device capacity; 0 disables
     int64_t expert_vram_reserve_mib = 0;
+    int64_t transient_vram_budget_mib = 0; // shared transient-module capacity; 0 disables
+    int64_t transient_vram_reserve_mib = 0;
+    int64_t transient_mtp_mib = 0;          // measured MTP companion allocation
+    int64_t transient_mmproj_mib = 0;       // measured multimodal projector allocation
     int expert_cache_min_observations = 2;
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
     bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)

@@ -1733,6 +1733,26 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.mmproj_use_gpu = false;
         return true;
     }
+    if (arg == "--transient-vram-budget-mib") {
+        CHECK_ARG
+        params.transient_vram_budget_mib = std::stoll(argv[i]);
+        return true;
+    }
+    if (arg == "--transient-vram-reserve-mib") {
+        CHECK_ARG
+        params.transient_vram_reserve_mib = std::stoll(argv[i]);
+        return true;
+    }
+    if (arg == "--transient-mtp-mib") {
+        CHECK_ARG
+        params.transient_mtp_mib = std::stoll(argv[i]);
+        return true;
+    }
+    if (arg == "--transient-mmproj-mib") {
+        CHECK_ARG
+        params.transient_mmproj_mib = std::stoll(argv[i]);
+        return true;
+    }
     if (arg == "--mtmd-kq-type") {
         CHECK_ARG
         params.mtmd_kq_type = argv[i];
@@ -3316,6 +3336,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --audio FILE",           "path to an audio file for multimodal models. Specify multiple times for batching" });
     options.push_back({ "*",           "       --mmproj-url URL",       "URL to download the multimodal projector file" });
     options.push_back({ "*",           "       --no-mmproj-offload",    "do not offload multimodal projector to GPU (default: offload enabled)" });
+    options.push_back({ "server",      "       --transient-vram-budget-mib N", "bounded capacity shared by transient MTP and multimodal contexts (default: disabled)" });
+    options.push_back({ "server",      "       --transient-vram-reserve-mib N", "safety margin kept outside the transient-module capacity" });
+    options.push_back({ "server",      "       --transient-mtp-mib N", "measured MTP companion allocation used for transient admission" });
+    options.push_back({ "server",      "       --transient-mmproj-mib N", "measured multimodal projector allocation used for transient admission" });
     options.push_back({ "*",           "       --image-min-tokens N",   "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)"});
     options.push_back({ "*",           "       --image-max-tokens N",   "maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)" });
     options.push_back({ "*",           "       --mtmd-kq-type TYPE",    "data type for multimodality K*Q (default: %s)", params.mtmd_kq_type.c_str() });

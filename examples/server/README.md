@@ -22,6 +22,13 @@ The project is under active development, and we are [looking for feedback and co
 
 ## Usage
 
+When a server combines an MTP-capable model with `--mmproj`, ESE can keep only the
+currently needed transient context resident. Enable it with
+`--transient-vram-budget-mib`, `--transient-vram-reserve-mib`,
+`--transient-mtp-mib`, and `--transient-mmproj-mib`. The two module sizes are
+measured peak allocations: include projector compute buffers in the multimodal
+number. A zero budget preserves the normal simultaneous-residency behavior.
+
 ```
 usage: ./llama-server [options]
 
