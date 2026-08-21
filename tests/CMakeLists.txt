@@ -208,6 +208,11 @@ llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 
 
+
+# Phase 1 Turbo KV: internal type metadata and checked CPU dispatch.
+llama_build(test-turbo-kv-core.cpp)
+llama_test(test-turbo-kv-core)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

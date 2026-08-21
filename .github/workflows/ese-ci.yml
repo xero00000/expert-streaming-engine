@@ -4,14 +4,16 @@ on:
   push:
     branches:
       - ese-unified
+      - main
+      - "phase1/**"
   pull_request:
     paths:
       - "ese"
       - "tools/**"
       - "tests/**"
-      - "docs/ESE_*.md"
-      - "docs/PORT_ROADMAP.md"
-      - "docs/BRANCH_POLICY.md"
+      - "scripts/**"
+      - "docs/**"
+      - "THIRD_PARTY_PORTS.md"
       - "README.md"
       - "CMakeLists.txt"
       - "ggml/**"
@@ -50,6 +52,34 @@ jobs:
         run: |
           ./ese --help
           ./ese doctor --json
+
+  turbo-kv-reference:
+    name: Turbo KV CPU reference
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: bash -n scripts/*.sh
+
+      - name: Build and test Turbo4/Turbo8 reference
+        run: bash scripts/test-turbo-kv.sh
+
+
+      - name: Configure internal GGML Turbo type test
+        run: >-
+          cmake -S . -B build-turbo-core
+          -DCMAKE_BUILD_TYPE=Release
+          -DGGML_CUDA=OFF
+          -DLLAMA_BUILD_TESTS=ON
+          -DLLAMA_BUILD_SERVER=OFF
+
+      - name: Build internal GGML Turbo type test
+        run: cmake --build build-turbo-core --target test-turbo-kv-core -j2
+
+      - name: Run internal GGML Turbo type test
+        run: build-turbo-core/bin/test-turbo-kv-core
 
   cpu-build:
     name: Native CPU server build

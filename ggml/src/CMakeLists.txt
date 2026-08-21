@@ -1299,6 +1299,7 @@ add_library(ggml
             ../include/ggml-alloc.h
             ../include/ggml-backend.h
             ggml.c
+            ggml-turbo-kv.cpp
             ggml-alloc.c
             ggml-backend.cpp
             ggml-moe-prefetch.cpp

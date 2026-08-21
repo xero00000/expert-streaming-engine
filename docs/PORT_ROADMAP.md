@@ -6,11 +6,19 @@ Reference analyzed for planning:
 
 ```text
 spiritbuun/buun-llama-cpp
-master observed at a2bd802d81936bab8a066cbf789a427776fb4839
+planning tree observed: a2bd802d81936bab8a066cbf789a427776fb4839
 MIT license
 ```
 
-Every code port must pin the exact source commit it uses, retain attribution, and separate mechanical adaptation from ESE-specific redesign.
+Phase 1 implementation source pin:
+
+```text
+commit: 799e3995cd4f19aa9f6a3fa9fb5b4674422bf0ee
+tree:   a2bd802d81936bab8a066cbf789a427776fb4839
+file:   ggml/src/ggml-turbo-quant.c
+```
+
+A tree SHA and a commit SHA are recorded separately. Every code port must pin the exact source commit it uses, retain attribution, and separate mechanical adaptation from ESE-specific redesign.
 
 ## Status
 
@@ -23,9 +31,10 @@ Every code port must pin the exact source commit it uses, retain attribution, an
 | GGUF-aware startup policy | Foundation | standard-library planner |
 | DeepSeek V4, DSpark, MTP integration-line work | Integrated | native options remain available |
 | Maple/TQ2_0 CPU and CUDA work | Integrated | integration-line native path |
+| Turbo4/Turbo8 CPU reference | Foundation | checked internal ABI and deterministic tests in Phase 1 |
 | Adaptive VRAM MoE cache | Planned | Phase 2 / issue #5 |
 | Multi-GPU expert-parallel cache | Planned | Phase 2 / issue #5 |
-| Turbo KV, TCQ, and VBR | Planned | Phase 1 / issue #4 |
+| Core Turbo KV types, CUDA, TCQ, and VBR | In progress | Phase 1 / issue #4 / PR #8 |
 | Transient mmproj/MTP sharing | Planned | Phase 3 / issue #6 |
 | Adaptive MTP depth / mapped vocabulary | Planned | Phase 3 / issue #6 |
 | Global dynamic resource controller | Planned | Phase 4 / issue #7 |
@@ -34,7 +43,18 @@ Every code port must pin the exact source commit it uses, retain attribution, an
 
 ### Fixed Turbo codecs
 
-Port `turbo8`, `turbo4`, `turbo3`, and `turbo2` with GGML storage accounting, CPU reference paths, CUDA kernels, Flash Attention integration, unusual-head-dimension padding, and serialization tests.
+The first completed slice provides checked deterministic CPU references for Turbo4 and Turbo8 without registering public cache types. See `docs/TURBO_KV_PHASE1.md`.
+
+Next, integrate fixed formats in stages:
+
+1. complete core type traits and checked dispatch;
+2. serialization and numeric type-ID compatibility;
+3. CUDA encode/decode;
+4. Flash Attention reads and unusual-head-dimension padding;
+5. lifecycle and quality validation;
+6. only then expose stable cache flags.
+
+Turbo3 and Turbo2 require complete correctness references rather than the simplified/zero-fill CPU paths present at the pinned source revision.
 
 Acceptance:
 
