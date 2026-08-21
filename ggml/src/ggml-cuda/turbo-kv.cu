@@ -13,6 +13,8 @@
 #include "ggml-turbo-kv.h"
 #include "../ggml-turbo-kv-internal.h"
 
+#include <cfloat>
+#include <cstdint>
 #include <mutex>
 
 static __device__ float d_turbo_rotation_forward[GGML_TURBO_KV_BLOCK_ELEMENTS * GGML_TURBO_KV_BLOCK_ELEMENTS];
@@ -356,4 +358,202 @@ void ggml_cuda_turbo_kv_dequantize_f16(
             src->ne[0], src->ne[1], src->ne[2], src->ne[3],
             src->nb[1], src->nb[2], src->nb[3]);
     }
+}
+
+template<int format_k, int format_v>
+static __global__ void k_turbo_flash_attn_direct(
+        const char * __restrict__ q_data,
+        const char * __restrict__ k_data,
+        const char * __restrict__ v_data,
+        const char * __restrict__ mask_data,
+        const float * __restrict__ sinks,
+        float * __restrict__ dst,
+        float scale,
+        float max_bias,
+        float m0,
+        float m1,
+        uint32_t n_head_log2,
+        float logit_softcap,
+        int32_t ne01,
+        int32_t ne02,
+        int32_t ne03,
+        size_t nb01,
+        size_t nb02,
+        size_t nb03,
+        int32_t ne11,
+        int32_t ne12,
+        size_t nb11,
+        size_t nb12,
+        size_t nb13,
+        size_t nb21,
+        size_t nb22,
+        size_t nb23,
+        int32_t ne33,
+        size_t nb31,
+        size_t nb33) {
+    constexpr int qk = GGML_TURBO_KV_BLOCK_ELEMENTS;
+    const int element = threadIdx.x;
+    const int query = blockIdx.x;
+    const int sequence = blockIdx.y / ne02;
+    const int head = blockIdx.y % ne02;
+    if (element >= qk || query >= ne01 || sequence >= ne03) return;
+
+    const int gqa_ratio = ne02 / ne12;
+    const int kv_head = head / gqa_ratio;
+    const float * q = reinterpret_cast<const float *>(
+        q_data + sequence * nb03 + head * nb02 + query * nb01);
+    const char * k_head = k_data + sequence * nb13 + kv_head * nb12;
+    const char * v_head = v_data + sequence * nb23 + kv_head * nb22;
+
+    __shared__ float q_rot[qk];
+    __shared__ float products[qk];
+    __shared__ float v_acc[qk];
+    __shared__ float state[4]; // max, denominator, old-output rescale, new weight
+
+    float transformed_q = 0.0f;
+    for (int original = 0; original < qk; ++original) {
+        transformed_q += d_turbo_rotation_inverse[original * qk + element] * q[original];
+    }
+    q_rot[element] = transformed_q;
+    v_acc[element] = 0.0f;
+    if (element == 0) {
+        state[0] = -FLT_MAX / 2.0f;
+        state[1] = 0.0f;
+    }
+    __syncthreads();
+
+    const uint32_t h = static_cast<uint32_t>(head);
+    const float slope = max_bias <= 0.0f ? 1.0f : powf(
+        h < n_head_log2 ? m0 : m1,
+        static_cast<float>(h < n_head_log2 ? h + 1 : 2 * (h - n_head_log2) + 1));
+    const half * mask = mask_data ? reinterpret_cast<const half *>(
+        mask_data + (sequence % ne33) * nb33 + query * nb31) : nullptr;
+
+    for (int key = 0; key < ne11; ++key) {
+        const void * k_block = k_head + key * nb11;
+        const float k_value = turbo_centroid<format_k>(turbo_index<format_k>(k_block, element)) *
+            turbo_scale<format_k>(k_block);
+        const float partial = warp_reduce_sum(q_rot[element] * k_value);
+        if ((element & (WARP_SIZE - 1)) == 0) {
+            products[element / WARP_SIZE] = partial;
+        }
+        __syncthreads();
+
+        if (element == 0) {
+            float score = 0.0f;
+            for (int warp = 0; warp < qk / WARP_SIZE; ++warp) score += products[warp];
+            score *= scale;
+            if (logit_softcap != 0.0f) score = logit_softcap * tanhf(score / logit_softcap);
+            if (mask) score += slope * __half2float(mask[key]);
+
+            const float new_max = fmaxf(state[0], score);
+            state[2] = expf(state[0] - new_max);
+            state[3] = expf(score - new_max);
+            state[0] = new_max;
+            state[1] = state[1] * state[2] + state[3];
+        }
+        __syncthreads();
+
+        const void * v_block = v_head + key * nb21;
+        const float v_value = turbo_centroid<format_v>(turbo_index<format_v>(v_block, element)) *
+            turbo_scale<format_v>(v_block);
+        v_acc[element] = v_acc[element] * state[2] + v_value * state[3];
+        __syncthreads();
+    }
+
+    if (sinks) {
+        if (element == 0) {
+            const float new_max = fmaxf(state[0], sinks[head]);
+            state[2] = expf(state[0] - new_max);
+            state[3] = expf(sinks[head] - new_max);
+            state[0] = new_max;
+            state[1] = state[1] * state[2] + state[3];
+        }
+        __syncthreads();
+        v_acc[element] *= state[2];
+        __syncthreads();
+    }
+
+    products[element] = state[1] > 0.0f ? v_acc[element] / state[1] : 0.0f;
+    __syncthreads();
+
+    float output = 0.0f;
+    for (int rotated = 0; rotated < qk; ++rotated) {
+        output += d_turbo_rotation_inverse[element * qk + rotated] * products[rotated];
+    }
+    dst[((sequence * ne01 + query) * ne02 + head) * qk + element] = output;
+}
+
+bool ggml_cuda_turbo_kv_fattn_is_supported(const ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    return q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        q->ne[0] == GGML_TURBO_KV_BLOCK_ELEMENTS &&
+        q->ne[1] <= 8 &&
+        k->ne[0] == GGML_TURBO_KV_BLOCK_ELEMENTS &&
+        v->ne[0] == GGML_TURBO_KV_BLOCK_ELEMENTS &&
+        (k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO8_0) &&
+        (v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO8_0) &&
+        k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2] && k->ne[3] == v->ne[3] &&
+        q->ne[2] % k->ne[2] == 0 &&
+        (!mask || (mask->type == GGML_TYPE_F16 &&
+            mask->ne[0] >= k->ne[1] && mask->ne[1] >= GGML_PAD(q->ne[1], 16)));
+}
+
+template<int format_k, int format_v>
+static void launch_turbo_flash_attn_direct(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        float scale,
+        float max_bias,
+        float m0,
+        float m1,
+        uint32_t n_head_log2,
+        float logit_softcap) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const dim3 blocks(q->ne[1], q->ne[2] * q->ne[3], 1);
+    k_turbo_flash_attn_direct<format_k, format_v><<<blocks, GGML_TURBO_KV_BLOCK_ELEMENTS, 0, ctx.stream()>>>(
+        static_cast<const char *>(q->data),
+        static_cast<const char *>(k->data),
+        static_cast<const char *>(v->data),
+        mask ? static_cast<const char *>(mask->data) : nullptr,
+        sinks ? static_cast<const float *>(sinks->data) : nullptr,
+        static_cast<float *>(dst->data),
+        scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+        q->ne[1], q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3],
+        k->ne[1], k->ne[2], k->nb[1], k->nb[2], k->nb[3],
+        v->nb[1], v->nb[2], v->nb[3],
+        mask ? mask->ne[3] : 1, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_turbo_kv_flash_attn(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_turbo_kv_fattn_is_supported(dst));
+    ggml_cuda_turbo_kv_ensure_tables();
+
+    float scale = 1.0f;
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const uint32_t n_head = dst->src[0]->ne[2];
+    const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
+    const float m0 = powf(2.0f, -max_bias / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    const bool k4 = dst->src[1]->type == GGML_TYPE_TURBO4_0;
+    const bool v4 = dst->src[2]->type == GGML_TYPE_TURBO4_0;
+    if (k4 && v4) launch_turbo_flash_attn_direct<4, 4>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (k4)  launch_turbo_flash_attn_direct<4, 8>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else if (v4)  launch_turbo_flash_attn_direct<8, 4>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
+    else          launch_turbo_flash_attn_direct<8, 8>(ctx, dst, scale, max_bias, m0, m1, n_head_log2, logit_softcap);
 }

@@ -59,24 +59,32 @@ The CUDA graph test proves:
 - backend support for both graph operations;
 - independent table initialization on every visible CUDA device.
 
-## CUDA Flash Attention compatibility bridge
+## CUDA Flash Attention integration
 
 CUDA Flash Attention can now consume internal Turbo4/Turbo8 K and V tensors
-without a host round trip. The bridge dequantizes each compressed tensor into
-stream-ordered F16 device staging, then invokes the established CUDA Flash
-Attention implementation. This preserves that implementation's mask, GQA,
-softcap, and precision dispatch semantics while the direct fused Turbo tile
-readers are still being developed.
+without a host round trip. Decode batches of up to eight queries use a native
+kernel that reads Turbo4/Turbo8 codes directly, rotates Q into the compressed
+domain, performs online softmax, accumulates V in the compressed domain, and
+inverse-rotates the result. It supports all four Turbo4/Turbo8 K/V pairings,
+masks, GQA, softcap, ALiBi slopes, multiple sequences, and attention sinks.
+This path allocates no cache-sized temporary buffer.
 
-The temporary device allocation is explicitly bounded at two bytes per staged
+Larger prompt-processing batches retain the compatibility route: each
+compressed tensor is dequantized into stream-ordered F16 device staging before
+the established CUDA Flash Attention implementation runs. This preserves the
+existing prefill dispatch while a tiled direct prefill reader is developed.
+
+The prefill temporary device allocation is explicitly bounded at two bytes per staged
 element: at most `2 * (K elements + V elements)` bytes when both tensors are
 compressed. Storage comes from the CUDA stream pool and follows its stream
 lifetime; there is no CPU allocation, copy, or backend fallback.
 
-The CUDA graph test compares Turbo attention against the decoded CPU reference
+The CUDA graph test requires the native path and compares Turbo attention against the decoded CPU reference
 for a padded 256-token K/V extent. It exercises an F16 additive mask, two-query
-GQA, and logit softcap for both formats on every visible CUDA device, with a
-maximum absolute-error bound of `1e-3`.
+GQA, logit softcap, all four K/V format pairings, and every visible CUDA device,
+with a maximum absolute-error bound of `1e-3`. Setting
+`GGML_TURBO_KV_REQUIRE_NATIVE_FATTN=1` makes an unsupported shape fail instead
+of silently using staging; the CUDA test enables this guard.
 
 ## Per-head padding for unusual dimensions
 
@@ -164,18 +172,21 @@ Before accepting the types as KV cache options:
 
 - native encode/decode row kernels — complete;
 - device-native Flash Attention compatibility bridge — complete;
-- fused direct Turbo reads — pending;
+- fused direct Turbo decode reads — complete for batches up to eight;
+- tiled direct Turbo prefill reads — pending;
 - odd head-dimension padding — complete at allocation and graph level;
 - no host fallback;
-- Ampere plus one newer NVIDIA architecture;
+- available NVIDIA hardware (the solo-maintainer Phase 1 release explicitly
+  waives runtime coverage newer than Ampere);
 - prompt-processing and decode measurements separately;
 - bounded temporary memory.
 
-Current hardware evidence covers Turing sm_75 and Ampere sm_86. It verifies the
-row codecs and the masked, soft-capped GQA compatibility bridge at aligned and
-odd logical head widths. The final promotion gate still requires direct fused
-reads, prompt/decode measurements, and Ampere plus one newer NVIDIA
-architecture.
+Current hardware evidence covers Turing sm_75 and two Ampere sm_86 devices. It
+verifies the row codecs and native masked, soft-capped GQA decode at aligned and
+odd logical head widths. Runtime coverage newer than Ampere is unavailable and
+is recorded as a maintainer-approved exception, not presented as tested. The
+final promotion gate still requires tiled direct prefill reads and separate
+prompt/decode measurements.
 
 ### Gate C — quality and lifecycle
 

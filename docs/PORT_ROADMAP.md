@@ -32,7 +32,7 @@ A tree SHA and a commit SHA are recorded separately. Every code port must pin th
 | DeepSeek V4, DSpark, MTP integration-line work | Integrated | native options remain available |
 | Maple/TQ2_0 CPU and CUDA work | Integrated | integration-line native path |
 | Turbo4/Turbo8 CPU + CUDA row codecs | Foundation | checked internal ABI, exact-byte parity, no host fallback |
-| Turbo4/Turbo8 CUDA Flash Attention bridge | Foundation | device-only F16 staging; fused reads still pending |
+| Turbo4/Turbo8 CUDA Flash Attention | Foundation | direct compressed decode reads; device-only F16 staging remains for prefill |
 | Turbo4/Turbo8 per-head padding | Foundation | odd K/V heads padded independently; logical output width restored |
 | Adaptive VRAM MoE cache | Planned | Phase 2 / issue #5 |
 | Multi-GPU expert-parallel cache | Planned | Phase 2 / issue #5 |
@@ -52,8 +52,9 @@ Next, integrate fixed formats in stages:
 1. complete core type traits and checked dispatch;
 2. serialization and numeric type-ID compatibility;
 3. CUDA encode/decode — row codec complete;
-4. Flash Attention compatibility bridge — complete, including unusual-head-
-   dimension padding; fused reads remain;
+4. Flash Attention integration — direct compressed decode reads complete for
+   batches up to eight, including unusual-head-dimension padding; tiled direct
+   prefill remains;
 5. lifecycle and quality validation;
 6. only then expose stable cache flags.
 

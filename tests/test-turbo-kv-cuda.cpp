@@ -51,8 +51,10 @@ std::vector<float> make_attention_values(int64_t width, int rows, float phase) {
 
 void check_flash_attention(
         int device,
-        ggml_type type,
-        ggml_turbo_kv_format format,
+        ggml_type type_k,
+        ggml_turbo_kv_format format_k,
+        ggml_type type_v,
+        ggml_turbo_kv_format format_v,
         const char * name,
         int64_t logical_width) {
     constexpr int64_t storage_width = GGML_TURBO_KV_BLOCK_ELEMENTS;
@@ -89,22 +91,22 @@ void check_flash_attention(
     }
     std::vector<ggml_fp16_t> mask_f16(mask_f32.size());
     ggml_fp32_to_fp16_row(mask_f32.data(), mask_f16.data(), mask_f32.size());
-    std::vector<uint8_t> encoded_keys(ggml_turbo_kv_encoded_size(format, keys.size()));
-    std::vector<uint8_t> encoded_values(ggml_turbo_kv_encoded_size(format, values.size()));
+    std::vector<uint8_t> encoded_keys(ggml_turbo_kv_encoded_size(format_k, keys.size()));
+    std::vector<uint8_t> encoded_values(ggml_turbo_kv_encoded_size(format_v, values.size()));
     require(ggml_turbo_kv_quantize_reference(
-                format, keys.data(), keys.size(), encoded_keys.data(), encoded_keys.size()) == GGML_TURBO_KV_STATUS_OK,
+                format_k, keys.data(), keys.size(), encoded_keys.data(), encoded_keys.size()) == GGML_TURBO_KV_STATUS_OK,
             std::string(name) + ": CPU key encode");
     require(ggml_turbo_kv_quantize_reference(
-                format, values.data(), values.size(), encoded_values.data(), encoded_values.size()) == GGML_TURBO_KV_STATUS_OK,
+                format_v, values.data(), values.size(), encoded_values.data(), encoded_values.size()) == GGML_TURBO_KV_STATUS_OK,
             std::string(name) + ": CPU value encode");
 
     std::vector<float> decoded_keys(keys.size());
     std::vector<float> decoded_values(values.size());
     require(ggml_turbo_kv_dequantize_reference(
-                format, encoded_keys.data(), encoded_keys.size(), decoded_keys.data(), decoded_keys.size()) == GGML_TURBO_KV_STATUS_OK,
+                format_k, encoded_keys.data(), encoded_keys.size(), decoded_keys.data(), decoded_keys.size()) == GGML_TURBO_KV_STATUS_OK,
             std::string(name) + ": CPU key decode");
     require(ggml_turbo_kv_dequantize_reference(
-                format, encoded_values.data(), encoded_values.size(), decoded_values.data(), decoded_values.size()) == GGML_TURBO_KV_STATUS_OK,
+                format_v, encoded_values.data(), encoded_values.size(), decoded_values.data(), decoded_values.size()) == GGML_TURBO_KV_STATUS_OK,
             std::string(name) + ": CPU value decode");
 
     std::vector<float> expected(logical_width * query_rows * query_heads);
@@ -145,8 +147,8 @@ void check_flash_attention(
     ggml_context * context = ggml_init(params);
     require(context != nullptr, std::string(name) + ": attention context");
     ggml_tensor * q = ggml_new_tensor_4d(context, GGML_TYPE_F32, logical_width, query_rows, query_heads, 1);
-    ggml_tensor * k = ggml_new_tensor_4d(context, type, storage_width, key_rows, 1, 1);
-    ggml_tensor * v = ggml_new_tensor_4d(context, type, storage_width, key_rows, 1, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(context, type_k, storage_width, key_rows, 1, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(context, type_v, storage_width, key_rows, 1, 1);
     ggml_tensor * mask = ggml_new_tensor_4d(context, GGML_TYPE_F16, key_rows, mask_rows, 1, 1);
     ggml_tensor * q_padded = logical_width < storage_width
         ? ggml_pad(context, q, storage_width - logical_width, 0, 0, 0)
@@ -296,6 +298,8 @@ void check_format(
 } // namespace
 
 int main() {
+    require(setenv("GGML_TURBO_KV_REQUIRE_NATIVE_FATTN", "1", 1) == 0,
+            "require native Turbo Flash Attention path");
     const int device_count = ggml_backend_cuda_get_device_count();
     require(device_count > 0, "CUDA device required");
     for (int device = 0; device < device_count; ++device) {
@@ -303,11 +307,25 @@ int main() {
         check_format(device, GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, GGML_TYPE_I64, "turbo4_0");
         check_format(device, GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, GGML_TYPE_I32, "turbo8_0");
         check_format(device, GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, GGML_TYPE_I64, "turbo8_0");
-        check_flash_attention(device, GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, "turbo4_0", 128);
-        check_flash_attention(device, GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, "turbo8_0", 128);
-        check_flash_attention(device, GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, "turbo4_0", 96);
-        check_flash_attention(device, GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, "turbo8_0", 96);
+        check_flash_attention(device,
+                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4,
+                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, "turbo4_0", 128);
+        check_flash_attention(device,
+                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8,
+                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, "turbo8_0", 128);
+        check_flash_attention(device,
+                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4,
+                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, "turbo4_0-K/turbo8_0-V", 128);
+        check_flash_attention(device,
+                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8,
+                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, "turbo8_0-K/turbo4_0-V", 128);
+        check_flash_attention(device,
+                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4,
+                GGML_TYPE_TURBO4_0, GGML_TURBO_KV_FORMAT_TURBO4, "turbo4_0", 96);
+        check_flash_attention(device,
+                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8,
+                GGML_TYPE_TURBO8_0, GGML_TURBO_KV_FORMAT_TURBO8, "turbo8_0", 96);
     }
-    std::cout << "PASS: native CUDA Turbo4/Turbo8 row codecs and Flash Attention bridge\n";
+    std::cout << "PASS: native CUDA Turbo4/Turbo8 row codecs and direct Flash Attention reads\n";
     return 0;
 }
