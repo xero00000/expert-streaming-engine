@@ -216,6 +216,10 @@ llama_test(test-turbo-kv-core)
 llama_build(test-turbo-kv-policy.cpp)
 llama_test(test-turbo-kv-policy)
 
+# Phase 2 expert hierarchy: checked descriptors and bounded lease lifetime.
+llama_build(test-expert-cache.cpp)
+llama_test(test-expert-cache)
+
 # Requires a caller-supplied GGUF model; exercised by the Phase 1 validation script.
 llama_build(test-turbo-kv-lifecycle.cpp)
 llama_build(test-turbo-kv-quality.cpp)

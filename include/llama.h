@@ -284,6 +284,12 @@ extern "C" {
         LLAMA_SPLIT_MODE_GRAPH   = 3, // splits computations across GPUs
     };
 
+    enum llama_expert_storage_backend {
+        LLAMA_EXPERT_STORAGE_MMAP = 0,
+        LLAMA_EXPERT_STORAGE_PREAD = 1,
+        LLAMA_EXPERT_STORAGE_IO_URING = 2,
+    };
+
     enum llama_mtp_op_type {
         MTP_OP_NONE             = 0,
         MTP_OP_WARMUP           = 1,
@@ -433,6 +439,10 @@ extern "C" {
         bool dry_run;       // skip loading tensors
         bool flash_attn;
         bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
+        bool expert_sidecar_only; // fail instead of reading original expert tensors outside the lease hierarchy
+        uint64_t expert_ram_cache_bytes;   // bounded resident expert bytes, 0 disables the RAM tier
+        uint64_t expert_ram_staging_bytes; // reusable miss staging bound, 0 selects a bounded default
+        enum llama_expert_storage_backend expert_storage_backend;
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -447,7 +457,6 @@ extern "C" {
         uint32_t n_threads_batch;   // number of threads to use for batch processing
         int32_t  max_extra_alloc;   // Max. additional VRAM the scheduler is allowed to allocate
         int32_t  worst_case_tokens; // number of tokens to use when reserving worst case graphs
-
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
         enum llama_attention_type    attention_type;    // attention type to use for embeddings
@@ -524,6 +533,9 @@ extern "C" {
         void *              abort_callback_data;
         void *              offload_policy;
         void *              cuda_params;
+        uint64_t expert_vram_cache_bytes;   // per-device adaptive expert cache bound
+        uint64_t expert_vram_reserve_bytes; // per-device reserve that cache allocation must preserve
+        uint32_t expert_cache_min_observations; // route observations before GPU admission
     };
 
     // model quantization parameters

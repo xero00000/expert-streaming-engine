@@ -8,7 +8,19 @@ class NativeSurfaceTests(unittest.TestCase):
     def test_policy_flags_exist_in_native_parser(self) -> None:
         root = Path(__file__).resolve().parents[1]
         source = (root / "common" / "common.cpp").read_text(encoding="utf-8")
-        for flag in ("--fit", "--cpu-moe", "--n-cpu-moe", "--defer-experts"):
+        for flag in (
+            "--fit",
+            "--cpu-moe",
+            "--n-cpu-moe",
+            "--defer-experts",
+            "--expert-ram-cache-mib",
+            "--expert-ram-staging-mib",
+            "--expert-storage-backend",
+            "--expert-sidecar-only",
+            "--expert-vram-cache-mib",
+            "--expert-vram-reserve-mib",
+            "--expert-cache-min-observations",
+        ):
             with self.subTest(flag=flag):
                 self.assertIn(flag, source)
 

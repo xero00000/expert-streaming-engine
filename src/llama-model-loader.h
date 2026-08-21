@@ -62,10 +62,11 @@ struct llama_model_loader {
     struct llama_tensor_weight {
         uint16_t  idx; // source file index
         size_t   offs; // tensor data offset in the original file
+        size_t   alignment;
 
         ggml_tensor * tensor;
 
-        llama_tensor_weight(const llama_file * file, uint16_t idx, const char * name, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+        llama_tensor_weight(const llama_file * file, uint16_t idx, const char * name, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), alignment(gguf_get_alignment(gguf_ctx)), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx, name);
             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
 

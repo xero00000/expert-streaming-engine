@@ -963,6 +963,30 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
 }
 
 llama_model::~llama_model() {
+    if (expert_ram_cache) {
+        const auto stats = expert_ram_cache->stats();
+        LLAMA_LOG_INFO("expert_cache_stats: {\"level\":\"ram\",\"capacity_bytes\":%llu,"
+                "\"resident_bytes\":%llu,\"peak_resident_bytes\":%llu,\"hits\":%llu,"
+                "\"misses\":%llu,\"evictions\":%llu,\"rejected_admissions\":%llu,"
+                "\"pinned_capacity_failures\":%llu,\"active_leases\":%llu,"
+                "\"staging_waits\":%llu,\"staging_wait_ns\":%llu,\"storage_read_ns\":%llu,"
+                "\"bytes_mmap\":%llu,\"bytes_pread\":%llu,\"bytes_io_uring\":%llu}\n",
+                (unsigned long long) stats.capacity_bytes,
+                (unsigned long long) stats.resident_bytes,
+                (unsigned long long) stats.peak_resident_bytes,
+                (unsigned long long) stats.hits,
+                (unsigned long long) stats.misses,
+                (unsigned long long) stats.evictions,
+                (unsigned long long) stats.rejected_admissions,
+                (unsigned long long) stats.pinned_capacity_failures,
+                (unsigned long long) stats.active_leases,
+                (unsigned long long) stats.staging_waits,
+                (unsigned long long) stats.staging_wait_ns,
+                (unsigned long long) stats.storage_read_ns,
+                (unsigned long long) stats.bytes_read[size_t(llama_expert_cache::read_backend::mmap)],
+                (unsigned long long) stats.bytes_read[size_t(llama_expert_cache::read_backend::pread)],
+                (unsigned long long) stats.bytes_read[size_t(llama_expert_cache::read_backend::io_uring)]);
+    }
     for (struct ggml_context * ctx : ctxs) {
         ggml_free(ctx);
     }
@@ -977,6 +1001,45 @@ llama_model::~llama_model() {
     while (!lora_adapters.empty()) {
         llama_lora_adapter_free(*lora_adapters.begin());
     }
+}
+
+struct llama_expert_lease_handle {
+    llama_expert_cache::ram_cache::lease lease;
+    explicit llama_expert_lease_handle(llama_expert_cache::ram_cache::lease value) : lease(std::move(value)) {}
+};
+
+static bool llama_expert_lease_acquire(
+        void * user_data,
+        int layer,
+        int expert,
+        int component,
+        ggml_backend_expert_lease * output) {
+    auto * model = static_cast<llama_model *>(user_data);
+    if (!model || !model->expert_ram_cache || !output || layer < 0 || expert < 0 || component < 0 || component > 5) {
+        return false;
+    }
+    const llama_expert_cache::expert_key key = {
+        uint32_t(layer),
+        uint32_t(expert),
+        llama_expert_cache::component(component),
+    };
+    const auto found = model->expert_index.descriptors.find(key);
+    if (found == model->expert_index.descriptors.end()) return false;
+    try {
+        auto handle = std::unique_ptr<llama_expert_lease_handle>(
+                new llama_expert_lease_handle(model->expert_ram_cache->acquire(found->second)));
+        output->data = handle->lease.data();
+        output->size = handle->lease.size();
+        output->handle = handle.release();
+        return true;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_WARN("%s: %s\n", __func__, error.what());
+        return false;
+    }
+}
+
+static void llama_expert_lease_release(void *, void * handle) {
+    delete static_cast<llama_expert_lease_handle *>(handle);
 }
 
 static size_t llama_get_device_count(const llama_model & model, int initial_count = 1) {
@@ -5479,10 +5542,13 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 throw std::runtime_error(error_msg);
             }
         }
-        if (params.defer_experts && params.use_mmap) {
+        if ((params.defer_experts && params.use_mmap) || params.expert_ram_cache_bytes > 0) {
 #ifdef __linux__
             ml.build_expert_tensor_index(model.hparams);
 #else
+            if (params.expert_ram_cache_bytes > 0) {
+                throw std::runtime_error("the bounded expert RAM cache currently requires Linux");
+            }
             LLAMA_LOG_WARN("%s: deferred expert loading is only supported on Linux; ignoring defer_experts\n", __func__);
 #endif
         }
@@ -5514,6 +5580,65 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             params.progress_callback, params.progress_callback_user_data
         )) {
             return -2;
+        }
+
+        model.expert_index = std::move(ml.expert_tensor_index);
+        model.expert_sidecar_only = params.expert_sidecar_only;
+        if (params.expert_sidecar_only && params.expert_ram_cache_bytes == 0) {
+            throw std::runtime_error("--expert-sidecar-only requires a non-zero expert RAM cache");
+        }
+        if (params.expert_ram_cache_bytes > 0) {
+            if (model.expert_index.descriptors.empty()) {
+                throw std::runtime_error("expert RAM cache requested but no lease-compatible expert descriptors were found");
+            }
+            uint64_t largest_component = 0;
+            for (const auto & item : model.expert_index.descriptors) {
+                largest_component = std::max(largest_component, item.second->bytes());
+            }
+            if (largest_component > params.expert_ram_cache_bytes) {
+                throw std::runtime_error(format(
+                        "expert RAM cache capacity (%llu bytes) cannot hold the largest expert component (%llu bytes)",
+                        (unsigned long long) params.expert_ram_cache_bytes,
+                        (unsigned long long) largest_component));
+            }
+            uint64_t staging_bytes = params.expert_ram_staging_bytes;
+            if (staging_bytes == 0) {
+                staging_bytes = std::max<uint64_t>(
+                        largest_component,
+                        std::min<uint64_t>(params.expert_ram_cache_bytes, 64ULL*1024ULL*1024ULL));
+            }
+            if (staging_bytes > params.expert_ram_cache_bytes) {
+                throw std::runtime_error("expert RAM staging capacity cannot exceed expert RAM cache capacity");
+            }
+            if (staging_bytes < largest_component) {
+                throw std::runtime_error(format(
+                        "expert RAM staging capacity (%llu bytes) cannot hold the largest expert component (%llu bytes)",
+                        (unsigned long long) staging_bytes,
+                        (unsigned long long) largest_component));
+            }
+
+            llama_expert_cache::read_backend backend = llama_expert_cache::read_backend::pread;
+            switch (params.expert_storage_backend) {
+                case LLAMA_EXPERT_STORAGE_MMAP: backend = llama_expert_cache::read_backend::mmap; break;
+                case LLAMA_EXPERT_STORAGE_PREAD: backend = llama_expert_cache::read_backend::pread; break;
+                case LLAMA_EXPERT_STORAGE_IO_URING: backend = llama_expert_cache::read_backend::io_uring; break;
+                default: throw std::runtime_error("invalid expert storage backend");
+            }
+            std::vector<std::shared_ptr<const llama_expert_cache::source>> sources;
+            sources.reserve(model.expert_index.sources.size());
+            for (const auto & source : model.expert_index.sources) {
+                sources.push_back(std::make_shared<llama_expert_cache::file_source>(
+                        source.id, source.identity, source.path, backend));
+            }
+            model.expert_ram_cache.reset(new llama_expert_cache::ram_cache({
+                params.expert_ram_cache_bytes,
+                staging_bytes,
+            }, std::move(sources)));
+            LLAMA_LOG_INFO("%s: bounded expert RAM cache enabled: %.1f MiB resident, %.1f MiB staging, backend=%s, descriptors=%zu\n",
+                    __func__, params.expert_ram_cache_bytes/1024.0/1024.0, staging_bytes/1024.0/1024.0,
+                    params.expert_storage_backend == LLAMA_EXPERT_STORAGE_MMAP ? "mmap" :
+                    params.expert_storage_backend == LLAMA_EXPERT_STORAGE_IO_URING ? "io_uring" : "pread",
+                    model.expert_index.descriptors.size());
         }
 
         // ---- populate reload registry ONLY when hot-swap is requested ----
@@ -6519,6 +6644,12 @@ static void llama_graph_compute(
         ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
         ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
+        ggml_backend_cpu_set_expert_lease_callbacks(
+                lctx.backend_cpu,
+                lctx.model.expert_ram_cache ? llama_expert_lease_acquire : nullptr,
+                lctx.model.expert_ram_cache ? llama_expert_lease_release : nullptr,
+                const_cast<llama_model *>(&lctx.model),
+                lctx.model.expert_sidecar_only);
     }
 
     ggml_backend_sched_graph_compute_async(lctx.sched, gf);
@@ -6541,6 +6672,12 @@ static void llama_graph_compute_sched(
         ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
         ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
+        ggml_backend_cpu_set_expert_lease_callbacks(
+                lctx.backend_cpu,
+                lctx.model.expert_ram_cache ? llama_expert_lease_acquire : nullptr,
+                lctx.model.expert_ram_cache ? llama_expert_lease_release : nullptr,
+                const_cast<llama_model *>(&lctx.model),
+                lctx.model.expert_sidecar_only);
     }
 
     ggml_backend_sched_graph_compute_async(sched, gf);
@@ -6887,6 +7024,16 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         auto & prev = cparams.mtp_op_type == MTP_OP_NONE ? lctx.prev : lctx.prev_mtp;
+        // A prompt may be split into one-token microbatches.  Preserve its
+        // CPU-MoE scheduling policy and enable the bounded VRAM cache only for
+        // a true single-token decode API call.
+        const bool active_expert_decode = n_tokens_all == 1;
+        if (lctx.active_expert_decode != active_expert_decode) {
+            lctx.prev.reset();
+            lctx.prev_mtp.reset();
+            lctx.active_expert_decode = active_expert_decode;
+        }
+        ggml_backend_sched_set_active_expert_decode(lctx.sched, active_expert_decode);
         ggml_cgraph * gf = nullptr;
         if (!lctx.can_reuse_graph(u_batch)) {
             lctx.reset_scheduler();
@@ -8012,6 +8159,10 @@ struct llama_model_params llama_model_default_params() {
         /*.dry_run                     =*/ false,
         /*.flash_attn                  =*/ true,
         /*.defer_experts               =*/ false,
+        /*.expert_sidecar_only         =*/ false,
+        /*.expert_ram_cache_bytes      =*/ 0,
+        /*.expert_ram_staging_bytes    =*/ 0,
+        /*.expert_storage_backend      =*/ LLAMA_EXPERT_STORAGE_PREAD,
     };
 
 #ifdef GGML_USE_METAL
@@ -8094,6 +8245,9 @@ struct llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
         /*.offload_policy              =*/ nullptr,
         /*.cuda_params                 =*/ nullptr,
+        /*.expert_vram_cache_bytes     =*/ 0,
+        /*.expert_vram_reserve_bytes   =*/ 0,
+        /*.expert_cache_min_observations =*/ 2,
     };
 
     return result;
@@ -8600,6 +8754,9 @@ struct llama_context * llama_init_from_model(
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
     cparams.worst_graph_tokens = params.worst_case_tokens;
+    cparams.expert_vram_cache_bytes = params.expert_vram_cache_bytes;
+    cparams.expert_vram_reserve_bytes = params.expert_vram_reserve_bytes;
+    cparams.expert_cache_min_observations = params.expert_cache_min_observations;
 
     cparams.reduce_type      = params.type_reduce;
     cparams.graph_attn_precision = params.type_graph_attn;
@@ -9076,6 +9233,22 @@ struct llama_context * llama_init_from_model(
             pipeline_parallel = false;
 #endif
             ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);
+            auto configure_expert_hierarchy = [&] {
+                ggml_backend_sched_set_expert_cache_capacity(
+                        ctx->sched,
+                        cparams.expert_vram_cache_bytes,
+                        cparams.expert_vram_reserve_bytes,
+                        cparams.expert_cache_min_observations);
+                if (model->expert_ram_cache) {
+                    ggml_backend_sched_set_expert_lease_callbacks(
+                            ctx->sched,
+                            llama_expert_lease_acquire,
+                            llama_expert_lease_release,
+                            model,
+                            model->expert_sidecar_only);
+                }
+            };
+            configure_expert_hierarchy();
 
             if (pipeline_parallel) {
                 LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(ctx->sched));
@@ -9099,7 +9272,9 @@ struct llama_context * llama_init_from_model(
             {
                 if (pipeline_parallel) {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                    ggml_backend_sched_free(ctx->sched);
                     ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
+                    configure_expert_hierarchy();
                     gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
                 }
                 if (!gf_success) {

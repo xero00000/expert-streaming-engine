@@ -23,6 +23,7 @@
 #include <future>
 #include <regex>
 #include <algorithm>
+#include <numeric>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -229,8 +230,20 @@ static bool parse_tensor_layer_index(const std::string & name, uint32_t & layer)
     return result.ec == std::errc() && result.ptr == last;
 }
 
-static bool is_split_expert_tensor(const std::string & name, uint32_t & expert) {
-    static const char * prefixes[] = { "ffn_gate.", "ffn_down.", "ffn_up." };
+static bool is_split_expert_tensor(
+        const std::string & name,
+        uint32_t & expert,
+        llama_expert_cache::component * component = nullptr) {
+    struct split_prefix {
+        const char * text;
+        llama_expert_cache::component component;
+    };
+    static const split_prefix prefixes[] = {
+        { "ffn_gate_up.", llama_expert_cache::component::gate_up },
+        { "ffn_gate.", llama_expert_cache::component::gate },
+        { "ffn_down.", llama_expert_cache::component::down },
+        { "ffn_up.",   llama_expert_cache::component::up },
+    };
 
     const size_t layer_end = name.find('.', 4);
     if (layer_end == std::string::npos) {
@@ -239,9 +252,9 @@ static bool is_split_expert_tensor(const std::string & name, uint32_t & expert) 
 
     const size_t prefix_begin = layer_end + 1;
 
-    for (const char * prefix : prefixes) {
-        const size_t prefix_len = std::char_traits<char>::length(prefix);
-        if (name.compare(prefix_begin, prefix_len, prefix) != 0) {
+    for (const auto & prefix : prefixes) {
+        const size_t prefix_len = std::char_traits<char>::length(prefix.text);
+        if (name.compare(prefix_begin, prefix_len, prefix.text) != 0) {
             continue;
         }
 
@@ -250,9 +263,13 @@ static bool is_split_expert_tensor(const std::string & name, uint32_t & expert) 
         if (expert_end == std::string::npos || expert_end == expert_begin) {
             continue;
         }
+        if (name.compare(expert_end, std::string::npos, ".weight") != 0) {
+            continue;
+        }
 
         auto result = std::from_chars(name.data() + expert_begin, name.data() + expert_end, expert);
         if (result.ec == std::errc() && result.ptr == name.data() + expert_end) {
+            if (component) *component = prefix.component;
             return true;
         }
     }
@@ -260,14 +277,62 @@ static bool is_split_expert_tensor(const std::string & name, uint32_t & expert) 
     return false;
 }
 
+static bool expert_component_for_tensor(
+        llm_tensor tensor_type,
+        llama_expert_cache::component & component) {
+    switch (tensor_type) {
+        case LLM_TENSOR_FFN_GATE_EXPS: component = llama_expert_cache::component::gate; return true;
+        case LLM_TENSOR_FFN_UP_EXPS: component = llama_expert_cache::component::up; return true;
+        case LLM_TENSOR_FFN_DOWN_EXPS: component = llama_expert_cache::component::down; return true;
+        case LLM_TENSOR_FFN_GATE_UP_EXPS: component = llama_expert_cache::component::gate_up; return true;
+        case LLM_TENSOR_FFN_NORM_EXPS: component = llama_expert_cache::component::normalization; return true;
+        case LLM_TENSOR_FFN_EXP_PROBS_B: component = llama_expert_cache::component::probability_bias; return true;
+        default: return false;
+    }
+}
+
+static uint64_t expert_identity_hash(uint64_t hash, const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static llama_expert_cache::source_identity expert_source_identity(const llama_file & file, uint32_t source_id) {
+    constexpr size_t sample_bytes = 64*1024;
+    std::vector<uint8_t> sample(std::min<uint64_t>(sample_bytes, file.size()));
+    auto reader = file.clone();
+    reader->seek(0, SEEK_SET);
+    reader->read_raw(sample.data(), sample.size());
+
+    uint64_t high = 1469598103934665603ULL;
+    uint64_t low  = 7809847782465536322ULL;
+    high = expert_identity_hash(high, &source_id, sizeof(source_id));
+    const uint64_t file_size = file.size();
+    high = expert_identity_hash(high, &file_size, sizeof(file_size));
+    high = expert_identity_hash(high, sample.data(), sample.size());
+
+    if (file.size() > sample.size()) {
+        reader->seek(file.size() - sample.size(), SEEK_SET);
+        reader->read_raw(sample.data(), sample.size());
+        low = expert_identity_hash(low, sample.data(), sample.size());
+    } else {
+        low = expert_identity_hash(low, sample.data(), sample.size());
+    }
+    low = expert_identity_hash(low, &file_size, sizeof(file_size));
+    low = expert_identity_hash(low, &source_id, sizeof(source_id));
+    if (high == 0 && low == 0) low = 1;
+    return { high, low };
+}
+
 static bool is_merged_expert_tensor(llm_tensor tensor_type) {
     switch (tensor_type) {
-        case LLM_TENSOR_FFN_NORM_EXPS:
         case LLM_TENSOR_FFN_DOWN_EXPS:
         case LLM_TENSOR_FFN_GATE_EXPS:
         case LLM_TENSOR_FFN_UP_EXPS:
         case LLM_TENSOR_FFN_GATE_UP_EXPS:
-        case LLM_TENSOR_FFN_EXP_PROBS_B:
             return true;
         default:
             return false;
@@ -620,8 +685,29 @@ void llama_model_loader::build_expert_tensor_index(const llama_hparams & hparams
 
     expert_tensor_index.file_ranges.resize(files.size());
 
+    std::map<uint32_t, uint64_t> source_sizes;
+    uint64_t model_high = 1469598103934665603ULL;
+    uint64_t model_low  = 7809847782465536322ULL;
+    for (uint32_t source_id = 0; source_id < files.size(); ++source_id) {
+        const auto identity = expert_source_identity(*files[source_id], source_id);
+        const uint64_t size = files[source_id]->size();
+        source_sizes.emplace(source_id, size);
+        expert_tensor_index.sources.push_back({
+            source_id,
+            identity,
+            size,
+            files[source_id]->get_path(),
+        });
+        model_high = expert_identity_hash(model_high, &identity.high, sizeof(identity.high));
+        model_low  = expert_identity_hash(model_low,  &identity.low,  sizeof(identity.low));
+    }
+    model_high = expert_identity_hash(model_high, arch_name.data(), arch_name.size());
+    model_low  = expert_identity_hash(model_low, &n_bytes, sizeof(n_bytes));
+    expert_tensor_index.model_identity = { model_high, model_low };
+
     size_t deferred_bytes = 0;
     const llm_arch arch = get_arch();
+    std::map<uint32_t, std::vector<std::pair<uint64_t, uint64_t>>> descriptor_intervals;
 
     for (const auto & weight : weights) {
         const std::string name(weight.tensor->name);
@@ -637,20 +723,93 @@ void llama_model_loader::build_expert_tensor_index(const llama_hparams & hparams
         // check for split expert tensors (blk.N.ffn_gate.E.weight) by name pattern,
         // since llm_tensor_type can't resolve these (two %d in the format string)
         uint32_t expert = 0;
-        if (is_split_expert_tensor(name, expert)) {
+        llama_expert_cache::component component = llama_expert_cache::component::gate;
+        bool split_expert = is_split_expert_tensor(name, expert, &component);
+        llm_tensor tensor_type = LLM_TENSOR_UNKNOWN;
+        if (split_expert) {
             if (expert >= hparams.n_expert) {
                 throw std::runtime_error(format("expert tensor '%s' has invalid expert index %u", name.c_str(), expert));
             }
         } else {
-            const llm_tensor tensor_type = llm_tensor_type(arch, name, int(layer));
+            tensor_type = llm_tensor_type(arch, name, int(layer));
             if (!is_merged_expert_tensor(tensor_type)) {
+                continue;
+            }
+            if (!expert_component_for_tensor(tensor_type, component)) {
                 continue;
             }
         }
 
-        const size_t tensor_bytes = ggml_nbytes(weight.tensor);
-        deferred_bytes += tensor_bytes;
-        expert_tensor_index.file_ranges.at(weight.idx).push_back({ weight.offs, weight.offs + tensor_bytes });
+        const auto & source = expert_tensor_index.sources.at(weight.idx);
+        const uint64_t tensor_bytes = ggml_nbytes(weight.tensor);
+        const uint64_t tensor_offset = weight.offs;
+        if (tensor_offset > source.size || tensor_bytes > source.size - tensor_offset) {
+            throw std::runtime_error(format("expert tensor '%s' is outside source bounds", name.c_str()));
+        }
+        if (tensor_bytes > SIZE_MAX - deferred_bytes) {
+            throw std::overflow_error("deferred expert byte count overflows size_t");
+        }
+        deferred_bytes += size_t(tensor_bytes);
+        const uint64_t tensor_end = tensor_offset + tensor_bytes;
+        if (tensor_offset > SIZE_MAX || tensor_end > SIZE_MAX) {
+            throw std::overflow_error("expert mmap range exceeds addressable size");
+        }
+        expert_tensor_index.file_ranges.at(weight.idx).push_back({ size_t(tensor_offset), size_t(tensor_end) });
+
+        auto make_descriptor = [&](uint32_t expert_id, uint64_t offset, uint64_t bytes, bool remove_expert_axis) {
+            llama_expert_cache::descriptor_spec spec;
+            spec.key = { layer, expert_id, component };
+            spec.ggml_type = uint32_t(weight.tensor->type);
+            spec.quant_axis = 0;
+            spec.block_elements = uint32_t(ggml_blck_size(weight.tensor->type));
+            spec.block_bytes = uint32_t(ggml_type_size(weight.tensor->type));
+            const uint64_t source_alignment = std::gcd<uint64_t>(weight.alignment, bytes);
+            if (source_alignment > UINT32_MAX) {
+                throw std::overflow_error("expert descriptor source alignment exceeds 32 bits");
+            }
+            spec.source_alignment = uint32_t(source_alignment);
+            spec.model_identity = expert_tensor_index.model_identity;
+
+            uint8_t rank = 0;
+            for (uint8_t axis = 0; axis < GGML_MAX_DIMS; ++axis) {
+                if (remove_expert_axis && axis == 2) continue;
+                if (weight.tensor->ne[axis] == 1 && axis >= 2) continue;
+                spec.dimensions[rank] = uint64_t(weight.tensor->ne[axis]);
+                spec.strides[rank] = uint64_t(weight.tensor->nb[axis]);
+                ++rank;
+            }
+            spec.rank = rank;
+            spec.extents.push_back({ weight.idx, source.identity, offset, bytes });
+            auto descriptor = llama_expert_cache::descriptor::make(std::move(spec), source_sizes);
+            descriptor_intervals[weight.idx].push_back({ offset, offset + bytes });
+            if (!expert_tensor_index.descriptors.emplace(descriptor->key(), std::move(descriptor)).second) {
+                throw std::runtime_error(format("duplicate expert descriptor for tensor '%s'", name.c_str()));
+            }
+        };
+
+        if (split_expert) {
+            make_descriptor(expert, tensor_offset, tensor_bytes, false);
+        } else if (weight.tensor->ne[2] == hparams.n_expert && weight.tensor->ne[3] == 1 && weight.tensor->nb[2] > 0) {
+            const uint64_t expert_bytes = weight.tensor->nb[2];
+            for (uint32_t expert_id = 0; expert_id < hparams.n_expert; ++expert_id) {
+                if (expert_id != 0 && expert_bytes > (UINT64_MAX - tensor_offset)/expert_id) {
+                    throw std::overflow_error("expert descriptor offset overflows 64 bits");
+                }
+                const uint64_t offset = tensor_offset + uint64_t(expert_id)*expert_bytes;
+                make_descriptor(expert_id, offset, expert_bytes, true);
+            }
+        }
+    }
+
+    for (auto & item : descriptor_intervals) {
+        auto & intervals = item.second;
+        std::sort(intervals.begin(), intervals.end());
+        for (size_t i = 1; i < intervals.size(); ++i) {
+            if (intervals[i].first < intervals[i - 1].second) {
+                throw std::runtime_error(format(
+                        "expert descriptor extents overlap in source %u", item.first));
+            }
+        }
     }
 
     for (auto & ranges : expert_tensor_index.file_ranges) {

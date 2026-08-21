@@ -28,7 +28,7 @@ For a dense model above the conservative free-VRAM threshold, the launcher adds 
 
 ## Hybrid policy
 
-Use for sparse models that fit host RAM but not VRAM:
+Use when you explicitly want static CPU/GPU expert placement:
 
 ```bash
 ./ese serve MODEL.gguf --policy hybrid
@@ -42,6 +42,7 @@ Safe default:
 ```
 
 Dense and non-expert tensors use normal GPU offload while routed experts remain in CPU memory.
+Unlike `cache`, this policy does not adapt expert residency from observed routes.
 
 Retain a measured final MoE tail on GPU:
 
@@ -59,6 +60,37 @@ For a 36-block GGUF this produces:
 
 The launcher requires a readable GGUF block count before translating this option. It does not guess layer geometry.
 
+## Cache policy
+
+Use when a sparse model fits the safe host-RAM budget but its experts do not
+fit VRAM:
+
+```bash
+./ese serve MODEL.gguf --policy cache
+```
+
+The launcher enables the unified bounded expert hierarchy:
+
+```text
+NVMe/model shards -> RAM leases -> per-device VRAM cache
+```
+
+The default storage backend is `mmap`. RAM and per-device VRAM capacities are
+calculated conservatively, or can be set explicitly:
+
+```bash
+./ese serve MODEL.gguf \
+  --policy cache \
+  --expert-ram-cache 4GiB \
+  --expert-ram-staging 64MiB \
+  --expert-vram-cache 1GiB \
+  --expert-cache-min-observations 2
+```
+
+The RAM limit is a hard arena bound. The VRAM limit is applied independently
+to every participating GPU and is reduced as needed to retain the configured
+free-memory reserve.
+
 ## Stream policy
 
 Use when a sparse model exceeds the safe host-RAM budget:
@@ -71,10 +103,10 @@ The launcher sets:
 
 ```text
 GGML_CUDA_NO_PINNED=1
-LLAMA_EXPERT_PREFETCH=1
 ```
 
-and adds:
+and adds the same bounded controller used by `cache`, with `pread` as the
+default storage backend:
 
 ```text
 --defer-experts
@@ -91,10 +123,13 @@ Keep a known-good GPU tail when capacity permits:
   --kv q8_0
 ```
 
-Router-logit-tail staging remains opt-in:
+Route-aware page-cache prefetch remains opt-in and requires mmap storage:
 
 ```bash
-./ese serve MODEL.gguf --policy stream --prefetch-tail 4
+./ese serve MODEL.gguf \
+  --policy stream \
+  --expert-storage-backend mmap \
+  --prefetch-tail 4
 ```
 
 This sets `LLAMA_EXPERT_PREFETCH_TAIL=4`. The fired top-k stays first; the extra near-miss experts are advisory asynchronous work.
@@ -132,7 +167,11 @@ Override after measuring a better model-specific split:
 ./ese serve MODEL.gguf --tensor-split 46,54
 ```
 
-The current unified line does not claim buun-style adaptive expert-parallel VRAM caching. That work is tracked in Phase 2.
+Each participating device has its own capacity and reserve. Expert uploads use
+dedicated transfer streams and event dependencies, while placement follows the
+normal graph/tensor split. The Phase 2 acceptance matrix exercises one, two,
+and three GPUs; the implementation remains validation-pending until that
+runtime evidence is attached.
 
 ## Context and reserve
 
@@ -150,8 +189,8 @@ Defaults:
 
 - decode threads: up to 8, approximately half detected logical CPUs;
 - batch threads: up to 32;
-- hybrid/stream batch: 1024;
-- hybrid/stream ubatch: 512.
+- hybrid/cache/stream batch: 1024;
+- hybrid/cache/stream ubatch: 512.
 
 Override after measuring your host:
 
@@ -190,11 +229,22 @@ The JSON includes policy and reason, shards and total size, architecture metadat
 
 ### Startup allocates most host RAM
 
-Verify the stream plan contains `GGML_CUDA_NO_PINNED=1` and `--defer-experts`.
+Verify the cache/stream plan contains `GGML_CUDA_NO_PINNED=1` and a non-zero
+`--expert-ram-cache-mib` bound. A `stream` plan must additionally contain
+`--defer-experts`.
 
 ### Hybrid mode is too slow
 
 Measure a small GPU tail with `--gpu-resident-moe N`. Increase gradually; a tail that does not fit can prevent startup.
+
+For route-adaptive placement instead, use `--policy cache` and inspect the
+per-device hit, admission, eviction, and transfer telemetry.
+
+### Stream prefetch is rejected
+
+`--prefetch-tail N` is a page-cache hint and therefore requires
+`--expert-storage-backend mmap`. The normal `stream` default is `pread` and
+does not enable speculative prefetch.
 
 ### Auto chose the wrong policy
 

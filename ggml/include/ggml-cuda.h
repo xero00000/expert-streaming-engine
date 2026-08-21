@@ -24,6 +24,7 @@ extern "C" {
 GGML_API GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, const void * params, const void * model);
 
 GGML_API GGML_CALL bool ggml_backend_is_cuda(ggml_backend_t backend);
+GGML_API GGML_CALL int  ggml_backend_cuda_get_device(ggml_backend_t backend);
 
 // device buffer
 GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);

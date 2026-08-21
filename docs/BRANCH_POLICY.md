@@ -13,8 +13,12 @@ Base: `deepseek4-expert-streaming`.
 Contains:
 
 - the current DeepSeek V4 integration line;
-- deferred expert streaming and route-aware prefetch;
+- deferred expert streaming and opt-in route-aware mmap prefetch;
 - CPU-MoE hybrid placement with an optional GPU-resident tail;
+- the bounded descriptor/storage/RAM expert tier and adaptive per-device VRAM
+  tier implemented for Phase 2, subject to its recorded hardware matrix;
+- the Phase 1 Turbo KV, TCQ, VBR, and lifecycle foundation released as
+  `v0.1.0`;
 - DeepSeek V4, DSpark/MTP, Maple/TQ2_0, and recent CUDA work already present on that line;
 - the `ese` launcher, focused docs, tests, and CI.
 

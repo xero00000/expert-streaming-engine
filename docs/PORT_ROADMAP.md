@@ -24,9 +24,9 @@ A tree SHA and a commit SHA are recorded separately. Every code port must pin th
 
 | Capability | Status | Unified treatment |
 | --- | --- | --- |
-| Deferred mmap expert storage | Integrated | `stream` policy |
-| Route-aware page-cache prefetch | Integrated | enabled by `stream` |
-| CPU MoE plus optional GPU-resident tail | Integrated | `hybrid` / `stream` |
+| Deferred expert storage | Integrated | `stream` policy; pread default, mmap optional |
+| Route-aware page-cache prefetch | Integrated | opt-in mmap hint for `cache` / `stream` |
+| CPU MoE plus optional GPU-resident tail | Integrated | `hybrid` / `cache` / `stream` |
 | One startup interface | Integrated | `ese doctor/build/plan/serve` |
 | GGUF-aware startup policy | Foundation | standard-library planner |
 | DeepSeek V4, DSpark, MTP integration-line work | Integrated | native options remain available |
@@ -35,14 +35,19 @@ A tree SHA and a commit SHA are recorded separately. Every code port must pin th
 | Fixed Turbo2/3/4/8 CUDA Flash Attention | Foundation | direct compressed decode reads; device-only F16 staging remains for prefill |
 | Fixed Turbo2/3/4/8 per-head padding | Foundation | odd K/V heads padded independently; logical output width restored |
 | Turbo1/2/3-TCQ CPU + CUDA | Foundation | substantive Viterbi references, signed FWHT, O(1) state lookup, direct decode reads |
-| Adaptive VRAM MoE cache | Planned | Phase 2 / issue #5 |
-| Multi-GPU expert-parallel cache | Planned | Phase 2 / issue #5 |
-| Core Turbo KV types, CUDA, TCQ, and VBR | In progress | Phase 1 / issue #4 |
+| Adaptive VRAM MoE cache | Validation pending | Phase 2 implementation complete; 1/2/3-GPU runtime gate remains |
+| Multi-GPU expert-parallel cache | Validation pending | graph/tensor-distributed matrix in Phase 2 / issue #5 |
+| Core Turbo KV types, CUDA, TCQ, and VBR | Phase 1 released | issue #4 closed; internal promotion gates remain explicit |
 | Transient mmproj/MTP sharing | Planned | Phase 3 / issue #6 |
 | Adaptive MTP depth / mapped vocabulary | Planned | Phase 3 / issue #6 |
 | Global dynamic resource controller | Planned | Phase 4 / issue #7 |
 
 ## Phase 1 — KV ladder, TCQ, and VBR
+
+Phase 1 was merged and released as `v0.1.0`. The release establishes the
+checked internal foundation described below; it does not waive the later
+promotion gates for formats that intentionally remain absent from the public
+cache-type parser.
 
 ### Fixed Turbo codecs
 
@@ -125,23 +130,41 @@ model sensitivity tables and live cache-storage retiering remain in progress.
 
 ## Phase 2 — One NVMe → RAM → VRAM expert hierarchy
 
-The current `stream` and static `hybrid` paths should become levels of one bounded native cache.
+The native hierarchy and the `cache`/`stream` launcher presets are implemented
+on the Phase 2 branch. CPU/storage parity, forced churn, compile, server, and
+sanitizer gates pass. The one-, two-, and three-GPU Turing/Ampere runtime
+matrix remains the final pre-merge gate; Ada-or-newer coverage has a documented
+solo-maintainer hardware exception. See
+`docs/PHASE2_EXPERT_CACHE_VALIDATION.md`.
 
 ### Common expert descriptor
 
-Use immutable checked 64-bit descriptors containing layer, expert, component, one or more shard extents, dtype/quant geometry, dimensions/strides/axis, and source identity.
+Implemented as immutable checked 64-bit descriptors containing layer, expert,
+component, one or more shard extents, dtype/quant geometry,
+dimensions/strides/axis, and source/model identity. File identity is rechecked
+when the cache opens each source.
 
 ### Bounded RAM cache
 
-Add explicit byte capacity, admission, lease lifetime, deterministic eviction, reusable staging, and mmap/pread/io_uring backends. Correctness and limits cannot depend on an unobservable unlimited OS page cache.
+Implemented with an exact fixed resident arena, explicit staging bound,
+lease-scoped lifetime, deterministic aligned first-fit/LRU eviction, and
+mmap/pread/io_uring sources. Deferred `stream` operation does not require the
+original expert pages to remain resident.
 
 ### Adaptive VRAM cache
 
-Consume expert leases from any host/storage backend. Add hysteresis, minimum observations, route frequency, predicted route, reuse distance, load cost, eviction cost, asynchronous promotion/demotion, and event-scoped readiness.
+The per-device cache consumes the same leases from every host/storage backend.
+Admission includes hysteresis, minimum observations, route frequency,
+prediction, reuse distance, and load cost; eviction includes deterministic age
+and ready-byte cost. Dedicated CUDA transfer streams and upload/compute events
+provide readiness without global compute synchronization.
 
 ### Multi-GPU expert parallelism
 
-Add per-device capacities/reserves, topology-aware placement, row/tensor distribution, and CPU miss overlap where profitable.
+Per-device capacities/reserves include route metadata, placement follows the
+device owning each activation, and the acceptance runner uses graph split to
+exercise row/tensor distribution across every requested GPU. Prompt-sized CPU
+MoE remains on the scheduler path where independent device work can overlap.
 
 Acceptance:
 

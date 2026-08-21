@@ -7,8 +7,9 @@ native execution paths that this branch actually exposes:
 * resident: ordinary GPU offload / native auto-fit;
 * hybrid: dense tensors on GPU with routed experts on CPU, optionally keeping
   a user-selected MoE tail on GPU;
-* stream: the hybrid path plus deferred mmap expert residency and route-aware
-  page-cache prefetch.
+* cache: bounded RAM expert leases feeding the adaptive per-device VRAM cache;
+* stream: the same hierarchy with deferred source residency and explicit
+  storage I/O.
 
 ``ese plan`` always prints the exact environment and native command. Native
 llama-server options can be appended after ``--``.
@@ -36,7 +37,7 @@ GIB = 1024**3
 MIB = 1024**2
 DEFAULT_SERVER = Path("build/bin/llama-server")
 KNOWN_KV_TYPES = ("auto", "f16", "q8_0", "q4_0")
-POLICIES = ("auto", "resident", "hybrid", "stream")
+POLICIES = ("auto", "resident", "hybrid", "cache", "stream")
 
 
 class ESEError(RuntimeError):
@@ -477,8 +478,8 @@ def select_policy(
         )
     if model.is_moe and (not free_vram or model.total_bytes > int(free_vram * 0.85)):
         return (
-            "hybrid",
-            "MoE weights do not fit safely in free VRAM; keep experts on CPU and dense tensors on GPU",
+            "cache",
+            "MoE weights do not fit safely in free VRAM; use bounded RAM leases and adaptive VRAM residency",
         )
     if free_vram and model.total_bytes <= int(free_vram * 0.85):
         return (
@@ -486,7 +487,7 @@ def select_policy(
             f"model fits within 85% of detected free VRAM ({human_bytes(free_vram)})",
         )
     if model.is_moe:
-        return "hybrid", "GPU capacity was not detected; CPU MoE is the safe default"
+        return "cache", "GPU capacity was not detected; use the bounded RAM expert tier on CPU"
     return "resident", "dense/non-MoE model; use the native resident/auto-fit path"
 
 
@@ -498,6 +499,33 @@ def auto_tensor_split(gpus: Sequence[GPUInfo]) -> str | None:
     percentages = [round(value * 100 / total) for value in weights]
     percentages[-1] += 100 - sum(percentages)
     return ",".join(str(max(1, value)) for value in percentages)
+
+
+def _mib_ceil(value: int, option: str) -> str:
+    if value < MIB:
+        raise ESEError(f"{option} must be at least 1MiB")
+    return str((value + MIB - 1) // MIB)
+
+
+def _mib_nonnegative(value: int, option: str) -> str:
+    if value < 0:
+        raise ESEError(f"{option} cannot be negative")
+    return str((value + MIB - 1) // MIB)
+
+
+def _default_expert_ram_cache(hardware: HardwareInfo) -> int:
+    available = hardware.host.available_bytes
+    if available <= 0:
+        return 512 * MIB
+    return max(MIB, min(4 * GIB, available // 8))
+
+
+def _default_expert_vram_cache(hardware: HardwareInfo, reserve_vram: int) -> int:
+    if not hardware.gpus:
+        return 0
+    usable_per_device = min(max(0, gpu.free_bytes - reserve_vram) for gpu in hardware.gpus)
+    candidate = min(2 * GIB, usable_per_device // 4)
+    return candidate if candidate >= 64 * MIB else 0
 
 
 def choose_kv_type(
@@ -564,14 +592,27 @@ def build_launch_plan(
     gpu_resident_moe: int | None = None,
     tensor_split: str | None = None,
     prefetch_tail: int = 0,
+    expert_ram_cache: int | None = None,
+    expert_ram_staging: int | None = None,
+    expert_vram_cache: int | None = None,
+    expert_storage_backend: str | None = None,
+    expert_cache_min_observations: int = 2,
     extra_args: Sequence[str] = (),
 ) -> LaunchPlan:
+    if reserve_vram < 0:
+        raise ESEError("--reserve-vram cannot be negative")
+    if not 0 <= prefetch_tail <= 32:
+        raise ESEError("--prefetch-tail must be between 0 and 32")
     selected_policy, reason = select_policy(model, hardware, policy)
     decode_default, batch_default = _default_threads(hardware.logical_cpus)
     threads = threads or decode_default
     batch_threads = batch_threads or batch_default
     kv = choose_kv_type(kv_type, context, hardware, reserve_vram)
     split = tensor_split or auto_tensor_split(hardware.gpus)
+    if expert_storage_backend not in (None, "mmap", "pread", "io_uring"):
+        raise ESEError("--expert-storage-backend must be mmap, pread, or io_uring")
+    if expert_cache_min_observations < 1:
+        raise ESEError("--expert-cache-min-observations must be at least 1")
 
     args: list[str] = [
         "-m",
@@ -617,16 +658,61 @@ def build_launch_plan(
         )
         args.extend(("-b", str(batch_size or 1024), "-ub", str(ubatch_size or 512)))
 
-    elif selected_policy == "stream":
+    elif selected_policy in ("cache", "stream"):
         if not model.is_moe:
-            raise ESEError("--policy stream requires a sparse MoE model")
-        env.update({"GGML_CUDA_NO_PINNED": "1", "LLAMA_EXPERT_PREFETCH": "1"})
+            raise ESEError(f"--policy {selected_policy} requires a sparse MoE model")
+        env["GGML_CUDA_NO_PINNED"] = "1"
+        backend = expert_storage_backend or ("pread" if selected_policy == "stream" else "mmap")
         if prefetch_tail > 0:
+            if backend != "mmap":
+                raise ESEError("--prefetch-tail requires --expert-storage-backend mmap")
+            env["LLAMA_EXPERT_PREFETCH"] = "1"
             env["LLAMA_EXPERT_PREFETCH_TAIL"] = str(min(prefetch_tail, 32))
-        args.extend(("-ngl", "99", "--defer-experts"))
+
+        ram_cache = (
+            _default_expert_ram_cache(hardware)
+            if expert_ram_cache is None
+            else expert_ram_cache
+        )
+        vram_cache = (
+            expert_vram_cache
+            if expert_vram_cache is not None
+            else _default_expert_vram_cache(hardware, reserve_vram)
+        )
+        args.extend(("-ngl", "99"))
+        if selected_policy == "stream":
+            args.append("--defer-experts")
         args.extend(
             _moe_placement_args(model, gpu_resident_moe, require_cpu_layer=True)
         )
+        args.extend(
+            (
+                "--expert-ram-cache-mib",
+                _mib_ceil(ram_cache, "--expert-ram-cache"),
+                "--expert-storage-backend",
+                backend,
+                "--expert-cache-min-observations",
+                str(expert_cache_min_observations),
+            )
+        )
+        if expert_ram_staging is not None:
+            if expert_ram_staging > ram_cache:
+                raise ESEError("--expert-ram-staging cannot exceed --expert-ram-cache")
+            args.extend(
+                (
+                    "--expert-ram-staging-mib",
+                    _mib_ceil(expert_ram_staging, "--expert-ram-staging"),
+                )
+            )
+        if vram_cache:
+            args.extend(
+                (
+                    "--expert-vram-cache-mib",
+                    _mib_ceil(vram_cache, "--expert-vram-cache"),
+                    "--expert-vram-reserve-mib",
+                    _mib_nonnegative(reserve_vram, "--reserve-vram"),
+                )
+            )
         args.extend(("-b", str(batch_size or 1024), "-ub", str(ubatch_size or 512)))
 
     else:
@@ -779,7 +865,7 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         "--policy",
         choices=POLICIES,
         default="auto",
-        help="resident, hybrid CPU-MoE, or deferred stream; auto is recommended",
+        help="resident, static hybrid, bounded cache, or deferred stream; auto is recommended",
     )
     parser.add_argument("--binary", help="path to llama-server (or set ESE_SERVER)")
     parser.add_argument("-c", "--context", type=int, default=65_536)
@@ -811,7 +897,36 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         "--prefetch-tail",
         type=int,
         default=0,
-        help="stream: stage N router-logit near-miss experts (0-32)",
+        help="mmap-backed cache/stream: stage N router-logit near-miss experts (0-32)",
+    )
+    parser.add_argument(
+        "--expert-ram-cache",
+        type=parse_size,
+        help="cache/stream RAM expert capacity (default: one eighth of available RAM, capped at 4GiB)",
+    )
+    parser.add_argument(
+        "--expert-ram-staging",
+        type=parse_size,
+        help=(
+            "cache/stream reusable I/O staging bound "
+            "(default: max(largest expert component, min(cache, 64MiB)))"
+        ),
+    )
+    parser.add_argument(
+        "--expert-vram-cache",
+        type=parse_size,
+        help="adaptive expert cache per GPU (default: one quarter of free VRAM after reserve, capped at 2GiB)",
+    )
+    parser.add_argument(
+        "--expert-storage-backend",
+        choices=("mmap", "pread", "io_uring"),
+        help="exact expert source backend (default: mmap for cache, pread for stream)",
+    )
+    parser.add_argument(
+        "--expert-cache-min-observations",
+        type=int,
+        default=2,
+        help="minimum routes before adaptive VRAM admission (default: 2)",
     )
     parser.add_argument("--json", action="store_true")
 
@@ -819,7 +934,7 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
 def _make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ese",
-        description="One front door for resident, hybrid, and disk-streamed ESE inference.",
+        description="One front door for resident, hybrid, cached, and disk-streamed ESE inference.",
     )
     parser.add_argument("--version", action="version", version="ese unified launcher 0.2")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -868,6 +983,11 @@ def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
         gpu_resident_moe=args.gpu_resident_moe,
         tensor_split=args.tensor_split,
         prefetch_tail=args.prefetch_tail,
+        expert_ram_cache=args.expert_ram_cache,
+        expert_ram_staging=args.expert_ram_staging,
+        expert_vram_cache=args.expert_vram_cache,
+        expert_storage_backend=args.expert_storage_backend,
+        expert_cache_min_observations=args.expert_cache_min_observations,
         extra_args=args.extra,
     )
 
