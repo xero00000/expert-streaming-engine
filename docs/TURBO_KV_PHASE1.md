@@ -78,6 +78,24 @@ for a padded 256-token K/V extent. It exercises an F16 additive mask, two-query
 GQA, and logit softcap for both formats on every visible CUDA device, with a
 maximum absolute-error bound of `1e-3`.
 
+## Per-head padding for unusual dimensions
+
+Turbo storage blocks contain 128 values, so a logical K or V head that is not
+128-aligned must never share a block with the next head. ESE now rounds each
+Turbo head independently, zero-pads K, V, and Q before Flash Attention, and
+crops the attention result back to the model's logical V width. Non-Turbo cache
+geometry is unchanged.
+
+The physical padded geometry is used consistently by whole-cache and split-
+cache allocation, cache writes, attention views, defragmentation, K shift,
+memory accounting, and state serialization. Turbo cache allocation is rejected
+when Flash Attention is disabled because the legacy transposed-V layout is not
+a valid Turbo execution path.
+
+The CUDA graph test covers both a naturally aligned 128-wide head and a
+96-wide head padded to 128 for Turbo4 and Turbo8 on every visible GPU. The odd-
+width case retains the mask, two-query GQA, softcap, and `1e-3` error gate.
+
 ## Deliberately not exposed yet
 
 This slice does **not** add `turbo4` or `turbo8` to:
@@ -85,7 +103,7 @@ This slice does **not** add `turbo4` or `turbo8` to:
 - `--cache-type-k` or `--cache-type-v`;
 - `tools/ese.py`;
 - ROCm, Metal, or Vulkan;
-- server save/restore or cache lifecycle operations.
+- a claim that the full serving cache lifecycle has passed validation.
 
 The native KV parser remains an explicit whitelist, and a source-level regression test prevents the internal type names from being added accidentally. A registered storage type is still not a serving feature until backend execution, lifecycle behavior, and quality gates all pass.
 
@@ -147,16 +165,17 @@ Before accepting the types as KV cache options:
 - native encode/decode row kernels — complete;
 - device-native Flash Attention compatibility bridge — complete;
 - fused direct Turbo reads — pending;
-- odd head-dimension padding;
+- odd head-dimension padding — complete at allocation and graph level;
 - no host fallback;
 - Ampere plus one newer NVIDIA architecture;
 - prompt-processing and decode measurements separately;
 - bounded temporary memory.
 
 Current hardware evidence covers Turing sm_75 and Ampere sm_86. It verifies the
-row codecs and the masked, soft-capped GQA compatibility bridge. The final
-promotion gate still requires direct fused reads, odd-dimension padding,
-prompt/decode measurements, and Ampere plus one newer NVIDIA architecture.
+row codecs and the masked, soft-capped GQA compatibility bridge at aligned and
+odd logical head widths. The final promotion gate still requires direct fused
+reads, prompt/decode measurements, and Ampere plus one newer NVIDIA
+architecture.
 
 ### Gate C — quality and lifecycle
 

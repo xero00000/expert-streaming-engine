@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-turbo-kv.h"
+#include "llama-kv-padding.h"
 
 #include <algorithm>
 #include <cmath>
@@ -131,6 +132,15 @@ static_assert(sizeof(ggml_turbo4_block) == GGML_TURBO4_BLOCK_BYTES, "Turbo4 ABI 
 static_assert(sizeof(ggml_turbo8_block) == GGML_TURBO8_BLOCK_BYTES, "Turbo8 ABI changed");
 
 int main() {
+    require(llama_kv_head_dim_for_type(GGML_TYPE_F16, 96) == 96,
+            "F16 head geometry remains unchanged");
+    require(llama_kv_head_dim_for_type(GGML_TYPE_TURBO4_0, 96) == 128,
+            "Turbo4 pads a 96-wide head independently");
+    require(llama_kv_head_dim_for_type(GGML_TYPE_TURBO8_0, 129) == 256,
+            "Turbo8 rounds each head to the next 128-value block");
+    require(llama_kv_gqa_dim_for_type(GGML_TYPE_TURBO4_0, 96, 3) == 384,
+            "Turbo GQA padding does not cross head boundaries");
+
     check_type(
         GGML_TYPE_TURBO4_0,
         GGML_TURBO_KV_FORMAT_TURBO4,
