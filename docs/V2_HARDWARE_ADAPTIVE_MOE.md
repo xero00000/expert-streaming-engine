@@ -27,11 +27,11 @@ Profiles default to `~/.cache/ese/hardware-profile.json`. They are versioned, wr
 | Measurement | Current source | Planner-ready |
 | --- | --- | --- |
 | Sustained host copy | native timed `memcpy` | No; baseline only |
-| H2D/D2H | `ggml_backend_tensor_set/get` on a real CUDA backend | No; missing expert geometry/type keys |
-| H2D under host-memory contention | CUDA upload concurrent with host copy | No; baseline only |
+| H2D/D2H | `ggml_backend_tensor_set/get` on every detected CUDA backend | No; needs confidence scoring |
+| H2D under host-memory contention | Per-device CUDA upload concurrent with host copy | No; baseline only |
 | CPU MoE | Real `ggml_mul_mat_id` over two actual GGUF expert payloads for every discovered type/geometry | No; still needs an independent numerical reference and confidence scoring |
-| Adaptive expert-cache upload | Shared production async upload primitive sized from real split-GGUF expert metadata | No; missing full lease/route/event timing |
-| CPU MoE + cache upload contention | Concurrent model-format routed matvec and production upload primitive | No; still needs full lease/route/event timing and per-device results |
+| Adaptive expert-cache upload | Per-device production async upload primitive sized from real split-GGUF expert metadata | No; missing full lease/route/event timing |
+| CPU MoE + cache upload contention | Per-device concurrent model-format routed matvec and production upload primitive | No; still needs full lease/route/event timing |
 
 The planner must not consume Phase A data until the last two rows use their production paths and results are keyed by expert GGML type, geometry, GPU, and NUMA node.
 Baseline profiles therefore carry `benchmark_source.planner_ready: false`.

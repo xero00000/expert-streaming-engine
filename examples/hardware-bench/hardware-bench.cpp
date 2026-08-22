@@ -142,10 +142,12 @@ std::string json_escape(const std::string & value) {
     return escaped;
 }
 
-ggml_backend_t find_cuda_backend(std::string & name) {
+ggml_backend_t find_cuda_backend(std::string & name, size_t ordinal = 0) {
+    size_t found = 0;
     for (size_t i = 0; i < ggml_backend_reg_get_count(); ++i) {
         const char * candidate = ggml_backend_reg_get_name(i);
         if (candidate && std::string(candidate).rfind("CUDA", 0) == 0) {
+            if (found++ != ordinal) continue;
             ggml_backend_t backend = ggml_backend_reg_init_backend(i, nullptr);
             if (backend) {
                 name = candidate;
@@ -180,9 +182,9 @@ struct transfer_probe {
     }
 };
 
-transfer_probe make_transfer_probe(size_t bytes, std::string & backend_name) {
+transfer_probe make_transfer_probe(size_t bytes, std::string & backend_name, size_t ordinal = 0) {
     transfer_probe probe;
-    probe.backend = find_cuda_backend(backend_name);
+    probe.backend = find_cuda_backend(backend_name, ordinal);
     if (!probe.backend) return probe;
     ggml_init_params params = { ggml_tensor_overhead() * 2, nullptr, true };
     probe.context = ggml_init(params);
@@ -201,6 +203,20 @@ struct cpu_moe_result {
     double latency_ms_median = 0;
     double effective_gbps_median = 0;
     double checksum = 0;
+};
+
+struct device_transfer_result {
+    std::string backend;
+    double h2d_gbps = 0;
+    double d2h_gbps = 0;
+    double contended_h2d_gbps = 0;
+    std::vector<double> expert_upload_gbps;
+};
+
+struct device_contention_result {
+    std::string backend;
+    std::vector<cpu_moe_result> cpu;
+    std::vector<double> upload_gbps;
 };
 
 cpu_moe_result measure_cpu_moe(
@@ -503,6 +519,73 @@ int main(int argc, char ** argv) {
                 }
             }
         }
+        std::vector<device_transfer_result> device_transfers;
+        if (transfer.backend) {
+            device_transfer_result primary;
+            primary.backend = backend_name;
+            primary.h2d_gbps = median(h2d_samples);
+            primary.d2h_gbps = median(d2h_samples);
+            primary.contended_h2d_gbps = median(contention_h2d_samples);
+            if (opts.model_experts.empty()) {
+                primary.expert_upload_gbps.push_back(median(expert_cache_upload_samples));
+            } else {
+                for (const auto & samples : model_expert_upload_samples) {
+                    primary.expert_upload_gbps.push_back(median(samples));
+                }
+            }
+            device_transfers.push_back(std::move(primary));
+
+            for (size_t ordinal = 1;; ++ordinal) {
+                std::string extra_name;
+                transfer_probe extra = make_transfer_probe(allocation_bytes, extra_name, ordinal);
+                if (!extra.backend) break;
+                std::vector<double> extra_h2d;
+                std::vector<double> extra_d2h;
+                std::vector<double> extra_contended;
+                std::vector<std::vector<double>> extra_uploads(
+                        std::max<size_t>(1, opts.model_experts.size()));
+                ggml_backend_tensor_set(extra.tensor, source.data(), 0, opts.bytes);
+                ggml_backend_synchronize(extra.backend);
+                for (int i = 0; i < opts.iterations; ++i) {
+                    auto start = clock_type::now();
+                    ggml_backend_tensor_set(extra.tensor, source.data(), 0, opts.bytes);
+                    ggml_backend_synchronize(extra.backend);
+                    extra_h2d.push_back(gbps(opts.bytes, seconds_since(start)));
+                    start = clock_type::now();
+                    ggml_backend_tensor_get(extra.tensor, destination.data(), 0, opts.bytes);
+                    ggml_backend_synchronize(extra.backend);
+                    extra_d2h.push_back(gbps(opts.bytes, seconds_since(start)));
+                    std::thread host_copy([&]() { std::memcpy(destination.data(), source.data(), opts.bytes); });
+                    start = clock_type::now();
+                    ggml_backend_tensor_set(extra.tensor, source.data(), 0, opts.bytes);
+                    ggml_backend_synchronize(extra.backend);
+                    extra_contended.push_back(gbps(opts.bytes, seconds_since(start)));
+                    host_copy.join();
+                    if (opts.model_experts.empty()) {
+                        start = clock_type::now();
+                        ggml_backend_expert_cache_upload_async(
+                                extra.backend, extra.tensor, source.data(), 0, expert_upload_bytes);
+                        ggml_backend_synchronize(extra.backend);
+                        extra_uploads[0].push_back(gbps(expert_upload_bytes, seconds_since(start)));
+                    } else {
+                        for (size_t j = 0; j < opts.model_experts.size(); ++j) {
+                            start = clock_type::now();
+                            ggml_backend_expert_cache_upload_async(
+                                    extra.backend, extra.tensor, source.data(), 0, opts.model_experts[j].bytes);
+                            ggml_backend_synchronize(extra.backend);
+                            extra_uploads[j].push_back(gbps(opts.model_experts[j].bytes, seconds_since(start)));
+                        }
+                    }
+                }
+                device_transfer_result measured;
+                measured.backend = extra_name;
+                measured.h2d_gbps = median(extra_h2d);
+                measured.d2h_gbps = median(extra_d2h);
+                measured.contended_h2d_gbps = median(extra_contended);
+                for (const auto & samples : extra_uploads) measured.expert_upload_gbps.push_back(median(samples));
+                device_transfers.push_back(std::move(measured));
+            }
+        }
         const cpu_moe_result cpu_moe = measure_cpu_moe(opts.iterations, opts.threads);
         std::vector<cpu_moe_result> model_cpu_moe;
         model_cpu_moe.reserve(opts.model_experts.size());
@@ -538,6 +621,49 @@ int main(int argc, char ** argv) {
                     &contended_model_upload_seconds[i]));
             }
         }
+        std::vector<device_contention_result> device_contentions;
+        if (transfer.backend) {
+            device_contention_result primary;
+            primary.backend = backend_name;
+            if (opts.model_experts.empty()) {
+                primary.cpu.push_back(contended_cpu_moe);
+                primary.upload_gbps.push_back(
+                        gbps(expert_upload_bytes, median(contended_expert_upload_seconds)));
+            } else {
+                primary.cpu = contended_model_cpu_moe;
+                for (size_t i = 0; i < opts.model_experts.size(); ++i) {
+                    primary.upload_gbps.push_back(
+                            gbps(opts.model_experts[i].bytes, median(contended_model_upload_seconds[i])));
+                }
+            }
+            device_contentions.push_back(std::move(primary));
+            for (size_t ordinal = 1;; ++ordinal) {
+                std::string extra_name;
+                transfer_probe extra = make_transfer_probe(allocation_bytes, extra_name, ordinal);
+                if (!extra.backend) break;
+                device_contention_result measured;
+                measured.backend = extra_name;
+                const size_t count = std::max<size_t>(1, opts.model_experts.size());
+                for (size_t i = 0; i < count; ++i) {
+                    const size_t bytes = opts.model_experts.empty() ? expert_upload_bytes : opts.model_experts[i].bytes;
+                    std::vector<double> upload_seconds;
+                    auto concurrent = [&]() {
+                        const auto start = clock_type::now();
+                        ggml_backend_expert_cache_upload_async(
+                                extra.backend, extra.tensor, source.data(), 0, bytes);
+                        ggml_backend_synchronize(extra.backend);
+                        return seconds_since(start);
+                    };
+                    measured.cpu.push_back(opts.model_experts.empty()
+                            ? measure_cpu_moe(opts.iterations, opts.threads, concurrent, &upload_seconds)
+                            : measure_model_cpu_moe(
+                                    opts.model_experts[i], opts.iterations, opts.threads,
+                                    concurrent, &upload_seconds));
+                    measured.upload_gbps.push_back(gbps(bytes, median(upload_seconds)));
+                }
+                device_contentions.push_back(std::move(measured));
+            }
+        }
 
         std::cout << std::fixed << std::setprecision(6);
         std::cout << "{\n  \"benchmark_source\": {\n"
@@ -556,7 +682,34 @@ int main(int argc, char ** argv) {
             std::cout << "    \"gpu_transfer\": {\"status\": \"measured\", \"backend\": \""
                       << json_escape(backend_name) << "\", \"h2d_gbps_median\": " << median(h2d_samples)
                       << ", \"d2h_gbps_median\": " << median(d2h_samples)
-                      << ", \"contended_h2d_gbps_median\": " << median(contention_h2d_samples) << "},\n";
+                      << ", \"contended_h2d_gbps_median\": " << median(contention_h2d_samples)
+                      << ", \"devices\": [";
+            for (size_t i = 0; i < device_transfers.size(); ++i) {
+                if (i) std::cout << ", ";
+                const auto & device = device_transfers[i];
+                std::cout << "{\"backend\": \"" << json_escape(device.backend)
+                          << "\", \"h2d_gbps_median\": " << device.h2d_gbps
+                          << ", \"d2h_gbps_median\": " << device.d2h_gbps
+                          << ", \"contended_h2d_gbps_median\": " << device.contended_h2d_gbps
+                          << ", \"expert_upload_profiles\": [";
+                for (size_t j = 0; j < device.expert_upload_gbps.size(); ++j) {
+                    if (j) std::cout << ", ";
+                    std::cout << "{";
+                    if (!opts.model_experts.empty()) {
+                        const auto & spec = opts.model_experts[j];
+                        std::cout << "\"ggml_type_id\": " << spec.type
+                                  << ", \"ggml_type\": \"" << ggml_type_name(static_cast<ggml_type>(spec.type))
+                                  << "\", \"input_width\": " << spec.input_width
+                                  << ", \"expert_width\": " << spec.expert_width
+                                  << ", \"bytes_per_expert_component\": " << spec.bytes << ", ";
+                    } else {
+                        std::cout << "\"bytes\": " << expert_upload_bytes << ", ";
+                    }
+                    std::cout << "\"gbps_median\": " << device.expert_upload_gbps[j] << "}";
+                }
+                std::cout << "]}";
+            }
+            std::cout << "]},\n";
         } else {
             std::cout << "    \"gpu_transfer\": {\"status\": \"unavailable\", \"reason\": \"no CUDA backend\"},\n";
         }
@@ -615,6 +768,32 @@ int main(int argc, char ** argv) {
                 }
                 std::cout << "]";
             }
+            std::cout << ", \"devices\": [";
+            for (size_t i = 0; i < device_contentions.size(); ++i) {
+                if (i) std::cout << ", ";
+                const auto & device = device_contentions[i];
+                std::cout << "{\"backend\": \"" << json_escape(device.backend) << "\", \"profiles\": [";
+                for (size_t j = 0; j < device.cpu.size(); ++j) {
+                    if (j) std::cout << ", ";
+                    const auto & result = device.cpu[j];
+                    std::cout << "{";
+                    if (!opts.model_experts.empty()) {
+                        const auto & spec = opts.model_experts[j];
+                        std::cout << "\"ggml_type_id\": " << spec.type
+                                  << ", \"ggml_type\": \"" << ggml_type_name(static_cast<ggml_type>(spec.type))
+                                  << "\", \"input_width\": " << spec.input_width
+                                  << ", \"expert_width\": " << spec.expert_width
+                                  << ", \"bytes_per_expert_component\": " << spec.bytes << ", ";
+                    } else {
+                        std::cout << "\"bytes_per_expert_component\": " << expert_upload_bytes << ", ";
+                    }
+                    std::cout << "\"cpu_latency_ms_median\": " << result.latency_ms_median
+                              << ", \"cpu_effective_gbps_median\": " << result.effective_gbps_median
+                              << ", \"upload_gbps_median\": " << device.upload_gbps[j] << "}";
+                }
+                std::cout << "]}";
+            }
+            std::cout << "]";
             std::cout << "},\n";
         } else {
             std::cout << "\"status\": \"unavailable\", \"reason\": \"no CUDA backend\"},\n";
