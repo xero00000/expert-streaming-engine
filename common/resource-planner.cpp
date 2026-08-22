@@ -7,13 +7,63 @@
 #include <cstdlib>
 #include <exception>
 #include <limits>
+#include <set>
 #include <sstream>
+#include <tuple>
+
+#include <nlohmann/json.hpp>
 
 #if defined(_MSC_VER) && defined(_M_X64)
 #include <intrin.h>
 #endif
 
 namespace {
+
+using calibration_format_key = std::tuple<int32_t, uint64_t, uint64_t, uint64_t>;
+using calibration_device_key = std::tuple<std::string, int32_t, uint64_t, uint64_t, uint64_t>;
+
+bool json_positive_u64(const nlohmann::json & value, uint64_t & result) {
+    if (value.is_number_unsigned()) {
+        result = value.get<uint64_t>();
+    } else if (value.is_number_integer()) {
+        const int64_t signed_value = value.get<int64_t>();
+        if (signed_value <= 0) return false;
+        result = uint64_t(signed_value);
+    } else {
+        return false;
+    }
+    return result > 0;
+}
+
+bool json_format_key(
+        const nlohmann::json & value,
+        calibration_format_key & key) {
+    if (!value.is_object() || !value.contains("ggml_type_id")) return false;
+    uint64_t type = 0;
+    uint64_t input_width = 0;
+    uint64_t expert_width = 0;
+    uint64_t bytes = 0;
+    if (!json_positive_u64(value["ggml_type_id"], type) ||
+            type > uint64_t(std::numeric_limits<int32_t>::max()) ||
+            !value.contains("input_width") ||
+            !json_positive_u64(value["input_width"], input_width) ||
+            !value.contains("expert_width") ||
+            !json_positive_u64(value["expert_width"], expert_width) ||
+            !value.contains("bytes_per_expert_component") ||
+            !json_positive_u64(value["bytes_per_expert_component"], bytes)) return false;
+    key = {int32_t(type), input_width, expert_width, bytes};
+    return true;
+}
+
+bool json_finite_number(
+        const nlohmann::json & value,
+        double & result,
+        double minimum,
+        double maximum = std::numeric_limits<double>::infinity()) {
+    if (!value.is_number()) return false;
+    result = value.get<double>();
+    return std::isfinite(result) && result >= minimum && result <= maximum;
+}
 
 bool add_checked(uint64_t & value, uint64_t add) {
     if (add > std::numeric_limits<uint64_t>::max() - value) {
@@ -536,6 +586,189 @@ bool common_expert_split_solve(
     plan.cpu_experts = input.misses - best_uploads;
     plan.predicted_step_ns = best_ns;
     plan.retained_by_hysteresis = retained;
+    return true;
+}
+
+bool common_expert_calibration_parse_json(
+        const std::string & text,
+        common_expert_calibration_profile & profile,
+        std::string & error) {
+    error.clear();
+    profile = {};
+    try {
+        const nlohmann::json root = nlohmann::json::parse(text);
+        if (!root.is_object()) {
+            error = "hardware profile root must be an object";
+            return false;
+        }
+        const auto & source = root.at("benchmark_source");
+        if (!source.is_object() || source.value("planner_ready", false) != true ||
+                source.value("calibration_level", std::string()) != "planner") {
+            error = "hardware profile is not planner-ready";
+            return false;
+        }
+        const auto & measurements = root.at("measurements");
+        const auto & cpu = measurements.at("cpu_moe");
+        const auto & cpu_profiles = cpu.at("model_profiles");
+        if (cpu.value("status", std::string()) != "measured" ||
+                !cpu_profiles.is_array() || cpu_profiles.empty()) {
+            error = "hardware profile has no model-backed CPU calibration";
+            return false;
+        }
+        std::set<calibration_format_key> formats;
+        for (const auto & item : cpu_profiles) {
+            calibration_format_key key;
+            double nrmse = 0;
+            double confidence = 0;
+            double relative_standard_error = 0;
+            uint64_t sample_count = 0;
+            if (!json_format_key(item, key) || !formats.insert(key).second ||
+                    item.value("correctness", std::string()) !=
+                            "single-thread-and-dequantized-scalar-reference" ||
+                    !item.contains("independent_reference_nrmse") ||
+                    !json_finite_number(item["independent_reference_nrmse"], nrmse, 0, 0.08) ||
+                    !item.contains("confidence") ||
+                    !json_finite_number(item["confidence"], confidence, 0.80, 1.0) ||
+                    !item.contains("relative_standard_error") ||
+                    !json_finite_number(item["relative_standard_error"], relative_standard_error, 0) ||
+                    !item.contains("sample_count") ||
+                    !json_positive_u64(item["sample_count"], sample_count) || sample_count < 7) {
+                error = "hardware profile CPU calibration is incomplete or duplicated";
+                return false;
+            }
+        }
+
+        const auto & contention = measurements.at("cpu_cache_contention");
+        const auto & devices = contention.at("devices");
+        if (contention.value("status", std::string()) != "measured" ||
+                contention.value("upload_path", std::string()) !=
+                        "pread_to_bounded_ram_lease_to_async_upload" ||
+                contention.value("distribution", std::string()) != "warm-steady-state" ||
+                !devices.is_array() || devices.empty()) {
+            error = "hardware profile contention path is incomplete";
+            return false;
+        }
+
+        common_expert_calibration_profile candidate;
+        std::set<std::string> backends;
+        std::set<calibration_device_key> contention_keys;
+        for (const auto & device : devices) {
+            const std::string backend = device.value("backend", std::string());
+            const auto & entries = device.at("profiles");
+            if (backend.empty() || !backends.insert(backend).second ||
+                    !entries.is_array() || entries.size() != formats.size()) {
+                error = "hardware profile contention devices are incomplete or duplicated";
+                return false;
+            }
+            std::set<calibration_format_key> device_formats;
+            for (const auto & item : entries) {
+                calibration_format_key format;
+                double cpu_ns = 0;
+                double upload_ns = 0;
+                double cpu_confidence = 0;
+                double upload_confidence = 0;
+                double cpu_rse = 0;
+                double upload_rse = 0;
+                uint64_t cpu_samples = 0;
+                uint64_t upload_samples = 0;
+                if (!json_format_key(item, format) || formats.count(format) != 1 ||
+                        !device_formats.insert(format).second ||
+                        !item.contains("cpu_ns_per_expert_component") ||
+                        !json_finite_number(item["cpu_ns_per_expert_component"], cpu_ns, 0) || cpu_ns == 0 ||
+                        !item.contains("upload_ns_per_expert_component") ||
+                        !json_finite_number(item["upload_ns_per_expert_component"], upload_ns, 0) || upload_ns == 0 ||
+                        !item.contains("cpu_confidence") ||
+                        !json_finite_number(item["cpu_confidence"], cpu_confidence, 0.80, 1.0) ||
+                        !item.contains("upload_confidence") ||
+                        !json_finite_number(item["upload_confidence"], upload_confidence, 0.80, 1.0) ||
+                        !item.contains("cpu_relative_standard_error") ||
+                        !json_finite_number(item["cpu_relative_standard_error"], cpu_rse, 0) ||
+                        !item.contains("upload_relative_standard_error") ||
+                        !json_finite_number(item["upload_relative_standard_error"], upload_rse, 0) ||
+                        !item.contains("cpu_sample_count") ||
+                        !json_positive_u64(item["cpu_sample_count"], cpu_samples) || cpu_samples < 7 ||
+                        !item.contains("upload_sample_count") ||
+                        !json_positive_u64(item["upload_sample_count"], upload_samples) || upload_samples < 7) {
+                    error = "hardware profile contention entry is invalid or below confidence";
+                    return false;
+                }
+                const auto [type, input_width, expert_width, bytes] = format;
+                calibration_device_key device_key = {
+                    backend, type, input_width, expert_width, bytes
+                };
+                if (!contention_keys.insert(device_key).second) {
+                    error = "hardware profile contention entry is duplicated";
+                    return false;
+                }
+                candidate.entries.push_back({
+                    {backend, type, input_width, expert_width, bytes},
+                    cpu_ns, upload_ns, cpu_confidence, upload_confidence
+                });
+            }
+            if (device_formats != formats) {
+                error = "hardware profile contention format matrix is incomplete";
+                return false;
+            }
+        }
+
+        const auto & upload = measurements.at("expert_cache_upload");
+        const auto & leases = upload.at("lease_upload_profiles");
+        if (upload.value("status", std::string()) != "measured" ||
+                !leases.is_array() || leases.size() != contention_keys.size()) {
+            error = "hardware profile leased-upload matrix is incomplete";
+            return false;
+        }
+        std::set<calibration_device_key> lease_keys;
+        for (const auto & item : leases) {
+            calibration_format_key format;
+            double confidence = 0;
+            double rse = 0;
+            uint64_t samples = 0;
+            const std::string backend = item.value("backend", std::string());
+            if (backend.empty() || backends.count(backend) != 1 ||
+                    item.value("storage_backend", std::string()) != "pread" ||
+                    item.value("distribution", std::string()) != "warm-steady-state" ||
+                    !json_format_key(item, format) ||
+                    !item.contains("confidence") ||
+                    !json_finite_number(item["confidence"], confidence, 0.80, 1.0) ||
+                    !item.contains("relative_standard_error") ||
+                    !json_finite_number(item["relative_standard_error"], rse, 0) ||
+                    !item.contains("sample_count") ||
+                    !json_positive_u64(item["sample_count"], samples) || samples < 7) {
+                error = "hardware profile leased-upload entry is invalid or below confidence";
+                return false;
+            }
+            const auto [type, input_width, expert_width, bytes] = format;
+            if (!lease_keys.insert({backend, type, input_width, expert_width, bytes}).second) {
+                error = "hardware profile leased-upload entry is duplicated";
+                return false;
+            }
+        }
+        if (lease_keys != contention_keys) {
+            error = "hardware profile leased-upload matrix does not match contention calibration";
+            return false;
+        }
+        profile = std::move(candidate);
+        return true;
+    } catch (const nlohmann::json::exception & exception) {
+        error = std::string("invalid hardware profile JSON: ") + exception.what();
+        return false;
+    } catch (const std::exception & exception) {
+        error = std::string("invalid hardware profile: ") + exception.what();
+        return false;
+    }
+}
+
+bool common_expert_calibration_lookup(
+        const common_expert_calibration_profile & profile,
+        const common_expert_calibration_key & key,
+        common_expert_calibration_entry & entry) {
+    const auto found = std::find_if(profile.entries.begin(), profile.entries.end(),
+            [&](const common_expert_calibration_entry & candidate) {
+                return candidate.key == key;
+            });
+    if (found == profile.entries.end()) return false;
+    entry = *found;
     return true;
 }
 

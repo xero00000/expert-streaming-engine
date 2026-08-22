@@ -5,6 +5,8 @@
 #include <string>
 #include <stdexcept>
 
+#include <nlohmann/json.hpp>
+
 namespace {
 
 #define REQUIRE(condition) do { \
@@ -307,6 +309,98 @@ void test_calibrated_expert_split_solver() {
     REQUIRE(!common_expert_split_solve(input, plan, error));
 }
 
+nlohmann::json calibrated_profile_json() {
+    const nlohmann::json format = {
+        {"ggml_type_id", 16},
+        {"input_width", 4096},
+        {"expert_width", 2048},
+        {"bytes_per_expert_component", 2162688},
+    };
+    nlohmann::json cpu = format;
+    cpu.update({
+        {"correctness", "single-thread-and-dequantized-scalar-reference"},
+        {"independent_reference_nrmse", 0.004},
+        {"sample_count", 21},
+        {"relative_standard_error", 0.02},
+        {"confidence", 0.92},
+    });
+    nlohmann::json contention = format;
+    contention.update({
+        {"cpu_ns_per_expert_component", 120000.0},
+        {"upload_ns_per_expert_component", 90000.0},
+        {"cpu_sample_count", 21},
+        {"cpu_relative_standard_error", 0.02},
+        {"cpu_confidence", 0.92},
+        {"upload_sample_count", 21},
+        {"upload_relative_standard_error", 0.02},
+        {"upload_confidence", 0.93},
+    });
+    nlohmann::json lease = format;
+    lease.update({
+        {"backend", "CUDA0"},
+        {"storage_backend", "pread"},
+        {"distribution", "warm-steady-state"},
+        {"sample_count", 21},
+        {"relative_standard_error", 0.02},
+        {"confidence", 0.94},
+    });
+    return {
+        {"benchmark_source", {
+            {"planner_ready", true},
+            {"calibration_level", "planner"},
+        }},
+        {"measurements", {
+            {"cpu_moe", {
+                {"status", "measured"},
+                {"model_profiles", nlohmann::json::array({cpu})},
+            }},
+            {"cpu_cache_contention", {
+                {"status", "measured"},
+                {"upload_path", "pread_to_bounded_ram_lease_to_async_upload"},
+                {"distribution", "warm-steady-state"},
+                {"devices", nlohmann::json::array({{
+                    {"backend", "CUDA0"},
+                    {"profiles", nlohmann::json::array({contention})},
+                }})},
+            }},
+            {"expert_cache_upload", {
+                {"status", "measured"},
+                {"lease_upload_profiles", nlohmann::json::array({lease})},
+            }},
+        }},
+    };
+}
+
+void test_native_calibration_profile_gate() {
+    common_expert_calibration_profile profile;
+    std::string error;
+    auto valid = calibrated_profile_json();
+    REQUIRE(common_expert_calibration_parse_json(valid.dump(), profile, error));
+    REQUIRE(profile.entries.size() == 1);
+    common_expert_calibration_entry entry;
+    common_expert_calibration_key key{"CUDA0", 16, 4096, 2048, 2162688};
+    REQUIRE(common_expert_calibration_lookup(profile, key, entry));
+    REQUIRE(entry.cpu_ns_per_expert_component == 120000.0);
+    REQUIRE(entry.upload_ns_per_expert_component == 90000.0);
+    key.backend = "CUDA1";
+    REQUIRE(!common_expert_calibration_lookup(profile, key, entry));
+
+    auto low_confidence = calibrated_profile_json();
+    low_confidence["measurements"]["cpu_cache_contention"]["devices"][0]["profiles"][0]["cpu_confidence"] = 0.79;
+    REQUIRE(!common_expert_calibration_parse_json(low_confidence.dump(), profile, error));
+    REQUIRE(error.find("confidence") != std::string::npos);
+
+    auto missing_lease = calibrated_profile_json();
+    missing_lease["measurements"]["expert_cache_upload"]["lease_upload_profiles"] = nlohmann::json::array();
+    REQUIRE(!common_expert_calibration_parse_json(missing_lease.dump(), profile, error));
+    REQUIRE(error.find("leased-upload") != std::string::npos);
+
+    auto forged_ready = calibrated_profile_json();
+    forged_ready["benchmark_source"]["planner_ready"] = false;
+    REQUIRE(!common_expert_calibration_parse_json(forged_ready.dump(), profile, error));
+    REQUIRE(error.find("planner-ready") != std::string::npos);
+}
+
 } // namespace
 
 int main() {
@@ -320,5 +414,6 @@ int main() {
     test_rollback_hook_failure_is_single_shot();
     test_native_override_normalization();
     test_calibrated_expert_split_solver();
+    test_native_calibration_profile_gate();
     return 0;
 }

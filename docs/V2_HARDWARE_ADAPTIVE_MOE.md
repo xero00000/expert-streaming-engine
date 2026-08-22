@@ -41,6 +41,8 @@ Without `--model`, provenance records `model_used: false`. With a GGUF file, fir
 
 The native resource planner now has a pure integer split solver for calibrated decode misses. It minimizes the maximum of concurrent CPU and upload completion time, handles all-CPU/all-upload/mixed small counts, retains the previous split within a configurable hysteresis band, and refuses incomplete, low-confidence, non-finite, or otherwise invalid calibration. It is not connected to live decode until profile confidence and the remaining correctness gates are satisfied.
 
+A native calibration table parser now independently rejects forged readiness, missing or duplicated device/format coverage, incomplete exact-lease evidence, low confidence, and invalid numerical-reference evidence. Accepted entries are keyed by CUDA backend, GGML type, input width, expert width, and component byte size and expose explicit CPU/upload nanoseconds per expert component. The launcher still owns topology-fingerprint freshness checks; live decode consumption remains gated.
+
 Each timed series records its sample count, raw coefficient of variation, robust relative standard error of the median, and a confidence score combining seven-sample coverage with that uncertainty. The median absolute deviation estimator resists isolated scheduler/interrupt outliers but still penalizes broad or bimodal samples. The profile gate requires at least `0.80` confidence for both CPU and upload on every device/format. Changing the provenance flag alone cannot bypass missing model-backed or per-device evidence.
 
 ### Remaining Phase A gate

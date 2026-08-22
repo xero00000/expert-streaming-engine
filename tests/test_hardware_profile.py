@@ -89,6 +89,8 @@ def complete_planner_profile() -> dict[str, object]:
                     "backend": "CUDA0",
                     "profiles": [{
                         **format_fields,
+                        "cpu_ns_per_expert_component": 120000.0,
+                        "upload_ns_per_expert_component": 90000.0,
                         "cpu_sample_count": 21,
                         "cpu_relative_standard_error": 0.02,
                         "cpu_confidence": 0.92,

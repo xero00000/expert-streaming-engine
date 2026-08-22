@@ -301,6 +301,8 @@ def planner_profile_reasons(
                     reasons.append(f"planner contention formats are incomplete for {backend}")
                 for measurement in profiles:
                     valid_confidence = isinstance(measurement, Mapping) and all((
+                        finite_number(measurement.get("cpu_ns_per_expert_component"), minimum=0),
+                        finite_number(measurement.get("upload_ns_per_expert_component"), minimum=0),
                         finite_number(measurement.get("cpu_confidence"), minimum=0.80),
                         finite_number(measurement.get("upload_confidence"), minimum=0.80),
                         finite_number(measurement.get("cpu_relative_standard_error"), minimum=0),
@@ -308,6 +310,10 @@ def planner_profile_reasons(
                         finite_number(measurement.get("cpu_sample_count"), minimum=7),
                         finite_number(measurement.get("upload_sample_count"), minimum=7),
                     ))
+                    valid_confidence = valid_confidence and (
+                        measurement.get("cpu_ns_per_expert_component", 0) > 0
+                        and measurement.get("upload_ns_per_expert_component", 0) > 0
+                    )
                     if not valid_confidence:
                         reasons.append(f"planner confidence is below 0.80 for {backend}")
                         break

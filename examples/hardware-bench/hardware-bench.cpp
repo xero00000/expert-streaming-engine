@@ -1068,11 +1068,15 @@ int main(int argc, char ** argv) {
                     }
                     std::cout << "\"cpu_latency_ms_median\": " << result.latency_ms_median
                               << ", \"cpu_effective_gbps_median\": " << result.effective_gbps_median
+                              << ", \"cpu_ns_per_expert_component\": "
+                              << result.latency_ms_median * 1.0e6 / double(result.routed_experts)
                               << ", \"cpu_sample_count\": " << result.sample_count
                               << ", \"cpu_coefficient_variation\": " << result.coefficient_variation
                               << ", \"cpu_relative_standard_error\": " << result.relative_standard_error
                               << ", \"cpu_confidence\": " << result.confidence
                               << ", \"upload_gbps_median\": " << device.upload_gbps[j]
+                              << ", \"upload_ns_per_expert_component\": "
+                              << device.upload_statistics[j].median * 1.0e9
                               << ", \"upload_sample_count\": " << device.upload_statistics[j].count
                               << ", \"upload_coefficient_variation\": "
                               << device.upload_statistics[j].coefficient_variation

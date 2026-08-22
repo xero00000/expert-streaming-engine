@@ -143,6 +143,32 @@ struct common_expert_split_plan {
     bool retained_by_hysteresis = false;
 };
 
+struct common_expert_calibration_key {
+    std::string backend;
+    int32_t ggml_type = -1;
+    uint64_t input_width = 0;
+    uint64_t expert_width = 0;
+    uint64_t bytes_per_expert_component = 0;
+
+    bool operator==(const common_expert_calibration_key & other) const {
+        return backend == other.backend && ggml_type == other.ggml_type &&
+                input_width == other.input_width && expert_width == other.expert_width &&
+                bytes_per_expert_component == other.bytes_per_expert_component;
+    }
+};
+
+struct common_expert_calibration_entry {
+    common_expert_calibration_key key;
+    double cpu_ns_per_expert_component = 0;
+    double upload_ns_per_expert_component = 0;
+    double cpu_confidence = 0;
+    double upload_confidence = 0;
+};
+
+struct common_expert_calibration_profile {
+    std::vector<common_expert_calibration_entry> entries;
+};
+
 bool common_resource_plan_solve(
     const common_resource_plan_input & input,
     common_resource_plan & plan,
@@ -152,6 +178,19 @@ bool common_expert_split_solve(
     const common_expert_split_input & input,
     common_expert_split_plan & plan,
     std::string & error);
+
+// Parse only a complete planner-ready production calibration matrix. The
+// launcher remains responsible for verifying the topology fingerprint before
+// passing a profile to native policy.
+bool common_expert_calibration_parse_json(
+    const std::string & text,
+    common_expert_calibration_profile & profile,
+    std::string & error);
+
+bool common_expert_calibration_lookup(
+    const common_expert_calibration_profile & profile,
+    const common_expert_calibration_key & key,
+    common_expert_calibration_entry & entry);
 
 std::string common_resource_plan_json(const common_resource_plan & plan);
 std::string common_memory_policy_name(common_memory_policy policy);
