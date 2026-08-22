@@ -1,10 +1,12 @@
 # ESE Studio
 
-ESE Studio is the Linux desktop control center for Expert Streaming Engine. It replaces the legacy launcher presentation while keeping ESE as the model-planning and serving authority.
+ESE Studio is the Linux and Windows desktop control center for Expert Streaming Engine. It replaces the legacy launcher presentation while keeping ESE as the model-planning and serving authority.
 
 This foundation includes:
 
 - automatic GGUF discovery from user-configured folders;
+- a streaming local-model chat with stop, regenerate, clear, and persistent
+  on-device conversation history;
 - Hugging Face GGUF search, hardware-fit quant recommendations, and
   revision-pinned resumable downloads with speed and ETA;
 - available models in the primary view and missing manual profiles in a collapsed **Unavailable profiles** section;
@@ -63,9 +65,28 @@ To install a release build for the current user, including an application-menu e
 ./scripts/install-local.sh
 ```
 
+## Windows source install
+
+Open PowerShell in `studio` and run:
+
+```powershell
+.\install.ps1 -Check
+.\install.ps1
+```
+
+The preflight checks Node.js, Rust, the Visual Studio C++ Build Tools, WebView2,
+and pnpm. When required software is missing, the installer shows the complete
+list and asks before using `winget`; nothing is installed silently. The build
+produces signed-ready NSIS (`.exe`) and MSI installers under
+`src-tauri\target\release\bundle\`.
+
 ## Configuration
 
-Studio creates no configuration file until settings are saved. Its defaults discover `~/models` and `~/.local/share/ese/models` when those directories exist, and expose installed Codex, Claude Code, and OpenCode commands as app templates.
+Studio creates no configuration file until settings are saved. Linux defaults
+discover `~/models` and `~/.local/share/ese/models`; Windows defaults discover
+`%USERPROFILE%\models` and `%USERPROFILE%\Documents\ESE\models`. Installed
+agent CLIs are discovered from platform-appropriate PATH, Cargo, Bun, npm, NVM,
+and Scoop locations.
 
 The first Studio launch presents one optional **Help improve ESE** switch. It
 can be changed later in Settings. Turning it off also removes locally queued,
@@ -74,7 +95,7 @@ responses, usernames, hostnames, local paths, raw logs, and raw error text.
 Turning sharing off cannot retract an anonymous result already accepted by the
 private collector or a grouped statistic already published on GitHub.
 
-The TOML format is versioned and designed to remain editable outside the GUI. Both camelCase and snake_case field names are accepted when reading. Studio writes camelCase. Commands and paths live in TOML; secrets must use environment-variable references or the Linux keyring rather than plaintext values.
+The TOML format is versioned and designed to remain editable outside the GUI. Both camelCase and snake_case field names are accepted when reading. Studio writes camelCase. Commands and paths live in TOML; secrets must use environment-variable references or the operating system credential manager rather than plaintext values.
 
 ```toml
 version = 1
@@ -91,9 +112,13 @@ args = []
 endpointAware = true
 ```
 
-## Supported platform
+## Supported platforms
 
-Linux is the first supported platform. The React UI and Rust backend are cross-platform by construction, but Windows packaging and process behavior are deferred until the Linux model/app/sweep workflows are stable.
+Linux packages are produced as DEB and RPM files. Windows packages are produced
+as NSIS and MSI installers. The same GUI, configuration format, app discovery,
+embedded terminals, model hub, and sweep workflow are used on both platforms.
+The same local chat interface is included on both platforms and connects only
+to the model server started by Studio.
 
 ## Release validation
 
@@ -103,9 +128,10 @@ pnpm build
 cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
-pnpm tauri build
+pnpm tauri build --bundles deb,rpm       # Linux
+pnpm tauri build --bundles nsis,msi      # Windows
 ```
 
-GitHub Actions repeats these checks on Ubuntu and publishes the DEB and RPM as
-CI artifacts. The tagged release workflow attaches both packages and a
-`SHA256SUMS` file to the GitHub release.
+GitHub Actions repeats these checks on Ubuntu and Windows and publishes the DEB,
+RPM, NSIS, and MSI packages as CI artifacts. The tagged release workflow
+attaches all four packages and platform checksum files to the GitHub release.

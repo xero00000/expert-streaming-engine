@@ -15,8 +15,9 @@ observable decisions, and no hidden backend or precision fallback.
 
 ## Quick start
 
-Requirements: Linux, Python 3.10+, CMake, a C++ compiler, and optionally an
-NVIDIA CUDA toolchain.
+Requirements: Python 3.10+, CMake, a C++ compiler, and optionally an NVIDIA
+CUDA toolchain. Linux is supported directly; Windows uses the MSVC Build Tools
+and PowerShell.
 
 ```bash
 git clone https://github.com/xero00000/expert-streaming-engine.git
@@ -27,6 +28,18 @@ cd expert-streaming-engine
 ./ese plan /models/model.gguf  # inspect the complete command without running it
 ./ese serve /models/model.gguf
 ```
+
+On Windows, run the same workflow from PowerShell with the included launcher:
+
+```powershell
+.\ese.cmd doctor
+.\ese.cmd build --backend cpu
+.\ese.cmd plan C:\Models\model.gguf
+.\ese.cmd serve C:\Models\model.gguf
+```
+
+Use `--backend cuda` when the Windows CUDA toolkit and a supported NVIDIA GPU
+are available.
 
 The server listens on `http://127.0.0.1:8080` by default. Check it with:
 
@@ -39,20 +52,28 @@ complete set before launch.
 
 ## ESE Studio
 
-`studio/` contains the new Linux desktop control center for model discovery,
-ESE planning/serving, configurable CLI apps in embedded terminal tabs, and
-verified configuration sweeps. Its installer checks required commands and
-system libraries and asks before installing missing packages:
+`studio/` contains the ESE Studio desktop GUI for model discovery, ESE
+planning/serving, configurable CLI apps in embedded terminal tabs, and
+verified configuration sweeps. It is deliberately a control center rather
+than a second inference backend: every model launch still goes through ESE's
+inspectable planner and `llama-server` command. Its installer checks required
+commands and system libraries and asks before installing missing packages.
 
 The [latest release](https://github.com/xero00000/expert-streaming-engine/releases/latest)
-provides x86-64 DEB and RPM packages plus `SHA256SUMS`. Verify the downloaded
-package, then install it with the native package manager:
+provides x86-64 Linux packages and, where listed, Windows installers plus
+checksums. Verify the downloaded package, then install it with the native
+package manager:
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
 sudo apt install ./ese-studio_0.1.0_amd64.deb       # Debian / Ubuntu
 sudo dnf install ./ese-studio-0.1.0-1.x86_64.rpm   # Fedora / Nobara
 ```
+
+On Windows, download the NSIS `.exe` (recommended) or MSI package from the
+release, verify it against `SHA256SUMS-windows.txt`, and run the installer.
+Source builders can use `studio\install.ps1`; it reports missing dependencies
+and asks before installing them with `winget`.
 
 Studio is the desktop control center; model serving still uses the `ese`
 launcher and locally built runtime from the Quick start above. To build Studio
@@ -63,6 +84,28 @@ cd studio
 ./install.sh --check  # read-only dependency preflight
 ./install.sh          # confirm dependencies, then build a native package
 ```
+
+### GUI tour
+
+The interface uses a restrained, keyboard-friendly dark layout with six main
+workspaces:
+
+| Screen | What it does |
+| --- | --- |
+| **Models** | Groups discovered GGUFs by model family, keeps each family collapsed until opened, and separates missing profiles into a collapsed unavailable section. Select a model to review its size, architecture, quantization, context, and saved launch profile. |
+| **Chat** | Provides a familiar streaming conversation view for the active local model, with stop, regenerate, clear, keyboard-send controls, and local conversation persistence. Prompts and responses stay between Studio and the local ESE endpoint. |
+| **Model hub** | Searches Hugging Face GGUF repositories, groups quantizations and split shards, recommends a hardware-appropriate download, and shows bytes transferred, speed, ETA, pause/cancel state, and resumable progress. |
+| **Apps** | Detects local agent CLIs such as Codex, Claude Code, OpenCode, Hermes, Gemini CLI, and Aider. Profiles remain editable, so advanced users can add any terminal application or custom arguments. |
+| **Config sweeper** | Runs measured Quick, Standard, or Exhaustive searches. The default objective finds the maximum safe context first and then the fastest stable KV/batch configuration at that context; advanced mode exposes selectable objectives and the full search controls. |
+| **Settings** | Manages model folders, rescans installed applications, controls the optional **Help improve ESE** upload, and shows the portable configuration location. |
+
+Launching a model or CLI app opens it inside Studio's persistent terminal
+area. Terminal tabs can be resized, expanded, collapsed, and restored without
+losing the running session. When a model is active, endpoint-aware apps receive
+its URL, API key, model identity, GGUF metadata, context, KV type, batch, and
+ubatch automatically. The GUI keeps previewed settings, live measurements,
+saved profiles, and unavailable models visually distinct so an estimate cannot
+be mistaken for verified evidence.
 
 Studio automatically discovers supported local agent CLIs from `PATH`, NVM,
 `~/.local/bin`, Cargo, Bun, and npm-global installs without replacing customized

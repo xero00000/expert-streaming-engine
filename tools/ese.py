@@ -35,7 +35,7 @@ from typing import Any, BinaryIO, Iterable, Sequence
 
 GIB = 1024**3
 MIB = 1024**2
-DEFAULT_SERVER = Path("build/bin/llama-server")
+DEFAULT_SERVER = Path("build/bin") / ("llama-server.exe" if os.name == "nt" else "llama-server")
 KNOWN_KV_TYPES = ("auto", "f16", "q8_0", "q4_0")
 POLICIES = ("auto", "resident", "hybrid", "cache", "stream")
 
@@ -751,14 +751,49 @@ def _repo_root() -> Path:
 
 
 def _resolve_binary(value: str | None, build_dir: Path | None = None) -> Path:
+    server_name = "llama-server.exe" if os.name == "nt" else "llama-server"
     if value:
-        return Path(value).expanduser().resolve()
+        requested = Path(value).expanduser()
+        if os.name == "nt" and not requested.suffix:
+            requested = requested.with_suffix(".exe")
+        return requested.resolve()
     if os.environ.get("ESE_SERVER"):
-        return Path(os.environ["ESE_SERVER"]).expanduser().resolve()
+        requested = Path(os.environ["ESE_SERVER"]).expanduser()
+        if os.name == "nt" and not requested.suffix:
+            requested = requested.with_suffix(".exe")
+        return requested.resolve()
     root = _repo_root()
-    if build_dir:
-        return (build_dir / "bin" / "llama-server").resolve()
-    return (root / DEFAULT_SERVER).resolve()
+    binary_root = build_dir if build_dir else root / "build"
+    candidates = [
+        binary_root / "bin" / server_name,
+        binary_root / "bin" / "Release" / server_name,
+        binary_root / "bin" / "RelWithDebInfo" / server_name,
+        binary_root / "bin" / "Debug" / server_name,
+    ]
+    return next((candidate.resolve() for candidate in candidates if candidate.is_file()), candidates[0].resolve())
+
+
+def _windows_msvc_installation() -> str | None:
+    if os.name != "nt":
+        return None
+    program_files = os.environ.get("ProgramFiles(x86)") or os.environ.get("ProgramFiles")
+    if not program_files:
+        return None
+    vswhere = Path(program_files) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.is_file():
+        return None
+    return _run_capture(
+        (
+            str(vswhere),
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        )
+    )
 
 
 def _print_plan(plan: LaunchPlan, as_json: bool) -> None:
@@ -790,7 +825,12 @@ def _doctor(as_json: bool) -> int:
     root = _repo_root()
     cmake = shutil.which("cmake")
     ninja = shutil.which("ninja")
-    compiler = shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")
+    compiler = (
+        shutil.which("c++")
+        or shutil.which("g++")
+        or shutil.which("clang++")
+        or _windows_msvc_installation()
+    )
     server = _resolve_binary(None)
     checks = {
         "platform": platform.platform(),
@@ -850,7 +890,9 @@ def _build(args: argparse.Namespace) -> int:
         "-DLLAMA_BUILD_SERVER=ON",
         f"-DGGML_CUDA={'ON' if backend == 'cuda' else 'OFF'}",
     ]
-    if shutil.which("ninja"):
+    if os.name == "nt":
+        configure.extend(("-A", "x64"))
+    elif shutil.which("ninja"):
         configure.extend(("-G", "Ninja"))
     print("+", shlex.join(configure))
     subprocess.run(configure, cwd=root, check=True)
@@ -1033,6 +1075,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         environment = os.environ.copy()
         environment.update(plan.environment)
+        if os.name == "nt":
+            return subprocess.run(list(plan.command()), env=environment, check=False).returncode
         os.execvpe(str(plan.binary), list(plan.command()), environment)
         return 0
     except ESEError as exc:

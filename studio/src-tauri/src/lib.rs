@@ -1,4 +1,4 @@
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,7 +8,10 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -79,6 +82,7 @@ struct StudioConfig {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StudioSnapshot {
+    platform: String,
     config_path: PathBuf,
     onboarding_complete: bool,
     help_improve_ese: bool,
@@ -86,6 +90,34 @@ struct StudioSnapshot {
     models: Vec<ModelProfile>,
     apps: Vec<AppProfile>,
     ese_binary: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatStatus {
+    active: bool,
+    model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatChunk {
+    request_id: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatFinished {
+    request_id: String,
+    stopped: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,6 +182,7 @@ struct StudioState {
     active_model: Mutex<Option<ManagedModel>>,
     sweep: SweepManager,
     downloads: DownloadManager,
+    chat_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 fn default_safe_margin() -> f32 {
@@ -165,22 +198,61 @@ fn config_path() -> Result<PathBuf, String> {
     Ok(project_dirs()?.config_dir().join("studio.toml"))
 }
 
+fn home_dir() -> Option<PathBuf> {
+    BaseDirs::new().map(|directories| directories.home_dir().to_path_buf())
+}
+
+fn executable_names(command: &str) -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        if Path::new(command).extension().is_none() {
+            return ["exe", "cmd", "bat", "com"]
+                .into_iter()
+                .map(|extension| format!("{command}.{extension}"))
+                .chain(std::iter::once(command.to_owned()))
+                .collect();
+        }
+    }
+    vec![command.to_owned()]
+}
+
+fn executable_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
+    executable_names(command)
+        .into_iter()
+        .map(|name| directory.join(name))
+        .collect()
+}
+
 fn resolve_executable(command: &str) -> Option<PathBuf> {
-    if command.contains('/') {
+    let command_path = Path::new(command);
+    if command_path.is_absolute() || command_path.components().count() > 1 {
         return Path::new(command).is_file().then(|| PathBuf::from(command));
     }
 
     let mut candidates = Vec::new();
     if let Some(paths) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&paths).map(|path| path.join(command)));
+        for path in std::env::split_paths(&paths) {
+            candidates.extend(executable_candidates(&path, command));
+        }
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.extend([
-            home.join(".local/bin").join(command),
-            home.join(".cargo/bin").join(command),
-            home.join(".bun/bin").join(command),
-            home.join(".npm-global/bin").join(command),
-        ]);
+    if let Some(home) = home_dir() {
+        for directory in [
+            home.join(".local/bin"),
+            home.join(".cargo/bin"),
+            home.join(".bun/bin"),
+            home.join(".npm-global/bin"),
+            home.join("scoop/shims"),
+        ] {
+            candidates.extend(executable_candidates(&directory, command));
+        }
+
+        #[cfg(target_os = "windows")]
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            candidates.extend(executable_candidates(
+                &PathBuf::from(app_data).join("npm"),
+                command,
+            ));
+        }
 
         let node_versions = home.join(".nvm/versions/node");
         if let Ok(entries) = fs::read_dir(node_versions) {
@@ -254,8 +326,13 @@ fn merge_detected_apps(configured: &mut Vec<AppProfile>, detected: Vec<AppProfil
 
 fn default_model_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for path in [home.join("models"), home.join(".local/share/ese/models")] {
+    if let Some(home) = home_dir() {
+        let mut candidates = vec![home.join("models")];
+        #[cfg(target_os = "windows")]
+        candidates.push(home.join("Documents/ESE/models"));
+        #[cfg(not(target_os = "windows"))]
+        candidates.push(home.join(".local/share/ese/models"));
+        for path in candidates {
             if path.is_dir() {
                 roots.push(path);
             }
@@ -297,8 +374,26 @@ fn write_config(config: &StudioConfig) -> Result<(), String> {
     let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
     fs::write(&temporary, serialized)
         .map_err(|error| format!("failed to write {}: {error}", temporary.display()))?;
-    fs::rename(&temporary, &path)
-        .map_err(|error| format!("failed to replace {}: {error}", path.display()))
+    replace_file(&temporary, &path)
+}
+
+fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
+    if !destination.exists() {
+        return fs::rename(temporary, destination)
+            .map_err(|error| format!("failed to create {}: {error}", destination.display()));
+    }
+    let backup = destination.with_extension(format!("toml.{}.bak", std::process::id()));
+    fs::rename(destination, &backup)
+        .map_err(|error| format!("failed to stage {}: {error}", destination.display()))?;
+    if let Err(error) = fs::rename(temporary, destination) {
+        let _ = fs::rename(&backup, destination);
+        return Err(format!(
+            "failed to replace {}: {error}",
+            destination.display()
+        ));
+    }
+    fs::remove_file(&backup)
+        .map_err(|error| format!("failed to remove {}: {error}", backup.display()))
 }
 
 fn model_name(path: &Path) -> String {
@@ -420,17 +515,19 @@ fn locate_ese() -> Option<PathBuf> {
         candidates.push(PathBuf::from(explicit));
     }
     if let Ok(executable) = std::env::current_exe() {
-        candidates.push(executable.with_file_name("ese"));
+        for name in executable_names("ese") {
+            candidates.push(executable.with_file_name(name));
+        }
         for ancestor in executable.ancestors() {
-            candidates.push(ancestor.join("ese"));
+            candidates.extend(executable_candidates(ancestor, "ese"));
         }
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".local/bin/ese"));
-        candidates.push(home.join("bin/ese"));
+    if let Some(home) = home_dir() {
+        candidates.extend(executable_candidates(&home.join(".local/bin"), "ese"));
+        candidates.extend(executable_candidates(&home.join("bin"), "ese"));
     }
-    if let Some(paths) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&paths).map(|path| path.join("ese")));
+    if let Some(resolved) = resolve_executable("ese") {
+        candidates.push(resolved);
     }
     candidates.into_iter().find(|candidate| candidate.is_file())
 }
@@ -439,6 +536,7 @@ fn locate_ese() -> Option<PathBuf> {
 fn get_studio_snapshot() -> Result<StudioSnapshot, String> {
     let config = load_config()?;
     Ok(StudioSnapshot {
+        platform: std::env::consts::OS.into(),
         config_path: config_path()?,
         onboarding_complete: config.onboarding_complete,
         help_improve_ese: config.help_improve_ese,
@@ -511,6 +609,155 @@ fn set_help_improve_ese(enabled: bool) -> Result<StudioSnapshot, String> {
 }
 
 #[tauri::command]
+fn get_chat_status(state: State<'_, StudioState>) -> Result<ChatStatus, String> {
+    let active = state
+        .active_model
+        .lock()
+        .map_err(|_| "model state is poisoned")?;
+    Ok(ChatStatus {
+        active: active.is_some(),
+        model_id: active.as_ref().map(|model| model.endpoint.model_id.clone()),
+    })
+}
+
+#[tauri::command]
+fn start_chat(
+    request_id: String,
+    messages: Vec<ChatMessage>,
+    app: AppHandle,
+    state: State<'_, StudioState>,
+) -> Result<(), String> {
+    if request_id.trim().is_empty() {
+        return Err("chat request id is required".into());
+    }
+    if messages.is_empty() || messages.len() > 200 {
+        return Err("chat history must contain between 1 and 200 messages".into());
+    }
+    if messages.iter().any(|message| {
+        !matches!(message.role.as_str(), "system" | "user" | "assistant")
+            || message.content.len() > 1_000_000
+    }) {
+        return Err("chat history contains an unsupported role or oversized message".into());
+    }
+    let endpoint = {
+        let mut active = state
+            .active_model
+            .lock()
+            .map_err(|_| "model state is poisoned")?;
+        let model = active
+            .as_mut()
+            .ok_or_else(|| "start a model before opening a chat".to_string())?;
+        refresh_model_endpoint(&mut model.endpoint);
+        model.endpoint.clone()
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    state
+        .chat_cancellations
+        .lock()
+        .map_err(|_| "chat state is poisoned")?
+        .insert(request_id.clone(), cancelled.clone());
+
+    thread::spawn(move || {
+        let result = stream_chat(&request_id, &messages, &endpoint, &cancelled, &app);
+        let managed = app.state::<StudioState>();
+        if let Ok(mut cancellations) = managed.chat_cancellations.lock() {
+            cancellations.remove(&request_id);
+        }
+        let stopped = cancelled.load(Ordering::Relaxed);
+        let _ = app.emit(
+            "chat-finished",
+            ChatFinished {
+                request_id,
+                stopped,
+                error: result.err(),
+            },
+        );
+    });
+    Ok(())
+}
+
+fn stream_chat(
+    request_id: &str,
+    messages: &[ChatMessage],
+    endpoint: &ModelEndpoint,
+    cancelled: &AtomicBool,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let url = format!(
+        "{}/chat/completions",
+        endpoint.base_url.trim_end_matches('/')
+    );
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(3600))
+        .build()
+        .map_err(|error| error.to_string())?
+        .post(url)
+        .bearer_auth(&endpoint.api_key)
+        .json(&serde_json::json!({
+            "model": endpoint.model_id,
+            "messages": messages,
+            "stream": true,
+            "temperature": 0.7
+        }))
+        .send()
+        .map_err(|error| format!("local model connection failed: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().unwrap_or_default();
+        return Err(format!(
+            "local model returned {status}: {}",
+            detail.chars().take(300).collect::<String>()
+        ));
+    }
+    let reader = std::io::BufReader::new(response);
+    for line in std::io::BufRead::lines(reader) {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let line = line.map_err(|error| format!("chat stream interrupted: {error}"))?;
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data == "[DONE]" {
+            return Ok(());
+        }
+        if let Some(content) = chat_delta_content(data) {
+            let _ = app.emit(
+                "chat-token",
+                ChatChunk {
+                    request_id: request_id.to_owned(),
+                    content,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn chat_delta_content(data: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()?
+        .pointer("/choices/0/delta/content")?
+        .as_str()
+        .filter(|content| !content.is_empty())
+        .map(str::to_owned)
+}
+
+#[tauri::command]
+fn cancel_chat(request_id: String, state: State<'_, StudioState>) -> Result<(), String> {
+    if let Some(cancelled) = state
+        .chat_cancellations
+        .lock()
+        .map_err(|_| "chat state is poisoned")?
+        .get(&request_id)
+    {
+        cancelled.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn add_model_root(path: PathBuf) -> Result<(), String> {
     let canonical = path
         .canonicalize()
@@ -571,8 +818,7 @@ fn configure_hermes(command: &str, endpoint: &ModelEndpoint) -> Result<(), Strin
         ("model.context_length", context.as_str()),
     ];
     for (key, value) in updates {
-        let status = ProcessCommand::new(command)
-            .args(["config", "set", key, value])
+        let status = process_command(command, &["config", "set", key, value])
             .status()
             .map_err(|error| format!("failed to configure Hermes field {key}: {error}"))?;
         if !status.success() {
@@ -580,6 +826,30 @@ fn configure_hermes(command: &str, endpoint: &ModelEndpoint) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+fn process_command(command: &str, arguments: &[&str]) -> ProcessCommand {
+    #[cfg(target_os = "windows")]
+    if Path::new(command).extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+    }) {
+        let mut process = ProcessCommand::new("cmd.exe");
+        process.args(["/d", "/s", "/c"]);
+        process.arg(windows_command_line(command, arguments.iter().copied()));
+        return process;
+    }
+    let mut process = ProcessCommand::new(command);
+    process.args(arguments);
+    process
+}
+
+#[cfg(target_os = "windows")]
+fn windows_command_line<'a>(command: &'a str, arguments: impl Iterator<Item = &'a str>) -> String {
+    std::iter::once(command)
+        .chain(arguments)
+        .map(|value| format!("\"{}\"", value.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn server_props(base_url: &str) -> Option<serde_json::Value> {
@@ -606,6 +876,7 @@ fn server_props(base_url: &str) -> Option<serde_json::Value> {
     serde_json::from_str(body).ok()
 }
 
+#[cfg(target_os = "linux")]
 fn argument_value(arguments: &[String], flags: &[&str]) -> Option<String> {
     arguments
         .windows(2)
@@ -629,41 +900,44 @@ fn refresh_model_endpoint(endpoint: &mut ModelEndpoint) {
         endpoint.resource_plan = props.get("resource_plan").cloned();
     }
 
-    let model_path = endpoint.model_path.to_string_lossy();
-    let matching_arguments = llama_server_pids().into_iter().find_map(|pid| {
-        let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-        let arguments = bytes
-            .split(|byte| *byte == 0)
-            .filter(|value| !value.is_empty())
-            .map(|value| String::from_utf8_lossy(value).into_owned())
-            .collect::<Vec<_>>();
-        arguments
-            .iter()
-            .any(|argument| argument == model_path.as_ref())
-            .then_some(arguments)
-    });
-    let Some(arguments) = matching_arguments else {
-        return;
-    };
-    if let Some(context) =
-        argument_value(&arguments, &["-c", "--ctx-size"]).and_then(|value| value.parse().ok())
+    #[cfg(target_os = "linux")]
     {
-        endpoint.context = context;
+        let model_path = endpoint.model_path.to_string_lossy();
+        let matching_arguments = llama_server_pids().into_iter().find_map(|pid| {
+            let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+            let arguments = bytes
+                .split(|byte| *byte == 0)
+                .filter(|value| !value.is_empty())
+                .map(|value| String::from_utf8_lossy(value).into_owned())
+                .collect::<Vec<_>>();
+            arguments
+                .iter()
+                .any(|argument| argument == model_path.as_ref())
+                .then_some(arguments)
+        });
+        let Some(arguments) = matching_arguments else {
+            return;
+        };
+        if let Some(context) =
+            argument_value(&arguments, &["-c", "--ctx-size"]).and_then(|value| value.parse().ok())
+        {
+            endpoint.context = context;
+        }
+        let key_type = argument_value(&arguments, &["-ctk", "--cache-type-k"]);
+        let value_type = argument_value(&arguments, &["-ctv", "--cache-type-v"]);
+        endpoint.kv_type = match (key_type, value_type) {
+            (Some(key), Some(value)) if key != value => Some(format!("{key}/{value}")),
+            (Some(key), _) => Some(key),
+            (_, Some(value)) => Some(value),
+            _ => endpoint.kv_type.take(),
+        };
+        endpoint.batch_size = argument_value(&arguments, &["-b", "--batch-size"])
+            .and_then(|value| value.parse().ok())
+            .or(endpoint.batch_size);
+        endpoint.ubatch_size = argument_value(&arguments, &["-ub", "--ubatch-size"])
+            .and_then(|value| value.parse().ok())
+            .or(endpoint.ubatch_size);
     }
-    let key_type = argument_value(&arguments, &["-ctk", "--cache-type-k"]);
-    let value_type = argument_value(&arguments, &["-ctv", "--cache-type-v"]);
-    endpoint.kv_type = match (key_type, value_type) {
-        (Some(key), Some(value)) if key != value => Some(format!("{key}/{value}")),
-        (Some(key), _) => Some(key),
-        (_, Some(value)) => Some(value),
-        _ => endpoint.kv_type.take(),
-    };
-    endpoint.batch_size = argument_value(&arguments, &["-b", "--batch-size"])
-        .and_then(|value| value.parse().ok())
-        .or(endpoint.batch_size);
-    endpoint.ubatch_size = argument_value(&arguments, &["-ub", "--ubatch-size"])
-        .and_then(|value| value.parse().ok())
-        .or(endpoint.ubatch_size);
 }
 
 fn apply_model_environment(command: &mut CommandBuilder, endpoint: &ModelEndpoint) {
@@ -760,8 +1034,7 @@ fn spawn_terminal(
             pixel_height: 0,
         })
         .map_err(|error| error.to_string())?;
-    let mut command = CommandBuilder::new(&request.command);
-    command.args(&request.args);
+    let mut command = terminal_command(&request.command, &request.args);
     if let Some(endpoint) = &endpoint {
         apply_model_environment(&mut command, endpoint);
     }
@@ -833,6 +1106,24 @@ fn spawn_terminal(
         let _ = app.emit("terminal-exit", output_id);
     });
     Ok(session_id)
+}
+
+fn terminal_command(command: &str, arguments: &[String]) -> CommandBuilder {
+    #[cfg(target_os = "windows")]
+    if Path::new(command).extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+    }) {
+        let mut builder = CommandBuilder::new("cmd.exe");
+        builder.args(["/d", "/s", "/c"]);
+        builder.arg(windows_command_line(
+            command,
+            arguments.iter().map(String::as_str),
+        ));
+        return builder;
+    }
+    let mut builder = CommandBuilder::new(command);
+    builder.args(arguments);
+    builder
 }
 
 #[tauri::command]
@@ -1144,6 +1435,7 @@ fn gpu_blocker_message() -> Option<String> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn llama_server_pids() -> Vec<u32> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
@@ -1165,6 +1457,36 @@ fn llama_server_pids() -> Vec<u32> {
         .collect()
 }
 
+#[cfg(target_os = "windows")]
+fn llama_server_pids() -> Vec<u32> {
+    let output = ProcessCommand::new("tasklist.exe")
+        .args(["/FI", "IMAGENAME eq llama-server.exe", "/FO", "CSV", "/NH"])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let fields = line
+                .trim()
+                .trim_matches('"')
+                .split("\",\"")
+                .collect::<Vec<_>>();
+            (fields
+                .first()
+                .is_some_and(|name| name.eq_ignore_ascii_case("llama-server.exe")))
+            .then(|| fields.get(1)?.replace(',', "").parse().ok())
+            .flatten()
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn llama_server_pids() -> Vec<u32> {
+    Vec::new()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1178,6 +1500,9 @@ pub fn run() {
             cancel_hf_download,
             save_config,
             set_help_improve_ese,
+            get_chat_status,
+            start_chat,
+            cancel_chat,
             add_model_root,
             add_app_profile,
             launch_terminal,
@@ -1197,6 +1522,36 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_an_existing_config_preserves_the_new_contents() {
+        let root = std::env::temp_dir().join(format!("ese-replace-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("studio.toml");
+        let temporary = root.join("studio.tmp");
+        fs::write(&destination, "old").unwrap();
+        fs::write(&temporary, "new").unwrap();
+
+        replace_file(&temporary, &destination).unwrap();
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "new");
+        assert!(!temporary.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_stream_parser_extracts_only_text_deltas() {
+        assert_eq!(
+            chat_delta_content(r#"{"choices":[{"delta":{"content":"hello"}}]}"#).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            chat_delta_content(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#),
+            None
+        );
+        assert_eq!(chat_delta_content("not json"), None);
+    }
+
     #[test]
     fn quantization_is_inferred_from_common_names() {
         assert_eq!(

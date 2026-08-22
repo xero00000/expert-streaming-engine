@@ -1,4 +1,9 @@
-export type View = "models" | "hub" | "apps" | "sweeper" | "settings";
+export type View = "models" | "chat" | "hub" | "apps" | "sweeper" | "settings";
+
+export interface ChatStatus {
+  active: boolean;
+  modelId?: string;
+}
 
 export interface ModelProfile {
   id: string;
@@ -25,6 +30,7 @@ export interface AppProfile {
 }
 
 export interface StudioSnapshot {
+  platform: string;
   configPath: string;
   onboardingComplete: boolean;
   helpImproveEse: boolean;

@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, AppWindow, Box, ChevronDown, ChevronRight, ChevronUp, CloudDownload, Download, Gauge, HardDrive, Heart, Library, Play, Plus, RefreshCw, Search, Settings, ShieldCheck, SlidersHorizontal, SquareTerminal, X } from "lucide-react";
+import { Activity, AppWindow, Bot, Box, ChevronDown, ChevronRight, ChevronUp, CloudDownload, Download, Gauge, HardDrive, Heart, Library, MessageSquare, Play, Plus, RefreshCw, RotateCcw, Search, Send, Settings, ShieldCheck, SlidersHorizontal, SquareTerminal, StopCircle, Trash2, User, X } from "lucide-react";
 import { TerminalPane } from "./components/TerminalPane";
-import type { AppProfile, DownloadStatus, HubModel, HubModelDetails, ModelProfile, StudioSnapshot, SweepPlan, SweepStatus, TerminalTab, View } from "./types";
+import type { AppProfile, ChatStatus, DownloadStatus, HubModel, HubModelDetails, ModelProfile, StudioSnapshot, SweepPlan, SweepStatus, TerminalTab, View } from "./types";
 import "./App.css";
 
 const demoSnapshot: StudioSnapshot = {
+  platform: navigator.platform.toLowerCase().includes("win") ? "windows" : "linux",
   configPath: "~/.config/ese/studio.toml",
   onboardingComplete: true,
   helpImproveEse: false,
@@ -25,10 +26,26 @@ const demoSnapshot: StudioSnapshot = {
 
 const nav: Array<{ id: View; label: string; icon: typeof Library }> = [
   { id: "models", label: "Models", icon: Library },
+  { id: "chat", label: "Chat", icon: MessageSquare },
   { id: "hub", label: "Model hub", icon: CloudDownload },
   { id: "apps", label: "Apps", icon: AppWindow },
   { id: "sweeper", label: "Config sweeper", icon: Gauge },
 ];
+
+interface ChatEntry {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+}
+
+function storedChat(): ChatEntry[] {
+  try {
+    const parsed = JSON.parse(globalThis.localStorage?.getItem("ese-chat-history") ?? "[]");
+    return Array.isArray(parsed) ? parsed.filter((item) => item && ["user", "assistant"].includes(item.role) && typeof item.content === "string").slice(-100) : [];
+  } catch {
+    return [];
+  }
+}
 
 function formatBytes(bytes?: number) {
   if (!bytes) return "—";
@@ -149,6 +166,12 @@ function App() {
   const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>();
   const [onboardingChoice, setOnboardingChoice] = useState(false);
   const [savingConsent, setSavingConsent] = useState(false);
+  const [chatStatus, setChatStatus] = useState<ChatStatus>({ active: false });
+  const [chatMessages, setChatMessages] = useState<ChatEntry[]>(storedChat);
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatRunning, setChatRunning] = useState(false);
+  const [chatRequestId, setChatRequestId] = useState<string>();
+  const chatEnd = useRef<HTMLDivElement>(null);
 
   const refresh = async () => {
     setLoading(true);
@@ -189,6 +212,15 @@ function App() {
       setDownloadStatus(payload);
       if (payload.state === "complete") void refresh();
     }));
+    register(listen<{ requestId: string; content: string }>("chat-token", ({ payload }) => {
+      setChatMessages((messages) => messages.map((message) => message.id === payload.requestId ? { ...message, content: message.content + payload.content } : message));
+    }));
+    register(listen<{ requestId: string; stopped: boolean; error?: string }>("chat-finished", ({ payload }) => {
+      setChatMessages((messages) => messages.filter((message) => message.id !== payload.requestId || message.content.length > 0));
+      setChatRunning(false);
+      setChatRequestId(undefined);
+      if (payload.error) setNotice(payload.error);
+    }));
     void invoke<SweepStatus | null>("get_sweep_status").then((status) => { if (status) setSweepStatus(status); }).catch(() => undefined);
     void invoke<DownloadStatus | null>("get_hf_download_status").then((status) => { if (status) setDownloadStatus(status); }).catch(() => undefined);
     return () => { disposed = true; cleanups.forEach((cleanup) => cleanup()); };
@@ -197,6 +229,19 @@ function App() {
   useEffect(() => {
     globalThis.localStorage?.setItem("ese-terminal-height", String(terminalHeight));
   }, [terminalHeight]);
+
+  useEffect(() => {
+    globalThis.localStorage?.setItem("ese-chat-history", JSON.stringify(chatMessages.filter((message) => message.content).slice(-100)));
+    chatEnd.current?.scrollIntoView({ behavior: chatRunning ? "auto" : "smooth", block: "end" });
+  }, [chatMessages, chatRunning]);
+
+  useEffect(() => {
+    if (!native) return;
+    const update = () => void invoke<ChatStatus>("get_chat_status").then(setChatStatus).catch(() => setChatStatus({ active: false }));
+    update();
+    const interval = window.setInterval(update, 2000);
+    return () => window.clearInterval(interval);
+  }, [native]);
 
   const availableModels = useMemo(() => snapshot.models.filter((model) => model.available), [snapshot.models]);
   const familyOptions = useMemo(() => familyOrder.filter((family) => availableModels.some((model) => modelFamily(model) === family)), [availableModels]);
@@ -364,6 +409,48 @@ function App() {
     void launchApp({ id: `ese-${mode}`, name: mode === "serve" ? `Serving · ${selected.name}` : `Plan · ${selected.name}`, command: snapshot.eseBinary ?? "ese", args, endpointAware: false }, mode === "serve" ? "model" : "tool");
   };
 
+  const sendChat = async (text: string, history = chatMessages) => {
+    const content = text.trim();
+    if (!content || !native || !chatStatus.active || chatRunning) return;
+    const requestId = crypto.randomUUID();
+    const userMessage: ChatEntry = { id: crypto.randomUUID(), role: "user", content };
+    const assistantMessage: ChatEntry = { id: requestId, role: "assistant", content: "" };
+    const next = [...history, userMessage];
+    setChatMessages([...next, assistantMessage]);
+    setChatDraft("");
+    setChatRunning(true);
+    setChatRequestId(requestId);
+    try {
+      await invoke("start_chat", { requestId, messages: next.map(({ role, content: messageContent }) => ({ role, content: messageContent })) });
+    } catch (error) {
+      setChatMessages(next);
+      setChatRunning(false);
+      setChatRequestId(undefined);
+      setNotice(String(error));
+    }
+  };
+
+  const stopChat = async () => {
+    if (!chatRequestId) return;
+    await invoke("cancel_chat", { requestId: chatRequestId }).catch(() => undefined);
+  };
+
+  const regenerateChat = () => {
+    if (chatRunning) return;
+    let lastUser = -1;
+    for (let index = chatMessages.length - 1; index >= 0; index -= 1) {
+      if (chatMessages[index].role === "user") {
+        lastUser = index;
+        break;
+      }
+    }
+    if (lastUser < 0) return;
+    const prompt = chatMessages[lastUser].content;
+    const history = chatMessages.slice(0, lastUser);
+    setChatMessages(history);
+    void sendChat(prompt, history);
+  };
+
   const toggleFamily = (family: string) => {
     setExpandedFamilies((current) => {
       const next = new Set(current);
@@ -409,12 +496,21 @@ function App() {
 
       <main className={`workspace ${terminalOpen ? "with-terminal" : ""}`} style={terminalOpen ? { gridTemplateRows: `auto minmax(100px, 1fr) ${clampTerminalHeight(terminalHeight)}px` } : undefined}>
         <header className="topbar">
-          <div><h1>{view === "models" ? "Models" : view === "hub" ? "Hugging Face models" : view === "apps" ? "Apps" : view === "sweeper" ? "Config sweeper" : "Settings"}</h1><p>{view === "models" ? "Discover, configure, and start local GGUF models." : view === "hub" ? "Find GGUF models and choose a hardware-matched quantization." : view === "apps" ? "Launch terminal apps without leaving your workspace." : view === "sweeper" ? "Find the fastest stable configuration at your target context." : "Portable configuration and discovery."}</p></div>
+          <div><h1>{view === "models" ? "Models" : view === "chat" ? "Chat" : view === "hub" ? "Hugging Face models" : view === "apps" ? "Apps" : view === "sweeper" ? "Config sweeper" : "Settings"}</h1><p>{view === "models" ? "Discover, configure, and start local GGUF models." : view === "chat" ? "Talk directly to the active local model." : view === "hub" ? "Find GGUF models and choose a hardware-matched quantization." : view === "apps" ? "Launch terminal apps without leaving your workspace." : view === "sweeper" ? "Find the fastest stable configuration at your target context." : "Portable configuration and discovery."}</p></div>
           <div className="top-actions"><button className="icon-button" onClick={() => void refresh()} aria-label="Refresh" title="Refresh"><RefreshCw size={16} className={loading ? "spin" : ""} /></button>{view === "models" && <button className="primary" onClick={() => setView("settings")}><Plus size={15} />Add model folder</button>}</div>
         </header>
 
         <section className="content">
           {notice && <div className="notice" role="alert"><span>{notice}</span><button onClick={() => setNotice(undefined)} aria-label="Dismiss"><X size={14} /></button></div>}
+
+          {view === "chat" && <div className="chat-layout">
+            <div className="chat-statusbar"><span className={`chat-model-state ${chatStatus.active ? "ready" : "offline"}`}><i />{chatStatus.active ? "Model connected" : "No active model"}</span><code title={chatStatus.modelId}>{chatStatus.modelId ?? "Start a model from Models to begin"}</code><div><button onClick={regenerateChat} disabled={chatRunning || !chatMessages.some((message) => message.role === "user")} aria-label="Regenerate last response" title="Regenerate last response"><RotateCcw size={14} />Regenerate</button><button onClick={() => setChatMessages([])} disabled={chatRunning || chatMessages.length === 0} aria-label="Clear conversation" title="Clear conversation"><Trash2 size={14} />Clear</button></div></div>
+            <div className="chat-transcript" role="log" aria-live="polite" aria-label="Conversation">
+              {chatMessages.length ? chatMessages.map((message) => <article className={`chat-message ${message.role}`} key={message.id}><span className="chat-avatar" aria-hidden="true">{message.role === "user" ? <User size={16} /> : <Bot size={16} />}</span><div><strong>{message.role === "user" ? "You" : "ESE"}</strong><p>{message.content || <span className="typing-indicator"><i /><i /><i /><span className="sr-only">Generating response</span></span>}</p></div></article>) : <div className="chat-empty"><span><MessageSquare size={22} /></span><h2>Chat with your local model</h2><p>{chatStatus.active ? "Messages stay on this computer and are sent only to the active ESE server." : "Start a model from the Models screen. Chat will connect automatically when it is ready."}</p>{!chatStatus.active && <button className="primary" onClick={() => setView("models")}><Play size={14} />Choose a model</button>}</div>}
+              <div ref={chatEnd} />
+            </div>
+            <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); void sendChat(chatDraft); }}><textarea value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void sendChat(chatDraft); } }} placeholder={chatStatus.active ? "Message your local model" : "Start a model to enable chat"} aria-label="Chat message" rows={2} disabled={!chatStatus.active || chatRunning} /><div><small>Enter to send · Shift+Enter for a new line</small>{chatRunning ? <button type="button" className="chat-stop" onClick={() => void stopChat()}><StopCircle size={15} />Stop</button> : <button type="submit" className="primary" disabled={!chatStatus.active || !chatDraft.trim()}><Send size={15} />Send</button>}</div></form>
+          </div>}
 
           {view === "hub" && <div className="hub-layout">
             <section className="panel hub-search-panel">
@@ -482,7 +578,7 @@ function App() {
           {view === "settings" && <div className="settings-layout">
             <section className="panel settings-models">
               <div className="panel-heading"><div><h2>Model discovery</h2><p>Folders are scanned recursively for GGUF files.</p></div></div>
-              <div className="path-entry"><input value={modelRoot} onChange={(event) => setModelRoot(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void addModelRoot(); }} placeholder="/path/to/models" aria-label="Model folder path" /><button className="primary" onClick={() => void addModelRoot()} disabled={!native || !modelRoot.trim()}><Plus size={14} />Add folder</button></div>
+              <div className="path-entry"><input value={modelRoot} onChange={(event) => setModelRoot(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void addModelRoot(); }} placeholder={snapshot.platform === "windows" ? "C:\\Models" : "/path/to/models"} aria-label="Model folder path" /><button className="primary" onClick={() => void addModelRoot()} disabled={!native || !modelRoot.trim()}><Plus size={14} />Add folder</button></div>
               {snapshot.modelRoots.length ? <div className="settings-paths">{snapshot.modelRoots.map((root) => <div className="setting-row" key={root}><Library size={16} /><code title={root}>{root}</code><span className="availability ready"><i />Scanning</span></div>)}</div> : <EmptyState title="No model folders" detail="Add a folder to make local models discoverable." />}
             </section>
             <div className="settings-side">
@@ -491,9 +587,9 @@ function App() {
                 <div className="privacy-note" id="telemetry-settings-detail"><ShieldCheck size={17} /><span><strong>{snapshot.helpImproveEse ? "Community sharing is on" : "Community sharing is off"}</strong>Raw results stay in the private collector. Public GitHub data is grouped and never includes prompts, responses, usernames, hostnames, local paths, or logs.</span></div>
               </section>
               <section className="panel settings-about">
-                <div className="panel-heading"><div><h2>About ESE Studio</h2><p>Linux control center for Expert Streaming Engine · v0.1.0</p></div></div>
+                <div className="panel-heading"><div><h2>About ESE Studio</h2><p>{snapshot.platform === "windows" ? "Windows" : snapshot.platform === "linux" ? "Linux" : snapshot.platform} control center for Expert Streaming Engine · v0.1.0</p></div></div>
                 <div className="config-path"><small>Configuration file</small><code title={snapshot.configPath}>{snapshot.configPath}</code></div>
-                <p>Model and app settings use portable TOML. Keep secrets in environment variables or your Linux keyring. The visible path makes the configuration easy to inspect, back up, or edit with your preferred tool.</p>
+                <p>Model and app settings use portable TOML. Keep secrets in environment variables or your operating system's credential manager. The visible path makes the configuration easy to inspect, back up, or edit with your preferred tool.</p>
               </section>
             </div>
           </div>}
