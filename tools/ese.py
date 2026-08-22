@@ -39,6 +39,7 @@ from tools.hardware_profile import (
     collect_hardware_identity,
     default_profile_path,
     load_hardware_profile,
+    planner_profile_reasons,
     save_hardware_profile,
     stale_profile_reasons,
 )
@@ -427,23 +428,96 @@ def _read_gguf_value(handle: BinaryIO, value_type: int, *, depth: int = 0) -> An
     raise ESEError(f"unsupported GGUF metadata value type: {value_type}")
 
 
-def read_gguf_metadata(path: Path) -> dict[str, Any]:
-    """Read GGUF metadata without loading tensor payloads or materializing arrays."""
+def read_gguf_index(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Read GGUF metadata and tensor descriptors without loading tensor payloads."""
     with path.open("rb") as handle:
         if _read_exact(handle, 4) != b"GGUF":
             raise ESEError(f"not a GGUF file: {path}")
         version = _read_u32(handle)
         if version not in (2, 3):
             raise ESEError(f"unsupported GGUF version {version}; expected 2 or 3")
-        _tensor_count = _read_u64(handle)
+        tensor_count = _read_u64(handle)
         metadata_count = _read_u64(handle)
+        if tensor_count > 10_000_000:
+            raise ESEError(f"unreasonable GGUF tensor count: {tensor_count}")
         if metadata_count > 1_000_000:
             raise ESEError(f"unreasonable GGUF metadata count: {metadata_count}")
         metadata: dict[str, Any] = {"_gguf.version": version}
         for _ in range(metadata_count):
             key = _read_gguf_string(handle)
             metadata[key] = _read_gguf_value(handle, _read_u32(handle))
-        return metadata
+        tensors: list[dict[str, Any]] = []
+        for _ in range(tensor_count):
+            name = _read_gguf_string(handle)
+            dimensions_count = _read_u32(handle)
+            if not 1 <= dimensions_count <= 4:
+                raise ESEError(f"invalid GGUF tensor rank {dimensions_count}: {name}")
+            dimensions = tuple(_read_u64(handle) for _ in range(dimensions_count))
+            ggml_type = _read_u32(handle)
+            offset = _read_u64(handle)
+            tensors.append(
+                {"name": name, "dimensions": dimensions, "ggml_type": ggml_type, "offset": offset}
+            )
+        alignment = int(metadata.get("general.alignment", 32))
+        if alignment <= 0 or alignment > MIB or alignment & (alignment - 1):
+            raise ESEError(f"invalid GGUF alignment: {alignment}")
+        data_offset = (handle.tell() + alignment - 1) // alignment * alignment
+        payload_bytes = max(0, path.stat().st_size - data_offset)
+        offsets = sorted({int(tensor["offset"]) for tensor in tensors})
+        if offsets and (offsets[0] < 0 or offsets[-1] > payload_bytes):
+            raise ESEError(f"GGUF tensor offset is outside the data payload: {path}")
+        next_offset = {
+            offset: offsets[index + 1] if index + 1 < len(offsets) else payload_bytes
+            for index, offset in enumerate(offsets)
+        }
+        for tensor in tensors:
+            tensor["span_bytes"] = max(0, next_offset[int(tensor["offset"])] - int(tensor["offset"]))
+        return metadata, tensors
+
+
+def read_gguf_metadata(path: Path) -> dict[str, Any]:
+    return read_gguf_index(path)[0]
+
+
+_EXPERT_TENSOR_RE = re.compile(r"\.ffn_(?:gate|up|down|gate_up)_exps(?:\.weight)?$", re.I)
+
+
+def inspect_expert_geometries(path: Path) -> list[dict[str, Any]]:
+    """Return unique real expert component formats/geometries from all shards."""
+    candidates: list[dict[str, Any]] = []
+    for shard in discover_model_shards(path):
+        _, tensors = read_gguf_index(shard)
+        for tensor in tensors:
+            dimensions = tensor["dimensions"]
+            if not _EXPERT_TENSOR_RE.search(tensor["name"]) or len(dimensions) < 3:
+                continue
+            expert_count = int(dimensions[-1])
+            if expert_count <= 0 or tensor["span_bytes"] <= 0:
+                continue
+            candidates.append(
+                {
+                    **tensor,
+                    "expert_count": expert_count,
+                    "expert_component_bytes": int(tensor["span_bytes"]) // expert_count,
+                    "shard": str(shard),
+                }
+            )
+    unique: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for item in candidates:
+        key = (
+            item["ggml_type"], tuple(item["dimensions"]),
+            item["expert_component_bytes"], item["expert_count"],
+        )
+        unique.setdefault(key, item)
+    return sorted(
+        unique.values(),
+        key=lambda item: (item["ggml_type"], tuple(item["dimensions"]), item["expert_component_bytes"]),
+    )
+
+
+def inspect_expert_geometry(path: Path) -> dict[str, Any] | None:
+    geometries = inspect_expert_geometries(path)
+    return max(geometries, key=lambda item: item["expert_component_bytes"]) if geometries else None
 
 
 def inspect_model(path: Path) -> ModelInfo:
@@ -952,8 +1026,22 @@ def _calibrate(args: argparse.Namespace) -> int:
             f"hardware benchmark not found: {benchmark}; build the "
             "ese-hardware-bench target or pass --benchmark"
         )
-    if args.model is not None and not args.model.expanduser().is_file():
-        raise ESEError(f"calibration model not found: {args.model.expanduser()}")
+    model_path: Path | None = None
+    expert_geometries: list[dict[str, Any]] = []
+    if args.model is not None:
+        requested_model = args.model.expanduser().resolve()
+        if requested_model.is_dir():
+            models = sorted(requested_model.glob("*.gguf"))
+            if not models:
+                raise ESEError(f"calibration model directory contains no GGUF files: {requested_model}")
+            model_path = models[0]
+        elif requested_model.is_file():
+            model_path = requested_model
+        else:
+            raise ESEError(f"calibration model not found: {requested_model}")
+        expert_geometries = inspect_expert_geometries(model_path)
+        if not expert_geometries:
+            raise ESEError(f"no routed expert tensors found in calibration model: {model_path}")
     identity = collect_hardware_identity()
     command = [
         str(benchmark),
@@ -966,8 +1054,21 @@ def _calibrate(args: argparse.Namespace) -> int:
     physical_cores = identity.get("cpu", {}).get("physical_cores", 0)
     if isinstance(physical_cores, int) and physical_cores > 0:
         command.extend(("--threads", str(physical_cores)))
-    if args.model is not None:
-        command.extend(("--model", str(args.model.expanduser().resolve())))
+    if model_path is not None:
+        command.extend(("--model", str(model_path)))
+        for geometry in expert_geometries:
+            dimensions = geometry["dimensions"]
+            command.extend(
+                (
+                    "--model-expert-spec",
+                    ":".join(
+                        str(value) for value in (
+                            geometry["ggml_type"], dimensions[0], dimensions[1],
+                            geometry["expert_count"], geometry["expert_component_bytes"],
+                        )
+                    ),
+                )
+            )
     completed = subprocess.run(
         command,
         check=False,
@@ -1015,13 +1116,17 @@ def _calibrate(args: argparse.Namespace) -> int:
 def _hardware_profile_status(args: argparse.Namespace) -> int:
     try:
         profile = load_hardware_profile(args.profile)
-        reasons = stale_profile_reasons(profile, collect_hardware_identity())
+        identity = collect_hardware_identity()
+        reasons = stale_profile_reasons(profile, identity)
+        planner_reasons = planner_profile_reasons(profile, identity)
     except HardwareProfileError as exc:
         raise ESEError(str(exc)) from exc
     payload = {
         "profile": str(args.profile),
         "valid": not reasons,
         "stale_reasons": reasons,
+        "planner_ready": not planner_reasons,
+        "planner_reasons": planner_reasons,
         "created_at": profile["created_at"],
         "hardware_fingerprint": profile["hardware_fingerprint"],
         "benchmark_source": profile["benchmark_source"],
@@ -1033,6 +1138,9 @@ def _hardware_profile_status(args: argparse.Namespace) -> int:
         print(f"Hardware profile: {args.profile}")
         print(f"Status: {'ready' if not reasons else 'stale'}")
         for reason in reasons:
+            print(f"  - {reason}")
+        print(f"Planner: {'ready' if not planner_reasons else 'not ready'}")
+        for reason in planner_reasons:
             print(f"  - {reason}")
     return 0 if not reasons else 2
 
@@ -1138,7 +1246,7 @@ def _make_parser() -> argparse.ArgumentParser:
     calibrate.add_argument(
         "--model",
         type=Path,
-        help="optional GGUF identity reserved for the upcoming model-backed probe",
+        help="GGUF file, first shard, or directory for model-backed expert calibration",
     )
     calibrate.add_argument("--iterations", type=int, default=7)
     calibrate.add_argument("--bytes", type=parse_size, default=256 * MIB, metavar="SIZE")

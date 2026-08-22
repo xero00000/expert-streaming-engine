@@ -17,8 +17,11 @@ from tools.ese import (
     auto_tensor_split,
     build_launch_plan,
     discover_model_shards,
+    inspect_expert_geometry,
+    inspect_expert_geometries,
     parse_size,
     read_gguf_metadata,
+    read_gguf_index,
     select_policy,
     _execution_environment,
     _repo_root,
@@ -40,6 +43,20 @@ def write_minimal_gguf(path: Path, metadata: dict[str, object]) -> None:
         else:
             raise TypeError(value)
     path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, len(values)) + b"".join(values))
+
+
+def write_tensor_gguf(path: Path) -> None:
+    metadata = _gguf_string("general.alignment") + struct.pack("<II", 4, 32)
+    tensors = b"".join(
+        (
+            _gguf_string("blk.0.ffn_gate_exps.weight")
+            + struct.pack("<IQQQIQ", 3, 16, 32, 2, 1, 0),
+            _gguf_string("output.weight") + struct.pack("<IQQIQ", 2, 16, 16, 1, 1024),
+        )
+    )
+    header = b"GGUF" + struct.pack("<IQQ", 3, 2, 1) + metadata + tensors
+    data_offset = (len(header) + 31) // 32 * 32
+    path.write_bytes(header + bytes(data_offset - len(header)) + bytes(2048))
 
 
 def moe_model(size: int = 40 * GIB) -> ModelInfo:
@@ -105,6 +122,20 @@ class LauncherTests(unittest.TestCase):
             metadata = read_gguf_metadata(path)
             self.assertEqual(metadata["general.architecture"], "gpt-oss")
             self.assertEqual(metadata["gpt-oss.block_count"], 36)
+
+    def test_read_tensor_index_and_expert_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "model.gguf"
+            write_tensor_gguf(path)
+            metadata, tensors = read_gguf_index(path)
+            self.assertEqual(metadata["general.alignment"], 32)
+            self.assertEqual(tensors[0]["dimensions"], (16, 32, 2))
+            self.assertEqual(tensors[0]["span_bytes"], 1024)
+            expert = inspect_expert_geometry(path)
+            self.assertIsNotNone(expert)
+            self.assertEqual(expert["ggml_type"], 1)
+            self.assertEqual(expert["expert_component_bytes"], 512)
+            self.assertEqual(len(inspect_expert_geometries(path)), 1)
 
     def test_discover_split_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

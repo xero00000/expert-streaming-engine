@@ -30,18 +30,18 @@ Profiles default to `~/.cache/ese/hardware-profile.json`. They are versioned, wr
 | H2D/D2H | `ggml_backend_tensor_set/get` on a real CUDA backend | No; missing expert geometry/type keys |
 | H2D under host-memory contention | CUDA upload concurrent with host copy | No; baseline only |
 | CPU MoE | Real `ggml_mul_mat_id` F16 baseline with fixed geometry | No; missing model formats/geometries and reference parity |
-| Adaptive expert-cache upload | Shared production async upload submission primitive | No; missing full lease/route/event timing and model geometry |
+| Adaptive expert-cache upload | Shared production async upload primitive sized from real split-GGUF expert metadata | No; missing full lease/route/event timing |
+| CPU MoE + cache upload contention | Concurrent real routed matvec and production upload primitive | No; CPU side is not yet model-format-specific |
 
 The planner must not consume Phase A data until the last two rows use their production paths and results are keyed by expert GGML type, geometry, GPU, and NUMA node.
 Baseline profiles therefore carry `benchmark_source.planner_ready: false`.
-If `--model` is supplied at this stage, provenance records it as `model_requested` with `model_used: false`; fixed-geometry data is never presented as model-specific calibration.
+Without `--model`, provenance records `model_used: false`. With a GGUF file, first shard, or model directory, ESE scans every shard without loading tensor payloads and uses the representative expert type, geometry, count, and component byte size for the cache-upload probe. The fixed F16 CPU result remains clearly separate and is not presented as model-specific compute calibration.
 
 ### Remaining Phase A gate
 
 - Add a model-backed probe for the real ESE CPU MoE kernel.
 - Resolve and test the standalone fused `ggml_moe_up_gate` probe; its first calibration harness exposed allocator corruption, so Phase A currently uses the stable routed `ggml_mul_mat_id` primitive.
 - Extend the shared upload probe across the full production lease/route/event path.
-- Run CPU MoE and cache upload concurrently and record both completion times.
 - Record per-format/per-geometry samples and confidence statistics.
 - Validate numerical output against a CPU reference.
 - Feed only complete, current, sufficiently confident profiles into the native resource controller.

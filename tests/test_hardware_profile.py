@@ -15,6 +15,7 @@ from tools.hardware_profile import (
     collect_hardware_identity,
     hardware_fingerprint,
     load_hardware_profile,
+    planner_profile_reasons,
     save_hardware_profile,
     stale_profile_reasons,
 )
@@ -163,6 +164,21 @@ class HardwareProfileTests(unittest.TestCase):
                 mock.patch("sys.stdout", new_callable=io.StringIO),
             ):
                 self.assertEqual(_hardware_profile_status(args), 2)
+
+    def test_baseline_profile_is_rejected_by_planner_gate(self) -> None:
+        profile = build_hardware_profile(
+            identity(),
+            {
+                "cpu_moe": {"status": "measured"},
+                "expert_cache_upload": {"status": "measured"},
+                "cpu_cache_contention": {"status": "measured"},
+            },
+            benchmark_source={"planner_ready": False},
+        )
+        self.assertEqual(
+            planner_profile_reasons(profile, identity()),
+            ["calibration is baseline-only and not approved for planner decisions"],
+        )
 
 
 if __name__ == "__main__":

@@ -213,6 +213,23 @@ def stale_profile_reasons(
     return reasons
 
 
+def planner_profile_reasons(
+    profile: Mapping[str, Any], current_identity: Mapping[str, Any]
+) -> list[str]:
+    reasons = stale_profile_reasons(profile, current_identity)
+    if reasons:
+        return reasons
+    source = profile.get("benchmark_source", {})
+    if not isinstance(source, Mapping) or source.get("planner_ready") is not True:
+        reasons.append("calibration is baseline-only and not approved for planner decisions")
+    measurements = profile.get("measurements", {})
+    for name in ("cpu_moe", "expert_cache_upload", "cpu_cache_contention"):
+        measurement = measurements.get(name, {}) if isinstance(measurements, Mapping) else {}
+        if not isinstance(measurement, Mapping) or measurement.get("status") != "measured":
+            reasons.append(f"required planner measurement is unavailable: {name}")
+    return reasons
+
+
 def load_hardware_profile(path: Path | None = None) -> dict[str, Any]:
     target = path or default_profile_path()
     try:
