@@ -2936,7 +2936,8 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
-                        if (node->op == GGML_OP_REDUCE) {
+                        if (node->op == GGML_OP_REDUCE &&
+                                !ggml_backend_is_cpu(sched->backends[src_backend_id])) {
                             //printf("setting tensor_id_copy(reduce, %zu, %d, %s) to %s\n", src_id, cur_backend_id, node->name, src->name);
                             tensor_id_copy(src_id, cur_backend_id, 0) = src;
                         } else if (node->op == GGML_OP_FAKE_CPY && src->op == GGML_OP_REDUCE) {
@@ -3352,7 +3353,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     for (auto & item : sched->needs_sync) item = true;
 
-    if (sched->is_async && sched->n_backends > 2 && sched->split_mode_graph && sched->has_reduce) {
+    if (sched->is_async && sched->n_backends > 1 && sched->split_mode_graph && sched->has_reduce) {
 
         for (auto & s : sched->statuses) s = GGML_STATUS_SUCCESS;
 
@@ -3369,11 +3370,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (!sched->backend_splits[i].empty()) {
                 auto split = sched->backend_splits[i].front();
                 if (ggml_backend_is_cpu(sched->backends[split->backend_id])) {
-                    //printf("CPU backend %d has %d splits\n", split->backend_id, (int)sched->backend_splits[i].size());
-                    if (sched->backend_splits[i].size() > 1) {
-                        has_cpu_work = true;
-                        break;
-                    }
+                    // A CPU backend invokes its own OpenMP worker team. Run
+                    // heterogeneous scheduler workers as std::threads so that
+                    // nested OpenMP does not silently collapse the CPU MoE
+                    // branch to one thread.
+                    has_cpu_work = true;
+                    break;
                 }
             }
         }

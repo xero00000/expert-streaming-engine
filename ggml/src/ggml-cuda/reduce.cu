@@ -136,6 +136,32 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         // The dst tensor is just a container for the sources and the reduce op is turned off
         return;
     }
+    if (dst->op_params[3] == 2) {
+        const int destination = dst->op_params[4];
+        GGML_ASSERT(destination >= 0 && destination < nreduce && dst->src[destination]);
+        GGML_ASSERT(dst->data == dst->src[destination]->data);
+        const int64_t nelem = ggml_nelements(dst);
+        const int num_blocks = int((nelem + CUDA_REDUCE_BLOCK_SIZE - 1)/CUDA_REDUCE_BLOCK_SIZE);
+        for (int i = 0; i < nreduce; ++i) {
+            if (i == destination || !dst->src[i]) continue;
+            GGML_ASSERT(dst->src[i]->type == dst->type && ggml_are_same_shape(dst, dst->src[i]));
+            const void * source = dst->src[i]->data;
+            if (dst->type == GGML_TYPE_F16) {
+                k_add<half, CUDA_REDUCE_BLOCK_SIZE><<<num_blocks, CUDA_REDUCE_BLOCK_SIZE, 0, ctx.stream()>>>(
+                        nelem, (const half *)source, (half *)dst->data);
+            } else if (dst->type == GGML_TYPE_BF16) {
+                k_add<nv_bfloat16, CUDA_REDUCE_BLOCK_SIZE><<<num_blocks, CUDA_REDUCE_BLOCK_SIZE, 0, ctx.stream()>>>(
+                        nelem, (const nv_bfloat16 *)source, (nv_bfloat16 *)dst->data);
+            } else if (dst->type == GGML_TYPE_Q8_0) {
+                k_add<CUDA_REDUCE_BLOCK_SIZE><<<num_blocks, CUDA_REDUCE_BLOCK_SIZE, 0, ctx.stream()>>>(
+                        nelem, (const block_q8_0 *)source, (block_q8_0 *)dst->data);
+            } else {
+                k_add<float, CUDA_REDUCE_BLOCK_SIZE><<<num_blocks, CUDA_REDUCE_BLOCK_SIZE, 0, ctx.stream()>>>(
+                        nelem, (const float *)source, (float *)dst->data);
+            }
+        }
+        return;
+    }
 
     auto & info = ggml_cuda_info();
     auto it = info.all_ctx.find(ctx.model);

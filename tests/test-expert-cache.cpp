@@ -2,9 +2,11 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-ese.h"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -455,6 +457,76 @@ std::vector<float> compute_cuda_mul_mat_id(
     return result;
 }
 
+std::vector<float> compute_hybrid_mul_mat_id(
+        ggml_backend_t cuda_backend,
+        const std::vector<ggml_fp16_t> & weights,
+        int32_t gpu_expert,
+        const std::array<int32_t, 2> & cpu_route,
+        const std::array<int32_t, 2> & gpu_route,
+        const std::vector<float> & input_values) {
+    constexpr int64_t k = 768;
+    constexpr int64_t m = 384;
+    constexpr int64_t n_experts = 8;
+    constexpr int64_t n_used = 2;
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    REQUIRE(cpu_backend != nullptr);
+    struct cpu_cleanup { ggml_backend_t value; ~cpu_cleanup() { ggml_backend_free(value); } } free_cpu{cpu_backend};
+
+    ggml_init_params params = {
+        ggml_tensor_overhead()*32 + ggml_graph_overhead_custom(32, false), nullptr, true
+    };
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    struct context_cleanup { ggml_context * value; ~context_cleanup() { ggml_free(value); } } free_ctx{ctx};
+
+    ggml_tensor * cpu_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, k, m, n_experts);
+    ggml_tensor * gpu_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, k, m, 1);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, 1);
+    ggml_tensor * cpu_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
+    ggml_tensor * gpu_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
+    ggml_set_input(input);
+    ggml_set_input(cpu_ids);
+    ggml_set_input(gpu_ids);
+    ggml_tensor * cpu_output = ggml_mul_mat_id(ctx, cpu_weights, input, cpu_ids);
+    ggml_tensor * gpu_output = ggml_mul_mat_id(ctx, gpu_weights, input, gpu_ids);
+    ggml_tensor * branches[] = {gpu_output, cpu_output};
+    ggml_tensor * output = ggml_ese_reduce_to(ctx, branches, 2, GGML_OP_ADD, 0);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_t backends[] = {cuda_backend, cpu_backend};
+    ggml_backend_sched_t scheduler = ggml_backend_sched_new(
+            backends, nullptr, 2, 64, true);
+    REQUIRE(scheduler != nullptr);
+    struct scheduler_cleanup {
+        ggml_backend_sched_t value;
+        ~scheduler_cleanup() { ggml_backend_sched_free(value); }
+    } free_scheduler{scheduler};
+    ggml_backend_sched_set_split_mode_graph(scheduler, true, true);
+    ggml_backend_sched_set_tensor_backend(scheduler, cpu_weights, cpu_backend);
+    ggml_backend_sched_set_tensor_backend(scheduler, gpu_weights, cuda_backend);
+    ggml_backend_sched_set_tensor_backend(scheduler, cpu_output, cpu_backend);
+    ggml_backend_sched_set_tensor_backend(scheduler, gpu_output, cuda_backend);
+    REQUIRE(ggml_backend_sched_alloc_graph(scheduler, graph));
+
+    REQUIRE(weights.size() == size_t(k*m*n_experts));
+    REQUIRE(gpu_expert >= 0 && gpu_expert < n_experts);
+    REQUIRE(input_values.size() == size_t(k*n_used));
+    ggml_backend_tensor_set(cpu_weights, weights.data(), 0, weights.size()*sizeof(weights[0]));
+    ggml_backend_tensor_set(gpu_weights,
+            weights.data() + size_t(gpu_expert)*size_t(k*m), 0,
+            size_t(k*m)*sizeof(weights[0]));
+    ggml_backend_tensor_set(input, input_values.data(), 0, input_values.size()*sizeof(input_values[0]));
+    ggml_backend_tensor_set(cpu_ids, cpu_route.data(), 0, sizeof(cpu_route));
+    ggml_backend_tensor_set(gpu_ids, gpu_route.data(), 0, sizeof(gpu_route));
+    REQUIRE(ggml_backend_sched_graph_compute(scheduler, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_sched_synchronize(scheduler);
+    std::vector<float> result(size_t(ggml_nelements(output)));
+    ggml_backend_tensor_get(output, result.data(), 0, result.size()*sizeof(result[0]));
+    return result;
+}
+
 std::vector<float> compute_cuda_fused_moe(
         ggml_backend_t backend,
         const std::vector<ggml_fp16_t> & up_weights,
@@ -545,6 +617,27 @@ void test_cuda_compact_remap_exact_parity() {
     const auto compact = compute_cuda_mul_mat_id(
             backend, compact_weights, n_used, n_experts, remapped, input_values);
     REQUIRE(compact == full);
+
+    // Negative route sentinels turn unassigned route positions into exact
+    // zeroes. This permits independent CPU and GPU branches to execute on the
+    // same activation and sum back to the unsplit routed result.
+    const auto hybrid = compute_hybrid_mul_mat_id(
+            backend, full_weights, route[1], {{route[0], -1}}, {{-1, 0}}, input_values);
+    double squared_hybrid_error = 0;
+    double squared_full = 0;
+    for (size_t i = 0; i < full.size(); ++i) {
+        REQUIRE(std::isfinite(hybrid[i]));
+        const double error = double(hybrid[i]) - full[i];
+        squared_hybrid_error += error*error;
+        squared_full += double(full[i])*full[i];
+        if (i >= size_t(m)) {
+            // The GPU-owned route position is the same CUDA kernel plus an
+            // exact CPU zero, so a masked branch must not perturb it at all.
+            REQUIRE(hybrid[i] == full[i]);
+        }
+    }
+    const double hybrid_nrmse = std::sqrt(squared_hybrid_error/squared_full);
+    REQUIRE(hybrid_nrmse <= 5.0e-3);
 
     constexpr int64_t fused_k = 384;
     constexpr int64_t fused_m = 768;

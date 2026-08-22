@@ -51,9 +51,32 @@ Each timed series records its sample count, raw coefficient of variation, robust
 - Instrument the live scheduler route/events around the exact leased upload path.
 - Feed only complete, current, sufficiently confident profiles into the native resource controller.
 
+## Phase B: heterogeneous decode execution
+
+The graph scheduler now supports a one-CUDA-backend-plus-CPU parallel split and
+an ESE reduction with an explicit destination branch. CPU results are copied to
+the destination backend only after the CPU split completes; CUDA work remains
+asynchronous until the reduction dependency is reached. Scheduler workers use
+ordinary threads whenever a CPU split is present so the CPU backend retains its
+own OpenMP worker team.
+
+The native CUDA test constructs two real routed `ggml_mul_mat_id` branches: a
+full host expert tensor on CPU and a compact one-expert tensor on CUDA. Negative
+route sentinels mask positions not owned by each branch, and the explicit CUDA
+reduction reconstructs the unsplit result. GPU-owned positions are bit-exact and
+the complete hybrid output must remain within `0.005` NRMSE of the unsplit CUDA
+reference. A CPU-only build also compiles and runs the same test suite, skipping
+only the unavailable CUDA path.
+
+This is a scheduler primitive and correctness checkpoint, not live model
+integration. The llama decode graph does not yet select calibrated expert
+splits, populate compact cache tensors, or emit route/event telemetry. Those
+connections and their end-to-end parity and memory-bound evidence remain Phase
+B gates.
+
 ## Later phases
 
-1. Phase B: native CPU/GPU hybrid decode co-execution.
+1. Complete Phase B live native CPU/GPU hybrid decode co-execution.
 2. Phase C: double-buffered prefill streaming.
 3. Phase D: live KV/expert/transient resource rebalancing.
 4. Phase E: optional aligned FastStore sidecar bound to GGUF identity.

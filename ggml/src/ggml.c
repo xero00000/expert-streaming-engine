@@ -11,6 +11,7 @@
 #include "ggml-turbo-kv.h"
 #include "ggml-quants.h"
 #include "ggml.h"
+#include "ggml-ese.h"
 #include "ggml-aarch64.h"
 #include "ggml-moe-prefetch.h"
 #include "iqk/iqk_quantize.h"
@@ -6266,21 +6267,21 @@ struct ggml_tensor * ggml_dup_inplace(
     return ggml_dup_impl(ctx, a, true);
 }
 
-struct ggml_tensor * ggml_reduce(
+GGML_API struct ggml_tensor * ggml_ese_reduce_to(
             struct ggml_context         * ctx,
             struct ggml_tensor         ** a,
             int                           n,
-            enum ggml_op                  op) {
+            enum ggml_op                  op,
+            int                           destination) {
     GGML_ASSERT(n > 1 && n <= GGML_MAX_SRC);
     GGML_ASSERT(op == GGML_OP_ADD); // currently we only handle reduce_add
-    struct ggml_tensor * last = NULL;
     int nhave = 0;
     for (int j = 0; j < n; ++j) {
-        if (a[j]) { ++nhave; last = a[j]; }
+        if (a[j]) ++nhave;
     }
-    GGML_ASSERT(last);
+    GGML_ASSERT(destination >= 0 && destination < n && a[destination]);
     GGML_ASSERT(nhave > 1);
-    struct ggml_tensor * result = ggml_view_tensor(ctx, last);
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a[destination]);
     for (int j = 0; j < n; ++j) {
         result->src[j] = a[j];
     }
@@ -6288,6 +6289,22 @@ struct ggml_tensor * ggml_reduce(
     result->op_params[0] = (int)op;
     result->op_params[1] = n;
     result->op_params[2] = nhave;
+    result->op_params[3] = 2; // heterogeneous sources copied to destination backend
+    result->op_params[4] = destination;
+    return result;
+}
+
+struct ggml_tensor * ggml_reduce(
+            struct ggml_context         * ctx,
+            struct ggml_tensor         ** a,
+            int                           n,
+            enum ggml_op                  op) {
+    int destination = n - 1;
+    while (destination >= 0 && !a[destination]) --destination;
+    GGML_ASSERT(destination >= 0);
+    struct ggml_tensor * result = ggml_ese_reduce_to(ctx, a, n, op, destination);
+    result->op_params[3] = 0; // established peer-device reduction
+    result->op_params[4] = 0;
     return result;
 }
 
