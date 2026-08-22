@@ -33,9 +33,22 @@ import sys
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Sequence
 
+from tools.hardware_profile import (
+    HardwareProfileError,
+    build_hardware_profile,
+    collect_hardware_identity,
+    default_profile_path,
+    load_hardware_profile,
+    save_hardware_profile,
+    stale_profile_reasons,
+)
+
 GIB = 1024**3
 MIB = 1024**2
 DEFAULT_SERVER = Path("build/bin") / ("llama-server.exe" if os.name == "nt" else "llama-server")
+DEFAULT_HARDWARE_BENCH = Path("build/bin") / (
+    "ese-hardware-bench.exe" if os.name == "nt" else "ese-hardware-bench"
+)
 KNOWN_KV_TYPES = ("auto", "f16", "q8_0", "q4_0")
 POLICIES = ("auto", "resident", "hybrid", "cache", "stream")
 
@@ -903,6 +916,7 @@ def _build(args: argparse.Namespace) -> int:
         str(build_dir),
         f"-DCMAKE_BUILD_TYPE={args.build_type}",
         "-DLLAMA_BUILD_TESTS=OFF",
+        "-DLLAMA_BUILD_EXAMPLES=ON",
         "-DLLAMA_BUILD_SERVER=ON",
         f"-DGGML_CUDA={'ON' if backend == 'cuda' else 'OFF'}",
     ]
@@ -920,13 +934,103 @@ def _build(args: argparse.Namespace) -> int:
         args.build_type,
         "--target",
         "llama-server",
+        "ese-hardware-bench",
         "-j",
         str(args.jobs),
     ]
     print("+", shlex.join(build))
     subprocess.run(build, cwd=root, check=True)
-    print(f"Built: {_resolve_binary(None, build_dir)}")
+    print(f"Built server: {_resolve_binary(None, build_dir)}")
+    print(f"Built calibration tool: {build_dir / 'bin' / 'ese-hardware-bench'}")
     return 0
+
+
+def _calibrate(args: argparse.Namespace) -> int:
+    benchmark = Path(args.benchmark).expanduser().resolve()
+    if not benchmark.is_file():
+        raise ESEError(
+            f"hardware benchmark not found: {benchmark}; build the "
+            "ese-hardware-bench target or pass --benchmark"
+        )
+    if args.model is not None and not args.model.expanduser().is_file():
+        raise ESEError(f"calibration model not found: {args.model.expanduser()}")
+    command = [
+        str(benchmark),
+        "--json",
+        "--iterations",
+        str(args.iterations),
+        "--bytes",
+        str(args.bytes),
+    ]
+    if args.model is not None:
+        command.extend(("--model", str(args.model.expanduser().resolve())))
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+        raise ESEError(f"hardware calibration failed: {detail}")
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ESEError("hardware benchmark did not return valid JSON") from exc
+    if not isinstance(result, dict) or not isinstance(result.get("measurements"), dict):
+        raise ESEError("hardware benchmark JSON is missing measurements")
+    source = result.get("benchmark_source")
+    if not isinstance(source, dict):
+        source = {}
+    source = {
+        **source,
+        "binary": str(benchmark),
+        "command": command,
+    }
+    try:
+        profile = build_hardware_profile(
+            collect_hardware_identity(), result["measurements"], benchmark_source=source
+        )
+        target = save_hardware_profile(profile, args.output)
+    except HardwareProfileError as exc:
+        raise ESEError(str(exc)) from exc
+    payload = {
+        "profile": str(target),
+        "hardware_fingerprint": profile["hardware_fingerprint"],
+        "measurements": profile["measurements"],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"Hardware calibration saved: {target}")
+        print(f"Fingerprint: {profile['hardware_fingerprint']}")
+    return 0
+
+
+def _hardware_profile_status(args: argparse.Namespace) -> int:
+    try:
+        profile = load_hardware_profile(args.profile)
+        reasons = stale_profile_reasons(profile, collect_hardware_identity())
+    except HardwareProfileError as exc:
+        raise ESEError(str(exc)) from exc
+    payload = {
+        "profile": str(args.profile),
+        "valid": not reasons,
+        "stale_reasons": reasons,
+        "created_at": profile["created_at"],
+        "hardware_fingerprint": profile["hardware_fingerprint"],
+        "benchmark_source": profile["benchmark_source"],
+        "measurements": profile["measurements"],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"Hardware profile: {args.profile}")
+        print(f"Status: {'ready' if not reasons else 'stale'}")
+        for reason in reasons:
+            print(f"  - {reason}")
+    return 0 if not reasons else 2
 
 
 def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1019,6 +1123,26 @@ def _make_parser() -> argparse.ArgumentParser:
     build.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1))
     build.add_argument("--clean", action="store_true")
 
+    calibrate = commands.add_parser(
+        "calibrate", help="measure this machine and save a topology-bound performance profile"
+    )
+    calibrate.add_argument(
+        "--benchmark",
+        default=str(_repo_root() / DEFAULT_HARDWARE_BENCH),
+        help="path to the native ESE hardware benchmark",
+    )
+    calibrate.add_argument("--model", type=Path, help="optional GGUF for real expert-kernel trials")
+    calibrate.add_argument("--iterations", type=int, default=7)
+    calibrate.add_argument("--bytes", type=parse_size, default=256 * MIB, metavar="SIZE")
+    calibrate.add_argument("--output", type=Path, default=default_profile_path())
+    calibrate.add_argument("--json", action="store_true")
+
+    profile = commands.add_parser(
+        "hardware-profile", help="inspect profile validity for the current topology"
+    )
+    profile.add_argument("--profile", type=Path, default=default_profile_path())
+    profile.add_argument("--json", action="store_true")
+
     plan = commands.add_parser("plan", help="inspect the policy and native command")
     _add_plan_arguments(plan)
 
@@ -1081,6 +1205,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _doctor(args.json)
         if args.command == "build":
             return _build(args)
+        if args.command == "calibrate":
+            if args.iterations < 3:
+                raise ESEError("--iterations must be at least 3")
+            if args.bytes < MIB:
+                raise ESEError("--bytes must be at least 1MiB")
+            return _calibrate(args)
+        if args.command == "hardware-profile":
+            return _hardware_profile_status(args)
         plan = _plan_from_args(args)
         _print_plan(plan, args.json)
         if args.command == "plan" or args.dry_run:
