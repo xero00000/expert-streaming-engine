@@ -318,7 +318,8 @@ int main(int argc, char ** argv) {
                   << "    \"calibration_level\": \"baseline\",\n"
                   << "    \"planner_ready\": false,\n"
                   << "    \"transfer_path\": \"ggml_backend_tensor_set/get\",\n"
-                  << "    \"model\": \"" << json_escape(opts.model) << "\"\n"
+                  << "    \"model_requested\": \"" << json_escape(opts.model) << "\",\n"
+                  << "    \"model_used\": false\n"
                   << "  },\n  \"measurements\": {\n"
                   << "    \"host_memory\": {\"copy_gbps_median\": " << median(host_samples)
                   << ", \"bytes\": " << opts.bytes << ", \"iterations\": " << opts.iterations << "},\n";

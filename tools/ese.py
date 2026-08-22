@@ -1135,7 +1135,11 @@ def _make_parser() -> argparse.ArgumentParser:
         default=str(_repo_root() / DEFAULT_HARDWARE_BENCH),
         help="path to the native ESE hardware benchmark",
     )
-    calibrate.add_argument("--model", type=Path, help="optional GGUF for real expert-kernel trials")
+    calibrate.add_argument(
+        "--model",
+        type=Path,
+        help="optional GGUF identity reserved for the upcoming model-backed probe",
+    )
     calibrate.add_argument("--iterations", type=int, default=7)
     calibrate.add_argument("--bytes", type=parse_size, default=256 * MIB, metavar="SIZE")
     calibrate.add_argument("--output", type=Path, default=default_profile_path())

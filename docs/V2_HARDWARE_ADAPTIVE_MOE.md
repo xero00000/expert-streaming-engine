@@ -34,6 +34,7 @@ Profiles default to `~/.cache/ese/hardware-profile.json`. They are versioned, wr
 
 The planner must not consume Phase A data until the last two rows use their production paths and results are keyed by expert GGML type, geometry, GPU, and NUMA node.
 Baseline profiles therefore carry `benchmark_source.planner_ready: false`.
+If `--model` is supplied at this stage, provenance records it as `model_requested` with `model_used: false`; fixed-geometry data is never presented as model-specific calibration.
 
 ### Remaining Phase A gate
 
