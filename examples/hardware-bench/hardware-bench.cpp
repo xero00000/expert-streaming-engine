@@ -11,10 +11,12 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -30,6 +32,8 @@ struct model_expert_spec {
     int64_t expert_width = 0;
     int64_t expert_count = 0;
     size_t bytes = 0;
+    uint64_t data_offset = 0;
+    std::string source;
 };
 
 struct options {
@@ -67,17 +71,19 @@ options parse_options(int argc, char ** argv) {
                 model_expert_spec spec;
                 size_t start = 0;
                 std::vector<std::string> fields;
-                for (size_t end = value.find(':');; end = value.find(':', start)) {
+                for (size_t end = value.find('|');; end = value.find('|', start)) {
                     if (end == std::string::npos) { fields.push_back(value.substr(start)); break; }
                     fields.push_back(value.substr(start, end - start));
                     start = end + 1;
                 }
-                if (fields.size() != 5) throw std::runtime_error("invalid --model-expert-spec");
+                if (fields.size() != 7) throw std::runtime_error("invalid --model-expert-spec");
                 spec.type = std::stoi(fields[0]);
                 spec.input_width = std::stoll(fields[1]);
                 spec.expert_width = std::stoll(fields[2]);
                 spec.expert_count = std::stoll(fields[3]);
                 spec.bytes = parse_size(fields[4]);
+                spec.data_offset = std::stoull(fields[5]);
+                spec.source = fields[6];
                 result.model_experts.push_back(spec);
             }
         } else {
@@ -92,7 +98,7 @@ options parse_options(int argc, char ** argv) {
     }
     for (const auto & spec : result.model_experts) {
         if (spec.type < 0 || spec.input_width <= 0 || spec.expert_width <= 0 ||
-                spec.expert_count <= 0 || spec.bytes == 0) {
+                spec.expert_count <= 0 || spec.bytes == 0 || spec.source.empty()) {
             throw std::runtime_error("model-backed calibration contains invalid expert geometry");
         }
     }
@@ -313,6 +319,113 @@ cpu_moe_result measure_cpu_moe(
     return {k, m, n_used, threads, elapsed * 1000.0, gbps(weight_bytes, elapsed), checksum};
 }
 
+cpu_moe_result measure_model_cpu_moe(
+        const model_expert_spec & spec, int iterations, int requested_threads,
+        const std::function<double()> & concurrent_work = {},
+        std::vector<double> * concurrent_samples = nullptr) {
+    constexpr int64_t n_used = 2;
+    constexpr int64_t stored_experts = 2;
+    const ggml_type type = static_cast<ggml_type>(spec.type);
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) throw std::runtime_error("could not initialize model CPU MoE backend");
+    struct backend_cleanup { ggml_backend_t value; ~backend_cleanup() { ggml_backend_free(value); } } free_backend{backend};
+    const int threads = requested_threads > 0
+            ? requested_threads : std::max(1u, std::thread::hardware_concurrency() / 2);
+
+    ggml_init_params params = {
+        ggml_tensor_overhead() * 20 + ggml_graph_overhead_custom(16, false), nullptr, true
+    };
+    ggml_context * context = ggml_init(params);
+    if (!context) throw std::runtime_error("could not create model CPU MoE context");
+    struct context_cleanup { ggml_context * value; ~context_cleanup() { ggml_free(value); } } free_context{context};
+
+    ggml_tensor * weights = ggml_new_tensor_3d(
+            context, type, spec.input_width, spec.expert_width, stored_experts);
+    ggml_tensor * input = ggml_new_tensor_3d(context, GGML_TYPE_F32, spec.input_width, n_used, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(context, GGML_TYPE_I32, n_used, 1);
+    ggml_tensor * output = ggml_mul_mat_id(context, weights, input, ids);
+    ggml_cgraph * graph = ggml_new_graph_custom(context, 16, false);
+    ggml_build_forward_expand(graph, output);
+    const size_t expected_bytes = ggml_nbytes(weights);
+    if (expected_bytes != spec.bytes * stored_experts) {
+        std::ostringstream message;
+        message << "GGUF expert byte geometry mismatch for " << spec.source
+                << ": metadata span implies " << spec.bytes * stored_experts
+                << " bytes but GGML expects " << expected_bytes;
+        throw std::runtime_error(message.str());
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(context, backend);
+    if (!buffer) throw std::runtime_error("could not allocate model CPU MoE tensors");
+    struct buffer_cleanup { ggml_backend_buffer_t value; ~buffer_cleanup() { ggml_backend_buffer_free(value); } } free_buffer{buffer};
+
+    std::vector<uint8_t> expert_weights(expected_bytes);
+    std::ifstream source(spec.source, std::ios::binary);
+    if (!source) throw std::runtime_error("could not open GGUF expert source: " + spec.source);
+    source.seekg(static_cast<std::streamoff>(spec.data_offset));
+    source.read(reinterpret_cast<char *>(expert_weights.data()), static_cast<std::streamsize>(expert_weights.size()));
+    if (!source || static_cast<size_t>(source.gcount()) != expert_weights.size()) {
+        throw std::runtime_error("could not read complete GGUF expert payload: " + spec.source);
+    }
+    std::vector<float> inputs(static_cast<size_t>(spec.input_width * n_used));
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        inputs[i] = float(int((i * 13) % 97) - 48) / 48.0f;
+    }
+    const int32_t route[n_used] = {0, 1};
+    ggml_backend_tensor_set(weights, expert_weights.data(), 0, expert_weights.size());
+    ggml_backend_tensor_set(input, inputs.data(), 0, inputs.size() * sizeof(inputs[0]));
+    ggml_backend_tensor_set(ids, route, 0, sizeof(route));
+
+    ggml_backend_cpu_set_n_threads(backend, 1);
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("single-thread model CPU MoE reference failed");
+    }
+    std::vector<float> reference(static_cast<size_t>(ggml_nelements(output)));
+    ggml_backend_tensor_get(output, reference.data(), 0, reference.size() * sizeof(reference[0]));
+    ggml_backend_cpu_set_n_threads(backend, threads);
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("model CPU MoE warmup failed");
+    }
+    std::vector<double> samples;
+    for (int i = 0; i < iterations; ++i) {
+        std::atomic<bool> worker_ready{false};
+        std::atomic<bool> start_work{false};
+        double concurrent_seconds = 0;
+        std::thread worker;
+        if (concurrent_work) {
+            worker = std::thread([&]() {
+                worker_ready.store(true, std::memory_order_release);
+                while (!start_work.load(std::memory_order_acquire)) std::this_thread::yield();
+                concurrent_seconds = concurrent_work();
+            });
+            while (!worker_ready.load(std::memory_order_acquire)) std::this_thread::yield();
+        }
+        const auto start = clock_type::now();
+        start_work.store(true, std::memory_order_release);
+        const ggml_status compute_status = ggml_backend_graph_compute(backend, graph);
+        ggml_backend_synchronize(backend);
+        samples.push_back(seconds_since(start));
+        if (worker.joinable()) {
+            worker.join();
+            if (concurrent_samples) concurrent_samples->push_back(concurrent_seconds);
+        }
+        if (compute_status != GGML_STATUS_SUCCESS) throw std::runtime_error("model CPU MoE benchmark failed");
+    }
+    std::vector<float> result(reference.size());
+    ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(result[0]));
+    double checksum = 0;
+    for (size_t i = 0; i < result.size(); ++i) {
+        if (!std::isfinite(result[i]) || std::abs(result[i] - reference[i]) > 1.0e-4f) {
+            throw std::runtime_error("model CPU MoE failed single-thread output parity");
+        }
+        checksum += result[i];
+    }
+    if (!std::isfinite(checksum)) throw std::runtime_error("model CPU MoE produced invalid checksum");
+    const double elapsed = median(samples);
+    return {spec.input_width, spec.expert_width, n_used, threads,
+            elapsed * 1000.0, gbps(expected_bytes, elapsed), checksum};
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -391,8 +504,15 @@ int main(int argc, char ** argv) {
             }
         }
         const cpu_moe_result cpu_moe = measure_cpu_moe(opts.iterations, opts.threads);
+        std::vector<cpu_moe_result> model_cpu_moe;
+        model_cpu_moe.reserve(opts.model_experts.size());
+        for (const auto & spec : opts.model_experts) {
+            model_cpu_moe.push_back(measure_model_cpu_moe(spec, opts.iterations, opts.threads));
+        }
         cpu_moe_result contended_cpu_moe;
         std::vector<double> contended_expert_upload_seconds;
+        std::vector<cpu_moe_result> contended_model_cpu_moe;
+        std::vector<std::vector<double>> contended_model_upload_seconds(opts.model_experts.size());
         if (transfer.backend) {
             contended_cpu_moe = measure_cpu_moe(
                 opts.iterations, opts.threads,
@@ -404,6 +524,19 @@ int main(int argc, char ** argv) {
                     return seconds_since(start);
                 },
                 &contended_expert_upload_seconds);
+            for (size_t i = 0; i < opts.model_experts.size(); ++i) {
+                const auto & spec = opts.model_experts[i];
+                contended_model_cpu_moe.push_back(measure_model_cpu_moe(
+                    spec, opts.iterations, opts.threads,
+                    [&]() {
+                        const auto start = clock_type::now();
+                        ggml_backend_expert_cache_upload_async(
+                                transfer.backend, transfer.tensor, source.data(), 0, spec.bytes);
+                        ggml_backend_synchronize(transfer.backend);
+                        return seconds_since(start);
+                    },
+                    &contended_model_upload_seconds[i]));
+            }
         }
 
         std::cout << std::fixed << std::setprecision(6);
@@ -434,7 +567,27 @@ int main(int argc, char ** argv) {
                   << ", \"threads\": " << cpu_moe.threads
                   << ", \"latency_ms_median\": " << cpu_moe.latency_ms_median
                   << ", \"effective_gbps_median\": " << cpu_moe.effective_gbps_median
-                  << ", \"correctness\": \"single-thread-parity\", \"checksum\": " << cpu_moe.checksum << "},\n"
+                  << ", \"correctness\": \"single-thread-parity\", \"checksum\": " << cpu_moe.checksum;
+        if (!model_cpu_moe.empty()) {
+            std::cout << ", \"model_profiles\": [";
+            for (size_t i = 0; i < model_cpu_moe.size(); ++i) {
+                if (i) std::cout << ", ";
+                const auto & spec = opts.model_experts[i];
+                const auto & result = model_cpu_moe[i];
+                std::cout << "{\"ggml_type_id\": " << spec.type
+                          << ", \"ggml_type\": \"" << ggml_type_name(static_cast<ggml_type>(spec.type))
+                          << "\", \"input_width\": " << spec.input_width
+                          << ", \"expert_width\": " << spec.expert_width
+                          << ", \"expert_count\": " << spec.expert_count
+                          << ", \"bytes_read\": " << spec.bytes * 2
+                          << ", \"latency_ms_median\": " << result.latency_ms_median
+                          << ", \"effective_gbps_median\": " << result.effective_gbps_median
+                          << ", \"correctness\": \"single-thread-parity\", \"checksum\": "
+                          << result.checksum << "}";
+            }
+            std::cout << "]";
+        }
+        std::cout << "},\n"
                   << "    \"cpu_cache_contention\": {";
         if (transfer.backend) {
             std::cout << "\"status\": \"measured\", \"cpu_operation\": \"ggml_mul_mat_id\", "
@@ -442,7 +595,27 @@ int main(int argc, char ** argv) {
                       << ", \"cpu_effective_gbps_median\": " << contended_cpu_moe.effective_gbps_median
                       << ", \"upload_gbps_median\": "
                       << gbps(expert_upload_bytes, median(contended_expert_upload_seconds))
-                      << ", \"bytes_per_expert_component\": " << expert_upload_bytes << "},\n";
+                      << ", \"bytes_per_expert_component\": " << expert_upload_bytes;
+            if (!contended_model_cpu_moe.empty()) {
+                std::cout << ", \"model_profiles\": [";
+                for (size_t i = 0; i < contended_model_cpu_moe.size(); ++i) {
+                    if (i) std::cout << ", ";
+                    const auto & spec = opts.model_experts[i];
+                    const auto & result = contended_model_cpu_moe[i];
+                    std::cout << "{\"ggml_type_id\": " << spec.type
+                              << ", \"ggml_type\": \"" << ggml_type_name(static_cast<ggml_type>(spec.type))
+                              << "\", \"input_width\": " << spec.input_width
+                              << ", \"expert_width\": " << spec.expert_width
+                              << ", \"expert_count\": " << spec.expert_count
+                              << ", \"bytes_per_expert_component\": " << spec.bytes
+                              << ", \"cpu_latency_ms_median\": " << result.latency_ms_median
+                              << ", \"cpu_effective_gbps_median\": " << result.effective_gbps_median
+                              << ", \"upload_gbps_median\": "
+                              << gbps(spec.bytes, median(contended_model_upload_seconds[i])) << "}";
+                }
+                std::cout << "]";
+            }
+            std::cout << "},\n";
         } else {
             std::cout << "\"status\": \"unavailable\", \"reason\": \"no CUDA backend\"},\n";
         }

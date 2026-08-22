@@ -472,6 +472,7 @@ def read_gguf_index(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         }
         for tensor in tensors:
             tensor["span_bytes"] = max(0, next_offset[int(tensor["offset"])] - int(tensor["offset"]))
+            tensor["data_offset"] = data_offset + int(tensor["offset"])
         return metadata, tensors
 
 
@@ -1061,10 +1062,11 @@ def _calibrate(args: argparse.Namespace) -> int:
             command.extend(
                 (
                     "--model-expert-spec",
-                    ":".join(
+                    "|".join(
                         str(value) for value in (
                             geometry["ggml_type"], dimensions[0], dimensions[1],
                             geometry["expert_count"], geometry["expert_component_bytes"],
+                            geometry["data_offset"], geometry["shard"],
                         )
                     ),
                 )
