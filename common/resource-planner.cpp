@@ -772,6 +772,47 @@ bool common_expert_calibration_lookup(
     return true;
 }
 
+bool common_expert_split_solve_calibrated(
+        const common_expert_calibration_profile & profile,
+        const std::vector<common_expert_calibration_key> & components,
+        uint32_t misses,
+        int32_t previous_upload_experts,
+        double hysteresis_fraction,
+        common_expert_split_plan & plan,
+        std::string & error) {
+    error.clear();
+    if (components.empty()) {
+        error = "expert split requires calibrated component geometry";
+        return false;
+    }
+    common_expert_split_input input;
+    input.misses = misses;
+    input.previous_upload_experts = previous_upload_experts;
+    input.hysteresis_fraction = hysteresis_fraction;
+    input.cpu_confidence = 1.0;
+    input.upload_confidence = 1.0;
+    for (const auto & key : components) {
+        common_expert_calibration_entry entry;
+        if (!common_expert_calibration_lookup(profile, key, entry)) {
+            error = "hardware calibration has no entry for a required expert component";
+            return false;
+        }
+        if (entry.cpu_ns_per_expert_component >
+                    std::numeric_limits<double>::max() - input.cpu_ns_per_expert ||
+                entry.upload_ns_per_expert_component >
+                    std::numeric_limits<double>::max() - input.upload_ns_per_expert) {
+            error = "calibrated expert component costs overflow";
+            return false;
+        }
+        input.cpu_ns_per_expert += entry.cpu_ns_per_expert_component;
+        input.upload_ns_per_expert += entry.upload_ns_per_expert_component;
+        input.cpu_confidence = std::min(input.cpu_confidence, entry.cpu_confidence);
+        input.upload_confidence = std::min(input.upload_confidence, entry.upload_confidence);
+    }
+    input.calibration_complete = true;
+    return common_expert_split_solve(input, plan, error);
+}
+
 std::string common_resource_plan_json(const common_resource_plan & plan) {
     std::ostringstream out;
     out << '{';

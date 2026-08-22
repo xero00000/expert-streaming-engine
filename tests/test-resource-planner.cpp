@@ -382,6 +382,15 @@ void test_native_calibration_profile_gate() {
     REQUIRE(common_expert_calibration_lookup(profile, key, entry));
     REQUIRE(entry.cpu_ns_per_expert_component == 120000.0);
     REQUIRE(entry.upload_ns_per_expert_component == 90000.0);
+    common_expert_split_plan split;
+    REQUIRE(common_expert_split_solve_calibrated(
+            profile, {key, key}, 7, -1, 0.05, split, error));
+    REQUIRE(split.cpu_experts == 3 && split.upload_experts == 4);
+    common_expert_calibration_key missing = key;
+    missing.ggml_type = 19;
+    REQUIRE(!common_expert_split_solve_calibrated(
+            profile, {key, missing}, 7, -1, 0.05, split, error));
+    REQUIRE(error.find("required expert component") != std::string::npos);
     key.backend = "CUDA1";
     REQUIRE(!common_expert_calibration_lookup(profile, key, entry));
 

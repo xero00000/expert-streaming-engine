@@ -192,6 +192,17 @@ bool common_expert_calibration_lookup(
     const common_expert_calibration_key & key,
     common_expert_calibration_entry & entry);
 
+// Sum every component required by one routed expert, then solve the integer
+// CPU/upload split for this decode step. Missing calibration fails closed.
+bool common_expert_split_solve_calibrated(
+    const common_expert_calibration_profile & profile,
+    const std::vector<common_expert_calibration_key> & components,
+    uint32_t misses,
+    int32_t previous_upload_experts,
+    double hysteresis_fraction,
+    common_expert_split_plan & plan,
+    std::string & error);
+
 std::string common_resource_plan_json(const common_resource_plan & plan);
 std::string common_memory_policy_name(common_memory_policy policy);
 std::string common_kv_quality_name(common_kv_quality quality);
