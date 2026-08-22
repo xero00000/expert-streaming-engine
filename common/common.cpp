@@ -4224,11 +4224,11 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
     llama_model_resource_bytes(probe, &input.dense_ram_bytes, &input.expert_source_bytes);
     input.model_is_moe = input.expert_source_bytes != 0;
     input.max_ram_bytes = params.max_ram_bytes;
-    input.requested_expert_ram_bytes = input.expert_source_bytes;
+    input.requested_expert_ram_bytes = common_resource_cache_limit_bytes(params.expert_ram_cache_mib);
     input.min_expert_ram_bytes = llama_model_largest_expert_component(probe);
     input.requested_aux_ram_bytes = params.cache_ram_mib > 0
         ? uint64_t(params.cache_ram_mib)*1024ULL*1024ULL : 0;
-    input.requested_expert_vram_bytes_per_device = input.expert_source_bytes;
+    input.requested_expert_vram_bytes_per_device = common_resource_cache_limit_bytes(params.expert_vram_cache_mib);
     input.io_staging_bytes = params.expert_ram_staging_mib > 0
         ? uint64_t(params.expert_ram_staging_mib)*1024ULL*1024ULL
         : std::max<uint64_t>(input.min_expert_ram_bytes, 64ULL*1024ULL*1024ULL);
@@ -4301,7 +4301,11 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
     params.cache_ram_mib = (int32_t) std::min<uint64_t>(INT32_MAX, plan.aux_ram_bytes/mib);
     params.expert_ram_staging_mib = (int64_t) ((plan.io_staging_bytes + mib - 1)/mib);
     params.defer_experts = plan.policy != COMMON_MEMORY_POLICY_RESIDENT && input.model_is_moe;
-    params.fit = !input.devices.empty() && input.devices.front().id >= 0;
+    // Static CPU-MoE placement already bounds the GPU-resident model tensors.
+    // The loader rejects combining that explicit placement with --fit, so only
+    // enable automatic layer fitting when no -ncmoe/--cpu-moe override exists.
+    params.fit = common_resource_should_enable_fit(
+        !input.devices.empty() && input.devices.front().id >= 0, params.ncmoe);
 
     uint64_t max_device_margin = params.reserve_vram_bytes;
     for (const auto & device : plan.devices) {

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tools.ese import (
     ESEError,
@@ -18,6 +20,8 @@ from tools.ese import (
     parse_size,
     read_gguf_metadata,
     select_policy,
+    _execution_environment,
+    _repo_root,
 )
 
 
@@ -63,6 +67,24 @@ def hardware(*free_gib: int, ram_available: int = 100) -> HardwareInfo:
 
 
 class LauncherTests(unittest.TestCase):
+    def test_frozen_launcher_uses_executable_directory_as_runtime_root(self) -> None:
+        with (
+            mock.patch.object(sys, "frozen", True, create=True),
+            mock.patch.object(sys, "executable", "/opt/ese/ese.exe"),
+        ):
+            self.assertEqual(_repo_root(), Path("/opt/ese"))
+
+    def test_execution_environment_prefers_bundled_native_libraries(self) -> None:
+        plan = build_launch_plan(
+            model=moe_model(),
+            hardware=hardware(20),
+            binary=Path("/opt/ese/build/bin/llama-server"),
+            policy="cache",
+        )
+        with mock.patch.dict("os.environ", {"LD_LIBRARY_PATH": "/system/libs"}, clear=True):
+            environment = _execution_environment(plan)
+        self.assertEqual(environment["LD_LIBRARY_PATH"], "/opt/ese/build/bin:/system/libs")
+
     def test_parse_size(self) -> None:
         self.assertEqual(parse_size("8GiB"), 8 * GIB)
         self.assertEqual(parse_size("1.5G"), 1_500_000_000)

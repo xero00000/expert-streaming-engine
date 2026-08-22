@@ -510,6 +510,18 @@ std::string common_resource_plan_json(const common_resource_plan & plan) {
     return out.str();
 }
 
+uint64_t common_resource_cache_limit_bytes(int64_t capacity_mib) {
+    constexpr uint64_t mib = 1024ULL*1024ULL;
+    if (capacity_mib <= 0) {
+        return 0;
+    }
+    return mul_saturated((uint64_t) capacity_mib, mib);
+}
+
+bool common_resource_should_enable_fit(bool has_accelerator, int32_t n_cpu_moe) {
+    return has_accelerator && n_cpu_moe == 0;
+}
+
 bool common_resource_apply_plan_atomic(
         common_resource_plan & current,
         const common_resource_plan & target,

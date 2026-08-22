@@ -7,6 +7,14 @@ on:
   pull_request:
     paths:
       - "studio/**"
+      - "ese"
+      - "ese.cmd"
+      - "tools/ese.py"
+      - "CMakeLists.txt"
+      - "ggml/**"
+      - "src/**"
+      - "common/**"
+      - "examples/server/**"
       - "telemetry/**"
       - "benchmarks/**"
       - "COMMUNITY_BENCHMARKS.md"
@@ -63,6 +71,16 @@ jobs:
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build bundled ESE CPU runtime
+        working-directory: .
+        run: >-
+          cmake -S . -B build-package
+          -DCMAKE_BUILD_TYPE=Release
+          -DGGML_CUDA=OFF
+          -DLLAMA_BUILD_TESTS=OFF
+          -DLLAMA_BUILD_SERVER=ON
+          && cmake --build build-package --target llama-server -j2
+
       - name: Check installer shell syntax
         run: |
           bash -n install.sh scripts/install-local.sh
@@ -81,15 +99,17 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build DEB and RPM packages
-        run: pnpm tauri build --bundles deb,rpm
+        run: pnpm tauri build --bundles deb,rpm --config src-tauri/tauri.unsigned.conf.json
 
       - name: Install and smoke-test DEB package
         run: |
           sudo dpkg -i src-tauri/target/release/bundle/deb/*.deb
           test -x /usr/bin/ese-studio
+          find /usr -path '*/ese/ese' -type f -print -quit | grep -F /ese/ese
+          find /usr -path '*/ese/build/bin/llama-server' -type f -print -quit | grep -F /ese/build/bin/llama-server
           desktop-file-validate "/usr/share/applications/ESE Studio.desktop"
           set +e
-          WEBKIT_DISABLE_DMABUF_RENDERER=1 xvfb-run -a timeout 8s /usr/bin/ese-studio
+          WEBKIT_DISABLE_DMABUF_RENDERER=1 timeout --kill-after=3s 12s xvfb-run -a /usr/bin/ese-studio
           status=$?
           set -e
           test "$status" -eq 0 -o "$status" -eq 124
@@ -122,6 +142,10 @@ jobs:
         with:
           node-version: 22
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -136,6 +160,21 @@ jobs:
 
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Build bundled ESE CPU runtime
+        working-directory: .
+        shell: pwsh
+        run: |
+          cmake -S . -B build-package -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON -A x64
+          cmake --build build-package --config Release --target llama-server -j 2
+
+      - name: Build standalone Windows ESE launcher
+        working-directory: .
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check "pyinstaller==6.16.0"
+          python -m PyInstaller --noconfirm --clean --onefile --name ese --paths . --hidden-import tools.ese --distpath dist --workpath build-pyinstaller --specpath build-pyinstaller ese
+          .\dist\ese.exe --version
 
       - name: Check installer PowerShell syntax
         shell: pwsh
@@ -152,6 +191,12 @@ jobs:
       - name: Build frontend
         run: pnpm build
 
+      - name: Verify staged Windows runtime
+        shell: pwsh
+        run: |
+          if (-not (Test-Path runtime\ese\ese.exe)) { throw "standalone ese.exe was not staged" }
+          if (-not (Test-Path runtime\ese\build\bin\llama-server.exe)) { throw "llama-server.exe was not staged" }
+
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
@@ -162,7 +207,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build NSIS and MSI installers
-        run: pnpm tauri build --bundles nsis,msi
+        run: pnpm tauri build --bundles nsis,msi --config src-tauri/tauri.unsigned.conf.json
 
       - name: Upload Windows installers
         uses: actions/upload-artifact@v4

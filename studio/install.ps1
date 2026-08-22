@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 $studioRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $missing = [System.Collections.Generic.List[string]]::new()
 
-foreach ($command in @("node", "cargo", "rustc")) {
+foreach ($command in @("node", "cargo", "rustc", "cmake", "python")) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         $missing.Add($command)
     }
@@ -39,7 +39,7 @@ if ($missing.Count -eq 0 -and -not $pnpmMissing) {
     }
 }
 
-foreach ($optional in @("ese", "nvidia-smi")) {
+foreach ($optional in @("nvidia-smi")) {
     if (-not (Get-Command $optional -ErrorAction SilentlyContinue)) {
         Write-Host "  Optional runtime tool not found: $optional"
     }
@@ -65,6 +65,12 @@ if ($missing.Count -gt 0) {
     if (($missing -contains "cargo") -or ($missing -contains "rustc")) {
         winget install --exact --id Rustlang.Rustup --accept-package-agreements --accept-source-agreements
     }
+    if ($missing -contains "cmake") {
+        winget install --exact --id Kitware.CMake --accept-package-agreements --accept-source-agreements
+    }
+    if ($missing -contains "python") {
+        winget install --exact --id Python.Python.3.12 --accept-package-agreements --accept-source-agreements
+    }
     if ($missing -contains "Visual Studio C++ Build Tools") {
         winget install --exact --id Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended" --accept-package-agreements --accept-source-agreements
     }
@@ -84,10 +90,22 @@ if ($pnpmMissing) {
     corepack enable pnpm
 }
 
+$pyInstallerReady = python -c "import PyInstaller" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    $reply = Read-Host "Install the PyInstaller build dependency for the standalone Windows ESE launcher? [y/N]"
+    if ($reply -notmatch '^[Yy]$') {
+        Write-Host "PyInstaller was not installed. A self-contained Windows package cannot be built."
+        exit 2
+    }
+    python -m pip install --disable-pip-version-check --user "pyinstaller==6.16.0"
+}
+
 Push-Location $studioRoot
 try {
+    python ..\ese build --backend auto --build-dir ..\build-package
+    python -m PyInstaller --noconfirm --clean --onefile --name ese --paths .. --hidden-import tools.ese --distpath ..\dist --workpath ..\build-pyinstaller --specpath ..\build-pyinstaller ..\ese
     pnpm install --frozen-lockfile
-    pnpm tauri build --bundles nsis,msi
+    pnpm tauri build --bundles nsis,msi --config src-tauri/tauri.unsigned.conf.json
 } finally {
     Pop-Location
 }

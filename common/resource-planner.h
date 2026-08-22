@@ -140,6 +140,11 @@ bool common_parse_resource_preference(const std::string & text, common_resource_
 bool common_parse_kv_quality(const std::string & text, common_kv_quality & quality);
 bool common_parse_resource_backend(const std::string & text, common_resource_backend & backend);
 
+// Normalize launcher/native-controller overrides before solving the plan.
+// Zero is an explicit disabled cache, not a request for an automatic maximum.
+uint64_t common_resource_cache_limit_bytes(int64_t capacity_mib);
+bool common_resource_should_enable_fit(bool has_accelerator, int32_t n_cpu_moe);
+
 bool common_resource_apply_plan_atomic(
     common_resource_plan & current,
     const common_resource_plan & target,
