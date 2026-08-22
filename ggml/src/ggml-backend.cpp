@@ -3,6 +3,7 @@
 #include "ggml-impl.h"
 #include "ggml-rpc.h"
 #include "ggml-moe-prefetch.h"
+#include "ggml-ese.h"
 
 #include <cassert>
 #include <climits>
@@ -221,6 +222,12 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
     } else {
         backend->iface.set_tensor_async(backend, tensor, data, offset, size);
     }
+}
+
+void ggml_backend_expert_cache_upload_async(
+        ggml_backend_t backend, struct ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size) {
+    ggml_backend_tensor_set_async(backend, tensor, data, offset, size);
 }
 
 void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2317,7 +2324,7 @@ static bool ggml_active_expert_cache_stage(
             GGML_ABORT("required expert lease path has no event-capable backend\n");
         }
         const auto submit_start = std::chrono::steady_clock::now();
-        ggml_backend_tensor_set_async(upload_backend, component.tensor,
+        ggml_backend_expert_cache_upload_async(upload_backend, component.tensor,
                 upload_source, cache_offset, input->nb[2]);
         sched->active_expert_cache_transfer_submit_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - submit_start).count());

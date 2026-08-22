@@ -144,6 +144,8 @@ class HardwareProfileTests(unittest.TestCase):
             saved = load_hardware_profile(target)
             self.assertEqual(saved["measurements"]["host_memory"]["copy_gbps"], 42.0)
             self.assertEqual(saved["benchmark_source"]["build"], "test")
+            self.assertIn("--threads", saved["benchmark_source"]["command"])
+            self.assertIn("8", saved["benchmark_source"]["command"])
             self.assertIs(subprocess_result, completed)
 
     def test_profile_status_returns_two_when_topology_is_stale(self) -> None:

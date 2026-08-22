@@ -954,6 +954,7 @@ def _calibrate(args: argparse.Namespace) -> int:
         )
     if args.model is not None and not args.model.expanduser().is_file():
         raise ESEError(f"calibration model not found: {args.model.expanduser()}")
+    identity = collect_hardware_identity()
     command = [
         str(benchmark),
         "--json",
@@ -962,6 +963,9 @@ def _calibrate(args: argparse.Namespace) -> int:
         "--bytes",
         str(args.bytes),
     ]
+    physical_cores = identity.get("cpu", {}).get("physical_cores", 0)
+    if isinstance(physical_cores, int) and physical_cores > 0:
+        command.extend(("--threads", str(physical_cores)))
     if args.model is not None:
         command.extend(("--model", str(args.model.expanduser().resolve())))
     completed = subprocess.run(
@@ -990,7 +994,7 @@ def _calibrate(args: argparse.Namespace) -> int:
     }
     try:
         profile = build_hardware_profile(
-            collect_hardware_identity(), result["measurements"], benchmark_source=source
+            identity, result["measurements"], benchmark_source=source
         )
         target = save_hardware_profile(profile, args.output)
     except HardwareProfileError as exc:
