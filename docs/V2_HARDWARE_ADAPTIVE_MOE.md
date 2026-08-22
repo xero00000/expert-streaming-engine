@@ -30,8 +30,8 @@ Profiles default to `~/.cache/ese/hardware-profile.json`. They are versioned, wr
 | H2D/D2H | `ggml_backend_tensor_set/get` on every detected CUDA backend | No; needs confidence scoring |
 | H2D under host-memory contention | Per-device CUDA upload concurrent with host copy | No; baseline only |
 | CPU MoE | Real `ggml_mul_mat_id` over two actual GGUF expert payloads for every discovered type/geometry | No; still needs an independent numerical reference and confidence scoring |
-| Adaptive expert-cache upload | Per-device production async upload primitive sized from real split-GGUF expert metadata | No; missing full lease/route/event timing |
-| CPU MoE + cache upload contention | Per-device concurrent model-format routed matvec and production upload primitive | No; still needs full lease/route/event timing |
+| Adaptive expert-cache upload | Real split-GGUF payload read through a bounded production RAM-cache lease, uploaded with the production async primitive on every CUDA backend, synchronized while the lease is held, then released | No; still needs live scheduler route/event timing |
+| CPU MoE + cache upload contention | Per-device concurrent model-format routed matvec and production upload primitive | No; still needs the live scheduler's lease/route/event timing |
 
 The planner must not consume Phase A data until the last two rows use their production paths and results are keyed by expert GGML type, geometry, GPU, and NUMA node.
 Baseline profiles therefore carry `benchmark_source.planner_ready: false`.
@@ -44,11 +44,9 @@ Each timed series records its sample count, coefficient of variation, and a cons
 ### Remaining Phase A gate
 
 - Resolve and test the standalone fused `ggml_moe_up_gate` probe; its first calibration harness exposed allocator corruption, so Phase A currently uses the stable routed `ggml_mul_mat_id` primitive.
-- Extend the shared upload probe across the full production lease/route/event path.
-- Record per-format/per-geometry samples and confidence statistics.
+- Instrument the live scheduler route/events around the exact leased upload path.
 - Validate numerical output against a CPU reference.
 - Feed only complete, current, sufficiently confident profiles into the native resource controller.
-- Add controller tests for all-upload, all-CPU, and mixed integer splits, including hysteresis and small miss counts.
 
 ## Later phases
 

@@ -51,6 +51,37 @@ uint64_t identity_hash(uint64_t hash, const void * data, size_t size) {
     return hash;
 }
 
+#if defined(__linux__)
+source_identity identity_from_fd(int fd, uint32_t source_id, uint64_t source_size) {
+    constexpr size_t identity_sample_bytes = 64*1024;
+    std::vector<uint8_t> sample(std::min<uint64_t>(identity_sample_bytes, source_size));
+    auto read_sample = [&](uint64_t offset) {
+        size_t completed = 0;
+        while (completed < sample.size()) {
+            const ssize_t result = ::pread(
+                    fd, sample.data() + completed, sample.size() - completed,
+                    off_t(offset + completed));
+            if (result < 0 && errno == EINTR) continue;
+            if (result <= 0) {
+                throw std::runtime_error("cannot read expert source identity: " + std::string(std::strerror(errno)));
+            }
+            completed += size_t(result);
+        }
+    };
+    read_sample(0);
+    uint64_t high = 1469598103934665603ULL;
+    uint64_t low  = 7809847782465536322ULL;
+    high = identity_hash(high, &source_id, sizeof(source_id));
+    high = identity_hash(high, &source_size, sizeof(source_size));
+    high = identity_hash(high, sample.data(), sample.size());
+    if (source_size > sample.size()) read_sample(source_size - sample.size());
+    low = identity_hash(low, sample.data(), sample.size());
+    low = identity_hash(low, &source_size, sizeof(source_size));
+    low = identity_hash(low, &source_id, sizeof(source_id));
+    return {high, low};
+}
+#endif
+
 std::string key_string(const expert_key & key) {
     std::ostringstream out;
     out << "layer=" << key.layer << ", expert=" << key.expert << ", component=" << unsigned(key.part);
@@ -58,6 +89,22 @@ std::string key_string(const expert_key & key) {
 }
 
 } // namespace
+
+source_identity identify_file_source(const std::string & path, uint32_t source_id) {
+#if defined(__linux__)
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) throw std::runtime_error("cannot open expert source '" + path + "': " + std::strerror(errno));
+    struct fd_cleanup { int value; ~fd_cleanup() { ::close(value); } } cleanup{fd};
+    struct stat info = {};
+    if (::fstat(fd, &info) != 0 || info.st_size <= 0) {
+        throw std::runtime_error("cannot stat non-empty expert source '" + path + "'");
+    }
+    return identity_from_fd(fd, source_id, uint64_t(info.st_size));
+#else
+    (void) path; (void) source_id;
+    throw std::runtime_error("expert file identity currently requires Linux");
+#endif
+}
 
 descriptor::descriptor(descriptor_spec spec, uint64_t bytes) :
     key_(spec.key),
@@ -124,38 +171,9 @@ struct file_source::impl {
         }
         source_size = uint64_t(info.st_size);
 
-        // Recompute the bounded source identity from the descriptor's actual
-        // file descriptor. This catches path replacement or mutation between
-        // GGUF indexing and cache construction instead of trusting a stale
-        // identity supplied by the caller.
-        constexpr size_t identity_sample_bytes = 64*1024;
-        std::vector<uint8_t> identity_sample(std::min<uint64_t>(identity_sample_bytes, source_size));
-        auto read_identity_sample = [&](uint64_t offset) {
-            size_t completed = 0;
-            while (completed < identity_sample.size()) {
-                const ssize_t result = ::pread(
-                        fd, identity_sample.data() + completed,
-                        identity_sample.size() - completed, off_t(offset + completed));
-                if (result < 0 && errno == EINTR) continue;
-                if (result <= 0) {
-                    throw std::runtime_error("cannot read expert source identity: " + std::string(std::strerror(errno)));
-                }
-                completed += size_t(result);
-            }
-        };
-        read_identity_sample(0);
-        uint64_t identity_high = 1469598103934665603ULL;
-        uint64_t identity_low  = 7809847782465536322ULL;
-        identity_high = identity_hash(identity_high, &source_id, sizeof(source_id));
-        identity_high = identity_hash(identity_high, &source_size, sizeof(source_size));
-        identity_high = identity_hash(identity_high, identity_sample.data(), identity_sample.size());
-        if (source_size > identity_sample.size()) {
-            read_identity_sample(source_size - identity_sample.size());
-        }
-        identity_low = identity_hash(identity_low, identity_sample.data(), identity_sample.size());
-        identity_low = identity_hash(identity_low, &source_size, sizeof(source_size));
-        identity_low = identity_hash(identity_low, &source_id, sizeof(source_id));
-        if (source_identity({ identity_high, identity_low }) != source_identity_value) {
+        // Recompute from the descriptor's actual open file to catch replacement
+        // or mutation between indexing and cache construction.
+        if (identity_from_fd(fd, source_id, source_size) != source_identity_value) {
             throw std::runtime_error("expert source identity changed before cache construction");
         }
 

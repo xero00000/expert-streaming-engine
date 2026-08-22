@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-ese.h"
 #include "llama.h"
+#include "llama-expert-cache.h"
 
 #include <algorithm>
 #include <atomic>
@@ -16,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -242,6 +244,60 @@ struct device_contention_result {
     std::vector<double> upload_gbps;
     std::vector<sample_summary> upload_statistics;
 };
+
+struct leased_upload_result {
+    std::string backend;
+    size_t spec_index = 0;
+    sample_summary statistics;
+};
+
+sample_summary measure_leased_expert_upload(
+        const model_expert_spec & spec,
+        ggml_backend_t backend,
+        ggml_tensor * destination,
+        int iterations) {
+    using namespace llama_expert_cache;
+    constexpr uint32_t source_id = 0;
+    const source_identity identity = identify_file_source(spec.source, source_id);
+    auto file = std::make_shared<file_source>(
+            source_id, identity, spec.source, read_backend::pread);
+    descriptor_spec description;
+    description.key = {0, 0, component::gate};
+    description.ggml_type = uint32_t(spec.type);
+    description.rank = 2;
+    description.quant_axis = 0;
+    description.block_elements = uint32_t(ggml_blck_size(static_cast<ggml_type>(spec.type)));
+    description.block_bytes = uint32_t(ggml_type_size(static_cast<ggml_type>(spec.type)));
+    description.source_alignment = uint32_t(std::gcd<uint64_t>(32, spec.bytes));
+    description.dimensions = {{uint64_t(spec.input_width), uint64_t(spec.expert_width), 0, 0}};
+    description.strides[0] = description.block_bytes;
+    description.strides[1] = uint64_t(ggml_row_size(
+            static_cast<ggml_type>(spec.type), spec.input_width));
+    description.model_identity = identity;
+    description.extents.push_back({source_id, identity, spec.data_offset, spec.bytes});
+    auto expert = descriptor::make(std::move(description), {{source_id, file->size()}});
+    ram_cache cache({spec.bytes, spec.bytes}, {file});
+    std::vector<double> samples;
+    for (int i = 0; i < iterations; ++i) {
+        cache.clear();
+        const auto start = clock_type::now();
+        {
+            auto lease = cache.acquire(expert);
+            if (!lease || lease.size() != spec.bytes) {
+                throw std::runtime_error("production expert lease returned the wrong payload size");
+            }
+            ggml_backend_expert_cache_upload_async(
+                    backend, destination, lease.data(), 0, lease.size());
+            ggml_backend_synchronize(backend);
+        }
+        samples.push_back(seconds_since(start));
+    }
+    const cache_stats stats = cache.stats();
+    if (stats.active_leases != 0 || stats.bytes_read[size_t(read_backend::pread)] < spec.bytes*iterations) {
+        throw std::runtime_error("production expert lease telemetry did not account for calibration reads");
+    }
+    return summarize(samples);
+}
 
 cpu_moe_result measure_cpu_moe(
         int iterations, int requested_threads,
@@ -695,6 +751,23 @@ int main(int argc, char ** argv) {
                 device_contentions.push_back(std::move(measured));
             }
         }
+        std::vector<leased_upload_result> leased_uploads;
+        if (transfer.backend && !opts.model_experts.empty()) {
+            for (size_t ordinal = 0;; ++ordinal) {
+                std::string lease_backend_name;
+                transfer_probe lease_probe = make_transfer_probe(
+                        allocation_bytes, lease_backend_name, ordinal);
+                if (!lease_probe.backend) break;
+                for (size_t spec_index = 0; spec_index < opts.model_experts.size(); ++spec_index) {
+                    leased_uploads.push_back({
+                            lease_backend_name,
+                            spec_index,
+                            measure_leased_expert_upload(
+                                    opts.model_experts[spec_index], lease_probe.backend,
+                                    lease_probe.tensor, opts.iterations)});
+                }
+            }
+        }
 
         std::cout << std::fixed << std::setprecision(6);
         std::cout << "{\n  \"benchmark_source\": {\n"
@@ -706,7 +779,7 @@ int main(int argc, char ** argv) {
                   << "    \"model_used\": " << (!opts.model_experts.empty() ? "true" : "false") << ",\n"
                   << "    \"model_usage\": "
                   << (!opts.model_experts.empty()
-                          ? "[\"expert_payload_cpu_moe\",\"expert_cache_upload_geometry\",\"per_device_contention\"]"
+                          ? "[\"expert_payload_cpu_moe\",\"expert_cache_upload_geometry\",\"bounded_ram_lease_upload\",\"per_device_contention\"]"
                           : "[]") << "\n"
                   << "  },\n  \"measurements\": {\n"
                   << "    \"host_memory\": {\"copy_gbps_median\": " << median(host_samples)
@@ -880,6 +953,25 @@ int main(int argc, char ** argv) {
                               << ", \"expert_count\": " << spec.expert_count
                               << ", \"bytes_per_expert_component\": " << spec.bytes
                               << ", \"gbps_median\": " << median(model_expert_upload_samples[i]) << "}";
+                }
+                std::cout << "]";
+            }
+            if (!leased_uploads.empty()) {
+                std::cout << ", \"lease_upload_profiles\": [";
+                for (size_t i = 0; i < leased_uploads.size(); ++i) {
+                    if (i) std::cout << ", ";
+                    const auto & result = leased_uploads[i];
+                    const auto & spec = opts.model_experts[result.spec_index];
+                    const auto & stats = result.statistics;
+                    std::cout << "{\"backend\": \"" << json_escape(result.backend)
+                              << "\", \"storage_backend\": \"pread\", \"ggml_type_id\": " << spec.type
+                              << ", \"ggml_type\": \"" << ggml_type_name(static_cast<ggml_type>(spec.type))
+                              << "\", \"bytes_per_expert_component\": " << spec.bytes
+                              << ", \"end_to_end_ms_median\": " << stats.median * 1000.0
+                              << ", \"end_to_end_gbps_median\": " << gbps(spec.bytes, stats.median)
+                              << ", \"sample_count\": " << stats.count
+                              << ", \"coefficient_variation\": " << stats.coefficient_variation
+                              << ", \"confidence\": " << stats.confidence << "}";
                 }
                 std::cout << "]";
             }

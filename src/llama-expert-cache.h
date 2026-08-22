@@ -39,6 +39,10 @@ struct source_identity {
     bool operator!=(const source_identity & other) const { return !(*this == other); }
 };
 
+// Compute the same bounded file identity validated by file_source. This is
+// exposed for calibration and descriptor construction without loading a GGUF.
+source_identity identify_file_source(const std::string & path, uint32_t source_id);
+
 struct expert_key {
     uint32_t layer  = 0;
     uint32_t expert = 0;

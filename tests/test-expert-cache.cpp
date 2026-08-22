@@ -274,6 +274,7 @@ void test_file_storage_backends() {
     for (size_t i = 0; i < 3; ++i) {
         try {
             const uint32_t source_id = uint32_t(i + 1);
+            REQUIRE(identify_file_source(path, source_id) == file_identity(source_id, bytes));
             auto storage = std::make_shared<file_source>(
                     source_id, file_identity(source_id, bytes), path, backends[i]);
             std::array<uint8_t, 32> output = {};
