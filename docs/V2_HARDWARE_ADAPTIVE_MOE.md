@@ -20,6 +20,8 @@ The user-facing commands are:
 ./ese hardware-profile
 ```
 
+Model-backed calibration defaults to 21 samples per series. Fewer samples can be requested for diagnostics, but fewer than seven can never produce planner-ready evidence.
+
 Profiles default to `~/.cache/ese/hardware-profile.json`. They are versioned, written atomically with mode `0600`, and bound to a fingerprint covering CPU/NUMA topology, GPU UUID/model/device order, driver, PCI bus identity, CUDA compute capability, kernel, and the NVIDIA topology matrix. A changed identity makes the profile stale.
 
 ### Measurement maturity

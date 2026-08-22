@@ -40,7 +40,7 @@ struct model_expert_spec {
 
 struct options {
     size_t bytes = 256ULL * 1024 * 1024;
-    int iterations = 7;
+    int iterations = 21;
     int threads = 0;
     bool json = false;
     std::string model;
@@ -872,11 +872,43 @@ int main(int argc, char ** argv) {
             }
         }
 
+        const auto confident = [](double confidence, double relative_standard_error) {
+            return std::isfinite(confidence) && confidence >= 0.80 &&
+                    std::isfinite(relative_standard_error) && relative_standard_error >= 0;
+        };
+        bool planner_ready = opts.iterations >= 7 && !opts.model_experts.empty() &&
+                !device_transfers.empty() && model_cpu_moe.size() == opts.model_experts.size() &&
+                device_contentions.size() == device_transfers.size() &&
+                leased_uploads.size() == device_transfers.size() * opts.model_experts.size();
+        for (const auto & result : model_cpu_moe) {
+            planner_ready = planner_ready &&
+                    confident(result.confidence, result.relative_standard_error) &&
+                    std::isfinite(result.independent_reference_nrmse) &&
+                    result.independent_reference_nrmse <= 0.08;
+        }
+        for (const auto & result : leased_uploads) {
+            planner_ready = planner_ready && confident(
+                    result.statistics.confidence,
+                    result.statistics.relative_standard_error);
+        }
+        for (const auto & device : device_contentions) {
+            planner_ready = planner_ready &&
+                    device.cpu.size() == opts.model_experts.size() &&
+                    device.upload_statistics.size() == opts.model_experts.size();
+            for (size_t i = 0; i < device.cpu.size() && i < device.upload_statistics.size(); ++i) {
+                planner_ready = planner_ready &&
+                        confident(device.cpu[i].confidence, device.cpu[i].relative_standard_error) &&
+                        confident(device.upload_statistics[i].confidence,
+                                device.upload_statistics[i].relative_standard_error);
+            }
+        }
+
         std::cout << std::fixed << std::setprecision(6);
         std::cout << "{\n  \"benchmark_source\": {\n"
                   << "    \"tool\": \"ese-hardware-bench\",\n"
-                  << "    \"calibration_level\": \"baseline\",\n"
-                  << "    \"planner_ready\": false,\n"
+                  << "    \"calibration_level\": \""
+                  << (planner_ready ? "planner" : "baseline") << "\",\n"
+                  << "    \"planner_ready\": " << (planner_ready ? "true" : "false") << ",\n"
                   << "    \"transfer_path\": \"ggml_backend_tensor_set/get\",\n"
                   << "    \"model_requested\": \"" << json_escape(opts.model) << "\",\n"
                   << "    \"model_used\": " << (!opts.model_experts.empty() ? "true" : "false") << ",\n"
@@ -945,6 +977,7 @@ int main(int argc, char ** argv) {
                           << "\", \"input_width\": " << spec.input_width
                           << ", \"expert_width\": " << spec.expert_width
                           << ", \"expert_count\": " << spec.expert_count
+                          << ", \"bytes_per_expert_component\": " << spec.bytes
                           << ", \"bytes_read\": " << spec.bytes * 2
                           << ", \"latency_ms_median\": " << result.latency_ms_median
                           << ", \"effective_gbps_median\": " << result.effective_gbps_median
@@ -1088,7 +1121,10 @@ int main(int argc, char ** argv) {
                               << "\", \"storage_backend\": \"pread\", \"distribution\": \"warm-steady-state\""
                               << ", \"ggml_type_id\": " << spec.type
                               << ", \"ggml_type\": \"" << ggml_type_name(static_cast<ggml_type>(spec.type))
-                              << "\", \"bytes_per_expert_component\": " << spec.bytes
+                              << "\", \"input_width\": " << spec.input_width
+                              << ", \"expert_width\": " << spec.expert_width
+                              << ", \"expert_count\": " << spec.expert_count
+                              << ", \"bytes_per_expert_component\": " << spec.bytes
                               << ", \"end_to_end_ms_median\": " << stats.median * 1000.0
                               << ", \"end_to_end_gbps_median\": " << gbps(spec.bytes, stats.median)
                               << ", \"sample_count\": " << stats.count

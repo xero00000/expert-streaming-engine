@@ -48,6 +48,70 @@ def identity() -> dict[str, object]:
     }
 
 
+def complete_planner_profile() -> dict[str, object]:
+    format_fields = {
+        "ggml_type_id": 16,
+        "input_width": 4096,
+        "expert_width": 2048,
+        "bytes_per_expert_component": 2162688,
+    }
+    return build_hardware_profile(
+        identity(),
+        {
+            "cpu_moe": {
+                "status": "measured",
+                "model_profiles": [{
+                    **format_fields,
+                    "correctness": "single-thread-and-dequantized-scalar-reference",
+                    "independent_reference_nrmse": 0.004,
+                    "sample_count": 21,
+                    "relative_standard_error": 0.02,
+                    "confidence": 0.92,
+                }],
+            },
+            "expert_cache_upload": {
+                "status": "measured",
+                "lease_upload_profiles": [{
+                    "backend": "CUDA0",
+                    "storage_backend": "pread",
+                    "distribution": "warm-steady-state",
+                    **format_fields,
+                    "sample_count": 21,
+                    "relative_standard_error": 0.02,
+                    "confidence": 0.92,
+                }],
+            },
+            "cpu_cache_contention": {
+                "status": "measured",
+                "upload_path": "pread_to_bounded_ram_lease_to_async_upload",
+                "distribution": "warm-steady-state",
+                "devices": [{
+                    "backend": "CUDA0",
+                    "profiles": [{
+                        **format_fields,
+                        "cpu_sample_count": 21,
+                        "cpu_relative_standard_error": 0.02,
+                        "cpu_confidence": 0.92,
+                        "upload_sample_count": 21,
+                        "upload_relative_standard_error": 0.02,
+                        "upload_confidence": 0.92,
+                    }],
+                }],
+            },
+        },
+        benchmark_source={
+            "planner_ready": True,
+            "calibration_level": "planner",
+            "model_usage": [
+                "expert_payload_cpu_moe",
+                "bounded_ram_lease_upload",
+                "bounded_ram_lease_contention",
+                "per_device_contention",
+            ],
+        },
+    )
+
+
 class HardwareProfileTests(unittest.TestCase):
     def test_identity_is_stable_and_ignores_volatile_free_memory(self) -> None:
         first = identity()
@@ -193,6 +257,25 @@ class HardwareProfileTests(unittest.TestCase):
         reasons = planner_profile_reasons(profile, identity())
         self.assertIn("planner profile has no model-backed CPU expert measurements", reasons)
         self.assertIn("planner profile has no per-device contention measurements", reasons)
+
+    def test_complete_production_matrix_passes_planner_gate(self) -> None:
+        self.assertEqual(planner_profile_reasons(complete_planner_profile(), identity()), [])
+
+    def test_planner_gate_rejects_missing_lease_matrix(self) -> None:
+        profile = complete_planner_profile()
+        profile["measurements"]["expert_cache_upload"]["lease_upload_profiles"] = []
+        self.assertIn(
+            "planner profile has no exact leased-upload measurements",
+            planner_profile_reasons(profile, identity()),
+        )
+
+    def test_planner_gate_rejects_low_confidence_contention(self) -> None:
+        profile = complete_planner_profile()
+        profile["measurements"]["cpu_cache_contention"]["devices"][0]["profiles"][0]["cpu_confidence"] = 0.79
+        self.assertIn(
+            "planner confidence is below 0.80 for CUDA0",
+            planner_profile_reasons(profile, identity()),
+        )
 
 
 if __name__ == "__main__":

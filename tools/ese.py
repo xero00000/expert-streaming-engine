@@ -1250,7 +1250,7 @@ def _make_parser() -> argparse.ArgumentParser:
         type=Path,
         help="GGUF file, first shard, or directory for model-backed expert calibration",
     )
-    calibrate.add_argument("--iterations", type=int, default=7)
+    calibrate.add_argument("--iterations", type=int, default=21)
     calibrate.add_argument("--bytes", type=parse_size, default=256 * MIB, metavar="SIZE")
     calibrate.add_argument("--output", type=Path, default=default_profile_path())
     calibrate.add_argument("--json", action="store_true")

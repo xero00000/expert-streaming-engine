@@ -229,33 +229,116 @@ def planner_profile_reasons(
         if not isinstance(measurement, Mapping) or measurement.get("status") != "measured":
             reasons.append(f"required planner measurement is unavailable: {name}")
     if isinstance(source, Mapping) and source.get("planner_ready") is True:
-        cpu_profiles = measurements.get("cpu_moe", {}).get("model_profiles", [])
-        contention_devices = measurements.get("cpu_cache_contention", {}).get("devices", [])
+        required_usage = {
+            "expert_payload_cpu_moe",
+            "bounded_ram_lease_upload",
+            "bounded_ram_lease_contention",
+            "per_device_contention",
+        }
+        usage = source.get("model_usage", [])
+        if source.get("calibration_level") != "planner" or not isinstance(usage, list) or not required_usage.issubset(usage):
+            reasons.append("planner provenance does not prove every production calibration path")
+
+        def finite_number(value: object, *, minimum: float | None = None, maximum: float | None = None) -> bool:
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+                return False
+            return (minimum is None or value >= minimum) and (maximum is None or value <= maximum)
+
+        def format_key(item: object) -> tuple[int, int, int, int] | None:
+            if not isinstance(item, Mapping):
+                return None
+            values = tuple(item.get(name) for name in (
+                "ggml_type_id", "input_width", "expert_width", "bytes_per_expert_component"
+            ))
+            if not all(isinstance(value, int) and not isinstance(value, bool) and value > 0 for value in values):
+                return None
+            return values  # type: ignore[return-value]
+
+        cpu_measurement = measurements.get("cpu_moe", {})
+        cpu_profiles = cpu_measurement.get("model_profiles", []) if isinstance(cpu_measurement, Mapping) else []
+        expected_formats: set[tuple[int, int, int, int]] = set()
         if not isinstance(cpu_profiles, list) or not cpu_profiles:
             reasons.append("planner profile has no model-backed CPU expert measurements")
+        else:
+            for item in cpu_profiles:
+                key = format_key(item)
+                if key is None or key in expected_formats:
+                    reasons.append("planner CPU formats are invalid or duplicated")
+                    continue
+                expected_formats.add(key)
+                if (
+                    item.get("correctness") != "single-thread-and-dequantized-scalar-reference"
+                    or not finite_number(item.get("independent_reference_nrmse"), minimum=0, maximum=0.08)
+                    or not finite_number(item.get("confidence"), minimum=0.80)
+                    or not finite_number(item.get("relative_standard_error"), minimum=0)
+                    or not finite_number(item.get("sample_count"), minimum=7)
+                ):
+                    reasons.append(f"planner CPU correctness or confidence is incomplete for type {key[0]}")
+
+        contention = measurements.get("cpu_cache_contention", {})
+        contention_devices = contention.get("devices", []) if isinstance(contention, Mapping) else []
+        if not isinstance(contention, Mapping) or (
+            contention.get("upload_path") != "pread_to_bounded_ram_lease_to_async_upload"
+            or contention.get("distribution") != "warm-steady-state"
+        ):
+            reasons.append("planner contention did not use the labeled bounded lease path")
+        contention_backends: set[str] = set()
         if not isinstance(contention_devices, list) or not contention_devices:
             reasons.append("planner profile has no per-device contention measurements")
         else:
             for device in contention_devices:
                 backend = device.get("backend", "unknown") if isinstance(device, Mapping) else "unknown"
+                if not isinstance(backend, str) or not backend or backend in contention_backends:
+                    reasons.append("planner contention devices are invalid or duplicated")
+                    continue
+                contention_backends.add(backend)
                 profiles = device.get("profiles", []) if isinstance(device, Mapping) else []
                 if not isinstance(profiles, list) or not profiles:
                     reasons.append(f"planner profile has no contention formats for {backend}")
                     continue
+                actual_formats = {key for item in profiles if (key := format_key(item)) is not None}
+                if len(actual_formats) != len(profiles) or actual_formats != expected_formats:
+                    reasons.append(f"planner contention formats are incomplete for {backend}")
                 for measurement in profiles:
-                    cpu_confidence = measurement.get("cpu_confidence", 0) if isinstance(measurement, Mapping) else 0
-                    upload_confidence = measurement.get("upload_confidence", 0) if isinstance(measurement, Mapping) else 0
-                    valid_confidence = (
-                        isinstance(cpu_confidence, (int, float))
-                        and isinstance(upload_confidence, (int, float))
-                        and math.isfinite(cpu_confidence)
-                        and math.isfinite(upload_confidence)
-                        and cpu_confidence >= 0.80
-                        and upload_confidence >= 0.80
-                    )
+                    valid_confidence = isinstance(measurement, Mapping) and all((
+                        finite_number(measurement.get("cpu_confidence"), minimum=0.80),
+                        finite_number(measurement.get("upload_confidence"), minimum=0.80),
+                        finite_number(measurement.get("cpu_relative_standard_error"), minimum=0),
+                        finite_number(measurement.get("upload_relative_standard_error"), minimum=0),
+                        finite_number(measurement.get("cpu_sample_count"), minimum=7),
+                        finite_number(measurement.get("upload_sample_count"), minimum=7),
+                    ))
                     if not valid_confidence:
                         reasons.append(f"planner confidence is below 0.80 for {backend}")
                         break
+
+        upload_measurement = measurements.get("expert_cache_upload", {})
+        lease_profiles = upload_measurement.get("lease_upload_profiles", []) if isinstance(upload_measurement, Mapping) else []
+        if not isinstance(lease_profiles, list) or not lease_profiles:
+            reasons.append("planner profile has no exact leased-upload measurements")
+        else:
+            lease_pairs: set[tuple[str, tuple[int, int, int, int]]] = set()
+            for item in lease_profiles:
+                key = format_key(item)
+                backend = item.get("backend") if isinstance(item, Mapping) else None
+                pair = (backend, key) if isinstance(backend, str) and key is not None else None
+                if pair is None or pair in lease_pairs:
+                    reasons.append("planner leased-upload formats are invalid or duplicated")
+                    continue
+                lease_pairs.add(pair)
+                if (
+                    item.get("storage_backend") != "pread"
+                    or item.get("distribution") != "warm-steady-state"
+                    or not finite_number(item.get("confidence"), minimum=0.80)
+                    or not finite_number(item.get("relative_standard_error"), minimum=0)
+                    or not finite_number(item.get("sample_count"), minimum=7)
+                ):
+                    reasons.append(f"planner leased-upload evidence is incomplete for {backend}")
+            expected_pairs = {
+                (backend, key) for backend in contention_backends for key in expected_formats
+            }
+            if lease_pairs != expected_pairs:
+                reasons.append("planner leased-upload matrix does not match contention devices and formats")
     return reasons
 
 
