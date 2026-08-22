@@ -1,6 +1,7 @@
 #include "resource-planner.h"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <stdexcept>
 
@@ -266,6 +267,46 @@ void test_native_override_normalization() {
     }
 }
 
+void test_calibrated_expert_split_solver() {
+    common_expert_split_input input;
+    input.calibration_complete = true;
+    input.cpu_confidence = input.upload_confidence = 0.95;
+    std::string error;
+    common_expert_split_plan plan;
+
+    input.misses = 1;
+    input.cpu_ns_per_expert = 100;
+    input.upload_ns_per_expert = 20;
+    REQUIRE(common_expert_split_solve(input, plan, error));
+    REQUIRE(plan.cpu_experts == 0 && plan.upload_experts == 1);
+
+    input.cpu_ns_per_expert = 20;
+    input.upload_ns_per_expert = 100;
+    REQUIRE(common_expert_split_solve(input, plan, error));
+    REQUIRE(plan.cpu_experts == 1 && plan.upload_experts == 0);
+
+    input.misses = 8;
+    input.cpu_ns_per_expert = input.upload_ns_per_expert = 100;
+    REQUIRE(common_expert_split_solve(input, plan, error));
+    REQUIRE(plan.cpu_experts == 4 && plan.upload_experts == 4);
+
+    input.previous_upload_experts = 3;
+    input.hysteresis_fraction = 0.30;
+    REQUIRE(common_expert_split_solve(input, plan, error));
+    REQUIRE(plan.upload_experts == 3 && plan.retained_by_hysteresis);
+
+    input.calibration_complete = false;
+    REQUIRE(!common_expert_split_solve(input, plan, error));
+    REQUIRE(error.find("incomplete") != std::string::npos);
+    input.calibration_complete = true;
+    input.cpu_confidence = 0.5;
+    REQUIRE(!common_expert_split_solve(input, plan, error));
+    REQUIRE(error.find("confidence") != std::string::npos);
+    input.cpu_confidence = 0.95;
+    input.cpu_ns_per_expert = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(!common_expert_split_solve(input, plan, error));
+}
+
 } // namespace
 
 int main() {
@@ -278,5 +319,6 @@ int main() {
     test_auto_unlimited_ram_and_minimum_expert_component();
     test_rollback_hook_failure_is_single_shot();
     test_native_override_normalization();
+    test_calibrated_expert_split_solver();
     return 0;
 }

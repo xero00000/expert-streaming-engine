@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -227,6 +228,34 @@ def planner_profile_reasons(
         measurement = measurements.get(name, {}) if isinstance(measurements, Mapping) else {}
         if not isinstance(measurement, Mapping) or measurement.get("status") != "measured":
             reasons.append(f"required planner measurement is unavailable: {name}")
+    if isinstance(source, Mapping) and source.get("planner_ready") is True:
+        cpu_profiles = measurements.get("cpu_moe", {}).get("model_profiles", [])
+        contention_devices = measurements.get("cpu_cache_contention", {}).get("devices", [])
+        if not isinstance(cpu_profiles, list) or not cpu_profiles:
+            reasons.append("planner profile has no model-backed CPU expert measurements")
+        if not isinstance(contention_devices, list) or not contention_devices:
+            reasons.append("planner profile has no per-device contention measurements")
+        else:
+            for device in contention_devices:
+                backend = device.get("backend", "unknown") if isinstance(device, Mapping) else "unknown"
+                profiles = device.get("profiles", []) if isinstance(device, Mapping) else []
+                if not isinstance(profiles, list) or not profiles:
+                    reasons.append(f"planner profile has no contention formats for {backend}")
+                    continue
+                for measurement in profiles:
+                    cpu_confidence = measurement.get("cpu_confidence", 0) if isinstance(measurement, Mapping) else 0
+                    upload_confidence = measurement.get("upload_confidence", 0) if isinstance(measurement, Mapping) else 0
+                    valid_confidence = (
+                        isinstance(cpu_confidence, (int, float))
+                        and isinstance(upload_confidence, (int, float))
+                        and math.isfinite(cpu_confidence)
+                        and math.isfinite(upload_confidence)
+                        and cpu_confidence >= 0.80
+                        and upload_confidence >= 0.80
+                    )
+                    if not valid_confidence:
+                        reasons.append(f"planner confidence is below 0.80 for {backend}")
+                        break
     return reasons
 
 

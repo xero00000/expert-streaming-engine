@@ -123,9 +123,34 @@ struct common_resource_transition_stats {
     uint64_t commit_failures = 0;
 };
 
+struct common_expert_split_input {
+    uint32_t misses = 0;
+    // Contended costs from a complete, topology-current hardware profile.
+    double cpu_ns_per_expert = 0;
+    double upload_ns_per_expert = 0;
+    double cpu_confidence = 0;
+    double upload_confidence = 0;
+    double minimum_confidence = 0.80;
+    double hysteresis_fraction = 0.05;
+    int32_t previous_upload_experts = -1;
+    bool calibration_complete = false;
+};
+
+struct common_expert_split_plan {
+    uint32_t cpu_experts = 0;
+    uint32_t upload_experts = 0;
+    double predicted_step_ns = 0;
+    bool retained_by_hysteresis = false;
+};
+
 bool common_resource_plan_solve(
     const common_resource_plan_input & input,
     common_resource_plan & plan,
+    std::string & error);
+
+bool common_expert_split_solve(
+    const common_expert_split_input & input,
+    common_expert_split_plan & plan,
     std::string & error);
 
 std::string common_resource_plan_json(const common_resource_plan & plan);

@@ -115,6 +115,26 @@ double median(std::vector<double> values) {
     return values.size() % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2.0;
 }
 
+struct sample_summary {
+    size_t count = 0;
+    double median = 0;
+    double coefficient_variation = 0;
+    double confidence = 0;
+};
+
+sample_summary summarize(const std::vector<double> & values) {
+    if (values.empty()) throw std::runtime_error("cannot summarize empty measurements");
+    double mean = 0;
+    for (double value : values) mean += value;
+    mean /= values.size();
+    double variance = 0;
+    for (double value : values) variance += (value - mean) * (value - mean);
+    variance /= values.size();
+    const double cv = mean != 0 ? std::sqrt(variance) / std::abs(mean) : 1.0;
+    const double sample_factor = std::min(1.0, double(values.size()) / 7.0);
+    return {values.size(), median(values), cv, sample_factor / (1.0 + 4.0 * cv)};
+}
+
 double gbps(size_t bytes, double seconds) {
     return static_cast<double>(bytes) / seconds / 1.0e9;
 }
@@ -203,6 +223,9 @@ struct cpu_moe_result {
     double latency_ms_median = 0;
     double effective_gbps_median = 0;
     double checksum = 0;
+    size_t sample_count = 0;
+    double coefficient_variation = 0;
+    double confidence = 0;
 };
 
 struct device_transfer_result {
@@ -217,6 +240,7 @@ struct device_contention_result {
     std::string backend;
     std::vector<cpu_moe_result> cpu;
     std::vector<double> upload_gbps;
+    std::vector<sample_summary> upload_statistics;
 };
 
 cpu_moe_result measure_cpu_moe(
@@ -330,9 +354,11 @@ cpu_moe_result measure_cpu_moe(
     if (!std::isfinite(checksum) || checksum == 0) {
         throw std::runtime_error("GGML CPU MoE produced an invalid checksum");
     }
-    const double elapsed = median(samples);
+    const sample_summary statistics = summarize(samples);
+    const double elapsed = statistics.median;
     const size_t weight_bytes = expert_weights.size() * sizeof(ggml_fp16_t);
-    return {k, m, n_used, threads, elapsed * 1000.0, gbps(weight_bytes, elapsed), checksum};
+    return {k, m, n_used, threads, elapsed * 1000.0, gbps(weight_bytes, elapsed), checksum,
+            statistics.count, statistics.coefficient_variation, statistics.confidence};
 }
 
 cpu_moe_result measure_model_cpu_moe(
@@ -437,9 +463,11 @@ cpu_moe_result measure_model_cpu_moe(
         checksum += result[i];
     }
     if (!std::isfinite(checksum)) throw std::runtime_error("model CPU MoE produced invalid checksum");
-    const double elapsed = median(samples);
+    const sample_summary statistics = summarize(samples);
+    const double elapsed = statistics.median;
     return {spec.input_width, spec.expert_width, n_used, threads,
-            elapsed * 1000.0, gbps(expected_bytes, elapsed), checksum};
+            elapsed * 1000.0, gbps(expected_bytes, elapsed), checksum,
+            statistics.count, statistics.coefficient_variation, statistics.confidence};
 }
 
 } // namespace
@@ -629,11 +657,13 @@ int main(int argc, char ** argv) {
                 primary.cpu.push_back(contended_cpu_moe);
                 primary.upload_gbps.push_back(
                         gbps(expert_upload_bytes, median(contended_expert_upload_seconds)));
+                primary.upload_statistics.push_back(summarize(contended_expert_upload_seconds));
             } else {
                 primary.cpu = contended_model_cpu_moe;
                 for (size_t i = 0; i < opts.model_experts.size(); ++i) {
                     primary.upload_gbps.push_back(
                             gbps(opts.model_experts[i].bytes, median(contended_model_upload_seconds[i])));
+                    primary.upload_statistics.push_back(summarize(contended_model_upload_seconds[i]));
                 }
             }
             device_contentions.push_back(std::move(primary));
@@ -660,6 +690,7 @@ int main(int argc, char ** argv) {
                                     opts.model_experts[i], opts.iterations, opts.threads,
                                     concurrent, &upload_seconds));
                     measured.upload_gbps.push_back(gbps(bytes, median(upload_seconds)));
+                    measured.upload_statistics.push_back(summarize(upload_seconds));
                 }
                 device_contentions.push_back(std::move(measured));
             }
@@ -674,7 +705,9 @@ int main(int argc, char ** argv) {
                   << "    \"model_requested\": \"" << json_escape(opts.model) << "\",\n"
                   << "    \"model_used\": " << (!opts.model_experts.empty() ? "true" : "false") << ",\n"
                   << "    \"model_usage\": "
-                  << (!opts.model_experts.empty() ? "[\"expert_cache_upload_geometry\"]" : "[]") << "\n"
+                  << (!opts.model_experts.empty()
+                          ? "[\"expert_payload_cpu_moe\",\"expert_cache_upload_geometry\",\"per_device_contention\"]"
+                          : "[]") << "\n"
                   << "  },\n  \"measurements\": {\n"
                   << "    \"host_memory\": {\"copy_gbps_median\": " << median(host_samples)
                   << ", \"bytes\": " << opts.bytes << ", \"iterations\": " << opts.iterations << "},\n";
@@ -720,6 +753,9 @@ int main(int argc, char ** argv) {
                   << ", \"threads\": " << cpu_moe.threads
                   << ", \"latency_ms_median\": " << cpu_moe.latency_ms_median
                   << ", \"effective_gbps_median\": " << cpu_moe.effective_gbps_median
+                  << ", \"sample_count\": " << cpu_moe.sample_count
+                  << ", \"coefficient_variation\": " << cpu_moe.coefficient_variation
+                  << ", \"confidence\": " << cpu_moe.confidence
                   << ", \"correctness\": \"single-thread-parity\", \"checksum\": " << cpu_moe.checksum;
         if (!model_cpu_moe.empty()) {
             std::cout << ", \"model_profiles\": [";
@@ -735,6 +771,9 @@ int main(int argc, char ** argv) {
                           << ", \"bytes_read\": " << spec.bytes * 2
                           << ", \"latency_ms_median\": " << result.latency_ms_median
                           << ", \"effective_gbps_median\": " << result.effective_gbps_median
+                          << ", \"sample_count\": " << result.sample_count
+                          << ", \"coefficient_variation\": " << result.coefficient_variation
+                          << ", \"confidence\": " << result.confidence
                           << ", \"correctness\": \"single-thread-parity\", \"checksum\": "
                           << result.checksum << "}";
             }
@@ -746,8 +785,16 @@ int main(int argc, char ** argv) {
             std::cout << "\"status\": \"measured\", \"cpu_operation\": \"ggml_mul_mat_id\", "
                       << "\"cpu_latency_ms_median\": " << contended_cpu_moe.latency_ms_median
                       << ", \"cpu_effective_gbps_median\": " << contended_cpu_moe.effective_gbps_median
+                      << ", \"cpu_sample_count\": " << contended_cpu_moe.sample_count
+                      << ", \"cpu_coefficient_variation\": " << contended_cpu_moe.coefficient_variation
+                      << ", \"cpu_confidence\": " << contended_cpu_moe.confidence
                       << ", \"upload_gbps_median\": "
                       << gbps(expert_upload_bytes, median(contended_expert_upload_seconds))
+                      << ", \"upload_sample_count\": " << summarize(contended_expert_upload_seconds).count
+                      << ", \"upload_coefficient_variation\": "
+                      << summarize(contended_expert_upload_seconds).coefficient_variation
+                      << ", \"upload_confidence\": "
+                      << summarize(contended_expert_upload_seconds).confidence
                       << ", \"bytes_per_expert_component\": " << expert_upload_bytes;
             if (!contended_model_cpu_moe.empty()) {
                 std::cout << ", \"model_profiles\": [";
@@ -763,8 +810,16 @@ int main(int argc, char ** argv) {
                               << ", \"bytes_per_expert_component\": " << spec.bytes
                               << ", \"cpu_latency_ms_median\": " << result.latency_ms_median
                               << ", \"cpu_effective_gbps_median\": " << result.effective_gbps_median
+                              << ", \"cpu_sample_count\": " << result.sample_count
+                              << ", \"cpu_coefficient_variation\": " << result.coefficient_variation
+                              << ", \"cpu_confidence\": " << result.confidence
                               << ", \"upload_gbps_median\": "
-                              << gbps(spec.bytes, median(contended_model_upload_seconds[i])) << "}";
+                              << gbps(spec.bytes, median(contended_model_upload_seconds[i]))
+                              << ", \"upload_sample_count\": " << summarize(contended_model_upload_seconds[i]).count
+                              << ", \"upload_coefficient_variation\": "
+                              << summarize(contended_model_upload_seconds[i]).coefficient_variation
+                              << ", \"upload_confidence\": "
+                              << summarize(contended_model_upload_seconds[i]).confidence << "}";
                 }
                 std::cout << "]";
             }
@@ -789,7 +844,14 @@ int main(int argc, char ** argv) {
                     }
                     std::cout << "\"cpu_latency_ms_median\": " << result.latency_ms_median
                               << ", \"cpu_effective_gbps_median\": " << result.effective_gbps_median
-                              << ", \"upload_gbps_median\": " << device.upload_gbps[j] << "}";
+                              << ", \"cpu_sample_count\": " << result.sample_count
+                              << ", \"cpu_coefficient_variation\": " << result.coefficient_variation
+                              << ", \"cpu_confidence\": " << result.confidence
+                              << ", \"upload_gbps_median\": " << device.upload_gbps[j]
+                              << ", \"upload_sample_count\": " << device.upload_statistics[j].count
+                              << ", \"upload_coefficient_variation\": "
+                              << device.upload_statistics[j].coefficient_variation
+                              << ", \"upload_confidence\": " << device.upload_statistics[j].confidence << "}";
                 }
                 std::cout << "]}";
             }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <exception>
 #include <limits>
@@ -471,6 +472,70 @@ bool common_resource_plan_solve(
         " plan at " + common_kv_quality_name(candidate.kv_quality) +
         " KV quality with explicit per-device reserves";
     plan = std::move(candidate);
+    return true;
+}
+
+bool common_expert_split_solve(
+        const common_expert_split_input & input,
+        common_expert_split_plan & plan,
+        std::string & error) {
+    error.clear();
+    plan = {};
+    if (!input.calibration_complete) {
+        error = "hardware calibration is incomplete";
+        return false;
+    }
+    if (input.misses == 0) return true;
+    if (!std::isfinite(input.cpu_ns_per_expert) || !std::isfinite(input.upload_ns_per_expert) ||
+            !(input.cpu_ns_per_expert > 0) || !(input.upload_ns_per_expert > 0)) {
+        error = "expert split requires positive contended CPU and upload costs";
+        return false;
+    }
+    if (!std::isfinite(input.minimum_confidence) || !std::isfinite(input.cpu_confidence) ||
+            !std::isfinite(input.upload_confidence) ||
+            input.minimum_confidence < 0 || input.minimum_confidence > 1 ||
+            input.cpu_confidence < input.minimum_confidence ||
+            input.upload_confidence < input.minimum_confidence) {
+        error = "hardware calibration confidence is below the planner threshold";
+        return false;
+    }
+    if (!std::isfinite(input.hysteresis_fraction) ||
+            input.hysteresis_fraction < 0 || input.hysteresis_fraction >= 1) {
+        error = "expert split hysteresis must be in [0, 1)";
+        return false;
+    }
+
+    auto completion = [&](uint32_t uploads) {
+        const double cpu_ns = double(input.misses - uploads)*input.cpu_ns_per_expert;
+        const double upload_ns = double(uploads)*input.upload_ns_per_expert;
+        return std::max(cpu_ns, upload_ns);
+    };
+    uint32_t best_uploads = 0;
+    double best_ns = completion(0);
+    for (uint32_t uploads = 1; uploads <= input.misses; ++uploads) {
+        const double candidate = completion(uploads);
+        if (candidate < best_ns) {
+            best_ns = candidate;
+            best_uploads = uploads;
+        }
+    }
+
+    bool retained = false;
+    if (input.previous_upload_experts >= 0 &&
+            uint32_t(input.previous_upload_experts) <= input.misses) {
+        const uint32_t previous = uint32_t(input.previous_upload_experts);
+        const double previous_ns = completion(previous);
+        const double required_improvement = previous_ns*input.hysteresis_fraction;
+        if (previous_ns - best_ns <= required_improvement) {
+            best_uploads = previous;
+            best_ns = previous_ns;
+            retained = true;
+        }
+    }
+    plan.upload_experts = best_uploads;
+    plan.cpu_experts = input.misses - best_uploads;
+    plan.predicted_step_ns = best_ns;
+    plan.retained_by_hysteresis = retained;
     return true;
 }
 

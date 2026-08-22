@@ -37,6 +37,10 @@ The planner must not consume Phase A data until the last two rows use their prod
 Baseline profiles therefore carry `benchmark_source.planner_ready: false`.
 Without `--model`, provenance records `model_used: false`. With a GGUF file, first shard, or model directory, ESE scans every shard without loading tensor payloads and uses the representative expert type, geometry, count, and component byte size for the cache-upload probe. The fixed F16 CPU result remains clearly separate and is not presented as model-specific compute calibration.
 
+The native resource planner now has a pure integer split solver for calibrated decode misses. It minimizes the maximum of concurrent CPU and upload completion time, handles all-CPU/all-upload/mixed small counts, retains the previous split within a configurable hysteresis band, and refuses incomplete, low-confidence, non-finite, or otherwise invalid calibration. It is not connected to live decode until profile confidence and the remaining correctness gates are satisfied.
+
+Each timed series records its sample count, coefficient of variation, and a conservative confidence score combining seven-sample coverage with dispersion. The profile gate requires at least `0.80` confidence for both CPU and upload on every device/format. Changing the provenance flag alone cannot bypass missing model-backed or per-device evidence.
+
 ### Remaining Phase A gate
 
 - Resolve and test the standalone fused `ggml_moe_up_gate` probe; its first calibration harness exposed allocator corruption, so Phase A currently uses the stable routed `ggml_mul_mat_id` primitive.
