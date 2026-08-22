@@ -15,6 +15,7 @@ This foundation includes:
 - per-trial checkpoints, cancellation/resume, exclusive-GPU safety, and active-model restoration;
 - one-click promotion of verified context, KV, and batch settings into future model launches;
 - optional, off-by-default sharing of sanitized verified-sweep summaries through **Help improve ESE**;
+- a bundled ESE launcher/native runtime and signed in-app updates with visible progress;
 - portable TOML configuration under `~/.config/ese/studio.toml`.
 
 Sweep previews only describe the search matrix and never count as evidence. A verified result is shown only after Studio has launched the real ESE-planned `llama-server`, passed its health check, and measured completion throughput. Interrupted matching sweeps resume from their last per-trial checkpoint.
@@ -40,15 +41,23 @@ files when cancelled so the next attempt can resume. Existing complete files
 are recognized rather than overwritten. Use `HF_TOKEN` or
 `HUGGING_FACE_HUB_TOKEN` for gated/private repositories.
 
-## Linux source install
+## Linux install
 
-Run:
+The v0.1.1 AppImage, DEB, and RPM packages contain both Studio and ESE. Use the
+AppImage for signed in-app updating, or use the distribution package and apply
+future package updates through APT/DNF.
+
+For a local source build from the repository root, run:
 
 ```bash
-./install.sh
+./studio/scripts/install-local.sh
 ```
 
-The installer checks commands and system libraries first. When required packages are missing on a supported distribution, it prints them and asks before using `sudo`; it never installs packages silently. NVIDIA tools and the `ese` launcher are reported separately because the desktop shell can build without them. The local release build produces DEB and RPM packages; an AppImage should be built in a compatible release container because newer Fedora/Nobara RELR libraries exceed the `linuxdeploy` strip tool used by Tauri.
+The installer checks commands and system libraries first. When required
+packages are missing on a supported distribution, it prints them and asks
+before using `sudo`; it never installs packages silently. It builds the ESE
+runtime with CUDA when detected (CPU otherwise), installs it beside Studio,
+and writes `ese-studio` plus `ese` launchers to `~/.local/bin`.
 
 To run only the non-mutating preflight, use `./install.sh --check`.
 
@@ -57,12 +66,6 @@ For development:
 ```bash
 pnpm install
 pnpm tauri dev
-```
-
-To install a release build for the current user, including an application-menu entry and Wayland-safe launcher wrapper:
-
-```bash
-./scripts/install-local.sh
 ```
 
 ## Windows source install
@@ -74,11 +77,22 @@ Open PowerShell in `studio` and run:
 .\install.ps1
 ```
 
-The preflight checks Node.js, Rust, the Visual Studio C++ Build Tools, WebView2,
-and pnpm. When required software is missing, the installer shows the complete
-list and asks before using `winget`; nothing is installed silently. The build
-produces signed-ready NSIS (`.exe`) and MSI installers under
+The preflight checks Python, CMake, Node.js, Rust, the Visual Studio C++ Build
+Tools, WebView2, and pnpm. When required software is missing, the installer
+shows the complete list and asks before using `winget`; nothing is installed
+silently. It separately asks before installing the PyInstaller build dependency,
+then builds a standalone `ese.exe` and native runtime before producing
+signed-ready NSIS (`.exe`) and MSI installers under
 `src-tauri\target\release\bundle\`.
+
+## Updates
+
+Open **Settings → Updates** and choose **Check for updates**. Studio uses the
+public release manifest on GitHub and accepts only artifacts signed by the ESE
+updater key. The download reports progress, is verified before installation,
+and restarts Studio when complete. Windows NSIS and Linux AppImage installs
+support the full in-app replacement flow; DEB/RPM users should install the next
+native package with their package manager.
 
 ## Configuration
 
@@ -128,10 +142,14 @@ pnpm build
 cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
-pnpm tauri build --bundles deb,rpm       # Linux
-pnpm tauri build --bundles nsis,msi      # Windows
+pnpm tauri build --bundles deb,rpm --config src-tauri/tauri.unsigned.conf.json       # Linux source package
+pnpm tauri build --bundles nsis,msi --config src-tauri/tauri.unsigned.conf.json      # Windows source package
 ```
 
 GitHub Actions repeats these checks on Ubuntu and Windows and publishes the DEB,
-RPM, NSIS, and MSI packages as CI artifacts. The tagged release workflow
-attaches all four packages and platform checksum files to the GitHub release.
+RPM, NSIS, and MSI packages as CI artifacts. The protected tagged-release
+workflow additionally builds the Linux AppImage, signs updater artifacts with
+`TAURI_SIGNING_PRIVATE_KEY`, generates `latest.json`, and attaches all packages,
+signatures, and platform checksum files to the GitHub release. The maintainer's
+recoverable private-key backup is stored outside the repository with mode
+`0600`; only the public key is committed.

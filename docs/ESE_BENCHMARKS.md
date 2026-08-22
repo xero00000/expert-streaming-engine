@@ -97,6 +97,57 @@ were allocated, `nvidia-smi` reported:
 This verifies the release controller's reserve invariant on the available
 Turing and Ampere hardware. It does not claim Ada-or-newer coverage.
 
+## v0.1.1 candidate: DeepSeek-V4-Flash-0731 UD-IQ1_S
+
+Measured on 2026-08-22 from the consolidated v0.1.1 pull-request worktree.
+This is a 284.335B-parameter sparse model with 256 experts, six active experts,
+43 blocks, and 76.87 GiB split across three GGUF shards. The original YaRN
+context is 65,536 tokens; the model metadata advertises a 1,048,576-token
+extended context.
+
+| Component | Configuration |
+| --- | --- |
+| Model | DeepSeek-V4-Flash-0731 UD-IQ1_S, effective 2.322 BPW |
+| Shard SHA-256 | `2fa152e25a14500e42e6d98f20d200eec1e945f34dc1cfb981b651b9c86b97be` / `e9fc77544cd48aa0c31fbf32fdf5432f2b560b92a9aeffd9f690d99867cf0e5f` / `fd99d5cd0503d668b6febc2eedcc9db68e264cfb79dd355efc88c15eabe4248d` |
+| Shard bytes | 5,257,664 / 49,093,726,624 / 33,440,253,504 |
+| CPU / RAM | Ryzen 9 5950X, 16 cores / 32 threads; 46 GiB RAM |
+| GPUs | RTX 3060 Ti + RTX 2080 SUPER + RTX 3080; automatic split near `32/32/36` |
+| Driver / CUDA | NVIDIA 595.84; CUDA 13.2 build toolkit |
+| Model storage | ST4000VX016-3CV104 SATA, Btrfs |
+| Context / slots | 65,536 / 1 |
+
+Accepted command (the absolute first-shard path is shortened to `$MODEL`):
+
+```bash
+ese serve "$MODEL" --binary ./build/bin/llama-server \
+  -c 65536 --slots 1 --expert-vram-cache 0
+```
+
+The native controller selected deferred `pread` expert storage, a bounded
+4 GiB expert RAM cache with 64 MiB staging, F16 KV, and no adaptive expert VRAM
+cache. All 44 dense/non-expert layers were offloaded across the three GPUs.
+The server produced the coherent response `The ESE benchmark is ready.`
+
+| Request | Prompt | Decode | End-to-end |
+| --- | ---: | ---: | ---: |
+| Cold, 9 prompt + 7 generated tokens | 0.060 tok/s | 0.140 tok/s | 200.83 s |
+| Identical warm request | 0.28 tok/s | 2.68 tok/s | 34.52 s |
+
+Two unsafe or slower variants were rejected:
+
+- The automatic adaptive VRAM expert cache crashed at first inference with an
+  illegal CUDA access on the mixed Turing/Ampere devices. Disabling only that
+  cache preserved GPU compute and completed inference.
+- `mmap` with a four-expert prefetch tail had not reached the health endpoint
+  after 313 seconds, versus about 105 seconds for bounded `pread`, and was
+  stopped without promotion.
+
+This result is intentionally storage-bound. It proves that the model can run
+coherently at its full original 65,536-token context without exceeding host or
+device memory; it is not an interactive-speed claim. The controller regression
+tests require an explicit zero cache to remain disabled and prevent automatic
+GPU fitting from conflicting with explicit CPU-MoE placement.
+
 ## GPT-OSS 120B F16
 
 Reference machine:

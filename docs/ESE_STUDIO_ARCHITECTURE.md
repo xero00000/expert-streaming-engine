@@ -74,15 +74,20 @@ The versioned user config is `~/.config/ese/studio.toml`. Model roots are auto-s
 
 Configuration is portable. Secrets are not: app profiles should reference environment variables or Linux Secret Service/keyring entries rather than storing plaintext tokens.
 
-## Current Linux foundation
+## Current desktop foundation
 
 - Desktop shell, recursive discovery, hidden missing profiles, native PTYs, and typed portable config.
 - Installed-agent discovery across PATH and common Linux user package locations, with non-destructive profile merging.
 - Active-model handoff to endpoint-aware apps through OpenAI-compatible and ESE-specific environment variables; Hermes also receives persistent provider synchronization.
 - ESE plan/serve supervision and real completion-based benchmark trials.
 - Stability gates, checkpoint/resume, cancellation, active-model restoration, and verified-profile promotion.
-- Local Linux packaging and per-user desktop installation.
+- Unified Linux and Windows packaging: Studio carries the ESE launcher, native
+  server, and required ESE libraries as one versioned runtime payload.
 - Hardware-aware Hugging Face GGUF browsing and safe resumable downloads.
 - Off-by-default community benchmark sharing with a private raw collector and privacy-thresholded public aggregates.
-
-Release signing, automatic updates, broader distribution validation, and Windows support remain separate future work.
+- Linux AppImage/DEB/RPM and Windows NSIS/MSI builds, with signed updater
+  artifacts generated only by the protected tag-release workflow.
+- Manual update checks, visible download progress, signature verification, and
+  restart installation through the stable GitHub release manifest. The full
+  in-app replacement flow targets Linux AppImage and Windows NSIS installs;
+  native Linux packages continue through APT/DNF.

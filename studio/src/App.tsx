@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, AppWindow, Bot, Box, ChevronDown, ChevronRight, ChevronUp, CloudDownload, Download, Gauge, HardDrive, Heart, Library, MessageSquare, Play, Plus, RefreshCw, RotateCcw, Search, Send, Settings, ShieldCheck, SlidersHorizontal, SquareTerminal, StopCircle, Trash2, User, X } from "lucide-react";
+import { getVersion } from "@tauri-apps/api/app";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { Activity, AppWindow, Bot, Box, ChevronDown, ChevronRight, ChevronUp, CloudDownload, Download, Gauge, HardDrive, Heart, Library, MessageSquare, Play, Plus, RefreshCw, RotateCcw, Search, Send, Settings, ShieldCheck, SlidersHorizontal, Sparkles, SquareTerminal, StopCircle, Trash2, User, X } from "lucide-react";
 import { TerminalPane } from "./components/TerminalPane";
 import type { AppProfile, ChatStatus, DownloadStatus, HubModel, HubModelDetails, ModelProfile, StudioSnapshot, SweepPlan, SweepStatus, TerminalTab, View } from "./types";
 import "./App.css";
@@ -37,6 +40,8 @@ interface ChatEntry {
   role: "user" | "assistant";
   content: string;
 }
+
+type UpdateState = "idle" | "checking" | "available" | "downloading" | "current" | "error";
 
 function storedChat(): ChatEntry[] {
   try {
@@ -171,6 +176,11 @@ function App() {
   const [chatDraft, setChatDraft] = useState("");
   const [chatRunning, setChatRunning] = useState(false);
   const [chatRequestId, setChatRequestId] = useState<string>();
+  const [appVersion, setAppVersion] = useState("0.1.1");
+  const [pendingUpdate, setPendingUpdate] = useState<Update>();
+  const [updateState, setUpdateState] = useState<UpdateState>("idle");
+  const [updateDetail, setUpdateDetail] = useState("Check GitHub Releases for a signed ESE Studio and runtime update.");
+  const [updateProgress, setUpdateProgress] = useState(0);
   const chatEnd = useRef<HTMLDivElement>(null);
 
   const refresh = async () => {
@@ -190,6 +200,7 @@ function App() {
   useEffect(() => {
     void refresh();
     if (!("__TAURI_INTERNALS__" in window)) return;
+    void getVersion().then(setAppVersion).catch(() => undefined);
     const cleanups: Array<() => void> = [];
     let disposed = false;
     const register = (listener: Promise<() => void>) => void listener.then((cleanup) => {
@@ -225,6 +236,50 @@ function App() {
     void invoke<DownloadStatus | null>("get_hf_download_status").then((status) => { if (status) setDownloadStatus(status); }).catch(() => undefined);
     return () => { disposed = true; cleanups.forEach((cleanup) => cleanup()); };
   }, []);
+
+  const checkForUpdate = async () => {
+    if (!native) return;
+    setUpdateState("checking");
+    setUpdateDetail("Contacting the signed GitHub release channel…");
+    setUpdateProgress(0);
+    try {
+      const availableUpdate = await check({ timeout: 30_000 });
+      setPendingUpdate(availableUpdate ?? undefined);
+      if (availableUpdate) {
+        setUpdateState("available");
+        setUpdateDetail(`Version ${availableUpdate.version} is ready to download.`);
+      } else {
+        setUpdateState("current");
+        setUpdateDetail(`ESE Studio ${appVersion} is up to date.`);
+      }
+    } catch (error) {
+      setUpdateState("error");
+      setUpdateDetail(`Update check failed: ${String(error)} Try again when your connection is available.`);
+    }
+  };
+
+  const installUpdate = async () => {
+    if (!pendingUpdate) return;
+    setUpdateState("downloading");
+    setUpdateDetail(`Downloading ESE Studio ${pendingUpdate.version} and its matching runtime…`);
+    let downloaded = 0;
+    let contentLength = 0;
+    try {
+      await pendingUpdate.downloadAndInstall((event) => {
+        if (event.event === "Started") contentLength = event.data.contentLength ?? 0;
+        if (event.event === "Progress") downloaded += event.data.chunkLength;
+        if (event.event === "Started" || event.event === "Progress") {
+          setUpdateProgress(contentLength ? Math.min(100, downloaded / contentLength * 100) : 0);
+        }
+      });
+      setUpdateProgress(100);
+      setUpdateDetail("Update installed. Restarting ESE Studio…");
+      await relaunch();
+    } catch (error) {
+      setUpdateState("error");
+      setUpdateDetail(`Update failed: ${String(error)} Your current installation was left in place.`);
+    }
+  };
 
   useEffect(() => {
     globalThis.localStorage?.setItem("ese-terminal-height", String(terminalHeight));
@@ -586,8 +641,14 @@ function App() {
                 <div className="panel-heading"><div><h2>Help improve ESE</h2><p>Share sanitized results automatically after verified sweeps.</p></div><label className="toggle telemetry-toggle"><input type="checkbox" checked={snapshot.helpImproveEse} disabled={!native || savingConsent} onChange={(event) => void saveHelpImproveEse(event.target.checked)} aria-describedby="telemetry-settings-detail" /><span /></label></div>
                 <div className="privacy-note" id="telemetry-settings-detail"><ShieldCheck size={17} /><span><strong>{snapshot.helpImproveEse ? "Community sharing is on" : "Community sharing is off"}</strong>Raw results stay in the private collector. Public GitHub data is grouped and never includes prompts, responses, usernames, hostnames, local paths, or logs.</span></div>
               </section>
+              <section className="panel settings-updates">
+                <div className="panel-heading"><div><h2>Updates</h2><p>Signed updates replace Studio and the bundled ESE runtime together.</p></div><span className="version-badge">v{appVersion}</span></div>
+                <div className={`update-state ${updateState}`} aria-live="polite"><Sparkles size={17} /><span><strong>{updateState === "available" ? `ESE Studio ${pendingUpdate?.version}` : updateState === "downloading" ? "Installing update" : updateState === "current" ? "You’re up to date" : updateState === "error" ? "Couldn’t update" : updateState === "checking" ? "Checking for updates" : "Stable release channel"}</strong>{updateDetail}</span></div>
+                {updateState === "downloading" && <><div className="progress-track" role="progressbar" aria-label="Update download" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(updateProgress)}><span style={{ width: `${Math.max(3, updateProgress)}%` }} /></div><div className="progress-meta"><span>Downloading and verifying</span><span>{updateProgress ? `${Math.round(updateProgress)}%` : "Preparing…"}</span></div></>}
+                <button className={updateState === "available" ? "primary wide update-action" : "wide update-action"} onClick={() => void (updateState === "available" ? installUpdate() : checkForUpdate())} disabled={!native || updateState === "checking" || updateState === "downloading"}>{updateState === "available" ? <><Download size={14} />Download, install & restart</> : <><RefreshCw size={14} className={updateState === "checking" ? "spin" : ""} />{updateState === "checking" ? "Checking…" : "Check for updates"}</>}</button>
+              </section>
               <section className="panel settings-about">
-                <div className="panel-heading"><div><h2>About ESE Studio</h2><p>{snapshot.platform === "windows" ? "Windows" : snapshot.platform === "linux" ? "Linux" : snapshot.platform} control center for Expert Streaming Engine · v0.1.0</p></div></div>
+                <div className="panel-heading"><div><h2>About ESE Studio</h2><p>{snapshot.platform === "windows" ? "Windows" : snapshot.platform === "linux" ? "Linux" : snapshot.platform} control center for Expert Streaming Engine · v{appVersion}</p></div></div>
                 <div className="config-path"><small>Configuration file</small><code title={snapshot.configPath}>{snapshot.configPath}</code></div>
                 <p>Model and app settings use portable TOML. Keep secrets in environment variables or your operating system's credential manager. The visible path makes the configuration easy to inspect, back up, or edit with your preferred tool.</p>
               </section>

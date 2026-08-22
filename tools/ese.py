@@ -747,7 +747,23 @@ def build_launch_plan(
 
 
 def _repo_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[1]
+
+
+def _execution_environment(plan: LaunchPlan) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update(plan.environment)
+    if os.name != "nt":
+        runtime_library_dir = str(plan.binary.parent)
+        inherited_library_path = environment.get("LD_LIBRARY_PATH")
+        environment["LD_LIBRARY_PATH"] = (
+            f"{runtime_library_dir}{os.pathsep}{inherited_library_path}"
+            if inherited_library_path
+            else runtime_library_dir
+        )
+    return environment
 
 
 def _resolve_binary(value: str | None, build_dir: Path | None = None) -> Path:
@@ -990,7 +1006,7 @@ def _make_parser() -> argparse.ArgumentParser:
         prog="ese",
         description="One front door for resident, hybrid, cached, and disk-streamed ESE inference.",
     )
-    parser.add_argument("--version", action="version", version="ese 0.1.0")
+    parser.add_argument("--version", action="version", version="ese 0.1.1")
     commands = parser.add_subparsers(dest="command", required=True)
 
     doctor = commands.add_parser("doctor", help="inspect build tools, RAM, and GPUs")
@@ -1073,8 +1089,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ESEError(
                 f"server binary not found: {plan.binary}; run './ese build' or pass --binary"
             )
-        environment = os.environ.copy()
-        environment.update(plan.environment)
+        environment = _execution_environment(plan)
         if os.name == "nt":
             return subprocess.run(list(plan.command()), env=environment, check=False).returncode
         os.execvpe(str(plan.binary), list(plan.command()), environment)

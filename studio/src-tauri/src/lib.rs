@@ -509,10 +509,15 @@ fn discover_models(config: &StudioConfig) -> Vec<ModelProfile> {
     models
 }
 
-fn locate_ese() -> Option<PathBuf> {
+fn locate_ese(app: Option<&AppHandle>) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(explicit) = std::env::var_os("ESE_BIN") {
         candidates.push(PathBuf::from(explicit));
+    }
+    if let Some(resource_dir) = app.and_then(|handle| handle.path().resource_dir().ok()) {
+        for name in executable_names("ese") {
+            candidates.push(resource_dir.join("ese").join(name));
+        }
     }
     if let Ok(executable) = std::env::current_exe() {
         for name in executable_names("ese") {
@@ -533,7 +538,7 @@ fn locate_ese() -> Option<PathBuf> {
 }
 
 #[tauri::command]
-fn get_studio_snapshot() -> Result<StudioSnapshot, String> {
+fn get_studio_snapshot(app: AppHandle) -> Result<StudioSnapshot, String> {
     let config = load_config()?;
     Ok(StudioSnapshot {
         platform: std::env::consts::OS.into(),
@@ -543,7 +548,7 @@ fn get_studio_snapshot() -> Result<StudioSnapshot, String> {
         model_roots: config.model_roots.clone(),
         models: discover_models(&config),
         apps: config.apps,
-        ese_binary: locate_ese(),
+        ese_binary: locate_ese(Some(&app)),
     })
 }
 
@@ -553,8 +558,9 @@ async fn search_hf_models(query: String) -> Result<Vec<HubModel>, String> {
 }
 
 #[tauri::command]
-async fn get_hf_model_details(repo_id: String) -> Result<HubModelDetails, String> {
-    let ese_binary = locate_ese().ok_or_else(|| "ESE launcher was not found".to_string())?;
+async fn get_hf_model_details(repo_id: String, app: AppHandle) -> Result<HubModelDetails, String> {
+    let ese_binary =
+        locate_ese(Some(&app)).ok_or_else(|| "ESE launcher was not found".to_string())?;
     hub::model_details(&repo_id, &ese_binary).await
 }
 
@@ -597,7 +603,7 @@ fn save_config(config: StudioConfig) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_help_improve_ese(enabled: bool) -> Result<StudioSnapshot, String> {
+fn set_help_improve_ese(enabled: bool, app: AppHandle) -> Result<StudioSnapshot, String> {
     let mut config = load_config()?;
     config.onboarding_complete = true;
     config.help_improve_ese = enabled;
@@ -605,7 +611,7 @@ fn set_help_improve_ese(enabled: bool) -> Result<StudioSnapshot, String> {
     if !enabled {
         telemetry::clear_outbox()?;
     }
-    get_studio_snapshot()
+    get_studio_snapshot(app)
 }
 
 #[tauri::command]
@@ -1306,8 +1312,8 @@ fn start_sweep(
         return Err(blocker_message);
     }
 
-    let ese_binary =
-        locate_ese().ok_or_else(|| "ESE launcher was not found in PATH".to_string())?;
+    let ese_binary = locate_ese(Some(&app))
+        .ok_or_else(|| "ESE launcher was not found in PATH or the Studio bundle".to_string())?;
     let checkpoint_root = project_dirs()?.config_dir().join("sweeps");
     let status = match state
         .sweep
@@ -1490,6 +1496,8 @@ fn llama_server_pids() -> Vec<u32> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(StudioState::default())
         .invoke_handler(tauri::generate_handler![
             get_studio_snapshot,

@@ -102,6 +102,18 @@ nav button > svg { width: 16px; min-width: 16px; flex: 0 0 16px; }
 .setting-row code, .config-path code { min-width: 0; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .settings-about .panel-heading { margin-bottom: 10px; }
 .settings-about .config-path { margin-top: 0; }
+.version-badge { flex: 0 0 auto; padding: 3px 7px; border: 1px solid #3a3b3f; border-radius: 10px; color: #b8b9bc; background: #27282b; font: 9px "JetBrains Mono", monospace; }
+.update-state { display: flex; align-items: flex-start; gap: 10px; padding: 11px; border: 1px solid #343539; border-radius: 6px; background: #232427; }
+.update-state svg { flex: 0 0 auto; color: #a9aaad; }
+.update-state span { min-width: 0; display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+.update-state strong { color: #d4d4d5; font-size: 10px; }
+.update-state.available, .update-state.current { border-color: #3e5946; }
+.update-state.available svg, .update-state.current svg { color: #a7c6af; }
+.update-state.error { border-color: #6b4040; }
+.update-state.error svg { color: #e0b0b0; }
+.settings-updates .progress-track { margin: 12px 0 6px; }
+.settings-updates .progress-meta { margin-bottom: 0; }
+.update-action { margin-top: 10px; }
 
 @media (max-width: 1100px) {
   .settings-layout { grid-template-columns: minmax(0, 1fr); }

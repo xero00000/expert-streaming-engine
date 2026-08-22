@@ -49,6 +49,7 @@ void test_deterministic_budget_and_json() {
     REQUIRE(common_resource_plan_solve(input, second, error));
     REQUIRE(common_resource_plan_json(first) == common_resource_plan_json(second));
     REQUIRE(first.policy == COMMON_MEMORY_POLICY_CACHE);
+    REQUIRE(first.expert_ram_bytes == input.requested_expert_ram_bytes);
     REQUIRE(first.aux_ram_bytes == 4ULL*1024*MiB);
     REQUIRE(first.context == input.requested_context);
     REQUIRE(first.kv_quality == COMMON_KV_QUALITY_TURBO8);
@@ -56,6 +57,7 @@ void test_deterministic_budget_and_json() {
     REQUIRE(first.devices[0].transient_bytes == 0);
     REQUIRE(first.devices[1].transient_bytes == input.multimodal_bytes);
     for (const auto & device : first.devices) {
+        REQUIRE(device.expert_cache_bytes <= input.requested_expert_vram_bytes_per_device);
         REQUIRE(device.planned_bytes + device.reserve_bytes <= device.capacity_bytes);
     }
     const std::string json = common_resource_plan_json(first);
@@ -243,6 +245,27 @@ void test_rollback_hook_failure_is_single_shot() {
     REQUIRE(error == "injected prepare failure");
 }
 
+void test_native_override_normalization() {
+    REQUIRE(common_resource_cache_limit_bytes(0) == 0);
+    REQUIRE(common_resource_cache_limit_bytes(-1) == 0);
+    REQUIRE(common_resource_cache_limit_bytes(4096) == 4096ULL*MiB);
+    REQUIRE(common_resource_should_enable_fit(true, 0));
+    REQUIRE(!common_resource_should_enable_fit(true, 1));
+    REQUIRE(!common_resource_should_enable_fit(true, 999));
+    REQUIRE(!common_resource_should_enable_fit(false, 0));
+
+    auto input = base_input();
+    input.requested_expert_ram_bytes = common_resource_cache_limit_bytes(0);
+    input.requested_expert_vram_bytes_per_device = common_resource_cache_limit_bytes(0);
+    common_resource_plan plan;
+    std::string error;
+    REQUIRE(common_resource_plan_solve(input, plan, error));
+    REQUIRE(plan.expert_ram_bytes == 0);
+    for (const auto & device : plan.devices) {
+        REQUIRE(device.expert_cache_bytes == 0);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -254,5 +277,6 @@ int main() {
     test_compatibility_presets_and_host_budget();
     test_auto_unlimited_ram_and_minimum_expert_component();
     test_rollback_hook_failure_is_single_shot();
+    test_native_override_normalization();
     return 0;
 }

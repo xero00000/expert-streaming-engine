@@ -52,11 +52,23 @@ jobs:
         with:
           workspaces: studio/src-tauri
 
+      - name: Build bundled ESE CPU runtime
+        run: >-
+          cmake -S . -B build-release-runtime
+          -DCMAKE_BUILD_TYPE=Release
+          -DGGML_CUDA=OFF
+          -DLLAMA_BUILD_TESTS=OFF
+          -DLLAMA_BUILD_SERVER=ON
+          && cmake --build build-release-runtime --target llama-server -j2
+
       - name: Build packages
         working-directory: studio
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           pnpm install --frozen-lockfile
-          pnpm tauri build --bundles deb,rpm
+          pnpm tauri build --bundles appimage,deb,rpm
 
       - name: Prepare Linux assets
         run: |
@@ -64,6 +76,8 @@ jobs:
           mkdir release-assets
           cp studio/src-tauri/target/release/bundle/deb/*.deb "release-assets/ese-studio_${version}_amd64.deb"
           cp studio/src-tauri/target/release/bundle/rpm/*.rpm "release-assets/ese-studio-${version}-1.x86_64.rpm"
+          cp studio/src-tauri/target/release/bundle/appimage/*.AppImage "release-assets/ese-studio_${version}_amd64.AppImage"
+          cp studio/src-tauri/target/release/bundle/appimage/*.AppImage.sig "release-assets/ese-studio_${version}_amd64.AppImage.sig"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -93,6 +107,10 @@ jobs:
         with:
           node-version: 22
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -103,8 +121,24 @@ jobs:
         with:
           workspaces: studio/src-tauri
 
+      - name: Build bundled ESE CPU runtime
+        shell: pwsh
+        run: |
+          cmake -S . -B build-release-runtime -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON -A x64
+          cmake --build build-release-runtime --config Release --target llama-server -j 2
+
+      - name: Build standalone Windows ESE launcher
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check "pyinstaller==6.16.0"
+          python -m PyInstaller --noconfirm --clean --onefile --name ese --paths . --hidden-import tools.ese --distpath dist --workpath build-pyinstaller --specpath build-pyinstaller ese
+          .\dist\ese.exe --version
+
       - name: Build installers
         working-directory: studio
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           pnpm install --frozen-lockfile
           pnpm tauri build --bundles nsis,msi
@@ -115,6 +149,7 @@ jobs:
           $version = $env:GITHUB_REF_NAME.Substring(1)
           New-Item -ItemType Directory release-assets | Out-Null
           Copy-Item (Get-ChildItem studio\src-tauri\target\release\bundle\nsis\*.exe | Select-Object -First 1) "release-assets\ese-studio_${version}_x64-setup.exe"
+          Copy-Item (Get-ChildItem studio\src-tauri\target\release\bundle\nsis\*.exe.sig | Select-Object -First 1) "release-assets\ese-studio_${version}_x64-setup.exe.sig"
           Copy-Item (Get-ChildItem studio\src-tauri\target\release\bundle\msi\*.msi | Select-Object -First 1) "release-assets\ese-studio_${version}_x64.msi"
 
       - uses: actions/upload-artifact@v4
@@ -139,8 +174,27 @@ jobs:
       - name: Generate checksums
         working-directory: release-assets
         run: |
-          sha256sum -- *.deb *.rpm *.exe *.msi > SHA256SUMS
+          sha256sum -- *.AppImage *.deb *.rpm *.exe *.msi > SHA256SUMS
           sha256sum -- *.exe *.msi > SHA256SUMS-windows.txt
+
+      - name: Generate signed updater manifest
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          linux_signature="$(cat "release-assets/ese-studio_${version}_amd64.AppImage.sig")"
+          windows_signature="$(cat "release-assets/ese-studio_${version}_x64-setup.exe.sig")"
+          jq -n \
+            --arg version "$version" \
+            --arg notes "Expert Streaming Engine ${RELEASE_TAG}" \
+            --arg pub_date "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg linux_url "https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}/ese-studio_${version}_amd64.AppImage" \
+            --arg linux_signature "$linux_signature" \
+            --arg windows_url "https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}/ese-studio_${version}_x64-setup.exe" \
+            --arg windows_signature "$windows_signature" \
+            '{version: $version, notes: $notes, pub_date: $pub_date, platforms: {"linux-x86_64": {url: $linux_url, signature: $linux_signature}, "windows-x86_64": {url: $windows_url, signature: $windows_signature}}}' \
+            > release-assets/latest.json
 
       - name: Publish GitHub release
         env:

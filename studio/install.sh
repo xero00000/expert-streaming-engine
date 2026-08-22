@@ -17,7 +17,7 @@ missing_commands=()
 missing_libraries=()
 optional_commands=()
 
-for command_name in node cargo rustc pkg-config; do
+for command_name in node cargo rustc pkg-config cmake python3; do
     command -v "$command_name" >/dev/null 2>&1 || missing_commands+=("$command_name")
 done
 pnpm_missing=0
@@ -27,7 +27,7 @@ for library_name in webkit2gtk-4.1 gtk+-3.0 openssl; do
     pkg-config --exists "$library_name" 2>/dev/null || missing_libraries+=("$library_name")
 done
 
-for command_name in nvidia-smi ese; do
+for command_name in nvidia-smi; do
     command -v "$command_name" >/dev/null 2>&1 || optional_commands+=("$command_name")
 done
 
@@ -57,16 +57,16 @@ fi
 install_command=()
 case "${ID:-}" in
     ubuntu|debian|linuxmint|pop)
-        install_command=(sudo apt-get install -y build-essential curl wget file pkg-config libwebkit2gtk-4.1-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev nodejs npm cargo rustc)
+        install_command=(sudo apt-get install -y build-essential cmake python3 curl wget file pkg-config libwebkit2gtk-4.1-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev nodejs npm cargo rustc patchelf)
         ;;
     fedora|nobara|rhel|centos|rocky|almalinux)
-        install_command=(sudo dnf install -y gcc gcc-c++ make curl wget file pkgconf-pkg-config webkit2gtk4.1-devel openssl-devel libappindicator-gtk3-devel librsvg2-devel nodejs npm cargo rust)
+        install_command=(sudo dnf install -y gcc gcc-c++ make cmake python3 curl wget file pkgconf-pkg-config webkit2gtk4.1-devel openssl-devel libappindicator-gtk3-devel librsvg2-devel nodejs npm cargo rust patchelf)
         ;;
     arch|manjaro|endeavouros)
-        install_command=(sudo pacman -S --needed base-devel curl wget file pkgconf webkit2gtk-4.1 openssl libappindicator-gtk3 librsvg nodejs npm rust)
+        install_command=(sudo pacman -S --needed base-devel cmake python curl wget file pkgconf webkit2gtk-4.1 openssl libappindicator-gtk3 librsvg nodejs npm rust patchelf)
         ;;
     opensuse*|sles)
-        install_command=(sudo zypper install -y gcc gcc-c++ make curl wget file pkg-config webkit2gtk3-devel libopenssl-devel libappindicator3-1 librsvg-devel nodejs npm rust cargo)
+        install_command=(sudo zypper install -y gcc gcc-c++ make cmake python3 curl wget file pkg-config webkit2gtk3-devel libopenssl-devel libappindicator3-1 librsvg-devel nodejs npm rust cargo patchelf)
         ;;
 esac
 
@@ -110,8 +110,11 @@ if ! command -v pnpm >/dev/null 2>&1; then
     fi
 fi
 
+printf '\nBuilding the ESE runtime…\n'
+python3 "$SCRIPT_DIR/../ese" build --backend auto --build-dir "$SCRIPT_DIR/../build-package"
+
 printf '\nBuilding %s…\n' "$APP_NAME"
 cd "$SCRIPT_DIR"
 pnpm install --frozen-lockfile
-pnpm tauri build
+pnpm tauri build --config src-tauri/tauri.unsigned.conf.json
 printf '\nBuild complete. DEB and RPM packages are under %s/src-tauri/target/release/bundle/.\n' "$SCRIPT_DIR"

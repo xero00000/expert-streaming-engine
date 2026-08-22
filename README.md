@@ -13,7 +13,69 @@ controller and a bounded `NVMe → RAM → VRAM` expert hierarchy. The result is
 normal `llama-server` and OpenAI-compatible API with explicit memory limits,
 observable decisions, and no hidden backend or precision fallback.
 
-## Quick start
+## Install ESE Studio + ESE
+
+The v0.1.1 desktop installers are unified: one installation provides ESE
+Studio, the `ese` launcher, and a matching native `llama-server` runtime. The
+published packages carry a portable CPU baseline. A source install detects an
+NVIDIA toolchain and builds CUDA automatically, falling back to CPU when CUDA
+is unavailable.
+
+Download the package and checksum file from the
+[latest release](https://github.com/xero00000/expert-streaming-engine/releases/latest),
+then verify and install it.
+
+### Linux
+
+The AppImage is recommended when you want signed in-app updates:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS
+chmod +x ese-studio_0.1.1_amd64.AppImage
+./ese-studio_0.1.1_amd64.AppImage
+```
+
+Native packages integrate with the system package manager and are updated by
+installing the next package release:
+
+```bash
+sudo apt install ./ese-studio_0.1.1_amd64.deb       # Debian / Ubuntu
+sudo dnf install ./ese-studio-0.1.1-1.x86_64.rpm   # Fedora / Nobara
+```
+
+For a user-local accelerated build from source:
+
+```bash
+git clone https://github.com/xero00000/expert-streaming-engine.git
+cd expert-streaming-engine
+./studio/scripts/install-local.sh
+ese doctor
+```
+
+The installer lists missing build dependencies and asks before installing
+them. It installs Studio under `~/.local/share/ese-studio`, and installs both
+`ese-studio` and `ese` commands under `~/.local/bin`.
+
+### Windows
+
+Download the NSIS `ese-studio_0.1.1_x64-setup.exe` (recommended) or MSI,
+compare its SHA-256 value with `SHA256SUMS-windows.txt`, and run it. Studio, a
+standalone `ese.exe`, and the native server are installed together; Python is
+not required at runtime. The NSIS build supports signed in-app updates from
+**Settings → Updates**.
+
+To build from source, open PowerShell in the repository:
+
+```powershell
+cd studio
+.\install.ps1 -Check
+.\install.ps1
+```
+
+The preflight can offer to install Python, CMake, Node.js, Rust, MSVC Build
+Tools, and WebView2 through `winget`; it never installs them without consent.
+
+## Command-line quick start
 
 Requirements: Python 3.10+, CMake, a C++ compiler, and optionally an NVIDIA
 CUDA toolchain. Linux is supported directly; Windows uses the MSVC Build Tools
@@ -59,31 +121,19 @@ than a second inference backend: every model launch still goes through ESE's
 inspectable planner and `llama-server` command. Its installer checks required
 commands and system libraries and asks before installing missing packages.
 
-The [latest release](https://github.com/xero00000/expert-streaming-engine/releases/latest)
-provides x86-64 Linux packages and, where listed, Windows installers plus
-checksums. Verify the downloaded package, then install it with the native
-package manager:
+Studio and ESE are versioned as one unit. From v0.1.1 onward, the packaged
+launcher/runtime is the one Studio uses; an unrelated older `ese` on `PATH`
+does not silently take precedence. Signed updates are checked manually from
+Settings, show byte progress, verify before installation, and leave the
+current install intact if a download or verification fails.
 
-```bash
-sha256sum --check --ignore-missing SHA256SUMS
-sudo apt install ./ese-studio_0.1.0_amd64.deb       # Debian / Ubuntu
-sudo dnf install ./ese-studio-0.1.0-1.x86_64.rpm   # Fedora / Nobara
-```
+![ESE Studio model library](docs/images/ese-studio-models.jpg)
 
-On Windows, download the NSIS `.exe` (recommended) or MSI package from the
-release, verify it against `SHA256SUMS-windows.txt`, and run the installer.
-Source builders can use `studio\install.ps1`; it reports missing dependencies
-and asks before installing them with `winget`.
+| Local chat | Configuration sweeper |
+| --- | --- |
+| ![ESE Studio local chat](docs/images/ese-studio-chat.jpg) | ![ESE Studio configuration sweeper](docs/images/ese-studio-config-sweeper.jpg) |
 
-Studio is the desktop control center; model serving still uses the `ese`
-launcher and locally built runtime from the Quick start above. To build Studio
-from source instead:
-
-```bash
-cd studio
-./install.sh --check  # read-only dependency preflight
-./install.sh          # confirm dependencies, then build a native package
-```
+![ESE Studio settings and signed updater](docs/images/ese-studio-settings-updates.jpg)
 
 ### GUI tour
 

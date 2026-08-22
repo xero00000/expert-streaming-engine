@@ -62,3 +62,19 @@ alone is not accepted as inference evidence.
 - AppImage, automatic updates, Windows, Android/QNN, and Ada-or-newer physical
   CUDA validation are not claimed by this release.
 - The Android/QNN work remains an isolated draft and is not part of v0.1.0.
+
+## v0.1.1 maintenance release
+
+- [x] Studio, launcher, and native server versions report `0.1.1`.
+- [x] Extracted RPM contains the launcher, planner, native server, and required
+  shared libraries; the native help surface runs from the extracted package.
+- [x] Linux package runtime uses relocatable `$ORIGIN` library paths.
+- [x] Tauri updater artifacts are mandatory-signed in the tag workflow and the
+  recoverable private key is stored outside the repository with mode `0600`.
+- [x] Stable GitHub `latest.json` generation covers Linux x86-64 AppImage and
+  Windows x86-64 installer assets.
+- [x] Settings exposes manual check, progress, verified install, failure
+  recovery, and restart states without changing the existing visual system.
+- [x] User-local Nobara installation reports `ese 0.1.1`, finds the installed
+  server, resolves bundled ESE libraries, and starts Studio successfully.
+- [x] Ubuntu and Windows packaging jobs pass on the consolidated pull request.
