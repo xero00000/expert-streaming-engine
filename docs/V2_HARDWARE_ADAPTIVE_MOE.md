@@ -30,8 +30,8 @@ Profiles default to `~/.cache/ese/hardware-profile.json`. They are versioned, wr
 | H2D/D2H | `ggml_backend_tensor_set/get` on every detected CUDA backend | No; needs confidence scoring |
 | H2D under host-memory contention | Per-device CUDA upload concurrent with host copy | No; baseline only |
 | CPU MoE | Real `ggml_mul_mat_id` over two actual GGUF expert payloads for every discovered type/geometry, checked against both single-thread execution and an independently dequantized scalar matvec | No; requires sufficiently confident samples for every format |
-| Adaptive expert-cache upload | Real split-GGUF payload read through a bounded production RAM-cache lease, uploaded with the production async primitive on every CUDA backend, synchronized while the lease is held, then released | No; still needs live scheduler route/event timing |
-| CPU MoE + cache upload contention | Per-device concurrent model-format routed matvec and production upload primitive | No; still needs the live scheduler's lease/route/event timing |
+| Adaptive expert-cache upload | Warm steady-state real split-GGUF payload read through a bounded production RAM-cache lease, uploaded with the production async primitive on every CUDA backend, synchronized while the lease is held, then released | No; still needs a separately labeled cold distribution and live scheduler route/event timing |
+| CPU MoE + cache upload contention | Per-device concurrent model-format routed matvec and warm steady-state exact `pread` → bounded RAM lease → production async upload path | No; still needs a separately labeled cold distribution and the live scheduler's route/event timing |
 
 The planner must not consume Phase A data until the last two rows use their production paths and results are keyed by expert GGML type, geometry, GPU, and NUMA node.
 Baseline profiles therefore carry `benchmark_source.planner_ready: false`.
@@ -39,7 +39,7 @@ Without `--model`, provenance records `model_used: false`. With a GGUF file, fir
 
 The native resource planner now has a pure integer split solver for calibrated decode misses. It minimizes the maximum of concurrent CPU and upload completion time, handles all-CPU/all-upload/mixed small counts, retains the previous split within a configurable hysteresis band, and refuses incomplete, low-confidence, non-finite, or otherwise invalid calibration. It is not connected to live decode until profile confidence and the remaining correctness gates are satisfied.
 
-Each timed series records its sample count, coefficient of variation, and a conservative confidence score combining seven-sample coverage with dispersion. The profile gate requires at least `0.80` confidence for both CPU and upload on every device/format. Changing the provenance flag alone cannot bypass missing model-backed or per-device evidence.
+Each timed series records its sample count, raw coefficient of variation, robust relative standard error of the median, and a confidence score combining seven-sample coverage with that uncertainty. The median absolute deviation estimator resists isolated scheduler/interrupt outliers but still penalizes broad or bimodal samples. The profile gate requires at least `0.80` confidence for both CPU and upload on every device/format. Changing the provenance flag alone cannot bypass missing model-backed or per-device evidence.
 
 ### Remaining Phase A gate
 

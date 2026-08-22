@@ -121,6 +121,7 @@ struct sample_summary {
     size_t count = 0;
     double median = 0;
     double coefficient_variation = 0;
+    double relative_standard_error = 0;
     double confidence = 0;
 };
 
@@ -133,8 +134,22 @@ sample_summary summarize(const std::vector<double> & values) {
     for (double value : values) variance += (value - mean) * (value - mean);
     variance /= values.size();
     const double cv = mean != 0 ? std::sqrt(variance) / std::abs(mean) : 1.0;
+    const double median_value = median(values);
+    std::vector<double> absolute_deviations;
+    absolute_deviations.reserve(values.size());
+    for (double value : values) absolute_deviations.push_back(std::abs(value - median_value));
+    // The policy consumes a median, so confidence must describe uncertainty
+    // in that robust central estimate rather than raw run-to-run variation.
+    // MAD resists isolated scheduler/interrupt outliers while still rejecting
+    // a genuinely broad or bimodal series. 1.4826 makes it sigma-consistent
+    // for a normal distribution; division by sqrt(n) estimates uncertainty.
+    const double robust_sigma = 1.4826 * median(std::move(absolute_deviations));
+    const double relative_standard_error = robust_sigma /
+            std::max(std::abs(median_value), std::numeric_limits<double>::epsilon()) /
+            std::sqrt(double(values.size()));
     const double sample_factor = std::min(1.0, double(values.size()) / 7.0);
-    return {values.size(), median(values), cv, sample_factor / (1.0 + 4.0 * cv)};
+    const double confidence = sample_factor / (1.0 + 4.0 * relative_standard_error);
+    return {values.size(), median_value, cv, relative_standard_error, confidence};
 }
 
 double gbps(size_t bytes, double seconds) {
@@ -227,6 +242,7 @@ struct cpu_moe_result {
     double checksum = 0;
     size_t sample_count = 0;
     double coefficient_variation = 0;
+    double relative_standard_error = 0;
     double confidence = 0;
     double independent_reference_nrmse = 0;
 };
@@ -252,51 +268,87 @@ struct leased_upload_result {
     sample_summary statistics;
 };
 
+class leased_expert_upload_probe {
+public:
+    leased_expert_upload_probe(
+            const model_expert_spec & spec,
+            ggml_backend_t backend,
+            ggml_tensor * destination) :
+        bytes_(spec.bytes), backend_(backend), destination_(destination) {
+        using namespace llama_expert_cache;
+        constexpr uint32_t source_id = 0;
+        const source_identity identity = identify_file_source(spec.source, source_id);
+        file_ = std::make_shared<file_source>(
+                source_id, identity, spec.source, read_backend::pread);
+        descriptor_spec description;
+        description.key = {0, 0, component::gate};
+        description.ggml_type = uint32_t(spec.type);
+        description.rank = 2;
+        description.quant_axis = 0;
+        description.block_elements = uint32_t(ggml_blck_size(static_cast<ggml_type>(spec.type)));
+        description.block_bytes = uint32_t(ggml_type_size(static_cast<ggml_type>(spec.type)));
+        description.source_alignment = uint32_t(std::gcd<uint64_t>(32, spec.bytes));
+        description.dimensions = {{uint64_t(spec.input_width), uint64_t(spec.expert_width), 0, 0}};
+        description.strides[0] = description.block_bytes;
+        description.strides[1] = uint64_t(ggml_row_size(
+                static_cast<ggml_type>(spec.type), spec.input_width));
+        description.model_identity = identity;
+        description.extents.push_back({source_id, identity, spec.data_offset, spec.bytes});
+        expert_ = descriptor::make(std::move(description), {{source_id, file_->size()}});
+        cache_ = std::make_unique<ram_cache>(
+                cache_config{spec.bytes, spec.bytes},
+                std::vector<std::shared_ptr<const source>>{file_});
+    }
+
+    double measure_once() {
+        cache_->clear();
+        const auto start = clock_type::now();
+        {
+            auto lease = cache_->acquire(expert_);
+            if (!lease || lease.size() != bytes_) {
+                throw std::runtime_error("production expert lease returned the wrong payload size");
+            }
+            ggml_backend_expert_cache_upload_async(
+                    backend_, destination_, lease.data(), 0, lease.size());
+            ggml_backend_synchronize(backend_);
+        }
+        return seconds_since(start);
+    }
+
+    void validate(size_t expected_reads) const {
+        using namespace llama_expert_cache;
+        const cache_stats stats = cache_->stats();
+        if (stats.active_leases != 0 ||
+                stats.bytes_read[size_t(read_backend::pread)] < bytes_ * expected_reads) {
+            throw std::runtime_error(
+                    "production expert lease telemetry did not account for calibration reads");
+        }
+    }
+
+private:
+    size_t bytes_;
+    ggml_backend_t backend_;
+    ggml_tensor * destination_;
+    std::shared_ptr<llama_expert_cache::file_source> file_;
+    std::shared_ptr<const llama_expert_cache::descriptor> expert_;
+    std::unique_ptr<llama_expert_cache::ram_cache> cache_;
+};
+
 sample_summary measure_leased_expert_upload(
         const model_expert_spec & spec,
         ggml_backend_t backend,
         ggml_tensor * destination,
         int iterations) {
-    using namespace llama_expert_cache;
-    constexpr uint32_t source_id = 0;
-    const source_identity identity = identify_file_source(spec.source, source_id);
-    auto file = std::make_shared<file_source>(
-            source_id, identity, spec.source, read_backend::pread);
-    descriptor_spec description;
-    description.key = {0, 0, component::gate};
-    description.ggml_type = uint32_t(spec.type);
-    description.rank = 2;
-    description.quant_axis = 0;
-    description.block_elements = uint32_t(ggml_blck_size(static_cast<ggml_type>(spec.type)));
-    description.block_bytes = uint32_t(ggml_type_size(static_cast<ggml_type>(spec.type)));
-    description.source_alignment = uint32_t(std::gcd<uint64_t>(32, spec.bytes));
-    description.dimensions = {{uint64_t(spec.input_width), uint64_t(spec.expert_width), 0, 0}};
-    description.strides[0] = description.block_bytes;
-    description.strides[1] = uint64_t(ggml_row_size(
-            static_cast<ggml_type>(spec.type), spec.input_width));
-    description.model_identity = identity;
-    description.extents.push_back({source_id, identity, spec.data_offset, spec.bytes});
-    auto expert = descriptor::make(std::move(description), {{source_id, file->size()}});
-    ram_cache cache({spec.bytes, spec.bytes}, {file});
+    leased_expert_upload_probe probe(spec, backend, destination);
+    // Planner calibration models recurring decode misses. Keep the cold-start
+    // distribution separate instead of mixing first-use initialization into
+    // a steady-state series and inflating its dispersion.
+    probe.measure_once();
     std::vector<double> samples;
     for (int i = 0; i < iterations; ++i) {
-        cache.clear();
-        const auto start = clock_type::now();
-        {
-            auto lease = cache.acquire(expert);
-            if (!lease || lease.size() != spec.bytes) {
-                throw std::runtime_error("production expert lease returned the wrong payload size");
-            }
-            ggml_backend_expert_cache_upload_async(
-                    backend, destination, lease.data(), 0, lease.size());
-            ggml_backend_synchronize(backend);
-        }
-        samples.push_back(seconds_since(start));
+        samples.push_back(probe.measure_once());
     }
-    const cache_stats stats = cache.stats();
-    if (stats.active_leases != 0 || stats.bytes_read[size_t(read_backend::pread)] < spec.bytes*iterations) {
-        throw std::runtime_error("production expert lease telemetry did not account for calibration reads");
-    }
+    probe.validate(size_t(iterations) + 1);
     return summarize(samples);
 }
 
@@ -415,7 +467,8 @@ cpu_moe_result measure_cpu_moe(
     const double elapsed = statistics.median;
     const size_t weight_bytes = expert_weights.size() * sizeof(ggml_fp16_t);
     return {k, m, n_used, threads, elapsed * 1000.0, gbps(weight_bytes, elapsed), checksum,
-            statistics.count, statistics.coefficient_variation, statistics.confidence};
+            statistics.count, statistics.coefficient_variation,
+            statistics.relative_standard_error, statistics.confidence};
 }
 
 cpu_moe_result measure_model_cpu_moe(
@@ -563,7 +616,8 @@ cpu_moe_result measure_model_cpu_moe(
     const double elapsed = statistics.median;
     return {spec.input_width, spec.expert_width, n_used, threads,
             elapsed * 1000.0, gbps(expected_bytes, elapsed), checksum,
-            statistics.count, statistics.coefficient_variation, statistics.confidence,
+            statistics.count, statistics.coefficient_variation,
+            statistics.relative_standard_error, statistics.confidence,
             independent_reference_nrmse};
 }
 
@@ -735,16 +789,16 @@ int main(int argc, char ** argv) {
                 &contended_expert_upload_seconds);
             for (size_t i = 0; i < opts.model_experts.size(); ++i) {
                 const auto & spec = opts.model_experts[i];
+                leased_expert_upload_probe lease_probe(
+                        spec, transfer.backend, transfer.tensor);
+                lease_probe.measure_once();
                 contended_model_cpu_moe.push_back(measure_model_cpu_moe(
                     spec, opts.iterations, opts.threads,
                     [&]() {
-                        const auto start = clock_type::now();
-                        ggml_backend_expert_cache_upload_async(
-                                transfer.backend, transfer.tensor, source.data(), 0, spec.bytes);
-                        ggml_backend_synchronize(transfer.backend);
-                        return seconds_since(start);
+                        return lease_probe.measure_once();
                     },
                     &contended_model_upload_seconds[i]));
+                lease_probe.validate(size_t(opts.iterations) + 1);
             }
         }
         std::vector<device_contention_result> device_contentions;
@@ -775,18 +829,25 @@ int main(int argc, char ** argv) {
                 for (size_t i = 0; i < count; ++i) {
                     const size_t bytes = opts.model_experts.empty() ? expert_upload_bytes : opts.model_experts[i].bytes;
                     std::vector<double> upload_seconds;
-                    auto concurrent = [&]() {
-                        const auto start = clock_type::now();
-                        ggml_backend_expert_cache_upload_async(
-                                extra.backend, extra.tensor, source.data(), 0, bytes);
-                        ggml_backend_synchronize(extra.backend);
-                        return seconds_since(start);
-                    };
-                    measured.cpu.push_back(opts.model_experts.empty()
-                            ? measure_cpu_moe(opts.iterations, opts.threads, concurrent, &upload_seconds)
-                            : measure_model_cpu_moe(
-                                    opts.model_experts[i], opts.iterations, opts.threads,
-                                    concurrent, &upload_seconds));
+                    if (opts.model_experts.empty()) {
+                        auto concurrent = [&]() {
+                            const auto start = clock_type::now();
+                            ggml_backend_expert_cache_upload_async(
+                                    extra.backend, extra.tensor, source.data(), 0, bytes);
+                            ggml_backend_synchronize(extra.backend);
+                            return seconds_since(start);
+                        };
+                        measured.cpu.push_back(measure_cpu_moe(
+                                opts.iterations, opts.threads, concurrent, &upload_seconds));
+                    } else {
+                        leased_expert_upload_probe lease_probe(
+                                opts.model_experts[i], extra.backend, extra.tensor);
+                        lease_probe.measure_once();
+                        measured.cpu.push_back(measure_model_cpu_moe(
+                                opts.model_experts[i], opts.iterations, opts.threads,
+                                [&]() { return lease_probe.measure_once(); }, &upload_seconds));
+                        lease_probe.validate(size_t(opts.iterations) + 1);
+                    }
                     measured.upload_gbps.push_back(gbps(bytes, median(upload_seconds)));
                     measured.upload_statistics.push_back(summarize(upload_seconds));
                 }
@@ -821,7 +882,7 @@ int main(int argc, char ** argv) {
                   << "    \"model_used\": " << (!opts.model_experts.empty() ? "true" : "false") << ",\n"
                   << "    \"model_usage\": "
                   << (!opts.model_experts.empty()
-                          ? "[\"expert_payload_cpu_moe\",\"expert_cache_upload_geometry\",\"bounded_ram_lease_upload\",\"per_device_contention\"]"
+                          ? "[\"expert_payload_cpu_moe\",\"expert_cache_upload_geometry\",\"bounded_ram_lease_upload\",\"bounded_ram_lease_contention\",\"per_device_contention\"]"
                           : "[]") << "\n"
                   << "  },\n  \"measurements\": {\n"
                   << "    \"host_memory\": {\"copy_gbps_median\": " << median(host_samples)
@@ -870,6 +931,7 @@ int main(int argc, char ** argv) {
                   << ", \"effective_gbps_median\": " << cpu_moe.effective_gbps_median
                   << ", \"sample_count\": " << cpu_moe.sample_count
                   << ", \"coefficient_variation\": " << cpu_moe.coefficient_variation
+                  << ", \"relative_standard_error\": " << cpu_moe.relative_standard_error
                   << ", \"confidence\": " << cpu_moe.confidence
                   << ", \"correctness\": \"single-thread-parity\", \"checksum\": " << cpu_moe.checksum;
         if (!model_cpu_moe.empty()) {
@@ -888,6 +950,7 @@ int main(int argc, char ** argv) {
                           << ", \"effective_gbps_median\": " << result.effective_gbps_median
                           << ", \"sample_count\": " << result.sample_count
                           << ", \"coefficient_variation\": " << result.coefficient_variation
+                          << ", \"relative_standard_error\": " << result.relative_standard_error
                           << ", \"confidence\": " << result.confidence
                           << ", \"correctness\": \"single-thread-and-dequantized-scalar-reference\""
                           << ", \"independent_reference_nrmse\": " << result.independent_reference_nrmse
@@ -900,16 +963,24 @@ int main(int argc, char ** argv) {
                   << "    \"cpu_cache_contention\": {";
         if (transfer.backend) {
             std::cout << "\"status\": \"measured\", \"cpu_operation\": \"ggml_mul_mat_id\", "
+                      << "\"distribution\": \"warm-steady-state\", "
+                      << "\"upload_path\": \""
+                      << (opts.model_experts.empty()
+                              ? "ggml_backend_expert_cache_upload_async"
+                              : "pread_to_bounded_ram_lease_to_async_upload") << "\", "
                       << "\"cpu_latency_ms_median\": " << contended_cpu_moe.latency_ms_median
                       << ", \"cpu_effective_gbps_median\": " << contended_cpu_moe.effective_gbps_median
                       << ", \"cpu_sample_count\": " << contended_cpu_moe.sample_count
                       << ", \"cpu_coefficient_variation\": " << contended_cpu_moe.coefficient_variation
+                      << ", \"cpu_relative_standard_error\": " << contended_cpu_moe.relative_standard_error
                       << ", \"cpu_confidence\": " << contended_cpu_moe.confidence
                       << ", \"upload_gbps_median\": "
                       << gbps(expert_upload_bytes, median(contended_expert_upload_seconds))
                       << ", \"upload_sample_count\": " << summarize(contended_expert_upload_seconds).count
                       << ", \"upload_coefficient_variation\": "
                       << summarize(contended_expert_upload_seconds).coefficient_variation
+                      << ", \"upload_relative_standard_error\": "
+                      << summarize(contended_expert_upload_seconds).relative_standard_error
                       << ", \"upload_confidence\": "
                       << summarize(contended_expert_upload_seconds).confidence
                       << ", \"bytes_per_expert_component\": " << expert_upload_bytes;
@@ -929,12 +1000,15 @@ int main(int argc, char ** argv) {
                               << ", \"cpu_effective_gbps_median\": " << result.effective_gbps_median
                               << ", \"cpu_sample_count\": " << result.sample_count
                               << ", \"cpu_coefficient_variation\": " << result.coefficient_variation
+                              << ", \"cpu_relative_standard_error\": " << result.relative_standard_error
                               << ", \"cpu_confidence\": " << result.confidence
                               << ", \"upload_gbps_median\": "
                               << gbps(spec.bytes, median(contended_model_upload_seconds[i]))
                               << ", \"upload_sample_count\": " << summarize(contended_model_upload_seconds[i]).count
                               << ", \"upload_coefficient_variation\": "
                               << summarize(contended_model_upload_seconds[i]).coefficient_variation
+                              << ", \"upload_relative_standard_error\": "
+                              << summarize(contended_model_upload_seconds[i]).relative_standard_error
                               << ", \"upload_confidence\": "
                               << summarize(contended_model_upload_seconds[i]).confidence << "}";
                 }
@@ -963,11 +1037,14 @@ int main(int argc, char ** argv) {
                               << ", \"cpu_effective_gbps_median\": " << result.effective_gbps_median
                               << ", \"cpu_sample_count\": " << result.sample_count
                               << ", \"cpu_coefficient_variation\": " << result.coefficient_variation
+                              << ", \"cpu_relative_standard_error\": " << result.relative_standard_error
                               << ", \"cpu_confidence\": " << result.confidence
                               << ", \"upload_gbps_median\": " << device.upload_gbps[j]
                               << ", \"upload_sample_count\": " << device.upload_statistics[j].count
                               << ", \"upload_coefficient_variation\": "
                               << device.upload_statistics[j].coefficient_variation
+                              << ", \"upload_relative_standard_error\": "
+                              << device.upload_statistics[j].relative_standard_error
                               << ", \"upload_confidence\": " << device.upload_statistics[j].confidence << "}";
                 }
                 std::cout << "]}";
@@ -1008,13 +1085,15 @@ int main(int argc, char ** argv) {
                     const auto & spec = opts.model_experts[result.spec_index];
                     const auto & stats = result.statistics;
                     std::cout << "{\"backend\": \"" << json_escape(result.backend)
-                              << "\", \"storage_backend\": \"pread\", \"ggml_type_id\": " << spec.type
+                              << "\", \"storage_backend\": \"pread\", \"distribution\": \"warm-steady-state\""
+                              << ", \"ggml_type_id\": " << spec.type
                               << ", \"ggml_type\": \"" << ggml_type_name(static_cast<ggml_type>(spec.type))
                               << "\", \"bytes_per_expert_component\": " << spec.bytes
                               << ", \"end_to_end_ms_median\": " << stats.median * 1000.0
                               << ", \"end_to_end_gbps_median\": " << gbps(spec.bytes, stats.median)
                               << ", \"sample_count\": " << stats.count
                               << ", \"coefficient_variation\": " << stats.coefficient_variation
+                              << ", \"relative_standard_error\": " << stats.relative_standard_error
                               << ", \"confidence\": " << stats.confidence << "}";
                 }
                 std::cout << "]";
