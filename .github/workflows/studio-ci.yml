@@ -81,7 +81,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build DEB and RPM packages
-        run: pnpm tauri build
+        run: pnpm tauri build --bundles deb,rpm
 
       - name: Install and smoke-test DEB package
         run: |
@@ -106,6 +106,71 @@ jobs:
           path: |
             studio/src-tauri/target/release/bundle/deb/*.deb
             studio/src-tauri/target/release/bundle/rpm/*.rpm
+          if-no-files-found: error
+
+  windows-studio:
+    name: Studio frontend, Rust, and Windows installers
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: studio
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri
+
+      - name: Install locked frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check installer PowerShell syntax
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\install.ps1),
+            [ref]$null,
+            [ref]$errors
+          )
+          if ($errors.Count) { $errors | Format-List; exit 1 }
+          .\install.ps1 -Check
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Test Rust backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build NSIS and MSI installers
+        run: pnpm tauri build --bundles nsis,msi
+
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: ese-studio-windows-installers
+          path: |
+            studio/src-tauri/target/release/bundle/nsis/*.exe
+            studio/src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: error
 
   collector:

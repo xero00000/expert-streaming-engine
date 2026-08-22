@@ -8,6 +8,10 @@
 #include <limits>
 #include <sstream>
 
+#if defined(_MSC_VER) && defined(_M_X64)
+#include <intrin.h>
+#endif
+
 namespace {
 
 bool add_checked(uint64_t & value, uint64_t add) {
@@ -23,6 +27,17 @@ uint64_t mul_saturated(uint64_t a, uint64_t b) {
         return std::numeric_limits<uint64_t>::max();
     }
     return a*b;
+}
+
+uint64_t mul_div_floor(uint64_t a, uint64_t b, uint64_t divisor) {
+#if defined(_MSC_VER) && defined(_M_X64)
+    uint64_t high = 0;
+    const uint64_t low = _umul128(a, b, &high);
+    uint64_t remainder = 0;
+    return _udiv128(high, low, divisor, &remainder);
+#else
+    return (uint64_t) (((__uint128_t) a*b)/divisor);
+#endif
 }
 
 common_memory_policy resolve_policy(const common_resource_plan_input & input) {
@@ -92,7 +107,7 @@ bool allocate_context(
         const auto & source = input.devices[i];
         const uint64_t share = i + 1 == input.devices.size()
             ? kv_total - assigned
-            : (uint64_t) (((__uint128_t) kv_total * usable[i])/weight_sum);
+            : mul_div_floor(kv_total, usable[i], weight_sum);
         if (share > usable[i]) {
             return false;
         }
