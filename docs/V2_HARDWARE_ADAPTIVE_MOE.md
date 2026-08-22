@@ -29,7 +29,7 @@ Profiles default to `~/.cache/ese/hardware-profile.json`. They are versioned, wr
 | Sustained host copy | native timed `memcpy` | No; baseline only |
 | H2D/D2H | `ggml_backend_tensor_set/get` on every detected CUDA backend | No; needs confidence scoring |
 | H2D under host-memory contention | Per-device CUDA upload concurrent with host copy | No; baseline only |
-| CPU MoE | Real `ggml_mul_mat_id` over two actual GGUF expert payloads for every discovered type/geometry | No; still needs an independent numerical reference and confidence scoring |
+| CPU MoE | Real `ggml_mul_mat_id` over two actual GGUF expert payloads for every discovered type/geometry, checked against both single-thread execution and an independently dequantized scalar matvec | No; requires sufficiently confident samples for every format |
 | Adaptive expert-cache upload | Real split-GGUF payload read through a bounded production RAM-cache lease, uploaded with the production async primitive on every CUDA backend, synchronized while the lease is held, then released | No; still needs live scheduler route/event timing |
 | CPU MoE + cache upload contention | Per-device concurrent model-format routed matvec and production upload primitive | No; still needs the live scheduler's lease/route/event timing |
 
@@ -45,7 +45,6 @@ Each timed series records its sample count, coefficient of variation, and a cons
 
 - Resolve and test the standalone fused `ggml_moe_up_gate` probe; its first calibration harness exposed allocator corruption, so Phase A currently uses the stable routed `ggml_mul_mat_id` primitive.
 - Instrument the live scheduler route/events around the exact leased upload path.
-- Validate numerical output against a CPU reference.
 - Feed only complete, current, sufficiently confident profiles into the native resource controller.
 
 ## Later phases

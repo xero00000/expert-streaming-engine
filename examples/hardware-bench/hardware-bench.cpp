@@ -228,6 +228,7 @@ struct cpu_moe_result {
     size_t sample_count = 0;
     double coefficient_variation = 0;
     double confidence = 0;
+    double independent_reference_nrmse = 0;
 };
 
 struct device_transfer_result {
@@ -420,7 +421,8 @@ cpu_moe_result measure_cpu_moe(
 cpu_moe_result measure_model_cpu_moe(
         const model_expert_spec & spec, int iterations, int requested_threads,
         const std::function<double()> & concurrent_work = {},
-        std::vector<double> * concurrent_samples = nullptr) {
+        std::vector<double> * concurrent_samples = nullptr,
+        bool validate_independent_reference = false) {
     constexpr int64_t n_used = 2;
     constexpr int64_t stored_experts = 2;
     const ggml_type type = static_cast<ggml_type>(spec.type);
@@ -519,11 +521,50 @@ cpu_moe_result measure_model_cpu_moe(
         checksum += result[i];
     }
     if (!std::isfinite(checksum)) throw std::runtime_error("model CPU MoE produced invalid checksum");
+    double independent_reference_nrmse = 0;
+    if (validate_independent_reference) {
+        const ggml_type_traits_t traits = ggml_internal_get_type_traits(type);
+        if (!traits.to_float) {
+            throw std::runtime_error("model expert type has no independent dequantization path");
+        }
+        const size_t row_bytes = ggml_row_size(type, spec.input_width);
+        if (row_bytes * size_t(spec.expert_width) != spec.bytes) {
+            throw std::runtime_error("model expert row geometry does not match its GGUF payload span");
+        }
+        std::vector<float> row(size_t(spec.input_width));
+        long double squared_error = 0;
+        long double squared_reference = 0;
+        for (int64_t routed = 0; routed < n_used; ++routed) {
+            const uint8_t * expert = expert_weights.data() + size_t(routed) * spec.bytes;
+            const float * activation = inputs.data() + size_t(routed) * spec.input_width;
+            for (int64_t output_row = 0; output_row < spec.expert_width; ++output_row) {
+                traits.to_float(expert + size_t(output_row) * row_bytes, row.data(), spec.input_width);
+                long double expected = 0;
+                for (int64_t column = 0; column < spec.input_width; ++column) {
+                    expected += static_cast<long double>(row[size_t(column)]) * activation[size_t(column)];
+                }
+                const long double observed = result[
+                        size_t(routed) * spec.expert_width + size_t(output_row)];
+                const long double error = observed - expected;
+                squared_error += error * error;
+                squared_reference += expected * expected;
+            }
+        }
+        independent_reference_nrmse = std::sqrt(double(
+                squared_error / std::max<long double>(squared_reference, 1.0e-30L)));
+        if (!std::isfinite(independent_reference_nrmse) || independent_reference_nrmse > 0.08) {
+            std::ostringstream message;
+            message << "model CPU MoE failed independent dequantized scalar reference: NRMSE="
+                    << independent_reference_nrmse;
+            throw std::runtime_error(message.str());
+        }
+    }
     const sample_summary statistics = summarize(samples);
     const double elapsed = statistics.median;
     return {spec.input_width, spec.expert_width, n_used, threads,
             elapsed * 1000.0, gbps(expected_bytes, elapsed), checksum,
-            statistics.count, statistics.coefficient_variation, statistics.confidence};
+            statistics.count, statistics.coefficient_variation, statistics.confidence,
+            independent_reference_nrmse};
 }
 
 } // namespace
@@ -674,7 +715,8 @@ int main(int argc, char ** argv) {
         std::vector<cpu_moe_result> model_cpu_moe;
         model_cpu_moe.reserve(opts.model_experts.size());
         for (const auto & spec : opts.model_experts) {
-            model_cpu_moe.push_back(measure_model_cpu_moe(spec, opts.iterations, opts.threads));
+            model_cpu_moe.push_back(measure_model_cpu_moe(
+                    spec, opts.iterations, opts.threads, {}, nullptr, true));
         }
         cpu_moe_result contended_cpu_moe;
         std::vector<double> contended_expert_upload_seconds;
@@ -847,7 +889,9 @@ int main(int argc, char ** argv) {
                           << ", \"sample_count\": " << result.sample_count
                           << ", \"coefficient_variation\": " << result.coefficient_variation
                           << ", \"confidence\": " << result.confidence
-                          << ", \"correctness\": \"single-thread-parity\", \"checksum\": "
+                          << ", \"correctness\": \"single-thread-and-dequantized-scalar-reference\""
+                          << ", \"independent_reference_nrmse\": " << result.independent_reference_nrmse
+                          << ", \"checksum\": "
                           << result.checksum << "}";
             }
             std::cout << "]";
