@@ -180,6 +180,20 @@ class HardwareProfileTests(unittest.TestCase):
             ["calibration is baseline-only and not approved for planner decisions"],
         )
 
+    def test_planner_ready_flag_cannot_bypass_completeness_gate(self) -> None:
+        profile = build_hardware_profile(
+            identity(),
+            {
+                "cpu_moe": {"status": "measured"},
+                "expert_cache_upload": {"status": "measured"},
+                "cpu_cache_contention": {"status": "measured"},
+            },
+            benchmark_source={"planner_ready": True},
+        )
+        reasons = planner_profile_reasons(profile, identity())
+        self.assertIn("planner profile has no model-backed CPU expert measurements", reasons)
+        self.assertIn("planner profile has no per-device contention measurements", reasons)
+
 
 if __name__ == "__main__":
     unittest.main()
