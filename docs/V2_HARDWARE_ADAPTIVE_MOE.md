@@ -280,6 +280,14 @@ replacement migrates occupied rows before publication; allocation, conversion,
 or injected migration failure leaves the old cache and logical plan active.
 Per-slot logical limits are changed only after publication.
 
+The KV replacement is now split into an internal reversible transaction. Its
+prepare step owns the candidate allocation and completes every row migration;
+publication is a no-allocation storage/scalar swap; rollback applies the same
+swap in reverse; and finalization alone releases the old checkpoint and retires
+the old buffers. `ESE_KV_TRANSACTION_FAIL_AFTER_PUBLISH=1` exercises the gap
+between publication and finalization, proving that a later resource publication
+can fail without committing the KV half of a future combined transaction.
+
 The per-device expert cache now has an equivalent prepared replacement. It
 allocates every backend layout at the target bound while the old cache remains
 active, migrates the most recently used resident entries and admission history,

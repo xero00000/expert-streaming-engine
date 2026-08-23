@@ -10517,164 +10517,288 @@ bool llama_kv_cache_get_layer_types(
     return true;
 }
 
+enum class llama_kv_cache_transaction_state {
+    prepared,
+    published,
+    rolled_back,
+    finalized,
+};
+
+static void llama_kv_cache_reset_graph_bindings(struct llama_context & ctx) noexcept {
+    ctx.reset_scheduler();
+    for (auto & copy : ctx.cache_copies) copy = {};
+    for (auto & copy : ctx.dsa_cache_copies) copy = {};
+    for (auto & copy : ctx.openpangu_cache_copies) copy = {};
+    for (auto & copy : ctx.openpangu_cache_copies_mtp) copy = {};
+}
+
+// Owns exactly one off-to-the-side cache. Before publication it is the new
+// candidate; after publication it is the old live storage. The live cache's
+// checkpoint deliberately does not participate in the storage swap, so a
+// publication can be rolled back without rebuilding or copying that checkpoint.
+struct llama_kv_cache_transaction {
+    explicit llama_kv_cache_transaction(
+            struct llama_context * context,
+            uint32_t target_context_size,
+            bool changes_storage) noexcept
+        : ctx(context),
+          previous_context_size(context->cparams.n_ctx),
+          target_context_size(target_context_size),
+          changes_storage(changes_storage) {
+    }
+
+    llama_kv_cache_transaction(const llama_kv_cache_transaction &) = delete;
+    llama_kv_cache_transaction & operator=(const llama_kv_cache_transaction &) = delete;
+
+    ~llama_kv_cache_transaction() {
+        // A caller that publishes but does not finalize has not committed. Keep
+        // the old cache/checkpoint contract even on an exception or early return.
+        if (state == llama_kv_cache_transaction_state::published) {
+            rollback();
+        }
+    }
+
+    bool publish() noexcept {
+        if (state != llama_kv_cache_transaction_state::prepared) {
+            return false;
+        }
+        if (changes_storage) {
+            // All allocation and migration work is already complete. These
+            // vector/storage swaps and scalar writes do not allocate.
+            llama_kv_cache_swap_storage(ctx->kv_self, alternate);
+            ctx->cparams.n_ctx = target_context_size;
+        }
+        state = llama_kv_cache_transaction_state::published;
+        if (changes_storage) {
+            llama_kv_cache_reset_graph_bindings(*ctx);
+        }
+        return true;
+    }
+
+    bool rollback() noexcept {
+        if (state != llama_kv_cache_transaction_state::published) {
+            return false;
+        }
+        if (changes_storage) {
+            llama_kv_cache_swap_storage(ctx->kv_self, alternate);
+            ctx->cparams.n_ctx = previous_context_size;
+            llama_kv_cache_reset_graph_bindings(*ctx);
+        }
+        state = llama_kv_cache_transaction_state::rolled_back;
+        return true;
+    }
+
+    bool finalize() noexcept {
+        if (state != llama_kv_cache_transaction_state::published) {
+            return false;
+        }
+        if (changes_storage) {
+            // The old checkpoint stayed attached to the live context so that a
+            // rollback remained possible. Only an irrevocable commit may drop
+            // it and retire the old buffers now held by alternate.
+            ctx->kv_self.ckpt.release();
+            alternate.ckpt.release();
+            llama_kv_cache retired;
+            llama_kv_cache_swap_storage(alternate, retired);
+        }
+        state = llama_kv_cache_transaction_state::finalized;
+        return true;
+    }
+
+    struct llama_context * ctx;
+    llama_kv_cache alternate;
+    uint32_t previous_context_size;
+    uint32_t target_context_size;
+    bool changes_storage;
+    llama_kv_cache_transaction_state state = llama_kv_cache_transaction_state::prepared;
+    int64_t migrated_rows = 0;
+    size_t peak_staging = 0;
+};
+
+static bool llama_kv_cache_transaction_fail_after_publish() noexcept {
+    const char * value = getenv("ESE_KV_TRANSACTION_FAIL_AFTER_PUBLISH");
+    return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static std::unique_ptr<llama_kv_cache_transaction> llama_kv_cache_transaction_prepare(
+        struct llama_context * ctx,
+        const enum ggml_type * type_k_layers,
+        const enum ggml_type * type_v_layers,
+        uint32_t n_layers,
+        uint32_t target_size) noexcept {
+    try {
+        if (ctx == nullptr || n_layers == 0 || n_layers != ctx->kv_self.k_l.size() ||
+                (type_k_layers == nullptr && type_v_layers == nullptr) || target_size == 0) {
+            LLAMA_LOG_ERROR("%s: invalid layer map\n", __func__);
+            return nullptr;
+        }
+
+        auto & current = ctx->kv_self;
+        const auto & model = ctx->model;
+        if (current.recurrent || current.hybrid || current.v_trans || model.is_mla_model() ||
+                model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_OPENPANGU ||
+                !current.split_k_l.empty() || !current.split_v_l.empty() ||
+                !current.split_s_l.empty() || !current.replicated_k_l.empty()) {
+            LLAMA_LOG_ERROR("%s: live retiering is not supported for recurrent, transposed, MLA, or split KV layouts\n", __func__);
+            return nullptr;
+        }
+
+        std::vector<ggml_type> target_k(n_layers, current.type_k);
+        std::vector<ggml_type> target_v(n_layers, current.type_v);
+        bool changed = target_size != current.size;
+        for (uint32_t layer = 0; layer < n_layers; ++layer) {
+            if (current.k_l[layer] != nullptr) {
+                target_k[layer] = type_k_layers == nullptr ? current.k_l[layer]->type : type_k_layers[layer];
+                changed |= target_k[layer] != current.k_l[layer]->type;
+            }
+            if (layer < current.v_l.size() && current.v_l[layer] != nullptr) {
+                target_v[layer] = type_v_layers == nullptr ? current.v_l[layer]->type : type_v_layers[layer];
+                changed |= target_v[layer] != current.v_l[layer]->type;
+            }
+        }
+
+        auto transaction = std::make_unique<llama_kv_cache_transaction>(ctx, target_size, changed);
+        if (!changed) {
+            return transaction;
+        }
+
+        if (target_size > ctx->n_ctx_max ||
+                target_size % llama_kv_cache_get_padding(ctx->cparams) != 0) {
+            LLAMA_LOG_ERROR("%s: target size %u exceeds the context limit or backend padding contract\n",
+                    __func__, target_size);
+            return nullptr;
+        }
+        if (target_size < current.size) {
+            for (uint32_t cell = target_size; cell < current.size; ++cell) {
+                if (current.cells[cell].pos >= 0) {
+                    LLAMA_LOG_ERROR("%s: target size %u would discard occupied cell %u\n",
+                            __func__, target_size, cell);
+                    return nullptr;
+                }
+            }
+        }
+
+        llama_synchronize(ctx);
+        if (llama_kv_cache_update_internal(*ctx) != 0) {
+            LLAMA_LOG_ERROR("%s: failed to settle pending KV updates\n", __func__);
+            return nullptr;
+        }
+        llama_synchronize(ctx);
+        ctx->reset_scheduler();
+
+        auto & prepared = transaction->alternate;
+        if (!llama_kv_cache_init(prepared, ctx, current.type_k, current.type_v,
+                    ctx->cparams.idx_type_k, target_size, ctx->cparams.offload_kqv,
+                    current.type_k, current.type_k, current.type_v, current.type_v,
+                    -1, -1, -1, -1,
+                    target_k.data(), target_v.data(), n_layers, n_layers)) {
+            LLAMA_LOG_ERROR("%s: target cache allocation failed; original cache retained\n", __func__);
+            return nullptr;
+        }
+
+        const auto & hparams = model.hparams;
+        const int64_t fail_after = llama_kv_retier_failure_row();
+        std::vector<uint8_t> source_bytes;
+        std::vector<uint8_t> destination_bytes;
+        std::vector<float> source_float;
+        std::vector<float> destination_float;
+
+        const auto migrate = [&](const ggml_tensor * source, ggml_tensor * destination,
+                uint32_t logical_head, uint32_t head_count, uint32_t cell) -> bool {
+            const uint32_t source_head = uint32_t(source->ne[0] / (source->ne[1] == 1 ? current.size * head_count : 1));
+            const uint32_t destination_head = uint32_t(destination->ne[0] /
+                    (destination->ne[1] == 1 ? prepared.size * head_count : 1));
+            const size_t source_head_bytes = ggml_row_size(source->type, source_head);
+            const size_t destination_head_bytes = ggml_row_size(destination->type, destination_head);
+            for (uint32_t head = 0; head < head_count; ++head) {
+                if (transaction->migrated_rows == fail_after) {
+                    LLAMA_LOG_WARN("%s: injected failure after %lld rows; original cache retained\n",
+                            __func__, (long long) transaction->migrated_rows);
+                    return false;
+                }
+                const size_t source_offset = (size_t(cell) * head_count + head) * source_head_bytes;
+                const size_t destination_offset = (size_t(cell) * head_count + head) * destination_head_bytes;
+                if (!llama_kv_cache_transcode_head_row(source, destination,
+                            source_offset, destination_offset, source_head, destination_head,
+                            logical_head, source_bytes, destination_bytes, source_float, destination_float)) {
+                    return false;
+                }
+                ++transaction->migrated_rows;
+                transaction->peak_staging = std::max(transaction->peak_staging,
+                        source_bytes.capacity() + destination_bytes.capacity() +
+                        (source_float.capacity() + destination_float.capacity()) * sizeof(float));
+            }
+            return true;
+        };
+
+        for (uint32_t layer = 0; layer < n_layers; ++layer) {
+            if ((current.k_l[layer] == nullptr) != (prepared.k_l[layer] == nullptr) ||
+                    (layer < current.v_l.size() && current.v_l[layer] != nullptr) !=
+                    (layer < prepared.v_l.size() && prepared.v_l[layer] != nullptr)) {
+                LLAMA_LOG_ERROR("%s: target cache geometry changed at layer %u\n", __func__, layer);
+                return nullptr;
+            }
+            if (current.k_l[layer] == nullptr) {
+                continue;
+            }
+            const uint32_t head_count = hparams.n_head_kv(layer);
+            for (uint32_t cell = 0; cell < current.size; ++cell) {
+                if (current.cells[cell].pos < 0) {
+                    continue;
+                }
+                if (!migrate(current.k_l[layer], prepared.k_l[layer],
+                            hparams.n_embd_head_k(layer), head_count, cell)) {
+                    return nullptr;
+                }
+                if (layer < current.v_l.size() && current.v_l[layer] != nullptr &&
+                        !migrate(current.v_l[layer], prepared.v_l[layer],
+                            hparams.n_embd_head_v(layer), head_count, cell)) {
+                    return nullptr;
+                }
+            }
+        }
+
+        const uint32_t retained_cells = std::min(current.size, prepared.size);
+        std::copy_n(current.cells.begin(), retained_cells, prepared.cells.begin());
+        prepared.head = current.head < prepared.size ? current.head : 0;
+        prepared.used = current.used;
+        prepared.n = std::min(current.n, prepared.size);
+        prepared.has_shift = current.has_shift;
+        prepared.save_per_step_ssm = current.save_per_step_ssm;
+        return transaction;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: preparation threw an exception; original cache retained: %s\n",
+                __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: preparation threw an unknown exception; original cache retained\n", __func__);
+    }
+    return nullptr;
+}
+
 static bool llama_kv_cache_replace(
         struct llama_context * ctx,
         const enum ggml_type * type_k_layers,
         const enum ggml_type * type_v_layers,
         uint32_t n_layers,
-        uint32_t target_size) {
-    if (ctx == nullptr || n_layers == 0 || n_layers != ctx->kv_self.k_l.size() ||
-            (type_k_layers == nullptr && type_v_layers == nullptr) || target_size == 0) {
-        LLAMA_LOG_ERROR("%s: invalid layer map\n", __func__);
+        uint32_t target_size) noexcept {
+    auto transaction = llama_kv_cache_transaction_prepare(
+            ctx, type_k_layers, type_v_layers, n_layers, target_size);
+    if (!transaction || !transaction->publish()) {
+        return false;
+    }
+    if (transaction->changes_storage && llama_kv_cache_transaction_fail_after_publish()) {
+        LLAMA_LOG_WARN("%s: injected failure after reversible publication; rolling back\n", __func__);
+        if (!transaction->rollback()) {
+            LLAMA_LOG_ERROR("%s: failed to roll back reversible KV publication\n", __func__);
+        }
         return false;
     }
 
-    auto & current = ctx->kv_self;
-    const auto & model = ctx->model;
-    if (current.recurrent || current.hybrid || current.v_trans || model.is_mla_model() ||
-            model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_OPENPANGU ||
-            !current.split_k_l.empty() || !current.split_v_l.empty() ||
-            !current.split_s_l.empty() || !current.replicated_k_l.empty()) {
-        LLAMA_LOG_ERROR("%s: live retiering is not supported for recurrent, transposed, MLA, or split KV layouts\n", __func__);
+    const int64_t migrated_rows = transaction->migrated_rows;
+    const size_t peak_staging = transaction->peak_staging;
+    if (!transaction->finalize()) {
         return false;
     }
-
-    std::vector<ggml_type> target_k(n_layers, current.type_k);
-    std::vector<ggml_type> target_v(n_layers, current.type_v);
-    bool changed = target_size != current.size;
-    for (uint32_t layer = 0; layer < n_layers; ++layer) {
-        if (current.k_l[layer] != nullptr) {
-            target_k[layer] = type_k_layers == nullptr ? current.k_l[layer]->type : type_k_layers[layer];
-            changed |= target_k[layer] != current.k_l[layer]->type;
-        }
-        if (layer < current.v_l.size() && current.v_l[layer] != nullptr) {
-            target_v[layer] = type_v_layers == nullptr ? current.v_l[layer]->type : type_v_layers[layer];
-            changed |= target_v[layer] != current.v_l[layer]->type;
-        }
-    }
-    if (!changed) {
-        return true;
-    }
-
-    if (target_size > ctx->n_ctx_max ||
-            target_size % llama_kv_cache_get_padding(ctx->cparams) != 0) {
-        LLAMA_LOG_ERROR("%s: target size %u exceeds the context limit or backend padding contract\n",
-                __func__, target_size);
-        return false;
-    }
-    if (target_size < current.size) {
-        for (uint32_t cell = target_size; cell < current.size; ++cell) {
-            if (current.cells[cell].pos >= 0) {
-                LLAMA_LOG_ERROR("%s: target size %u would discard occupied cell %u\n",
-                        __func__, target_size, cell);
-                return false;
-            }
-        }
-    }
-
-    llama_synchronize(ctx);
-    if (llama_kv_cache_update_internal(*ctx) != 0) {
-        LLAMA_LOG_ERROR("%s: failed to settle pending KV updates\n", __func__);
-        return false;
-    }
-    llama_synchronize(ctx);
-    ctx->reset_scheduler();
-
-    llama_kv_cache prepared;
-    if (!llama_kv_cache_init(prepared, ctx, current.type_k, current.type_v,
-                ctx->cparams.idx_type_k, target_size, ctx->cparams.offload_kqv,
-                current.type_k, current.type_k, current.type_v, current.type_v,
-                -1, -1, -1, -1,
-                target_k.data(), target_v.data(), n_layers, n_layers)) {
-        LLAMA_LOG_ERROR("%s: target cache allocation failed; original cache retained\n", __func__);
-        return false;
-    }
-
-    const auto & hparams = model.hparams;
-    const int64_t fail_after = llama_kv_retier_failure_row();
-    int64_t migrated_rows = 0;
-    size_t peak_staging = 0;
-    std::vector<uint8_t> source_bytes;
-    std::vector<uint8_t> destination_bytes;
-    std::vector<float> source_float;
-    std::vector<float> destination_float;
-
-    const auto migrate = [&](const ggml_tensor * source, ggml_tensor * destination,
-            uint32_t logical_head, uint32_t head_count, uint32_t cell) -> bool {
-        const uint32_t source_head = uint32_t(source->ne[0] / (source->ne[1] == 1 ? current.size * head_count : 1));
-        const uint32_t destination_head = uint32_t(destination->ne[0] /
-                (destination->ne[1] == 1 ? prepared.size * head_count : 1));
-        const size_t source_head_bytes = ggml_row_size(source->type, source_head);
-        const size_t destination_head_bytes = ggml_row_size(destination->type, destination_head);
-        for (uint32_t head = 0; head < head_count; ++head) {
-            if (migrated_rows == fail_after) {
-                LLAMA_LOG_WARN("%s: injected failure after %lld rows; original cache retained\n",
-                        __func__, (long long) migrated_rows);
-                return false;
-            }
-            const size_t source_offset = (size_t(cell) * head_count + head) * source_head_bytes;
-            const size_t destination_offset = (size_t(cell) * head_count + head) * destination_head_bytes;
-            if (!llama_kv_cache_transcode_head_row(source, destination,
-                        source_offset, destination_offset, source_head, destination_head,
-                        logical_head, source_bytes, destination_bytes, source_float, destination_float)) {
-                return false;
-            }
-            ++migrated_rows;
-            peak_staging = std::max(peak_staging,
-                    source_bytes.capacity() + destination_bytes.capacity() +
-                    (source_float.capacity() + destination_float.capacity()) * sizeof(float));
-        }
-        return true;
-    };
-
-    for (uint32_t layer = 0; layer < n_layers; ++layer) {
-        if ((current.k_l[layer] == nullptr) != (prepared.k_l[layer] == nullptr) ||
-                (layer < current.v_l.size() && current.v_l[layer] != nullptr) !=
-                (layer < prepared.v_l.size() && prepared.v_l[layer] != nullptr)) {
-            LLAMA_LOG_ERROR("%s: target cache geometry changed at layer %u\n", __func__, layer);
-            return false;
-        }
-        if (current.k_l[layer] == nullptr) {
-            continue;
-        }
-        const uint32_t head_count = hparams.n_head_kv(layer);
-        for (uint32_t cell = 0; cell < current.size; ++cell) {
-            if (current.cells[cell].pos < 0) {
-                continue;
-            }
-            if (!migrate(current.k_l[layer], prepared.k_l[layer],
-                        hparams.n_embd_head_k(layer), head_count, cell)) {
-                return false;
-            }
-            if (layer < current.v_l.size() && current.v_l[layer] != nullptr &&
-                    !migrate(current.v_l[layer], prepared.v_l[layer],
-                        hparams.n_embd_head_v(layer), head_count, cell)) {
-                return false;
-            }
-        }
-    }
-
-    const uint32_t retained_cells = std::min(current.size, prepared.size);
-    std::copy_n(current.cells.begin(), retained_cells, prepared.cells.begin());
-    prepared.head = current.head < prepared.size ? current.head : 0;
-    prepared.used = current.used;
-    prepared.n = std::min(current.n, prepared.size);
-    prepared.has_shift = current.has_shift;
-    prepared.save_per_step_ssm = current.save_per_step_ssm;
-
-    // Publication cannot fail: all allocation and conversion work completed
-    // above. Releasing an in-memory checkpoint prevents it from retaining
-    // tensors owned by the old representation.
-    current.ckpt.release();
-    prepared.ckpt.release();
-    llama_kv_cache_swap_storage(current, prepared);
-    ctx->cparams.n_ctx = target_size;
-    ctx->reset_scheduler();
-    for (auto & copy : ctx->cache_copies) copy = {};
-    for (auto & copy : ctx->dsa_cache_copies) copy = {};
-    for (auto & copy : ctx->openpangu_cache_copies) copy = {};
-    for (auto & copy : ctx->openpangu_cache_copies_mtp) copy = {};
-
     LLAMA_LOG_INFO("%s: committed %lld bounded row migrations (peak host staging %.2f KiB)\n",
             __func__, (long long) migrated_rows, peak_staging / 1024.0);
     return true;
@@ -10690,19 +10814,26 @@ bool llama_kv_cache_retier(
 }
 
 bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size) {
-    if (ctx == nullptr || ctx->kv_self.k_l.empty()) {
-        return false;
-    }
-    const uint32_t n_layers = uint32_t(ctx->kv_self.k_l.size());
-    std::vector<ggml_type> type_k(n_layers, ctx->kv_self.type_k);
-    std::vector<ggml_type> type_v(n_layers, ctx->kv_self.type_v);
-    for (uint32_t layer = 0; layer < n_layers; ++layer) {
-        if (ctx->kv_self.k_l[layer] != nullptr) type_k[layer] = ctx->kv_self.k_l[layer]->type;
-        if (layer < ctx->kv_self.v_l.size() && ctx->kv_self.v_l[layer] != nullptr) {
-            type_v[layer] = ctx->kv_self.v_l[layer]->type;
+    try {
+        if (ctx == nullptr || ctx->kv_self.k_l.empty()) {
+            return false;
         }
+        const uint32_t n_layers = uint32_t(ctx->kv_self.k_l.size());
+        std::vector<ggml_type> type_k(n_layers, ctx->kv_self.type_k);
+        std::vector<ggml_type> type_v(n_layers, ctx->kv_self.type_v);
+        for (uint32_t layer = 0; layer < n_layers; ++layer) {
+            if (ctx->kv_self.k_l[layer] != nullptr) type_k[layer] = ctx->kv_self.k_l[layer]->type;
+            if (layer < ctx->kv_self.v_l.size() && ctx->kv_self.v_l[layer] != nullptr) {
+                type_v[layer] = ctx->kv_self.v_l[layer]->type;
+            }
+        }
+        return llama_kv_cache_replace(ctx, type_k.data(), type_v.data(), n_layers, size);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: exception while constructing target layer map: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception while constructing target layer map\n", __func__);
     }
-    return llama_kv_cache_replace(ctx, type_k.data(), type_v.data(), n_layers, size);
+    return false;
 }
 
 bool llama_expert_cache_resize(

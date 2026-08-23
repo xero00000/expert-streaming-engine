@@ -149,6 +149,29 @@ int main(int argc, char ** argv) {
 #else
     unsetenv("ESE_TURBO_RETIER_FAIL_AFTER_ROWS");
 #endif
+
+    // Preparation succeeded and the candidate was made live, but a combined
+    // transaction may still need to roll it back if a later publication fails.
+    // This gate exercises that reversible boundary through the compatibility
+    // API and proves that geometry, representation, and sequence state survive.
+    const auto before_publish_rollback = save_sequence(ctx, 0);
+#if defined(_WIN32)
+    _putenv_s("ESE_KV_TRANSACTION_FAIL_AFTER_PUBLISH", "1");
+#else
+    setenv("ESE_KV_TRANSACTION_FAIL_AFTER_PUBLISH", "1", 1);
+#endif
+    assert(!llama_kv_cache_resize(ctx, 256));
+    assert(llama_kv_cache_size(ctx) == 512);
+    assert(llama_n_ctx(ctx) == 512);
+    require_all_types(ctx, GGML_TYPE_Q8_0);
+    assert(save_sequence(ctx, 0) == before_publish_rollback);
+    assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
+#if defined(_WIN32)
+    _putenv_s("ESE_KV_TRANSACTION_FAIL_AFTER_PUBLISH", "");
+#else
+    unsetenv("ESE_KV_TRANSACTION_FAIL_AFTER_PUBLISH");
+#endif
+
     assert(llama_kv_cache_resize(ctx, 256));
     assert(llama_kv_cache_size(ctx) == 256);
     assert(llama_n_ctx(ctx) == 256);
