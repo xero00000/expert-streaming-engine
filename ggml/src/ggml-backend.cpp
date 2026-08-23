@@ -371,6 +371,15 @@ static bool ggml_are_same_layout(const struct ggml_tensor * a, const struct ggml
 }
 
 void ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (!ggml_are_same_layout(src, dst)) {
+        fprintf(stderr, "ggml backend copy layout mismatch: src=%s %s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] dst=%s %s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+                ggml_get_name(src), ggml_type_name(src->type),
+                (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2], (long long) src->ne[3],
+                src->nb[0], src->nb[1], src->nb[2], src->nb[3],
+                ggml_get_name(dst), ggml_type_name(dst->type),
+                (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+    }
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
@@ -1569,6 +1578,11 @@ static int ggml_active_expert_cache_backend_for_node(
         return -1;
     }
 
+    const ggml_tensor * branch_ids = node->op == GGML_OP_MOE_FUSED_UP_GATE ? node->src[3] : node->src[2];
+    if (ggml_ese_route_get_role(branch_ids) == GGML_ESE_ROUTE_CPU) {
+        return -1;
+    }
+
     const ggml_tensor * route_ids = node->op == GGML_OP_MOE_FUSED_UP_GATE ? node->src[3] : node->src[2];
     if (!route_ids || !node->src[0] ||
             ggml_active_expert_cache_slots_for(sched, node->src[0]) < route_ids->ne[0]) {
@@ -2183,7 +2197,8 @@ static bool ggml_active_expert_cache_prepare_route(
             admission_ready = false;
         }
     }
-    if (!admission_ready && !sched->expert_lease_required) {
+    const bool calibrated_gpu_partition = ggml_ese_route_get_role(ids_source) == GGML_ESE_ROUTE_GPU;
+    if (!admission_ready && !sched->expert_lease_required && !calibrated_gpu_partition) {
         ++sched->active_expert_cache_rejected_admissions;
         return false;
     }
@@ -2526,6 +2541,12 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    // Cache redirects point into the scheduler tensor context. Restore them
+    // while that context is still alive; doing this after ggml_free() can
+    // mutate unrelated tensors that reuse the same metadata address in the
+    // next graph (for example, an expert layout overwriting top-k IDs).
+    ggml_active_expert_cache_reset_pass(sched);
+
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -2558,8 +2579,35 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         int * node_backend_id = &tensor_backend_id(node);
+        if (ggml_ese_tensor_get_role(node) == GGML_ESE_ROUTE_CPU) {
+            *node_backend_id = sched->n_backends - 1;
+        } else if (ggml_ese_tensor_get_role(node) == GGML_ESE_ROUTE_GPU) {
+            for (int source = 0; source < GGML_MAX_SRC; ++source) {
+                if (!node->src[source]) continue;
+                const int source_backend_id = tensor_backend_id(node->src[source]);
+                if (source_backend_id >= 0 && source_backend_id < sched->n_backends - 1) {
+                    *node_backend_id = source_backend_id;
+                    break;
+                }
+            }
+        }
         if (node->op == GGML_OP_REDUCE) {
             auto view_src = node->view_src;
+            if (node->op_params[3] == 2) {
+                // ESE heterogeneous sources are not ordered by scheduler
+                // backend ID (for example source 1 can be CPU backend 3 on a
+                // three-GPU host). Their producing branches already carry the
+                // correct assignment; the reduction follows its explicit
+                // destination branch.
+                const int destination = node->op_params[4];
+                GGML_ASSERT(destination >= 0 && destination < node->op_params[1]);
+                GGML_ASSERT(node->src[destination] == view_src);
+                const int destination_backend_id = tensor_backend_id(view_src);
+                if (destination_backend_id >= 0) {
+                    *node_backend_id = destination_backend_id;
+                }
+                continue;
+            }
             int src_id = -1;
             for (int j = 0; j < node->op_params[1]; ++j) {
                 if (node->src[j]) {
@@ -2816,6 +2864,28 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
 
     // pass 5: split graph, find tensors that need to be copied
     {
+        // Expansion can assign an initially unallocated reduction view from an
+        // adjacent node. Re-assert the explicit ESE destination after every
+        // producing branch has its final backend so the reduction kernel runs
+        // on the device that owns its result storage.
+        for (int node_index = 0; node_index < graph->n_nodes; ++node_index) {
+            ggml_tensor * node = graph->nodes[node_index];
+            if (node->op != GGML_OP_REDUCE || node->op_params[3] != 2) continue;
+            const int destination = node->op_params[4];
+            GGML_ASSERT(destination >= 0 && destination < node->op_params[1]);
+            const int destination_backend_id = tensor_backend_id(node->src[destination]);
+            GGML_ASSERT(destination_backend_id >= 0);
+            tensor_backend_id(node) = destination_backend_id;
+            if (getenv("GGML_ESE_REDUCE_DEBUG")) {
+                fprintf(stderr, "ggml ESE reduce: node=%s destination=%d backend=%d sources=",
+                        ggml_get_name(node), destination, destination_backend_id);
+                for (int source = 0; source < node->op_params[1]; ++source) {
+                    fprintf(stderr, "%s%d", source ? "," : "", node->src[source] ? tensor_backend_id(node->src[source]) : -1);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+
         int i_split = 0;
         struct ggml_backend_sched_split * split = &sched->splits[0];
         // find the backend of the first split, skipping view ops
@@ -2936,7 +3006,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
-                        if (node->op == GGML_OP_REDUCE &&
+                        if (node->op == GGML_OP_REDUCE && node->op_params[3] != 2 &&
                                 !ggml_backend_is_cpu(sched->backends[src_backend_id])) {
                             //printf("setting tensor_id_copy(reduce, %zu, %d, %s) to %s\n", src_id, cur_backend_id, node->name, src->name);
                             tensor_id_copy(src_id, cur_backend_id, 0) = src;
@@ -3220,6 +3290,9 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                         for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                             int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+                            if (id < 0 || id >= n_expert) {
+                                continue;
+                            }
                             unique_ids[id >> 5] |= (1u << (id & 31));
                         }
                     }
@@ -3543,8 +3616,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         sched->workers.clear();
         }
         for (auto status : sched->statuses) {
-            if (status != GGML_STATUS_SUCCESS) return status;
+            if (status != GGML_STATUS_SUCCESS) {
+                ggml_active_expert_cache_reset_pass(sched);
+                return status;
+            }
         }
+        ggml_active_expert_cache_reset_pass(sched);
         return GGML_STATUS_SUCCESS;
 
     }
@@ -3663,6 +3740,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         auto ec = ggml_backend_sched_eval(sched, split_backend, split);
         if (ec != GGML_STATUS_SUCCESS) {
+            ggml_active_expert_cache_reset_pass(sched);
             return ec;
         }
 
@@ -3685,6 +3763,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
 
+    ggml_active_expert_cache_reset_pass(sched);
     return GGML_STATUS_SUCCESS;
 }
 

@@ -536,6 +536,7 @@ extern "C" {
         uint64_t expert_vram_cache_bytes;   // per-device adaptive expert cache bound
         uint64_t expert_vram_reserve_bytes; // per-device reserve that cache allocation must preserve
         uint32_t expert_cache_min_observations; // route observations before GPU admission
+        uint32_t expert_hybrid_gpu_experts; // decode top-k positions assigned to the GPU branch; 0 disables
     };
 
     // model quantization parameters

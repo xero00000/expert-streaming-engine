@@ -6308,6 +6308,83 @@ struct ggml_tensor * ggml_reduce(
     return result;
 }
 
+static uint16_t ggml_ese_route_ranges[65*65];
+static const int32_t GGML_ESE_ROUTE_MAGIC = 0x45534500;
+static const int32_t GGML_ESE_TENSOR_CPU_FLAG = 1 << 28;
+static const int32_t GGML_ESE_TENSOR_GPU_FLAG = 1 << 29;
+
+static void ggml_ese_route_partition_compute(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * src,
+        int ith,
+        int nth,
+        void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) return;
+
+    GGML_ASSERT(src->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+    const ptrdiff_t range_index = (uint16_t *) userdata - ggml_ese_route_ranges;
+    GGML_ASSERT(range_index >= 0 && range_index < 65*65);
+    const int begin = (int) range_index/65;
+    const int count = (int) range_index%65;
+    const int end = begin + count;
+    const int64_t width = src->ne[0];
+    const int64_t elements = ggml_nelements(src);
+    GGML_ASSERT(begin >= 0 && count >= 0 && end <= width);
+
+    memcpy(dst->data, src->data, ggml_nbytes(src));
+    int32_t * values = (int32_t *) dst->data;
+    for (int64_t index = 0; index < elements; ++index) {
+        const int64_t route_position = index%width;
+        if (route_position < begin || route_position >= end) {
+            values[index] = -1;
+        }
+    }
+}
+
+GGML_API struct ggml_tensor * ggml_ese_route_partition(
+        struct ggml_context * ctx,
+        struct ggml_tensor * ids,
+        int begin,
+        int count) {
+    GGML_ASSERT(ids && ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
+    GGML_ASSERT(ids->ne[0] >= 1 && ids->ne[0] <= 64);
+    GGML_ASSERT(begin >= 0 && count >= 0 && begin + count <= ids->ne[0]);
+    const int range_index = begin*65 + count;
+    struct ggml_tensor * result = ggml_map_custom1(ctx, ids, ggml_ese_route_partition_compute, 1,
+            &ggml_ese_route_ranges[range_index]);
+    ggml_set_op_params_i32(result, GGML_MAX_OP_PARAMS/sizeof(int32_t) - 1,
+            GGML_ESE_ROUTE_MAGIC | (begin == 0 ? GGML_ESE_ROUTE_GPU : GGML_ESE_ROUTE_CPU));
+    return result;
+}
+
+GGML_API enum ggml_ese_route_role ggml_ese_route_get_role(
+        const struct ggml_tensor * ids) {
+    if (!ids || ids->op != GGML_OP_MAP_CUSTOM1) return GGML_ESE_ROUTE_NONE;
+    const int32_t value = ggml_get_op_params_i32(ids, GGML_MAX_OP_PARAMS/sizeof(int32_t) - 1);
+    if ((value & 0xffffff00) != GGML_ESE_ROUTE_MAGIC) return GGML_ESE_ROUTE_NONE;
+    const int32_t role = value & 0xff;
+    return role == GGML_ESE_ROUTE_GPU ? GGML_ESE_ROUTE_GPU :
+           role == GGML_ESE_ROUTE_CPU ? GGML_ESE_ROUTE_CPU : GGML_ESE_ROUTE_NONE;
+}
+
+GGML_API void ggml_ese_tensor_set_role(
+        struct ggml_tensor * tensor,
+        enum ggml_ese_route_role role) {
+    GGML_ASSERT(tensor && (role == GGML_ESE_ROUTE_GPU || role == GGML_ESE_ROUTE_CPU));
+    tensor->flags &= ~(GGML_ESE_TENSOR_CPU_FLAG | GGML_ESE_TENSOR_GPU_FLAG);
+    tensor->flags |= role == GGML_ESE_ROUTE_CPU ? GGML_ESE_TENSOR_CPU_FLAG : GGML_ESE_TENSOR_GPU_FLAG;
+}
+
+GGML_API enum ggml_ese_route_role ggml_ese_tensor_get_role(
+        const struct ggml_tensor * tensor) {
+    if (!tensor) return GGML_ESE_ROUTE_NONE;
+    if (tensor->flags & GGML_ESE_TENSOR_CPU_FLAG) return GGML_ESE_ROUTE_CPU;
+    if (tensor->flags & GGML_ESE_TENSOR_GPU_FLAG) return GGML_ESE_ROUTE_GPU;
+    return GGML_ESE_ROUTE_NONE;
+}
+
 struct ggml_tensor * ggml_fake_cpy(
             struct ggml_context         * ctx,
             struct ggml_tensor          * dst,
@@ -13759,12 +13836,15 @@ static void ggml_compute_forward_add_id_f32(
 
         // src1 indices
         const int i11 = *(int32_t *) ((char *) src2->data + i1*nb20 + i2*nb21);
+        float * dst_row = (float *) ((char *) dst->data  + i3*nb3  + i2*nb2  + i1*nb1 );
+        float * src0_row = (float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01);
 
-        GGML_ASSERT(i11 >= 0 && i11 < ne11);
+        if (i11 < 0 || i11 >= ne11) {
+            ggml_vec_cpy_f32(ne0, dst_row, src0_row);
+            continue;
+        }
 
-        ggml_vec_add_f32(ne0,
-                (float *) ((char *) dst->data  + i3*nb3  + i2*nb2  + i1*nb1 ),
-                (float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01),
+        ggml_vec_add_f32(ne0, dst_row, src0_row,
                 (float *) ((char *) src1->data + i11*nb11));
     }
 }
@@ -18390,6 +18470,12 @@ static void ggml_compute_forward_mul_mat_id(
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12 + (i1)]
 
+    if (ids->ne[1] != dst->ne[2] && ith == 0) {
+        fprintf(stderr, "ggml MUL_MAT_ID route/output mismatch: dst=%s ne2=%lld ids=%s ne=[%lld,%lld] src0=%s src1=%s\n",
+                ggml_get_name(dst), (long long) dst->ne[2], ggml_get_name(ids),
+                (long long) ids->ne[0], (long long) ids->ne[1],
+                ggml_get_name(src0), ggml_get_name(src1));
+    }
     GGML_ASSERT(ids->ne[1] == dst->ne[2]);
     for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
         for (int id = 0; id < n_ids; ++id) {

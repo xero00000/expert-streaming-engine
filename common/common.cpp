@@ -2289,6 +2289,15 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--expert-hybrid-gpu-experts") {
+        CHECK_ARG;
+        params.expert_hybrid_gpu_experts = std::stoi(argv[i]);
+        if (params.expert_hybrid_gpu_experts < 0 || params.expert_hybrid_gpu_experts > 64) {
+            fprintf(stderr, "error: --expert-hybrid-gpu-experts must be between 0 and 64\n");
+            invalid_param = true;
+        }
+        return true;
+    }
     if (arg == "--prefetch-experts") {
         params.prefetch_experts = true;
         return true;
@@ -3432,6 +3441,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --expert-vram-cache-mib N", "per-device adaptive GPU expert-cache bound in MiB (default: disabled)"});
     options.push_back({ "*",           "       --expert-vram-reserve-mib N", "VRAM that the expert cache must leave unallocated per device"});
     options.push_back({ "*",           "       --expert-cache-min-observations N", "minimum routes before GPU-cache admission (default: 2)"});
+    options.push_back({ "*",           "       --expert-hybrid-gpu-experts N", "decode top-k positions assigned to the GPU branch (default: disabled)"});
     options.push_back({ "*",           "       --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
     options.push_back({ "*",           "       --prefetch-experts-threads N",
                                                                         "number of expert prefetch workers, tune to drive speed/type (default: auto)"});
@@ -4683,6 +4693,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.expert_vram_cache_bytes = uint64_t(params.expert_vram_cache_mib)*expert_mib;
     cparams.expert_vram_reserve_bytes = uint64_t(params.expert_vram_reserve_mib)*expert_mib;
     cparams.expert_cache_min_observations = uint32_t(params.expert_cache_min_observations);
+    cparams.expert_hybrid_gpu_experts = uint32_t(params.expert_hybrid_gpu_experts);
     cparams.mtp               = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     cparams.mtp_op_type      = MTP_OP_NONE;
 

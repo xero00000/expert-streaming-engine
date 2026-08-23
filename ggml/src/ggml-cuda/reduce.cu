@@ -140,6 +140,21 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         const int destination = dst->op_params[4];
         GGML_ASSERT(destination >= 0 && destination < nreduce && dst->src[destination]);
         GGML_ASSERT(dst->data == dst->src[destination]->data);
+        if (getenv("GGML_ESE_REDUCE_DEBUG")) {
+            fprintf(stderr, "ggml CUDA ESE reduce: device=%d destination=%d dst=%p sources=",
+                    ctx.device, destination, dst->data);
+            for (int i = 0; i < nreduce; ++i) {
+                cudaPointerAttributes attributes = {};
+                int pointer_device = -1;
+                if (dst->src[i] && cudaPointerGetAttributes(&attributes, dst->src[i]->data) == cudaSuccess) {
+                    pointer_device = attributes.device;
+                } else {
+                    (void) cudaGetLastError();
+                }
+                fprintf(stderr, "%s%p@%d", i ? "," : "", dst->src[i] ? dst->src[i]->data : nullptr, pointer_device);
+            }
+            fprintf(stderr, "\n");
+        }
         const int64_t nelem = ggml_nelements(dst);
         const int num_blocks = int((nelem + CUDA_REDUCE_BLOCK_SIZE - 1)/CUDA_REDUCE_BLOCK_SIZE);
         for (int i = 0; i < nreduce; ++i) {

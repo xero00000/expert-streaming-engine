@@ -68,11 +68,27 @@ the complete hybrid output must remain within `0.005` NRMSE of the unsplit CUDA
 reference. A CPU-only build also compiles and runs the same test suite, skipping
 only the unavailable CUDA path.
 
-This is a scheduler primitive and correctness checkpoint, not live model
-integration. The llama decode graph does not yet select calibrated expert
-splits, populate compact cache tensors, or emit route/event telemetry. Those
-connections and their end-to-end parity and memory-bound evidence remain Phase
-B gates.
+The llama decode graph can now build complementary CPU and GPU branches for a
+one-token input graph. `--expert-hybrid-gpu-experts N` assigns the first `N`
+top-k route positions to the compact CUDA-cache branch and masks those
+positions from the full host-weight branch; the explicit reduction reconstructs
+the layer result on the GPU. The option is disabled by default and requires a
+nonzero bounded expert VRAM cache. Prompt graphs remain on their established
+path even when their final layer is collapsed to one requested output.
+
+The integration also closes three scheduler lifetime/correctness gaps exposed
+only by a real model graph: heterogeneous reduction sources cannot assume their
+array index is a CUDA backend index, negative route sentinels must be skipped by
+the active-expert fallback bitmap, and temporary cache redirects must be
+restored before graph metadata is recycled.
+
+On the local `TinyMoE-100m-2x8-fixed-f16.gguf` fixture, a deterministic 16-token
+run produced byte-identical text with and without a one-GPU/one-CPU split. The
+single-GPU decode changed from `65.15` to `103.04` tokens/s; async graph scheduling
+changed from `44.64` to `58.37` tokens/s. These are development-fixture results,
+not published product benchmarks, and primarily prove end-to-end execution and
+parity. Automatic consumption of a current calibrated profile, larger-model
+numerical parity, and production benchmark selection remain Phase B gates.
 
 ## Later phases
 

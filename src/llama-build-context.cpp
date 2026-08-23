@@ -7,6 +7,7 @@
 #include "llama-kv-padding.h"
 
 #include "ggml.h"
+#include "ggml-ese.h"
 
 #include <unordered_set>
 #include <algorithm>
@@ -56,7 +57,11 @@ llm_build_context::llm_build_context(
         n_embd_head_v    (hparams.n_embd_head_v(0)),
         n_embd_v_gqa     (hparams.n_embd_v_gqa()),
         n_expert         (hparams.n_expert),
-        n_expert_used    (warmup ? hparams.n_expert : hparams.n_expert_used),
+        // A hybrid decode graph has a bounded top-k partition and must reserve
+        // the same shape it will execute. The legacy warmup still exercises
+        // every expert when hybrid execution is disabled.
+        n_expert_used    (warmup && cparams.expert_hybrid_gpu_experts == 0
+                          ? hparams.n_expert : hparams.n_expert_used),
         freq_base        (cparams.rope_freq_base),
         freq_scale       (cparams.rope_freq_scale),
         ext_factor       (cparams.yarn_ext_factor),
@@ -1492,142 +1497,176 @@ llm_expert_gating_func_type   gating_op,
         ggml_build_forward_expand(graph, weights);
     }
 
-    cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+    auto build_expert_branch = [&](ggml_tensor * branch_ids, bool branch_add_input) {
+        ggml_tensor * branch_cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+        ggml_tensor * branch_weights = weights;
 
-    if (weight_before_ffn) {
-        // TODO: this is a workaround as we don't yet have a repeat op that takes custom dim (ggml_repeat_4d)
-        ggml_tensor * repeated = ggml_new_tensor_3d(ctx, cur->type, n_embd, n_expert_used, n_tokens);
-        repeated = ggml_repeat(ctx, cur, repeated); // [n_embd, n_expert_used, n_tokens]
-        cur = ggml_mul(ctx, repeated, weights);
-        cb(cur, "ffn_moe_weighted", il);
-    }
-
-    // For now we don't modify the fused up/gate op to include biases.
-    // Hence, if we have biases, we cannot use fmoe.
-    //
-    //bool can_use_fmoe = !up_exps_b && !gate_exps_b && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
-    bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI);
-
-    ggml_tensor * par;
-    if (can_use_fmoe && up_gate_exps) {
-        if (up_gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
-            par = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, cur, selected_experts, up_gate_exps_b, nullptr,
-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
-                    type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
-        } else {
-            GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
-            par = ggml_moe_up_gate(ctx, up_gate_exps, nullptr, cur, selected_experts,
-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
-        }
-        if (lctx.model.arch == LLM_ARCH_STEP35 || lctx.model.arch == LLM_ARCH_DEEPSEEK4) {
-            *((float *)(par->op_params + 1)) = lctx.model.hparams.swiglu_limits[il];
-        }
-    } else {
-    GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
-
-    if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
-        if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
-            par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
-                    type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
-        } else {
-            GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
-            par = ggml_moe_up_gate(ctx, up_exps, gate_exps, cur, selected_experts,
-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
-        }
-        if (lctx.model.arch == LLM_ARCH_STEP35 || lctx.model.arch == LLM_ARCH_DEEPSEEK4) {
-            *(float *)(par->op_params + 1) = lctx.model.hparams.swiglu_limits[il];
-        }
-    } else {
-        ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
-        cb(up, "ffn_moe_up", il);
-
-        ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
-        cb(gate, "ffn_moe_gate", il);
-
-        if (graph) {
-            // So we can potentially fuse the up and gate mul_mat_id
-            ggml_build_forward_expand(graph, up);
-            ggml_build_forward_expand(graph, gate);
+        if (weight_before_ffn) {
+            // TODO: this is a workaround as we don't yet have a repeat op that takes custom dim (ggml_repeat_4d)
+            ggml_tensor * repeated = ggml_new_tensor_3d(ctx, branch_cur->type, n_embd, n_expert_used, n_tokens);
+            repeated = ggml_repeat(ctx, branch_cur, repeated); // [n_embd, n_expert_used, n_tokens]
+            branch_cur = ggml_mul(ctx, repeated, branch_weights);
+            cb(branch_cur, "ffn_moe_weighted", il);
         }
 
-        if (up_exps_b) {
-            up = ggml_add_id(ctx, up, up_exps_b, selected_experts);
-            cb(up, "ffn_moe_up_biased", il);
-        }
+        // For now we don't modify the fused up/gate op to include biases.
+        // Hence, if we have biases, we cannot use fmoe.
+        //
+        //bool can_use_fmoe = !up_exps_b && !gate_exps_b && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
+        bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI);
 
-        if (gate_exps_b) {
-            gate = ggml_add_id(ctx, gate, gate_exps_b, selected_experts);
-            cb(gate, "ffn_moe_gate_biased", il);
-        }
-
-        if (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) {
-            par = ggml_fused_mul_unary(ctx, gate, up, type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+        ggml_tensor * par;
+        if (can_use_fmoe && up_gate_exps) {
+            if (up_gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
+                par = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, branch_cur, branch_ids, up_gate_exps_b, nullptr,
+                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
+                        type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
+            } else {
+                GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
+                par = ggml_moe_up_gate(ctx, up_gate_exps, nullptr, branch_cur, branch_ids,
+                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+            }
             if (lctx.model.arch == LLM_ARCH_STEP35 || lctx.model.arch == LLM_ARCH_DEEPSEEK4) {
                 *((float *)(par->op_params + 1)) = lctx.model.hparams.swiglu_limits[il];
             }
-        } else if (type_op == LLM_FFN_SWIGLU_OAI) {
-            constexpr float alpha = 1.702f;
-            constexpr float limit = 7.0f;
-            par = ggml_swiglu_oai(ctx, gate, up, alpha, limit);
+        } else {
+            GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
+
+            if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
+                if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
+                    par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, branch_cur, branch_ids, up_exps_b, gate_exps_b,
+                            type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
+                            type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
+                } else {
+                    GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
+                    par = ggml_moe_up_gate(ctx, up_exps, gate_exps, branch_cur, branch_ids,
+                            type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+                }
+                if (lctx.model.arch == LLM_ARCH_STEP35 || lctx.model.arch == LLM_ARCH_DEEPSEEK4) {
+                    *(float *)(par->op_params + 1) = lctx.model.hparams.swiglu_limits[il];
+                }
+            } else {
+                ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, branch_cur, branch_ids); // [n_ff, n_expert_used, n_tokens]
+                cb(up, "ffn_moe_up", il);
+
+                ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, branch_cur, branch_ids); // [n_ff, n_expert_used, n_tokens]
+                cb(gate, "ffn_moe_gate", il);
+
+                if (graph) {
+                    // So we can potentially fuse the up and gate mul_mat_id
+                    ggml_build_forward_expand(graph, up);
+                    ggml_build_forward_expand(graph, gate);
+                }
+
+                if (up_exps_b) {
+                    up = ggml_add_id(ctx, up, up_exps_b, branch_ids);
+                    cb(up, "ffn_moe_up_biased", il);
+                }
+
+                if (gate_exps_b) {
+                    gate = ggml_add_id(ctx, gate, gate_exps_b, branch_ids);
+                    cb(gate, "ffn_moe_gate_biased", il);
+                }
+
+                if (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) {
+                    par = ggml_fused_mul_unary(ctx, gate, up, type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+                    if (lctx.model.arch == LLM_ARCH_STEP35 || lctx.model.arch == LLM_ARCH_DEEPSEEK4) {
+                        *((float *)(par->op_params + 1)) = lctx.model.hparams.swiglu_limits[il];
+                    }
+                } else if (type_op == LLM_FFN_SWIGLU_OAI) {
+                    constexpr float alpha = 1.702f;
+                    constexpr float limit = 7.0f;
+                    par = ggml_swiglu_oai(ctx, gate, up, alpha, limit);
+                }
+                else {
+                    GGML_ABORT("fatal error");
+                }
+
+            }
         }
-        else {
-            GGML_ABORT("fatal error");
+        cb(par, "ffn_moe_gate_par", il);
+
+        ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, branch_ids); // [n_embd, n_expert_used, n_tokens]
+        cb(experts, "ffn_moe_down", il);
+
+        if (down_exps_b) {
+            experts = ggml_add_id(ctx, experts, down_exps_b, branch_ids);
+            cb(experts, "ffn_moe_down_biased", il);
         }
 
-    }
-    }
-    cb(par, "ffn_moe_gate_par", il);
+        if (down_exps_s && !lctx.cparams.fused_mmad) {
+            GGML_ASSERT(!weight_before_ffn);
+            auto s = ggml_reshape_3d(ctx, down_exps_s, 1, n_expert, 1);
+            s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tokens, 1);
+            s = ggml_get_rows(ctx, s, branch_ids);
+            auto w_reshaped = ggml_reshape_2d(ctx, branch_weights, n_expert_used, n_tokens);
+            auto s_reshaped = ggml_reshape_2d(ctx, s, n_expert_used, n_tokens);
+            w_reshaped = ggml_mul(ctx, w_reshaped, s_reshaped);
+            branch_weights = ggml_reshape_3d(ctx, w_reshaped, 1, n_expert_used, n_tokens);
+        }
 
-    ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
-    cb(experts, "ffn_moe_down", il);
-
-    if (down_exps_b) {
-        experts = ggml_add_id(ctx, experts, down_exps_b, selected_experts);
-        cb(experts, "ffn_moe_down_biased", il);
-    }
-
-    if (down_exps_s && !lctx.cparams.fused_mmad) {
-        GGML_ASSERT(!weight_before_ffn);
-        auto s = ggml_reshape_3d(ctx, down_exps_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx, s, selected_experts);
-        auto w_reshaped = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
-        auto s_reshaped = ggml_reshape_2d(ctx, s, n_expert_used, n_tokens);
-        w_reshaped = ggml_mul(ctx, w_reshaped, s_reshaped);
-        weights = ggml_reshape_3d(ctx, w_reshaped, 1, n_expert_used, n_tokens);
-    }
-
-    if (!weight_before_ffn) {
-        if (lctx.cparams.fused_mmad) {
-            experts = ggml_mul_multi_add(ctx, experts, weights);
+        if (!weight_before_ffn) {
+            if (lctx.cparams.fused_mmad) {
+                experts = ggml_mul_multi_add(ctx, experts, branch_weights);
+                cb(experts, "ffn_moe_weighted", il);
+                if (down_exps_s) {
+                    experts->src[2] = down_exps_s;
+                    experts->src[3] = branch_ids;
+                }
+                if (branch_add_input) {
+                    experts = ggml_add(ctx, experts, input);
+                    cb(experts, "ffn_out_with_inp", il);
+                }
+                return experts;
+            }
+            experts = ggml_mul(ctx, experts, branch_weights);
             cb(experts, "ffn_moe_weighted", il);
-            if (down_exps_s) {
-                experts->src[2] = down_exps_s;
-                experts->src[3] = selected_experts;
-            }
-            if (add_input) {
-                experts = ggml_add(ctx, experts, input);
-                cb(experts, "ffn_out_with_inp", il);
-            }
-            return experts;
         }
-        experts = ggml_mul(ctx, experts, weights);
-        cb(experts, "ffn_moe_weighted", il);
+
+        ggml_tensor * result;
+        if (n_expert_used == 1) {
+            result = ggml_cont(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0));
+        }
+        if (n_expert_used == 2) {
+            result = ggml_add(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0),
+                                 ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], experts->nb[1]));
+        }
+        result = ggml_multi_add(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0), n_expert_used);
+        if (branch_add_input) {
+            cb(result, "ffn_out", il);
+            result = ggml_add(ctx, result, input);
+        }
+        return result;
+    };
+
+    const int64_t hybrid_gpu_experts = std::min<int64_t>(
+            lctx.cparams.expert_hybrid_gpu_experts, n_expert_used);
+    const int64_t graph_tokens = lctx.inp_tokens ? lctx.inp_tokens->ne[0] :
+            lctx.inp_embd ? lctx.inp_embd->ne[1] : n_tokens;
+    const bool use_hybrid = graph_tokens == 1 && n_tokens == 1 && hybrid_gpu_experts > 0 &&
+            hybrid_gpu_experts < n_expert_used && lctx.cparams.expert_vram_cache_bytes > 0;
+    if (!use_hybrid) {
+        return build_expert_branch(selected_experts, add_input);
     }
 
-    ggml_tensor * result;
-    if (n_expert_used == 1) {
-        result = ggml_cont(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0));
-    }
-    if (n_expert_used == 2) {
-        result = ggml_add(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0),
-                             ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], experts->nb[1]));
-    }
-    result = ggml_multi_add(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0), n_expert_used);
+    ggml_tensor * gpu_ids = ggml_ese_route_partition(
+            ctx, selected_experts, 0, (int) hybrid_gpu_experts);
+    ggml_tensor * cpu_ids = ggml_ese_route_partition(
+            ctx, selected_experts, (int) hybrid_gpu_experts,
+            (int) (n_expert_used - hybrid_gpu_experts));
+    cb(gpu_ids, "ffn_moe_topk_gpu", il);
+    cb(cpu_ids, "ffn_moe_topk_cpu", il);
+    ggml_tensor * branches[] = {
+        build_expert_branch(gpu_ids, false),
+        build_expert_branch(cpu_ids, false),
+    };
+    ggml_ese_tensor_set_role(branches[0], GGML_ESE_ROUTE_GPU);
+    ggml_ese_tensor_set_role(branches[1], GGML_ESE_ROUTE_CPU);
+    ggml_tensor * result = ggml_ese_reduce_to(ctx, branches, 2, GGML_OP_ADD, 0);
+    cb(result, "ffn_moe_hybrid", il);
     if (add_input) {
-        cb(result, "ffn_out", il);
         result = ggml_add(ctx, result, input);
+        cb(result, "ffn_out_with_inp", il);
     }
     return result;
 

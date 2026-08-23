@@ -405,6 +405,55 @@ void test_cpu_kernel_exact_parity_and_no_original_fallback() {
     REQUIRE(*((const int32_t *) ids->data + 1) == route[1]);
 }
 
+void test_route_partition_is_complementary() {
+    ggml_init_params params = { 1024*1024, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    struct cleanup { ggml_context * ctx; ~cleanup() { ggml_free(ctx); } } free_ctx{ctx};
+
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, 2);
+    const std::array<int32_t, 8> route = {{ 7, 3, 5, 1, 2, -1, 6, 4 }};
+    std::memcpy(ids->data, route.data(), sizeof(route));
+    ggml_tensor * gpu_ids = ggml_ese_route_partition(ctx, ids, 0, 2);
+    ggml_tensor * cpu_ids = ggml_ese_route_partition(ctx, ids, 2, 2);
+    REQUIRE(ggml_ese_route_get_role(gpu_ids) == GGML_ESE_ROUTE_GPU);
+    REQUIRE(ggml_ese_route_get_role(cpu_ids) == GGML_ESE_ROUTE_CPU);
+    ggml_tensor * activations = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 4, 2);
+    ggml_tensor * biases = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 8);
+    std::fill_n(static_cast<float *>(activations->data), ggml_nelements(activations), 0.0f);
+    for (int expert = 0; expert < 8; ++expert) {
+        static_cast<float *>(biases->data)[2*expert + 0] = float(expert + 1);
+        static_cast<float *>(biases->data)[2*expert + 1] = float(100 + expert);
+    }
+    ggml_tensor * biased_cpu = ggml_add_id(ctx, activations, biases, cpu_ids);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(graph, gpu_ids);
+    ggml_build_forward_expand(graph, cpu_ids);
+    ggml_build_forward_expand(graph, biased_cpu);
+    ggml_cplan plan = ggml_graph_plan(graph, 2);
+    std::vector<uint8_t> work(plan.work_size);
+    plan.work_data = work.empty() ? nullptr : work.data();
+    REQUIRE(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS);
+
+    const auto * gpu = static_cast<const int32_t *>(gpu_ids->data);
+    const auto * cpu = static_cast<const int32_t *>(cpu_ids->data);
+    for (size_t i = 0; i < route.size(); ++i) {
+        const bool gpu_position = i%4 < 2;
+        REQUIRE(gpu[i] == (gpu_position ? route[i] : -1));
+        REQUIRE(cpu[i] == (gpu_position ? -1 : route[i]));
+        if (route[i] >= 0) {
+            REQUIRE((gpu[i] >= 0) != (cpu[i] >= 0));
+        }
+        const float * biased = static_cast<const float *>(biased_cpu->data) + 2*i;
+        if (gpu_position || route[i] < 0) {
+            REQUIRE(biased[0] == 0.0f && biased[1] == 0.0f);
+        } else {
+            REQUIRE(biased[0] == float(route[i] + 1));
+            REQUIRE(biased[1] == float(100 + route[i]));
+        }
+    }
+}
+
 std::vector<float> compute_cuda_mul_mat_id(
         ggml_backend_t backend,
         const std::vector<ggml_fp16_t> & weights,
@@ -677,6 +726,7 @@ int main() {
         test_file_storage_backends();
         test_concurrent_single_fill();
         test_cpu_kernel_exact_parity_and_no_original_fallback();
+        test_route_partition_is_complementary();
         test_cuda_compact_remap_exact_parity();
         std::cout << "PASS: checked bounded expert caches and exact full/compact CUDA parity\n";
         return 0;

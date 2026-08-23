@@ -8261,6 +8261,7 @@ struct llama_context_params llama_context_default_params() {
         /*.expert_vram_cache_bytes     =*/ 0,
         /*.expert_vram_reserve_bytes   =*/ 0,
         /*.expert_cache_min_observations =*/ 2,
+        /*.expert_hybrid_gpu_experts   =*/ 0,
     };
 
     return result;
@@ -8770,6 +8771,7 @@ struct llama_context * llama_init_from_model(
     cparams.expert_vram_cache_bytes = params.expert_vram_cache_bytes;
     cparams.expert_vram_reserve_bytes = params.expert_vram_reserve_bytes;
     cparams.expert_cache_min_observations = params.expert_cache_min_observations;
+    cparams.expert_hybrid_gpu_experts = params.expert_hybrid_gpu_experts;
 
     cparams.reduce_type      = params.type_reduce;
     cparams.graph_attn_precision = params.type_graph_attn;
@@ -9269,6 +9271,28 @@ struct llama_context * llama_init_from_model(
 
             llama_repack_up_gate_exps(*ctx);
 
+            auto reserve_hybrid_decode_graph = [&]() {
+                if (cparams.expert_hybrid_gpu_experts == 0 || cparams.expert_vram_cache_bytes == 0) {
+                    return true;
+                }
+                int hybrid_past = cparams.n_ctx > 0 ? (int)cparams.n_ctx - 1 : 0;
+                llama_token hybrid_token = llama_token_bos(&ctx->model);
+                llama_batch hybrid_batch = llama_batch_get_one(&hybrid_token, 1, hybrid_past, 0);
+                if (ctx->model.arch == LLM_ARCH_DEEPSEEK4 &&
+                        !llama_prepare_dsv4_graph_inputs(*ctx, hybrid_batch, false, true)) {
+                    return false;
+                }
+                ggml_cgraph * hybrid_graph = llm_build_context::llama_build_graph(
+                        *ctx, hybrid_batch, true, 1);
+                return ggml_backend_sched_reserve(ctx->sched, hybrid_graph);
+            };
+
+            if (!reserve_hybrid_decode_graph()) {
+                LLAMA_LOG_ERROR("%s: failed to reserve hybrid decode compute buffers\n", __func__);
+                llama_free(ctx);
+                return nullptr;
+            }
+
             // build worst-case graph
             int n_past = cparams.n_ctx - n_tokens;
             llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
@@ -9288,7 +9312,17 @@ struct llama_context * llama_init_from_model(
                     ggml_backend_sched_free(ctx->sched);
                     ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
                     configure_expert_hierarchy();
-                    gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
+                    gf_success = reserve_hybrid_decode_graph();
+                    if (gf_success) {
+                        if (ctx->model.arch == LLM_ARCH_DEEPSEEK4 &&
+                                !llama_prepare_dsv4_graph_inputs(*ctx, reserve_batch, false, true)) {
+                            gf_success = false;
+                        } else {
+                            gf = llm_build_context::llama_build_graph(
+                                    *ctx, reserve_batch, true, cparams.worst_graph_tokens);
+                            gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
+                        }
+                    }
                 }
                 if (!gf_success) {
                     LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);

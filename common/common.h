@@ -468,6 +468,7 @@ struct gpt_params {
     std::string resolved_resource_plan_json;
     ggml_type resolved_resource_kv_type = GGML_TYPE_COUNT;
     int expert_cache_min_observations = 2;
+    int expert_hybrid_gpu_experts = 0;
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
     bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)
     bool split_mode_graph_scheduling = false; // if true, force split mode graph scheduling
