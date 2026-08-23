@@ -115,6 +115,17 @@ class ModelInfo:
         )
 
     @property
+    def expert_used_count(self) -> int | None:
+        return _first_positive_int(
+            self.metadata,
+            (
+                f"{self.architecture}.expert_used_count",
+                "llama.expert_used_count",
+                "general.expert_used_count",
+            ),
+        )
+
+    @property
     def is_moe(self) -> bool:
         if (self.expert_count or 0) > 1:
             return True
@@ -146,6 +157,8 @@ class LaunchPlan:
     binary: Path
     environment: dict[str, str]
     arguments: tuple[str, ...]
+    hybrid_gpu_experts: int = 0
+    hybrid_selection: str = "automatic hybrid routing was not evaluated"
 
     def command(self) -> tuple[str, ...]:
         return (str(self.binary), *self.arguments)
@@ -182,6 +195,10 @@ class LaunchPlan:
                 "vram_free_human": human_bytes(self.hardware.free_vram),
             },
             "environment": dict(self.environment),
+            "hybrid_routing": {
+                "gpu_experts": self.hybrid_gpu_experts,
+                "selection": self.hybrid_selection,
+            },
             "arguments": list(self.arguments),
             "command": list(self.command()),
             "shell_command": self.shell_command(),
@@ -481,6 +498,10 @@ def read_gguf_metadata(path: Path) -> dict[str, Any]:
 
 
 _EXPERT_TENSOR_RE = re.compile(r"\.ffn_(?:gate|up|down|gate_up)_exps(?:\.weight)?$", re.I)
+_EXPERT_COMPONENT_RE = re.compile(
+    r"^(?P<layer>.+)\.ffn_(?P<component>gate|up|down|gate_up)_exps(?:\.weight)?$",
+    re.I,
+)
 
 
 def inspect_expert_geometries(path: Path) -> list[dict[str, Any]]:
@@ -519,6 +540,116 @@ def inspect_expert_geometries(path: Path) -> list[dict[str, Any]]:
 def inspect_expert_geometry(path: Path) -> dict[str, Any] | None:
     geometries = inspect_expert_geometries(path)
     return max(geometries, key=lambda item: item["expert_component_bytes"]) if geometries else None
+
+
+def inspect_expert_layer_formats(path: Path) -> tuple[tuple[tuple[int, int, int, int], ...], ...]:
+    """Return unique per-layer expert component multisets used by decode."""
+    layers: dict[str, list[tuple[int, int, int, int]]] = {}
+    for shard in discover_model_shards(path):
+        _, tensors = read_gguf_index(shard)
+        for tensor in tensors:
+            match = _EXPERT_COMPONENT_RE.match(tensor["name"])
+            dimensions = tensor["dimensions"]
+            if not match or len(dimensions) < 3:
+                continue
+            expert_count = int(dimensions[-1])
+            span_bytes = int(tensor["span_bytes"])
+            if expert_count <= 0 or span_bytes <= 0:
+                continue
+            layers.setdefault(match.group("layer"), []).append(
+                (
+                    int(tensor["ggml_type"]),
+                    int(dimensions[0]),
+                    int(dimensions[1]),
+                    span_bytes // expert_count,
+                )
+            )
+    return tuple(sorted({tuple(sorted(components)) for components in layers.values()}))
+
+
+def _solve_calibrated_hybrid(
+    profile: dict[str, Any],
+    layer_formats: Sequence[Sequence[tuple[int, int, int, int]]],
+    expert_used: int,
+) -> tuple[int, str]:
+    """Mirror the native integer split solver and fail closed on missing formats."""
+    if expert_used < 2:
+        return 0, "model does not expose a mixed top-k expert route"
+    contention = profile.get("measurements", {}).get("cpu_cache_contention", {})
+    devices = contention.get("devices", []) if isinstance(contention, dict) else []
+    if not layer_formats or not isinstance(devices, list) or not devices:
+        return 0, "profile or model has no calibrated expert layout"
+
+    solved: list[int] = []
+    for device in devices:
+        if not isinstance(device, dict) or not isinstance(device.get("backend"), str):
+            return 0, "profile has an invalid calibrated backend"
+        entries = device.get("profiles", [])
+        if not isinstance(entries, list):
+            return 0, f"profile has no calibrated formats for {device['backend']}"
+        costs: dict[tuple[int, int, int, int], tuple[float, float]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                key = tuple(int(entry[name]) for name in (
+                    "ggml_type_id", "input_width", "expert_width",
+                    "bytes_per_expert_component",
+                ))
+                costs[key] = (
+                    float(entry["cpu_ns_per_expert_component"]),
+                    float(entry["upload_ns_per_expert_component"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        for components in layer_formats:
+            try:
+                cpu_ns = sum(costs[tuple(component)][0] for component in components)
+                upload_ns = sum(costs[tuple(component)][1] for component in components)
+            except KeyError:
+                return 0, f"profile has no exact component match for {device['backend']}"
+            if not cpu_ns > 0 or not upload_ns > 0:
+                return 0, f"profile contains invalid costs for {device['backend']}"
+            best_uploads = min(
+                range(expert_used + 1),
+                key=lambda uploads: max(
+                    (expert_used - uploads) * cpu_ns,
+                    uploads * upload_ns,
+                ),
+            )
+            solved.append(best_uploads)
+
+    conservative = min(solved, default=0)
+    if conservative == 0:
+        return 0, "calibration selected the established all-CPU expert path"
+    if conservative >= expert_used:
+        return 0, "calibration selected the established all-GPU cache path"
+    return conservative, (
+        f"planner-ready calibration selected {conservative} GPU and "
+        f"{expert_used - conservative} CPU route positions"
+    )
+
+
+def calibrated_hybrid_gpu_experts(
+    model: ModelInfo,
+    profile_path: Path,
+    current_identity: dict[str, Any],
+) -> tuple[int, str]:
+    try:
+        profile = load_hardware_profile(profile_path)
+    except HardwareProfileError as exc:
+        return 0, f"automatic hybrid routing disabled: {exc}"
+    reasons = planner_profile_reasons(profile, current_identity)
+    if reasons:
+        return 0, f"automatic hybrid routing disabled: {reasons[0]}"
+    expert_used = model.expert_used_count
+    if expert_used is None:
+        return 0, "automatic hybrid routing disabled: model top-k metadata is unavailable"
+    try:
+        layouts = inspect_expert_layer_formats(model.requested_path)
+    except ESEError as exc:
+        return 0, f"automatic hybrid routing disabled: {exc}"
+    return _solve_calibrated_hybrid(profile, layouts, expert_used)
 
 
 def inspect_model(path: Path) -> ModelInfo:
@@ -685,6 +816,8 @@ def build_launch_plan(
     expert_vram_cache: int | None = None,
     expert_storage_backend: str | None = None,
     expert_cache_min_observations: int = 2,
+    hybrid_gpu_experts: int = 0,
+    hybrid_selection: str = "automatic hybrid routing was not evaluated",
     extra_args: Sequence[str] = (),
 ) -> LaunchPlan:
     if reserve_vram < 0:
@@ -701,6 +834,8 @@ def build_launch_plan(
         raise ESEError("--expert-storage-backend must be mmap, pread, or io_uring")
     if expert_cache_min_observations < 1:
         raise ESEError("--expert-cache-min-observations must be at least 1")
+    if hybrid_gpu_experts < 0 or hybrid_gpu_experts > 64:
+        raise ESEError("hybrid GPU experts must be between 0 and 64")
 
     args: list[str] = [
         "-m",
@@ -763,6 +898,12 @@ def build_launch_plan(
             raise ESEError(f"--policy {selected_policy} requires a sparse MoE model")
         env["GGML_CUDA_NO_PINNED"] = "1"
         backend = expert_storage_backend or ("pread" if selected_policy == "stream" else "mmap")
+        if hybrid_gpu_experts and backend != "pread":
+            hybrid_gpu_experts = 0
+            hybrid_selection = (
+                "automatic hybrid routing disabled: planner calibration covers "
+                "the pread bounded-lease path"
+            )
         if prefetch_tail > 0:
             if backend != "mmap":
                 raise ESEError("--prefetch-tail requires --expert-storage-backend mmap")
@@ -813,6 +954,11 @@ def build_launch_plan(
                     _mib_nonnegative(reserve_vram, "--reserve-vram"),
                 )
             )
+            if hybrid_gpu_experts:
+                args.extend(("--expert-hybrid-gpu-experts", str(hybrid_gpu_experts)))
+        elif hybrid_gpu_experts:
+            hybrid_gpu_experts = 0
+            hybrid_selection = "automatic hybrid routing disabled: expert VRAM cache is unavailable"
         args.extend(("-b", str(batch_size or 1024), "-ub", str(ubatch_size or 512)))
 
     else:
@@ -831,6 +977,12 @@ def build_launch_plan(
         binary=binary,
         environment=env,
         arguments=tuple(args),
+        hybrid_gpu_experts=hybrid_gpu_experts if selected_policy in ("cache", "stream") else 0,
+        hybrid_selection=(
+            hybrid_selection
+            if selected_policy in ("cache", "stream")
+            else "automatic hybrid routing is not used by the selected policy"
+        ),
     )
 
 
@@ -906,6 +1058,7 @@ def _print_plan(plan: LaunchPlan, as_json: bool) -> None:
         return
     print(f"Policy : {plan.policy}")
     print(f"Reason : {plan.reason}")
+    print(f"Hybrid : {plan.hybrid_selection}")
     print(
         f"Model  : {plan.model.name} | {human_bytes(plan.model.total_bytes)} | "
         f"{len(plan.model.shards)} shard(s)"
@@ -1216,6 +1369,17 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         default=2,
         help="minimum routes before adaptive VRAM admission (default: 2)",
     )
+    parser.add_argument(
+        "--hardware-profile",
+        type=Path,
+        default=default_profile_path(),
+        help="topology-bound calibration profile used for automatic hybrid routing",
+    )
+    parser.add_argument(
+        "--no-auto-hybrid",
+        action="store_true",
+        help="disable calibrated CPU/GPU expert route splitting",
+    )
     parser.add_argument("--json", action="store_true")
 
 
@@ -1277,9 +1441,20 @@ def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
         raise ESEError("--slots must be positive")
     if not 1 <= args.port <= 65535:
         raise ESEError("--port must be between 1 and 65535")
+    model = inspect_model(args.model)
+    hardware = detect_hardware()
+    hybrid_gpu_experts = 0
+    selected_policy, _ = select_policy(model, hardware, args.policy)
+    hybrid_selection = "automatic hybrid routing is not used by the selected policy"
+    if selected_policy in ("cache", "stream") and args.no_auto_hybrid:
+        hybrid_selection = "automatic hybrid routing disabled by --no-auto-hybrid"
+    elif selected_policy in ("cache", "stream"):
+        hybrid_gpu_experts, hybrid_selection = calibrated_hybrid_gpu_experts(
+            model, args.hardware_profile, collect_hardware_identity()
+        )
     return build_launch_plan(
-        model=inspect_model(args.model),
-        hardware=detect_hardware(),
+        model=model,
+        hardware=hardware,
         binary=_resolve_binary(args.binary),
         policy=args.policy,
         context=args.context,
@@ -1300,6 +1475,8 @@ def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
         expert_vram_cache=args.expert_vram_cache,
         expert_storage_backend=args.expert_storage_backend,
         expert_cache_min_observations=args.expert_cache_min_observations,
+        hybrid_gpu_experts=hybrid_gpu_experts,
+        hybrid_selection=hybrid_selection,
         extra_args=args.extra,
     )
 

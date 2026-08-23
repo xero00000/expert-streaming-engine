@@ -39,9 +39,9 @@ The planner must not consume Phase A data until the last two rows use their prod
 Baseline profiles therefore carry `benchmark_source.planner_ready: false`.
 Without `--model`, provenance records `model_used: false`. With a GGUF file, first shard, or model directory, ESE scans every shard without loading tensor payloads and uses the representative expert type, geometry, count, and component byte size for the cache-upload probe. The fixed F16 CPU result remains clearly separate and is not presented as model-specific compute calibration.
 
-The native resource planner now has a pure integer split solver for calibrated decode misses. It minimizes the maximum of concurrent CPU and upload completion time, handles all-CPU/all-upload/mixed small counts, retains the previous split within a configurable hysteresis band, and refuses incomplete, low-confidence, non-finite, or otherwise invalid calibration. It is not connected to live decode until profile confidence and the remaining correctness gates are satisfied.
+The native resource planner now has a pure integer split solver for calibrated decode misses. It minimizes the maximum of concurrent CPU and upload completion time, handles all-CPU/all-upload/mixed small counts, retains the previous split within a configurable hysteresis band, and refuses incomplete, low-confidence, non-finite, or otherwise invalid calibration. The launcher applies the same golden-tested completion rule after its stronger topology and profile gate, then passes only a mixed result into live decode.
 
-A native calibration table parser now independently rejects forged readiness, missing or duplicated device/format coverage, incomplete exact-lease evidence, low confidence, and invalid numerical-reference evidence. Accepted entries are keyed by CUDA backend, GGML type, input width, expert width, and component byte size and expose explicit CPU/upload nanoseconds per expert component. A calibrated split entry point fails closed if any component is missing, sums all components required by one routed expert, then applies the integer solver and hysteresis. The launcher still owns topology-fingerprint freshness checks; live decode consumption remains gated.
+A native calibration table parser now independently rejects forged readiness, missing or duplicated device/format coverage, incomplete exact-lease evidence, low confidence, and invalid numerical-reference evidence. Accepted entries are keyed by CUDA backend, GGML type, input width, expert width, and component byte size and expose explicit CPU/upload nanoseconds per expert component. A calibrated split entry point fails closed if any component is missing, sums all components required by one routed expert, then applies the integer solver and hysteresis. The launcher owns topology-fingerprint freshness checks and now mirrors the integer solver to select a conservative split across every calibrated GPU and distinct model layer layout. It passes that result to the native decode graph only for a genuinely mixed plan.
 
 Each timed series records its sample count, raw coefficient of variation, robust relative standard error of the median, and a confidence score combining seven-sample coverage with that uncertainty. The median absolute deviation estimator resists isolated scheduler/interrupt outliers but still penalizes broad or bimodal samples. The profile gate requires at least `0.80` confidence for both CPU and upload on every device/format. Changing the provenance flag alone cannot bypass missing model-backed or per-device evidence.
 
@@ -49,7 +49,7 @@ Each timed series records its sample count, raw coefficient of variation, robust
 
 - Resolve and test the standalone fused `ggml_moe_up_gate` probe; its first calibration harness exposed allocator corruption, so Phase A currently uses the stable routed `ggml_mul_mat_id` primitive.
 - Instrument the live scheduler route/events around the exact leased upload path.
-- Feed only complete, current, sufficiently confident profiles into the native resource controller.
+- Keep the launcher and native calibrated split solvers covered by shared golden cases as the controller evolves.
 
 ## Phase B: heterogeneous decode execution
 
@@ -76,6 +76,16 @@ the layer result on the GPU. The option is disabled by default and requires a
 nonzero bounded expert VRAM cache. Prompt graphs remain on their established
 path even when their final layer is collapsed to one requested output.
 
+`ese plan` and `ese serve` automatically inspect the topology-bound profile at
+`~/.cache/ese/hardware-profile.json`. The launcher requires exact GGUF component
+geometry, complete per-device evidence, and model top-k metadata before adding
+the native split option. Automatic activation also requires the calibrated
+`pread` bounded-lease storage path; stream mode uses it by default, while cache
+mode must select it explicitly. `--hardware-profile PATH` selects another profile and
+`--no-auto-hybrid` opts out. Missing, stale, incomplete, all-CPU, and all-GPU
+solutions leave the established execution path unchanged and report the reason
+in JSON under `hybrid_routing`.
+
 The integration also closes three scheduler lifetime/correctness gaps exposed
 only by a real model graph: heterogeneous reduction sources cannot assume their
 array index is a CUDA backend index, negative route sentinels must be skipped by
@@ -87,8 +97,8 @@ run produced byte-identical text with and without a one-GPU/one-CPU split. The
 single-GPU decode changed from `65.15` to `103.04` tokens/s; async graph scheduling
 changed from `44.64` to `58.37` tokens/s. These are development-fixture results,
 not published product benchmarks, and primarily prove end-to-end execution and
-parity. Automatic consumption of a current calibrated profile, larger-model
-numerical parity, and production benchmark selection remain Phase B gates.
+parity. Larger-model numerical parity and production benchmark selection remain
+Phase B gates.
 
 ## Later phases
 

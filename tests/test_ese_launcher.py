@@ -19,12 +19,14 @@ from tools.ese import (
     discover_model_shards,
     inspect_expert_geometry,
     inspect_expert_geometries,
+    inspect_expert_layer_formats,
     parse_size,
     read_gguf_metadata,
     read_gguf_index,
     select_policy,
     _execution_environment,
     _repo_root,
+    _solve_calibrated_hybrid,
 )
 
 
@@ -67,6 +69,7 @@ def moe_model(size: int = 40 * GIB) -> ModelInfo:
         metadata={
             "general.architecture": "gpt-oss",
             "gpt-oss.expert_count": 128,
+            "gpt-oss.expert_used_count": 4,
             "gpt-oss.block_count": 36,
         },
     )
@@ -84,6 +87,114 @@ def hardware(*free_gib: int, ram_available: int = 100) -> HardwareInfo:
 
 
 class LauncherTests(unittest.TestCase):
+    def test_calibrated_hybrid_solver_is_conservative_across_devices(self) -> None:
+        key = {
+            "ggml_type_id": 16,
+            "input_width": 4096,
+            "expert_width": 2048,
+            "bytes_per_expert_component": 2162688,
+        }
+        profile = {
+            "measurements": {
+                "cpu_cache_contention": {
+                    "devices": [
+                        {
+                            "backend": "CUDA0",
+                            "profiles": [{
+                                **key,
+                                "cpu_ns_per_expert_component": 120000.0,
+                                "upload_ns_per_expert_component": 90000.0,
+                            }],
+                        },
+                        {
+                            "backend": "CUDA1",
+                            "profiles": [{
+                                **key,
+                                "cpu_ns_per_expert_component": 120000.0,
+                                "upload_ns_per_expert_component": 150000.0,
+                            }],
+                        },
+                    ]
+                }
+            }
+        }
+        uploads, reason = _solve_calibrated_hybrid(
+            profile, [(tuple(key.values()), tuple(key.values()))], 7
+        )
+        self.assertEqual(uploads, 3)
+        self.assertIn("3 GPU and 4 CPU", reason)
+
+        single_device = {
+            "measurements": {
+                "cpu_cache_contention": {
+                    "devices": profile["measurements"]["cpu_cache_contention"]["devices"][:1]
+                }
+            }
+        }
+        uploads, _ = _solve_calibrated_hybrid(
+            single_device, [(tuple(key.values()), tuple(key.values()))], 7
+        )
+        self.assertEqual(uploads, 4)  # same golden case as the native solver
+
+        missing = dict(key)
+        missing["ggml_type_id"] = 19
+        uploads, reason = _solve_calibrated_hybrid(
+            profile, [(tuple(missing.values()),)], 7
+        )
+        self.assertEqual(uploads, 0)
+        self.assertIn("no exact component match", reason)
+
+        for cpu_cost, upload_cost, expected in (
+            (1.0, 1_000_000.0, "all-CPU"),
+            (1_000_000.0, 1.0, "all-GPU"),
+        ):
+            extreme = {
+                "measurements": {
+                    "cpu_cache_contention": {
+                        "devices": [{
+                            "backend": "CUDA0",
+                            "profiles": [{
+                                **key,
+                                "cpu_ns_per_expert_component": cpu_cost,
+                                "upload_ns_per_expert_component": upload_cost,
+                            }],
+                        }]
+                    }
+                }
+            }
+            uploads, reason = _solve_calibrated_hybrid(
+                extreme, [(tuple(key.values()),)], 7
+            )
+            self.assertEqual(uploads, 0)
+            self.assertIn(expected, reason)
+
+    def test_cache_plan_applies_a_verified_hybrid_split(self) -> None:
+        plan = build_launch_plan(
+            model=moe_model(),
+            hardware=hardware(20),
+            binary=Path("/server"),
+            policy="cache",
+            expert_vram_cache=256 * 1024**2,
+            expert_storage_backend="pread",
+            hybrid_gpu_experts=2,
+            hybrid_selection="verified test profile",
+        )
+        position = plan.arguments.index("--expert-hybrid-gpu-experts")
+        self.assertEqual(plan.arguments[position + 1], "2")
+        self.assertEqual(plan.hybrid_gpu_experts, 2)
+        self.assertEqual(plan.as_dict()["hybrid_routing"]["selection"], "verified test profile")
+
+        mmap_plan = build_launch_plan(
+            model=moe_model(),
+            hardware=hardware(20),
+            binary=Path("/server"),
+            policy="cache",
+            expert_vram_cache=256 * 1024**2,
+            hybrid_gpu_experts=2,
+        )
+        self.assertNotIn("--expert-hybrid-gpu-experts", mmap_plan.arguments)
+        self.assertIn("pread bounded-lease", mmap_plan.hybrid_selection)
+
     def test_frozen_launcher_uses_executable_directory_as_runtime_root(self) -> None:
         with (
             mock.patch.object(sys, "frozen", True, create=True),
@@ -122,6 +233,15 @@ class LauncherTests(unittest.TestCase):
             metadata = read_gguf_metadata(path)
             self.assertEqual(metadata["general.architecture"], "gpt-oss")
             self.assertEqual(metadata["gpt-oss.block_count"], 36)
+
+    def test_expert_layer_formats_preserve_component_multiplicity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "model.gguf"
+            write_tensor_gguf(path)
+            self.assertEqual(
+                inspect_expert_layer_formats(path),
+                (((1, 16, 32, 512),),),
+            )
 
     def test_read_tensor_index_and_expert_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
