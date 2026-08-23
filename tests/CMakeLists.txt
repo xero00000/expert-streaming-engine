@@ -228,6 +228,9 @@ llama_test(test-transient-module-manager)
 llama_build(test-spec-tuner.cpp)
 llama_test(test-spec-tuner)
 
+llama_build(test-speculative-mtp-transaction.cpp)
+llama_test(test-speculative-mtp-transaction)
+
 llama_build(test-resource-planner.cpp)
 llama_test(test-resource-planner)
 

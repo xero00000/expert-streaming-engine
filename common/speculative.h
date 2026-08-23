@@ -6,6 +6,9 @@
 #include "spec-tuner.h"
 
 struct common_speculative;
+struct common_speculative_mtp_transaction;
+
+using common_speculative_mtp_transaction_t = common_speculative_mtp_transaction *;
 
 bool common_speculative_needs_checkpoint(const llama_model * model);
 
@@ -251,6 +254,35 @@ void common_speculative_clear_sequence_kv(
     llama_seq_id seq_id);
 
 llama_context * common_speculative_get_companion_ctx(common_speculative * spec);
+
+// Prepare an MTP companion-owner replacement without changing the live state.
+// A resident target creates a complete context/sampler owner when the companion
+// is suspended; a non-resident target prepares an empty owner. Preparing the
+// already-active residency is a valid no-op transaction. At most one unresolved
+// transaction may be open for an MTP state. Calls must run on the quiescent MTP
+// owner thread, and the handle must not outlive spec.
+//
+// publish() installs the prepared owner using allocation-free swaps. rollback()
+// applies the inverse swaps. finalize() commits publication and retires the old
+// owner. free() discards a prepared/rolled-back owner and automatically rolls
+// back a published-but-unfinalized transaction. State-changing calls return
+// false outside prepare -> publish -> rollback/finalize order; free(nullptr) is
+// a no-op.
+common_speculative_mtp_transaction_t common_speculative_mtp_prepare_residency(
+        common_speculative * spec,
+        bool                 target_resident) noexcept;
+
+bool common_speculative_mtp_transaction_publish(
+        common_speculative_mtp_transaction_t transaction) noexcept;
+
+bool common_speculative_mtp_transaction_rollback(
+        common_speculative_mtp_transaction_t transaction) noexcept;
+
+bool common_speculative_mtp_transaction_finalize(
+        common_speculative_mtp_transaction_t transaction) noexcept;
+
+void common_speculative_mtp_transaction_free(
+        common_speculative_mtp_transaction_t transaction) noexcept;
 
 // Releases/reconstructs the MTP companion context without unloading the target
 // model. Resume starts with empty MTP state; callers must force prompt warmup.
