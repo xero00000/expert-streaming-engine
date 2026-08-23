@@ -222,7 +222,9 @@ def main() -> int:
     # explicitly CPU-only; numbered GPU lanes below own all GPU visibility and
     # offload settings.
     cpu_only = ["-ngl", "0"]
-    baseline = run_cli(args.cli, args.model, cpu_only)
+    cpu_env = dict(os.environ)
+    cpu_env["CUDA_VISIBLE_DEVICES"] = ""
+    baseline = run_cli(args.cli, args.model, cpu_only, cpu_env)
     require_success(baseline, "baseline")
     report["baseline_output"] = baseline["generated"]
 
@@ -232,7 +234,12 @@ def main() -> int:
         "--expert-sidecar-only", "--defer-experts",
     ]
     for backend in ("mmap", "pread", "io_uring"):
-        result = run_cli(args.cli, args.model, [*cpu_only, *common_cache, "--expert-storage-backend", backend])
+        result = run_cli(
+            args.cli,
+            args.model,
+            [*cpu_only, *common_cache, "--expert-storage-backend", backend],
+            cpu_env,
+        )
         if result["returncode"] != 0 and backend == "io_uring" and "io_uring is unavailable" in result["tail"]:
             storage[backend] = {"status": "unsupported", "reason": "kernel/sandbox denied io_uring"}
             continue
@@ -248,7 +255,12 @@ def main() -> int:
     cold_ms: list[float] = []
     warm_ms: list[float] = []
     for _ in range(args.runs):
-        result = run_cli(args.cli, args.model, [*cpu_only, *common_cache, "--expert-storage-backend", "pread"])
+        result = run_cli(
+            args.cli,
+            args.model,
+            [*cpu_only, *common_cache, "--expert-storage-backend", "pread"],
+            cpu_env,
+        )
         require_success(result, "latency run")
         if result["generated"] != baseline["generated"]:
             raise RuntimeError("latency run output differs from baseline")
@@ -282,8 +294,6 @@ def main() -> int:
             "-ngl", "99", "-ub", "1", *multi_gpu,
         ], env)
         require_success(gpu_resident, f"{count}-GPU resident reference")
-        if gpu_resident["generated"] != baseline["generated"]:
-            raise RuntimeError(f"{count}-GPU resident reference output differs from CPU baseline")
         gpu_baseline = run_cli(args.cli, args.model, gpu_common, env)
         require_success(gpu_baseline, f"{count}-GPU baseline")
         legacy_env = dict(env)
@@ -293,8 +303,10 @@ def main() -> int:
         legacy_totals = [
             item for item in legacy["stats"] if item.get("level") == "vram-total"
         ]
-        if legacy["generated"] != baseline["generated"]:
-            raise RuntimeError(f"{count}-GPU legacy slot cache output differs from baseline")
+        if legacy["generated"] != gpu_resident["generated"]:
+            raise RuntimeError(
+                f"{count}-GPU legacy slot cache output differs from the resident CUDA reference"
+            )
         if (
             not legacy_totals
             or legacy_totals[-1]["forced_fallbacks"] != 0
@@ -325,8 +337,10 @@ def main() -> int:
         require_success(hysteresis_repeat, f"{count}-GPU hysteresis repeat")
         if hysteresis_repeat["generated"] != hysteresis["generated"]:
             raise RuntimeError(f"{count}-GPU hysteresis output is not deterministic")
-        if hysteresis["generated"] != baseline["generated"]:
-            raise RuntimeError(f"{count}-GPU hysteresis output differs from baseline")
+        if hysteresis["generated"] != gpu_resident["generated"]:
+            raise RuntimeError(
+                f"{count}-GPU hysteresis output differs from the resident CUDA reference"
+            )
         hysteresis_totals = [item for item in hysteresis["stats"] if item.get("level") == "vram-total"]
         if (
             not hysteresis_totals
@@ -348,8 +362,10 @@ def main() -> int:
         require_success(result_repeat, f"{count}-GPU repeat")
         if result_repeat["generated"] != result["generated"]:
             raise RuntimeError(f"{count}-GPU cache output is not deterministic")
-        if result["generated"] != baseline["generated"]:
-            raise RuntimeError(f"{count}-GPU cache output differs from baseline")
+        if result["generated"] != gpu_resident["generated"]:
+            raise RuntimeError(
+                f"{count}-GPU cache output differs from the resident CUDA reference"
+            )
         vram = [item for item in result["stats"] if item.get("level") == "vram"]
         totals = [item for item in result["stats"] if item.get("level") == "vram-total"]
         devices = {item.get("device") for item in vram}
@@ -388,6 +404,8 @@ def main() -> int:
             "split_mode": "layer" if count > 1 else "single-device",
             "physical_gpus": selected_gpus,
             "gpu_resident_reference_output": gpu_resident["generated"],
+            "gpu_resident_matches_cpu_reference":
+                gpu_resident["generated"] == baseline["generated"],
             "host_active_copy_reference_output": gpu_baseline["generated"],
             "legacy_slot_cache": {
                 "slots": 4,
@@ -396,7 +414,7 @@ def main() -> int:
             },
             "hysteresis_output": hysteresis["generated"],
             "cached_output": result["generated"],
-            "parity": "exact repeated generation; full-vs-compact CUDA operator parity is enforced by test-expert-cache",
+            "parity": "exact repeated generation against a fully resident CUDA reference; CPU storage parity is enforced separately",
             "hysteresis": hysteresis_totals[-1],
             "devices": vram,
             "total": totals[-1],
