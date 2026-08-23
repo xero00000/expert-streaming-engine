@@ -173,14 +173,14 @@ throughput benchmark. Longer schema-v3 validation on this larger model remains
 a Phase B gate.
 
 The fail-closed workload validator has also run end-to-end on the local TinyMoE
-fixture with three measured four-token samples after warmup. The established
-path median was `71.36` tokens/s and the one-GPU-position hybrid median was
-`92.23` tokens/s (`1.293x`), with exact output hashes for every paired sample.
-All 10 layers reconciled with the aggregate telemetry, 130 of 260 route
-positions exercised the GPU partition, all 53 misses accounted for 159
-lease-backed component uploads, all 130 CPU branch calls were timed, and forced
+fixture with five measured 16-token samples after warmup. The established path
+median was `52.04` tokens/s and the one-GPU-position hybrid median was
+`88.79` tokens/s (`1.706x`), with exact output hashes for every paired sample.
+All 10 layers reconciled with the aggregate telemetry, 910 of 1,820 route
+positions exercised the GPU partition, all 369 misses accounted for 1,107
+lease-backed component uploads, all 910 CPU branch calls were timed, and forced
 fallbacks remained zero. Observed CPU and upload-path time were respectively
-`0.375x` and `2.921x` their conservative development-profile predictions,
+`0.228x` and `2.092x` their conservative development-profile predictions,
 inside the `4x` fail-closed bounds. This uses a tiny fixture and a test profile;
 it is gate-development evidence, not a product benchmark.
 
