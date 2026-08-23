@@ -118,11 +118,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
-        with:
-          cuda: "12.4.1"
-          method: network
-          sub-packages: '["nvcc", "cudart", "crt", "cccl", "nvrtc", "cublas", "cublas_dev", "visual_studio_integration"]'
+        shell: pwsh
+        run: .\.github\scripts\setup-cuda-windows.ps1
 
       - uses: Swatinem/rust-cache@v2
         with:
