@@ -204,7 +204,7 @@ def main() -> int:
         )
 
     report: dict[str, object] = {
-        "schema": 2,
+        "schema": 3,
         "model": str(args.model),
         "model_sha256": sha256_file(args.model),
         "cli": str(args.cli),
@@ -323,31 +323,39 @@ def main() -> int:
             "--expert-cache-min-observations", "2",
         ]
         non_asserted_cache = [item for item in common_cache if item != "--expert-sidecar-only"]
-        hysteresis = run_cli(args.cli, args.model, [
+        compact_safety = run_cli(args.cli, args.model, [
             *non_asserted_cache,
             *vram_policy,
             *gpu_common,
         ], env)
-        require_success(hysteresis, f"{count}-GPU hysteresis")
-        hysteresis_repeat = run_cli(args.cli, args.model, [
+        require_success(compact_safety, f"{count}-GPU compact admission safety")
+        compact_safety_repeat = run_cli(args.cli, args.model, [
             *non_asserted_cache,
             *vram_policy,
             *gpu_common,
         ], env)
-        require_success(hysteresis_repeat, f"{count}-GPU hysteresis repeat")
-        if hysteresis_repeat["generated"] != hysteresis["generated"]:
-            raise RuntimeError(f"{count}-GPU hysteresis output is not deterministic")
-        if hysteresis["generated"] != gpu_resident["generated"]:
+        require_success(compact_safety_repeat, f"{count}-GPU compact admission safety repeat")
+        if compact_safety_repeat["generated"] != compact_safety["generated"]:
+            raise RuntimeError(f"{count}-GPU compact admission output is not deterministic")
+        if compact_safety["generated"] != gpu_resident["generated"]:
             raise RuntimeError(
-                f"{count}-GPU hysteresis output differs from the resident CUDA reference"
+                f"{count}-GPU compact admission output differs from the resident CUDA reference"
             )
-        hysteresis_totals = [item for item in hysteresis["stats"] if item.get("level") == "vram-total"]
+        compact_safety_totals = [
+            item for item in compact_safety["stats"] if item.get("level") == "vram-total"
+        ]
+        # Decode graphs already contain compact expert tensors. Deferring an
+        # admission in that graph has no full-tensor fallback and used to abort
+        # at staging time. A minimum-observation policy must therefore admit
+        # compact routes immediately, with neither a rejection nor fallback.
         if (
-            not hysteresis_totals
-            or hysteresis_totals[-1]["rejected_admissions"] == 0
-            or hysteresis_totals[-1]["forced_fallbacks"] == 0
+            not compact_safety_totals
+            or compact_safety_totals[-1]["admissions"] == 0
+            or compact_safety_totals[-1]["uploads"] == 0
+            or compact_safety_totals[-1]["rejected_admissions"] != 0
+            or compact_safety_totals[-1]["forced_fallbacks"] != 0
         ):
-            raise RuntimeError(f"{count}-GPU run did not exercise admission hysteresis")
+            raise RuntimeError(f"{count}-GPU run did not prove compact admission safety")
         result = run_cli(args.cli, args.model, [
             *common_cache,
             *vram_policy,
@@ -412,10 +420,10 @@ def main() -> int:
                 "output": legacy["generated"],
                 "total": legacy_totals[-1],
             },
-            "hysteresis_output": hysteresis["generated"],
+            "compact_admission_output": compact_safety["generated"],
             "cached_output": result["generated"],
             "parity": "exact repeated generation against a fully resident CUDA reference; CPU storage parity is enforced separately",
-            "hysteresis": hysteresis_totals[-1],
+            "compact_admission_safety": compact_safety_totals[-1],
             "devices": vram,
             "total": totals[-1],
         }
