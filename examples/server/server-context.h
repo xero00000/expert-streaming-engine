@@ -9,6 +9,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 
@@ -300,7 +301,7 @@ struct server_context {
 
     bool transient_enabled() const;
     std::string resource_plan_json() const;
-    void publish_resource_plan_json(std::string value);
+    std::pair<int32_t, std::string> published_resource_state() const;
     uint64_t acquire_transient(bool multimodal, std::string & error);
     void release_transient(uint64_t lease, bool success = true);
 

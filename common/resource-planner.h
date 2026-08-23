@@ -221,12 +221,15 @@ bool common_resource_rebalance_target(
 // Validate the double-buffer preparation peak for a derived target. A pool is
 // treated as a whole-plan replacement when its context/allocation differs on
 // any device; its complete target allocation is then counted on every device.
+// force_expert_cache_preparation covers explicit same-target reconciliation,
+// where the realized allocation must be rebuilt despite no serialized delta.
 // report is updated only after all devices pass overflow and reserve checks.
 bool common_resource_rebalance_preparation_peak(
     const common_resource_plan & current,
     const common_resource_plan & target,
     common_resource_preparation_peak & report,
-    std::string & error);
+    std::string & error,
+    bool force_expert_cache_preparation = false);
 
 bool common_expert_split_solve(
     const common_expert_split_input & input,

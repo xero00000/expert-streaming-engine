@@ -24,6 +24,12 @@ from pathlib import Path
 
 PROMPT = "ESE runtime resource transactions preserve deterministic continuation."
 BUSY_PROMPT = "ESE rejects resource mutation while an inference slot is active."
+COMBINED_FAILURE_STAGES = (
+    "after-kv-prepare",
+    "after-expert-prepare",
+    "after-kv-publish",
+    "before-logical-publish",
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -39,6 +45,18 @@ def content_hash(response: dict) -> str:
     if not isinstance(content, str) or not content:
         raise RuntimeError("completion returned no generated content")
     return hashlib.sha256(content.encode()).hexdigest()
+
+
+def require_rollback_message(failure: dict, label: str) -> None:
+    message = failure.get("error", {}).get("message", "").lower()
+    accepted = (
+        "original cache remains active",
+        "original resources remain active",
+        "original resources were restored",
+        "original cache retained",
+    )
+    if not any(fragment in message for fragment in accepted):
+        raise RuntimeError(f"{label} did not report rollback usability")
 
 
 def request_json(
@@ -109,6 +127,12 @@ class Server:
             environment["ESE_EXPERT_CACHE_REPLACE_FAIL_AFTER_DEVICES"] = str(
                 args.expert_failure_after_devices
             )
+        elif failure_kind in COMBINED_FAILURE_STAGES:
+            environment["ESE_RESOURCE_REBALANCE_FAIL_STAGE"] = failure_kind
+        elif failure_kind == "expert-published-device":
+            environment[
+                "ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES"
+            ] = "1"
         self.process = subprocess.Popen(
             command,
             cwd=args.server.resolve().parents[2],
@@ -187,8 +211,172 @@ def rebalance_expert(
     )
 
 
+def rebalance_combined(
+    port: int,
+    context: int,
+    bytes_per_device: int,
+    dry_run: bool,
+    expected_status: int = 200,
+) -> dict:
+    return request_json(
+        f"http://127.0.0.1:{port}/v1/ese/resources/rebalance",
+        {
+            "dry_run": dry_run,
+            "context": context,
+            "expert_cache_bytes_per_device": bytes_per_device,
+        },
+        timeout=30,
+        expected_status=expected_status,
+    )
+
+
+def rebalance_combined_observing_props(
+    port: int,
+    context: int,
+    bytes_per_device: int,
+) -> tuple[dict, int]:
+    samples = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            rebalance_combined, port, context, bytes_per_device, False
+        )
+        while not future.done():
+            props = request_json(f"http://127.0.0.1:{port}/props")
+            plan_context = props.get("resource_plan", {}).get("context")
+            if props.get("n_ctx") != plan_context:
+                raise RuntimeError(
+                    "/props exposed context and resource plan from different commits"
+                )
+            samples += 1
+            time.sleep(0.001)
+        result = future.result()
+    props = request_json(f"http://127.0.0.1:{port}/props")
+    if props.get("n_ctx") != props.get("resource_plan", {}).get("context"):
+        raise RuntimeError("/props exposed a split logical state after commit")
+    return result, samples + 1
+
+
 def resources(port: int) -> dict:
     return request_json(f"http://127.0.0.1:{port}/v1/ese/resources")
+
+
+def kv_geometry(snapshot: dict, include_occupancy: bool = False) -> dict:
+    kv = snapshot.get("kv", {})
+    keys = ["capacity_tokens", "max_capacity_tokens", "allocated_bytes"]
+    if include_occupancy:
+        keys.append("used_cells")
+    if any(not isinstance(kv.get(key), int) for key in keys):
+        raise RuntimeError(f"incomplete live KV accounting: {kv}")
+    return {key: kv[key] for key in keys}
+
+
+def expert_accounting(snapshot: dict) -> list[dict]:
+    devices = snapshot.get("devices", [])
+    if not devices:
+        raise RuntimeError("expert-cache validation requires at least one accelerator")
+    accounting = []
+    for device in devices:
+        cache = device.get("expert_cache", {})
+        item = {
+            "device": device.get("id"),
+            "capacity_bytes": cache.get("capacity_bytes"),
+            "allocated_bytes": cache.get("allocated_bytes"),
+            "resident_bytes": cache.get("resident_bytes"),
+        }
+        if not isinstance(item["device"], int) or any(
+            not isinstance(item[key], int)
+            for key in ("capacity_bytes", "allocated_bytes", "resident_bytes")
+        ):
+            raise RuntimeError(f"incomplete per-device expert accounting: {device}")
+        accounting.append(item)
+    return sorted(accounting, key=lambda item: item["device"])
+
+
+def exact_transaction_state(snapshot: dict) -> dict:
+    plan = snapshot.get("plan")
+    if not isinstance(plan, dict):
+        raise RuntimeError("resource snapshot omitted the serialized resource plan")
+    return {
+        "kv": kv_geometry(snapshot, include_occupancy=True),
+        "expert_cache": expert_accounting(snapshot),
+        "plan": plan,
+    }
+
+
+def require_serialized_plan(
+    snapshot: dict,
+    context: int,
+    expert_capacity: int,
+    expected_plan: dict | None = None,
+) -> dict:
+    plan = snapshot.get("plan")
+    if not isinstance(plan, dict) or plan.get("context") != context:
+        raise RuntimeError("serialized resource plan exposes stale context geometry")
+    live_devices = {item["device"] for item in expert_accounting(snapshot)}
+    plan_devices = {
+        item.get("id"): item
+        for item in plan.get("devices", [])
+        if item.get("id") in live_devices
+    }
+    if set(plan_devices) != live_devices or any(
+        item.get("expert_cache_bytes") != expert_capacity
+        for item in plan_devices.values()
+    ):
+        raise RuntimeError("serialized resource plan exposes stale expert-cache geometry")
+    if expected_plan is not None and plan != expected_plan:
+        raise RuntimeError("serialized resource plan differs from the committed response")
+    return plan
+
+
+def require_combined_preparation_peak(dry_run: dict) -> None:
+    peak = dry_run.get("preparation_peak", {})
+    if not peak.get("prepares_kv") or not peak.get("prepares_expert_cache"):
+        raise RuntimeError("combined dry run did not prepare both resource pools")
+    current_devices = {
+        item.get("id"): item for item in dry_run.get("current_plan", {}).get("devices", [])
+    }
+    target_devices = {
+        item.get("id"): item for item in dry_run.get("target_plan", {}).get("devices", [])
+    }
+    peak_devices = {item.get("id"): item for item in peak.get("devices", [])}
+    if not current_devices or set(current_devices) != set(target_devices) or set(
+        current_devices
+    ) != set(peak_devices):
+        raise RuntimeError("combined dry run returned inconsistent device topology")
+    for device_id, item in peak_devices.items():
+        current = current_devices[device_id]
+        target = target_devices[device_id]
+        expected = {
+            "target_live_bytes": target.get("planned_bytes"),
+            "prepared_kv_bytes": target.get("kv_bytes"),
+            "prepared_expert_cache_bytes": target.get("expert_cache_bytes"),
+        }
+        if any(item.get(key) != value for key, value in expected.items()):
+            raise RuntimeError(
+                f"combined preparation peak is inconsistent on device {device_id}: {item}"
+            )
+        current_live = item.get("current_live_bytes")
+        current_without_expert = (
+            current.get("planned_bytes", 0)
+            - current.get("expert_cache_bytes", 0)
+        )
+        if not isinstance(current_live, int) or current_live < current_without_expert:
+            raise RuntimeError(
+                f"combined preparation peak omitted realized live bytes on device {device_id}"
+            )
+        expected_peak = (
+            current_live
+            + expected["prepared_kv_bytes"]
+            + expected["prepared_expert_cache_bytes"]
+        )
+        usable = item.get("capacity_bytes", 0) - item.get("reserve_bytes", 0)
+        if (
+            item.get("peak_bytes") != expected_peak
+            or item.get("peak_headroom_bytes") != usable - expected_peak
+        ):
+            raise RuntimeError(
+                f"combined preparation peak arithmetic failed on device {device_id}: {item}"
+            )
 
 
 def require_geometry(snapshot: dict, active: int, maximum: int) -> None:
@@ -200,7 +388,12 @@ def require_geometry(snapshot: dict, active: int, maximum: int) -> None:
         raise RuntimeError("logical resource plan does not match the active KV geometry")
 
 
-def require_http_views(port: int, active: int, maximum: int) -> None:
+def require_http_views(
+    port: int,
+    active: int,
+    maximum: int,
+    expected_plan: dict | None = None,
+) -> None:
     props = request_json(f"http://127.0.0.1:{port}/props")
     if (
         props.get("n_ctx") != active
@@ -219,6 +412,8 @@ def require_http_views(port: int, active: int, maximum: int) -> None:
         or v1_models[0].get("max_model_len") != active
     ):
         raise RuntimeError("model discovery endpoints expose stale context geometry")
+    if expected_plan is not None and props.get("resource_plan") != expected_plan:
+        raise RuntimeError("/props exposes a stale serialized resource plan")
 
 
 def validate_success(args: argparse.Namespace) -> dict:
@@ -293,9 +488,7 @@ def validate_failure(args: argparse.Namespace) -> dict:
         after_hash = content_hash(after)
         if before_hash != after_hash:
             raise RuntimeError("failed transaction changed deterministic continuation")
-        message = failure.get("error", {}).get("message", "")
-        if "original cache remains active" not in message:
-            raise RuntimeError("failed transaction did not report rollback usability")
+        require_rollback_message(failure, "failed KV transaction")
         return {"output_sha256": before_hash, "failure_http": 500, "old_engine_usable": True}
     finally:
         server.stop()
@@ -307,28 +500,18 @@ def require_expert_capacity(
     require_resident: bool,
     required_resident_devices: set[int] | None = None,
 ) -> dict:
-    devices = snapshot.get("devices", [])
-    if not devices:
-        raise RuntimeError("expert-cache validation requires at least one accelerator")
-    summaries = []
-    for device in devices:
-        cache = device.get("expert_cache", {})
-        capacity = cache.get("capacity_bytes")
-        allocated = cache.get("allocated_bytes", expected + 1)
-        resident = cache.get("resident_bytes", 0)
+    summaries = expert_accounting(snapshot)
+    for item in summaries:
+        capacity = item["capacity_bytes"]
+        allocated = item["allocated_bytes"]
+        resident = item["resident_bytes"]
         if (
             capacity != expected
             or allocated > expected
             or resident > expected
             or (expected > 0 and allocated == 0)
         ):
-            raise RuntimeError(f"unexpected expert-cache accounting: {cache}")
-        summaries.append({
-            "device": device.get("id"),
-            "capacity_bytes": capacity,
-            "allocated_bytes": allocated,
-            "resident_bytes": resident,
-        })
+            raise RuntimeError(f"unexpected expert-cache accounting: {item}")
     resident_devices = {
         item["device"] for item in summaries if item["resident_bytes"] > 0
     }
@@ -351,31 +534,119 @@ def validate_expert_success(args: argparse.Namespace) -> dict:
         server.wait_ready()
         completion(port, args.predict, args.request_timeout)
         before = completion(port, args.predict, args.request_timeout)
-        initial_stats = require_expert_capacity(resources(port), initial, True)
+        initial_snapshot = resources(port)
+        require_geometry(initial_snapshot, args.context, args.context)
+        initial_geometry = kv_geometry(initial_snapshot)
+        initial_stats = require_expert_capacity(initial_snapshot, initial, True)
+        initial_plan = require_serialized_plan(
+            initial_snapshot, args.context, initial
+        )
+        require_http_views(port, args.context, args.context, initial_plan)
         resident_devices = {
             item["device"]
             for item in initial_stats["devices"]
             if item["resident_bytes"] > 0
         }
+        reconcile_dry = rebalance_expert(port, initial, True)
+        reconcile_peak = reconcile_dry.get("preparation_peak", {})
+        if not reconcile_peak.get("prepares_expert_cache") or any(
+            item.get("prepared_expert_cache_bytes") != initial
+            for item in reconcile_peak.get("devices", [])
+            if item.get("id", -1) >= 0
+        ):
+            raise RuntimeError(
+                "same-target expert reconciliation omitted preparation-peak accounting"
+            )
         reconcile = rebalance_expert(port, initial, False)
         if reconcile.get("scope") != "expert-cache-only" or reconcile.get("mutated") is not False:
             raise RuntimeError("explicit same-target expert-cache reconciliation was suppressed")
         if require_expert_capacity(resources(port), initial, True) != initial_stats:
             raise RuntimeError("same-target reconciliation changed a realized expert cache")
-        combined = request_json(
-            f"http://127.0.0.1:{port}/v1/ese/resources/rebalance",
-            {
-                "dry_run": False,
-                "context": args.target_context,
-                "expert_cache_bytes_per_device": target,
-            },
-            timeout=30,
-            expected_status=501,
+
+        combined_dry = rebalance_combined(
+            port, args.target_context, target, True
         )
-        if "one resource class" not in combined.get("error", {}).get("message", ""):
-            raise RuntimeError("combined mutation was not rejected at the explicit boundary")
-        require_geometry(resources(port), args.context, args.context)
-        require_expert_capacity(resources(port), initial, True)
+        combined_target = combined_dry.get("target_plan", {})
+        combined_target_devices = [
+            item
+            for item in combined_target.get("devices", [])
+            if item.get("id", -1) >= 0
+        ]
+        if (
+            combined_dry.get("mutated") is not False
+            or combined_dry.get("current_plan") != initial_plan
+            or combined_target.get("context") != args.target_context
+            or len(combined_target_devices) != len(initial_stats["devices"])
+            or any(
+                item.get("expert_cache_bytes") != target
+                for item in combined_target_devices
+            )
+        ):
+            raise RuntimeError("combined dry run did not preserve the exact requested target")
+        require_combined_preparation_peak(combined_dry)
+
+        combined_shrink, shrink_props_samples = rebalance_combined_observing_props(
+            port, args.target_context, target
+        )
+        if (
+            combined_shrink.get("status") != "committed"
+            or combined_shrink.get("scope") != "kv-and-expert"
+            or combined_shrink.get("previous_context") != args.context
+            or combined_shrink.get("current_context") != args.target_context
+            or combined_shrink.get("previous_expert_cache_bytes_per_device") != initial
+            or combined_shrink.get("current_expert_cache_bytes_per_device") != target
+            or not isinstance(combined_shrink.get("current_plan"), dict)
+        ):
+            raise RuntimeError("combined KV/expert shrink did not commit atomically")
+        combined_target_snapshot = resources(port)
+        require_geometry(combined_target_snapshot, args.target_context, args.context)
+        target_geometry = kv_geometry(combined_target_snapshot)
+        combined_target_stats = require_expert_capacity(
+            combined_target_snapshot, target, True, resident_devices
+        )
+        combined_target_plan = require_serialized_plan(
+            combined_target_snapshot,
+            args.target_context,
+            target,
+            combined_shrink.get("current_plan"),
+        )
+        require_http_views(
+            port, args.target_context, args.context, combined_target_plan
+        )
+        after_combined_shrink = completion(port, args.predict, args.request_timeout)
+
+        combined_grow, grow_props_samples = rebalance_combined_observing_props(
+            port, args.context, initial
+        )
+        if (
+            combined_grow.get("status") != "committed"
+            or combined_grow.get("scope") != "kv-and-expert"
+            or combined_grow.get("previous_context") != args.target_context
+            or combined_grow.get("current_context") != args.context
+            or combined_grow.get("previous_expert_cache_bytes_per_device") != target
+            or combined_grow.get("current_expert_cache_bytes_per_device") != initial
+            or not isinstance(combined_grow.get("current_plan"), dict)
+        ):
+            raise RuntimeError("combined KV/expert restore did not commit atomically")
+        combined_grown_snapshot = resources(port)
+        require_geometry(combined_grown_snapshot, args.context, args.context)
+        grown_geometry = kv_geometry(combined_grown_snapshot)
+        if grown_geometry != initial_geometry:
+            raise RuntimeError(
+                "combined round trip did not restore the exact load-time KV geometry"
+            )
+        combined_grown_stats = require_expert_capacity(
+            combined_grown_snapshot, initial, True, resident_devices
+        )
+        combined_grown_plan = require_serialized_plan(
+            combined_grown_snapshot,
+            args.context,
+            initial,
+            combined_grow.get("current_plan"),
+        )
+        require_http_views(port, args.context, args.context, combined_grown_plan)
+        after_combined_grow = completion(port, args.predict, args.request_timeout)
+
         dry = rebalance_expert(port, target, True)
         target_devices = dry.get("target_plan", {}).get("devices", [])
         if dry.get("mutated") is not False or not any(
@@ -391,16 +662,20 @@ def validate_expert_success(args: argparse.Namespace) -> dict:
         shrink = rebalance_expert(port, target, False)
         if shrink.get("status") != "committed" or shrink.get("scope") != "expert-cache-only":
             raise RuntimeError("prepared expert-cache shrink did not commit")
-        target_stats = require_expert_capacity(
-            resources(port), target, True, resident_devices
+        expert_target_snapshot = resources(port)
+        require_geometry(expert_target_snapshot, args.context, args.context)
+        expert_target_stats = require_expert_capacity(
+            expert_target_snapshot, target, True, resident_devices
         )
         after_shrink = completion(port, args.predict, args.request_timeout)
 
         grow = rebalance_expert(port, initial, False)
         if grow.get("status") != "committed" or grow.get("scope") != "expert-cache-only":
             raise RuntimeError("prepared expert-cache growth did not commit")
-        grown_stats = require_expert_capacity(
-            resources(port), initial, True, resident_devices
+        expert_grown_snapshot = resources(port)
+        require_geometry(expert_grown_snapshot, args.context, args.context)
+        expert_grown_stats = require_expert_capacity(
+            expert_grown_snapshot, initial, True, resident_devices
         )
         after_grow = completion(port, args.predict, args.request_timeout)
 
@@ -424,18 +699,50 @@ def validate_expert_success(args: argparse.Namespace) -> dict:
         )
 
         hashes = [content_hash(item) for item in (
-            before, after_shrink, after_grow, after_disable, after_enable
+            before,
+            after_combined_shrink,
+            after_combined_grow,
+            after_shrink,
+            after_grow,
+            after_disable,
+            after_enable,
         )]
         if len(set(hashes)) != 1:
-            raise RuntimeError("deterministic output changed across expert-cache replacements")
+            raise RuntimeError(
+                "deterministic output changed across combined or expert-cache replacements"
+            )
         return {
             "output_sha256": hashes[0],
-            "combined_boundary_http": 501,
+            "accelerator_count": len(initial_stats["devices"]),
+            "combined": {
+                "scope": "kv-and-expert",
+                "preparation_peak": combined_dry["preparation_peak"],
+                "shrink": {
+                    "kv": {"from": initial_geometry, "to": target_geometry},
+                    "expert_cache": {
+                        "from": initial_stats,
+                        "to": combined_target_stats,
+                    },
+                },
+                "restore": {
+                    "kv": {"from": target_geometry, "to": grown_geometry},
+                    "expert_cache": {
+                        "from": combined_target_stats,
+                        "to": combined_grown_stats,
+                    },
+                },
+                "serialized_plan_verified": True,
+                "http_views_verified": True,
+                "concurrent_props_samples": {
+                    "shrink": shrink_props_samples,
+                    "restore": grow_props_samples,
+                },
+            },
             "shrink": {"from": initial, "to": target},
             "grow": {"from": target, "to": initial},
             "initial": initial_stats,
-            "target": target_stats,
-            "grown": grown_stats,
+            "target": expert_target_stats,
+            "grown": expert_grown_stats,
             "disabled": disabled_stats,
             "re_enabled": enabled_stats,
         }
@@ -468,9 +775,7 @@ def validate_expert_failure(
         after_hash = content_hash(after)
         if before_hash != after_hash:
             raise RuntimeError("failed expert-cache replacement changed deterministic output")
-        message = failure.get("error", {}).get("message", "")
-        if "original cache remains active" not in message:
-            raise RuntimeError("failed expert-cache replacement did not report rollback usability")
+        require_rollback_message(failure, "failed expert-cache replacement")
         return {
             "injection": failure_kind,
             "output_sha256": before_hash,
@@ -478,6 +783,134 @@ def validate_expert_failure(
             "old_engine_usable": True,
             "before": before_stats,
             "after": after_stats,
+        }
+    finally:
+        server.stop()
+
+
+def validate_combined_failure(
+    args: argparse.Namespace,
+    failure_kind: str,
+    port_offset: int,
+) -> dict:
+    initial = args.expert_initial_mib * 1024 * 1024
+    target = args.expert_target_mib * 1024 * 1024
+    port = args.port + port_offset
+    server = Server(args, port, failure_kind=failure_kind, expert_mode=True)
+    try:
+        server.wait_ready()
+        completion(port, args.predict, args.request_timeout)
+        before = completion(port, args.predict, args.request_timeout)
+        before_snapshot = resources(port)
+        require_geometry(before_snapshot, args.context, args.context)
+        before_stats = require_expert_capacity(before_snapshot, initial, True)
+        resident_devices = {
+            item["device"]
+            for item in before_stats["devices"]
+            if item["resident_bytes"] > 0
+        }
+        before_geometry = kv_geometry(before_snapshot)
+        before_plan = require_serialized_plan(
+            before_snapshot, args.context, initial
+        )
+        before_state = exact_transaction_state(before_snapshot)
+
+        failure = rebalance_combined(
+            port,
+            args.target_context,
+            target,
+            False,
+            expected_status=500,
+        )
+
+        # This snapshot must precede any completion: KV occupancy and expert
+        # residency are part of the rollback invariant, not eventual state.
+        immediate_snapshot = resources(port)
+        immediate_state = exact_transaction_state(immediate_snapshot)
+        if immediate_state != before_state:
+            raise RuntimeError(
+                f"{failure_kind} changed live KV, expert, or plan state before recovery: "
+                f"before={before_state}, after={immediate_state}"
+            )
+        require_geometry(immediate_snapshot, args.context, args.context)
+        require_expert_capacity(immediate_snapshot, initial, True)
+        require_serialized_plan(
+            immediate_snapshot, args.context, initial, before_plan
+        )
+        require_http_views(port, args.context, args.context, before_plan)
+        request_json(f"http://127.0.0.1:{port}/health")
+        recovery_dry_run = rebalance_combined(
+            port, args.target_context, target, True
+        )
+        require_combined_preparation_peak(recovery_dry_run)
+
+        after = completion(port, args.predict, args.request_timeout)
+        before_hash = content_hash(before)
+        after_hash = content_hash(after)
+        if before_hash != after_hash:
+            raise RuntimeError(
+                f"{failure_kind} changed deterministic output after rollback"
+            )
+        recovered_snapshot = resources(port)
+        require_geometry(recovered_snapshot, args.context, args.context)
+        require_expert_capacity(recovered_snapshot, initial, True)
+        require_serialized_plan(
+            recovered_snapshot, args.context, initial, before_plan
+        )
+        require_http_views(port, args.context, args.context, before_plan)
+        require_rollback_message(failure, failure_kind)
+
+        # Every test fault is one-shot. A successful target commit and exact
+        # restore in this same process prove that rollback released both opaque
+        # transaction owners instead of merely leaving inference usable.
+        retry = rebalance_combined(
+            port, args.target_context, target, False
+        )
+        if retry.get("status") != "committed" or retry.get("scope") != "kv-and-expert":
+            raise RuntimeError(
+                f"{failure_kind} left a transaction owner that blocked retry"
+            )
+        retry_snapshot = resources(port)
+        require_geometry(retry_snapshot, args.target_context, args.context)
+        require_expert_capacity(retry_snapshot, target, True, resident_devices)
+        retry_plan = require_serialized_plan(
+            retry_snapshot,
+            args.target_context,
+            target,
+            retry.get("current_plan"),
+        )
+        require_http_views(port, args.target_context, args.context, retry_plan)
+
+        restore = rebalance_combined(port, args.context, initial, False)
+        if restore.get("status") != "committed" or restore.get("scope") != "kv-and-expert":
+            raise RuntimeError(f"{failure_kind} retry could not restore initial resources")
+        restored_snapshot = resources(port)
+        require_geometry(restored_snapshot, args.context, args.context)
+        if kv_geometry(restored_snapshot) != before_geometry:
+            raise RuntimeError(f"{failure_kind} retry changed KV allocation geometry")
+        require_expert_capacity(restored_snapshot, initial, True, resident_devices)
+        restored_plan = require_serialized_plan(
+            restored_snapshot,
+            args.context,
+            initial,
+            restore.get("current_plan"),
+        )
+        require_http_views(port, args.context, args.context, restored_plan)
+        after_retry = completion(port, args.predict, args.request_timeout)
+        if content_hash(after_retry) != before_hash:
+            raise RuntimeError(
+                f"{failure_kind} retry/restore changed deterministic output"
+            )
+        return {
+            "injection": failure_kind,
+            "output_sha256": before_hash,
+            "failure_http": 500,
+            "exact_pre_completion_state_restored": True,
+            "serialized_plan_restored": True,
+            "http_endpoints_usable": True,
+            "same_process_retry_committed": True,
+            "same_process_restore_committed": True,
+            "state": before_state,
         }
     finally:
         server.stop()
@@ -528,6 +961,7 @@ def main() -> int:
     failure = validate_failure(args)
     expert = None
     if args.expert_initial_mib:
+        committed_path = validate_expert_success(args)
         failures = {
             "first_resident_copy": validate_expert_failure(args),
         }
@@ -535,12 +969,25 @@ def main() -> int:
             failures["after_prepared_devices"] = validate_expert_failure(
                 args, failure_kind="expert-device", port_offset=4
             )
+        combined_failures = {
+            stage: validate_combined_failure(args, stage, 10 + index)
+            for index, stage in enumerate(COMBINED_FAILURE_STAGES)
+        }
+        if committed_path["accelerator_count"] >= 2:
+            combined_failures["after_first_published_expert_device"] = (
+                validate_combined_failure(
+                    args,
+                    failure_kind="expert-published-device",
+                    port_offset=10 + len(COMBINED_FAILURE_STAGES),
+                )
+            )
         expert = {
-            "committed_path": validate_expert_success(args),
+            "committed_path": committed_path,
             "injected_failures": failures,
+            "combined_injected_failures": combined_failures,
         }
     report = {
-        "schema": 1,
+        "schema": 2,
         "status": "pass",
         "model": str(args.model.resolve()),
         "model_sha256": sha256_file(args.model),

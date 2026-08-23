@@ -109,6 +109,7 @@ class NativeSurfaceTests(unittest.TestCase):
         self.assertIn("llama_kv_cache_transaction_rollback", public_header)
         self.assertIn("llama_kv_cache_transaction_finalize", public_header)
         self.assertIn("llama_kv_cache_transaction_free", public_header)
+        self.assertIn("llama_expert_cache_transaction_t", public_header)
         self.assertIn("llama_expert_cache_prepare_resize", public_header)
         self.assertIn("llama_expert_cache_transaction_publish", public_header)
         self.assertIn("llama_expert_cache_transaction_rollback", public_header)
@@ -121,6 +122,7 @@ class NativeSurfaceTests(unittest.TestCase):
         self.assertIn("active_expert_cache_transaction", llama_source)
         self.assertIn("ggml_backend_sched_get_resource_device_stats", backend_header)
         self.assertIn("ggml_backend_sched_replace_expert_cache", backend_header)
+        self.assertIn("ggml_backend_sched_expert_cache_txn_t", backend_header)
         self.assertIn("ggml_backend_sched_expert_cache_prepare", backend_header)
         self.assertIn("ggml_backend_sched_expert_cache_publish", backend_header)
         self.assertIn("ggml_backend_sched_expert_cache_rollback", backend_header)
@@ -131,15 +133,66 @@ class NativeSurfaceTests(unittest.TestCase):
         self.assertIn("task.type = SERVER_TASK_TYPE_METRICS", server)
         self.assertIn("task.type = SERVER_TASK_TYPE_RESOURCE_REBALANCE", server)
         self.assertIn("common_resource_rebalance_target", server)
+        self.assertIn('"kv-and-expert"', server)
         self.assertIn('res.data["resources"]', context)
         self.assertIn('"mutation_enabled", true', context)
-        self.assertIn("llama_kv_cache_resize(ctx, target_context)", context)
-        self.assertIn("llama_expert_cache_resize(ctx, target_expert_cache)", context)
-        self.assertIn("KV resize transaction failed; the original cache remains active", context)
+        self.assertIn('"idle-atomic-multi-pool"', context)
+        self.assertIn('"combined_mutation", true', context)
+        self.assertIn("llama_kv_cache_prepare_resize", context)
+        self.assertIn("llama_expert_cache_prepare_resize", context)
+        self.assertIn("llama_kv_cache_transaction_publish", context)
+        self.assertIn("llama_expert_cache_transaction_publish", context)
+        self.assertIn("llama_expert_cache_transaction_rollback", context)
+        self.assertIn("llama_kv_cache_transaction_rollback", context)
+        self.assertIn("llama_expert_cache_transaction_finalize", context)
+        self.assertIn("llama_kv_cache_transaction_finalize", context)
+        self.assertIn("ESE_RESOURCE_REBALANCE_FAIL_STAGE", context)
+        self.assertIn("published_resource_state", context)
+        self.assertIn("logical_publish_lock(resource_plan_mutex)", context)
+        self.assertIn("compare_exchange_strong", context)
+        for boundary in (
+            "after-kv-prepare",
+            "after-expert-prepare",
+            "after-kv-publish",
+            "before-logical-publish",
+        ):
+            with self.subTest(boundary=boundary):
+                self.assertIn(boundary, context)
         self.assertIn("ESE_TURBO_RETIER_FAIL_AFTER_ROWS", validator)
         self.assertIn("ESE_EXPERT_CACHE_REPLACE_FAIL_AFTER_COPIES", validator)
         self.assertIn("ESE_EXPERT_CACHE_REPLACE_FAIL_AFTER_DEVICES", validator)
+        self.assertIn("ESE_RESOURCE_REBALANCE_FAIL_STAGE", validator)
+        self.assertIn(
+            "ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES",
+            validator,
+        )
+        self.assertIn('"scope": "kv-and-expert"', validator)
+        self.assertIn("exact_pre_completion_state_restored", validator)
+        self.assertIn("same_process_retry_committed", validator)
+        self.assertIn("same_process_restore_committed", validator)
+        self.assertIn("rebalance_combined_observing_props", validator)
         self.assertIn("busy_rejection_http", validator)
+
+        # Physical publication stays reversible until both pools are live;
+        # rollback runs in reverse order and the logical plan is published last.
+        self.assertLess(
+            context.index("llama_kv_cache_prepare_resize"),
+            context.index("llama_expert_cache_prepare_resize"),
+        )
+        self.assertLess(
+            context.index("llama_kv_cache_transaction_publish"),
+            context.index("llama_expert_cache_transaction_publish"),
+        )
+        self.assertLess(
+            context.index("llama_expert_cache_transaction_rollback"),
+            context.index("llama_kv_cache_transaction_rollback"),
+        )
+        self.assertLess(
+            context.index("llama_kv_cache_transaction_finalize"),
+            context.index(
+                "params_base.resolved_resource_plan_json = std::move(target_plan_text)"
+            ),
+        )
 
         backend = (root / "ggml" / "src" / "ggml-backend.cpp").read_text(
             encoding="utf-8"

@@ -1025,9 +1025,82 @@ int main(int argc, char ** argv) {
                 return;
             }
 
+            // Preparation peaks use realized live cache allocations rather
+            // than trusting only the serialized policy. This covers legacy
+            // slot mode and same-target repair requests whose physical cache
+            // can legitimately differ from the plan being reconciled.
+            common_resource_plan preparation_current = current;
+            common_resource_plan preparation_target = target;
+            for (auto & device : preparation_current.devices) {
+                if (device.id < 0) {
+                    continue;
+                }
+                const auto realized = std::find_if(
+                    resources.at("devices").begin(),
+                    resources.at("devices").end(),
+                    [&device](const json & item) {
+                        return item.value("id", -1) == device.id;
+                    });
+                if (realized == resources.at("devices").end()) {
+                    res_err(res, format_error_response(
+                        "live resource snapshot omitted an accelerator from the plan",
+                        ERROR_TYPE_SERVER));
+                    return;
+                }
+                const uint64_t allocated = realized->at("expert_cache")
+                    .at("allocated_bytes").get<uint64_t>();
+                if (device.planned_bytes < device.expert_cache_bytes ||
+                        allocated > UINT64_MAX -
+                            (device.planned_bytes - device.expert_cache_bytes)) {
+                    res_err(res, format_error_response(
+                        "realized expert-cache accounting overflows the current plan",
+                        ERROR_TYPE_SERVER));
+                    return;
+                }
+                device.planned_bytes =
+                    device.planned_bytes - device.expert_cache_bytes + allocated;
+                device.expert_cache_bytes = allocated;
+                const uint64_t usable = device.capacity_bytes >= device.reserve_bytes
+                    ? device.capacity_bytes - device.reserve_bytes : 0;
+                device.headroom_bytes = device.planned_bytes <= usable
+                    ? usable - device.planned_bytes : 0;
+
+                // A KV-only transaction keeps the realized expert cache as-is;
+                // mirror it into the accounting target so the peak counts the
+                // live bytes without inventing an expert replacement.
+                if (!request.set_expert_cache_bytes_per_device) {
+                    auto target_device = std::find_if(
+                        preparation_target.devices.begin(),
+                        preparation_target.devices.end(),
+                        [&device](const common_resource_device_plan & item) {
+                            return item.id == device.id;
+                        });
+                    if (target_device == preparation_target.devices.end() ||
+                            target_device->planned_bytes < target_device->expert_cache_bytes ||
+                            allocated > UINT64_MAX -
+                                (target_device->planned_bytes - target_device->expert_cache_bytes)) {
+                        res_err(res, format_error_response(
+                            "realized expert-cache accounting cannot be applied to the target plan",
+                            ERROR_TYPE_SERVER));
+                        return;
+                    }
+                    target_device->planned_bytes =
+                        target_device->planned_bytes - target_device->expert_cache_bytes + allocated;
+                    target_device->expert_cache_bytes = allocated;
+                    const uint64_t target_usable =
+                        target_device->capacity_bytes >= target_device->reserve_bytes
+                        ? target_device->capacity_bytes - target_device->reserve_bytes : 0;
+                    target_device->headroom_bytes =
+                        target_device->planned_bytes <= target_usable
+                        ? target_usable - target_device->planned_bytes : 0;
+                }
+            }
+
             common_resource_preparation_peak preparation_peak;
             if (!common_resource_rebalance_preparation_peak(
-                        current, target, preparation_peak, error)) {
+                        preparation_current, preparation_target,
+                        preparation_peak, error,
+                        request.set_expert_cache_bytes_per_device)) {
                 res_err(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
@@ -1054,19 +1127,12 @@ int main(int argc, char ** argv) {
                 expert_cache_change |= current.devices[index].expert_cache_bytes !=
                     target.devices[index].expert_cache_bytes;
             }
-            if (context_change && expert_cache_change) {
-                res_err(res, format_error_response(
-                    "combined KV/expert mutation is not enabled yet; submit one resource class per transaction",
-                    ERROR_TYPE_NOT_SUPPORTED));
-                return;
-            }
-
             // An explicit same-plan expert target is a reconciliation request:
             // the owner thread must verify realized per-device allocations
             // (and an explicit zero must disable legacy slot mode) instead of
             // trusting only the serialized policy.
             const bool expert_cache_operation = expert_cache_change ||
-                    (request.set_expert_cache_bytes_per_device && !context_change);
+                    request.set_expert_cache_bytes_per_device;
             if (!context_change && !expert_cache_operation) {
                 res_ok(res, {
                     {"status", "committed"},
@@ -1079,10 +1145,21 @@ int main(int argc, char ** argv) {
                 return;
             }
 
-            const std::string scope = expert_cache_operation ? "expert-cache-only" : "kv-only";
-            target.reason = expert_cache_operation
-                ? "idle-only prepared expert-cache replacement target"
-                : "idle-only runtime KV rebalance target";
+            const bool combined_operation = context_change && expert_cache_operation;
+            const std::string scope = combined_operation
+                ? "kv-and-expert"
+                : (expert_cache_operation ? "expert-cache-only" : "kv-only");
+            if (!context_change && !expert_cache_change) {
+                // Same-target reconciliation repairs realized state without
+                // manufacturing a logical-plan mutation.
+                target.reason = current.reason;
+            } else {
+                target.reason = combined_operation
+                    ? "idle-only atomic KV and expert-cache replacement target"
+                    : (expert_cache_operation
+                        ? "idle-only prepared expert-cache replacement target"
+                        : "idle-only runtime KV rebalance target");
+            }
             target_json = json::parse(common_resource_plan_json(target));
             server_task task;
             task.id = ctx_server.queue_tasks.get_new_id();
@@ -1373,6 +1450,7 @@ int main(int argc, char ** argv) {
                 "upload-drift" : hybrid_guard_code == LLAMA_EXPERT_HYBRID_GUARD_MONITORING ?
                 "within-calibrated-bounds" : "not-active";
 
+        const auto published_resources = ctx_server.published_resource_state();
         json data = {
             { "system_prompt",               ctx_server.system_prompt.c_str() },
             { "model_alias",                 ctx_server.params_base.model_alias },
@@ -1389,7 +1467,7 @@ int main(int argc, char ** argv) {
                 {"vision", ctx_server.chat_params.allow_image},
                 {"audio",  ctx_server.chat_params.allow_audio},
             } },
-            { "n_ctx",                       ctx_server.n_ctx_published.load(std::memory_order_acquire) },
+            { "n_ctx",                       published_resources.first },
             { "n_ctx_max",                   ctx_server.n_ctx_max },
             { "cors_proxy_enabled",          ctx_server.params_base.webui_mcp_proxy},
             { "expert_hybrid_guard", json {
@@ -1404,7 +1482,7 @@ int main(int argc, char ** argv) {
 
         };
 
-        const std::string plan_json = ctx_server.resource_plan_json();
+        const std::string & plan_json = published_resources.second;
         if (!plan_json.empty()) {
             data["resource_plan"] = json::parse(plan_json);
         }

@@ -923,7 +923,8 @@ bool common_resource_rebalance_preparation_peak(
         const common_resource_plan & current,
         const common_resource_plan & target,
         common_resource_preparation_peak & report,
-        std::string & error) {
+        std::string & error,
+        bool force_expert_cache_preparation) {
     error.clear();
     if (current.devices.empty() || current.devices.size() != target.devices.size()) {
         error = "current and target resource plans have different device topologies";
@@ -932,6 +933,7 @@ bool common_resource_rebalance_preparation_peak(
 
     common_resource_preparation_peak candidate;
     candidate.prepares_kv = current.context != target.context;
+    candidate.prepares_expert_cache = force_expert_cache_preparation;
     for (size_t index = 0; index < current.devices.size(); ++index) {
         const auto & live = current.devices[index];
         const auto & next = target.devices[index];

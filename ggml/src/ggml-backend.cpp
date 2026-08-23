@@ -2627,10 +2627,17 @@ static int64_t ggml_active_expert_cache_replace_failure_device() {
 static int64_t ggml_active_expert_cache_transaction_failure_published_devices() {
     const char * value = getenv(
             "ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES");
-    if (value == nullptr || value[0] == '\0') return -1;
+    static std::atomic<bool> consumed{false};
+    if (value == nullptr || value[0] == '\0') {
+        consumed.store(false, std::memory_order_relaxed);
+        return -1;
+    }
     char * end = nullptr;
     const long long parsed = strtoll(value, &end, 10);
-    return end != value && *end == '\0' && parsed >= 0 ? parsed : -1;
+    if (end == value || *end != '\0' || parsed < 0) return -1;
+    bool expected = false;
+    return consumed.compare_exchange_strong(
+            expected, true, std::memory_order_relaxed) ? parsed : -1;
 }
 
 static bool ggml_active_expert_cache_same_layout(

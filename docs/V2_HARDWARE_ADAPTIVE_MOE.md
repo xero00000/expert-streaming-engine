@@ -274,11 +274,12 @@ staging capacity, allocation and residency alongside the resolved global plan.
 `expert_cache_bytes_per_device`, prove integer accounting and per-device reserve
 bounds, reject targets smaller than live KV occupancy, and return current and
 target plans. Dry runs also prove the server's immutable load-time KV maximum.
-An explicit `"dry_run": false` can commit one resource class while every slot
-is idle and the deferred queue is empty. The existing off-to-the-side KV
-replacement migrates occupied rows before publication; allocation, conversion,
-or injected migration failure leaves the old cache and logical plan active.
-Per-slot logical limits are changed only after publication.
+An explicit `"dry_run": false` can commit KV, expert cache, or both resource
+classes atomically while every slot is idle and the deferred queue is empty.
+The off-to-the-side KV replacement migrates occupied rows before publication;
+allocation, conversion, or injected migration failure leaves the old cache and
+logical plan active. Per-slot logical limits are changed only after both
+requested physical pools finalize.
 
 The KV replacement exposes an opaque reversible transaction through
 `llama_kv_cache_prepare_resize()` / `llama_kv_cache_prepare_retier()` and the
@@ -301,8 +302,9 @@ old configuration. Zero disables the cache, and a later nonzero target prepares
 it from a persistent value-only layout and route-capacity catalog (never
 scratch-graph tensor pointers). Unknown fields, signed/overflowing values,
 non-whole per-slot context, reserve violations, and unavailable target
-allocations fail closed. A request that changes both KV and expert-cache
-geometry is explicitly rejected until the common publication boundary exists.
+allocations fail closed. Preparation-peak accounting uses realized live cache
+allocations, so a same-target repair or legacy slot allocation cannot bypass a
+device reserve merely because the serialized plan differs from physical state.
 
 The replacement is exposed as an opaque reversible transaction at both the
 GGML scheduler and public llama-context boundaries: `prepare` owns complete
@@ -314,8 +316,8 @@ automatically rolls it back. Only one transaction may be open for a scheduler
 or context. Context teardown releases it before scheduler/backend destruction.
 A monotonic layout/route catalog generation rejects a prepared cache if graph
 geometry changed before publication, and the legacy one-call replacement
-remains a prepare -> publish -> finalize wrapper. This is the expert-cache half
-of the next combined KV/expert commit boundary.
+remains a prepare -> publish -> finalize wrapper. The server composes this with
+the KV transaction under the shared publication boundary described below.
 
 A local CPU TinyMoE endpoint trial reported the actual 30 MiB KV allocation and
 64 MiB bounded RAM tier. After a 1,502-token prompt, a two-token target was
@@ -356,9 +358,9 @@ unfused reduction reproduced the uncached output exactly. Both bounded byte
 capacity and legacy `LLAMA_EXPERT_GPU_CACHE_SLOTS=4` launches are covered by
 the parity gate; the fusion must remain off until an equivalent full-model
 proof passes.
-The next step is a single combined KV/expert commit boundary followed by
-transient-pool policy. Phase D remains incomplete until those resources meet
-the same failure-atomic endpoint gate.
+The remaining Phase D step is transient-pool policy. KV and expert cache now
+meet the shared failure-atomic endpoint gate; transient resources must reach
+the same standard before Phase D is complete.
 
 ### Combined KV/expert publication contract
 
@@ -371,9 +373,11 @@ old pools remain live until the transaction is irreversible.
 The combined implementation is split into reversible pool transactions. Each
 pool has four states: prepare off-side, publish by ownership swap, roll back by
 the inverse swap, and finalize by retiring the old allocation. The owner thread
-must prepare both pools, synchronize their migrations, publish KV, publish all
-expert devices, then update context/configuration and the serialized plan as a
-single final step. No inference task can run between those operations.
+prepares both pools, synchronizes their migrations, publishes KV, publishes all
+expert devices, then updates context/configuration and the serialized plan as a
+single mutex-protected snapshot. No inference task can run between those
+operations, and concurrent `/props` readers cannot combine state from two
+commits.
 
 Failure injection must cover both preparation and reversible publication:
 
@@ -383,14 +387,21 @@ Failure injection must cover both preparation and reversible publication:
 4. after expert device N publication;
 5. after both physical pools publish but before logical configuration publish.
 
-Every failure gate must retain the old context, per-device cache accounting,
+Every failure gate retains the old context, per-device cache accounting,
 resource-plan JSON, deterministic output hash, and a usable inference engine.
-Only after this matrix passes on one Ampere GPU and the mixed Turing/Ampere
-topology may the endpoint stop rejecting combined requests.
+Faults are one-shot so the same server must then commit the target and restore
+the initial plan, proving that no opaque transaction owner leaked.
+
+The model-backed gate passed on one RTX 3060 Ti and on the mixed RTX 2080
+SUPER/RTX 3060 Ti/RTX 3080 topology. Both ran 1,024 -> 512 -> 1,024 KV and
+8 MiB -> 4 MiB -> 8 MiB per-device expert-cache transactions with identical
+deterministic output. The mixed run also restored all three devices after one
+expert device had published. Concurrent `/props` sampling observed 97 coherent
+snapshots in the single-Ampere run and 60 in the mixed run.
 
 ## Later phases
 
-1. Complete Phase D live KV/expert/transient resource rebalancing.
+1. Complete Phase D live transient-resource rebalancing.
 2. Phase E: optional aligned FastStore sidecar bound to GGUF identity.
 3. Phase F: semantic cache anchors and newer hardware kernels.
 

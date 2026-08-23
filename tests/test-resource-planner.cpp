@@ -295,6 +295,30 @@ void test_preparation_peak_reports_single_pool_replacement() {
     REQUIRE(json.find("\"peak_headroom_bytes\":20971520") != std::string::npos);
 }
 
+void test_preparation_peak_counts_same_target_expert_reconciliation() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 25*MiB);
+    const auto target = current;
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(common_resource_rebalance_preparation_peak(
+            current, target, report, error, true));
+    REQUIRE(report.prepares_expert_cache);
+    REQUIRE(report.devices.front().current_live_bytes == 55*MiB);
+    REQUIRE(report.devices.front().prepared_expert_cache_bytes == 25*MiB);
+    REQUIRE(report.devices.front().peak_bytes == 80*MiB);
+    REQUIRE(report.devices.front().peak_headroom_bytes == 10*MiB);
+}
+
+void test_preparation_peak_rejects_same_target_expert_reconciliation_without_headroom() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 35*MiB);
+    const auto target = current;
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(!common_resource_rebalance_preparation_peak(
+            current, target, report, error, true));
+    REQUIRE(error.find("preparation peak crosses") != std::string::npos);
+}
+
 void test_preparation_peak_rejects_combined_cross_pool_trade() {
     const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 50*MiB, 10*MiB);
     const auto target = runtime_plan(100*MiB, 10*MiB, 10*MiB, 10*MiB, 50*MiB, 8192);
@@ -590,6 +614,8 @@ int main() {
     test_preparation_peak_detects_u64_overflow_without_mutating_report();
     test_preparation_peak_accepts_exact_reserve_boundary();
     test_preparation_peak_reports_single_pool_replacement();
+    test_preparation_peak_counts_same_target_expert_reconciliation();
+    test_preparation_peak_rejects_same_target_expert_reconciliation_without_headroom();
     test_preparation_peak_rejects_combined_cross_pool_trade();
     test_interface_parsers();
     test_compatibility_presets_and_host_budget();

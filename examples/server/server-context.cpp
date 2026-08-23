@@ -17,6 +17,23 @@
 #include <iostream>
 #include <regex>
 #include <exception>
+#include <cstdlib>
+#include <string_view>
+
+static bool server_resource_rebalance_fail_at(std::string_view boundary) noexcept {
+    const char * requested = std::getenv("ESE_RESOURCE_REBALANCE_FAIL_STAGE");
+    static std::atomic<bool> consumed{false};
+    if (requested == nullptr || requested[0] == '\0') {
+        consumed.store(false, std::memory_order_relaxed);
+        return false;
+    }
+    if (std::string_view(requested) != boundary) {
+        return false;
+    }
+    bool expected = false;
+    return consumed.compare_exchange_strong(
+            expected, true, std::memory_order_relaxed);
+}
 
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min, llama_pos pos_max, int32_t offset) {
     ckpt.pos_min = pos_min;
@@ -281,9 +298,12 @@ std::string server_context::resource_plan_json() const {
     return params_base.resolved_resource_plan_json;
 }
 
-void server_context::publish_resource_plan_json(std::string value) {
+std::pair<int32_t, std::string> server_context::published_resource_state() const {
     std::lock_guard<std::mutex> lock(resource_plan_mutex);
-    params_base.resolved_resource_plan_json = std::move(value);
+    return {
+        n_ctx_published.load(std::memory_order_relaxed),
+        params_base.resolved_resource_plan_json,
+    };
 }
 
 void server_context::init() {
@@ -3145,9 +3165,9 @@ void server_context::process_single_task(server_task&& task) {
             {"devices", std::move(devices)},
             {"runtime_rebalance", {
                 {"mutation_enabled", true},
-                {"mode", "idle-single-pool"},
+                {"mode", "idle-atomic-multi-pool"},
                 {"mutable_pools", {"kv", "expert-cache"}},
-                {"combined_mutation", false},
+                {"combined_mutation", true},
                 {"dry_run_endpoint", "/v1/ese/resources/rebalance"},
             }},
         };
@@ -3220,7 +3240,8 @@ void server_context::process_single_task(server_task&& task) {
         }
 
         const std::string scope = task.data.at("scope").get<std::string>();
-        if (scope != "kv-only" && scope != "expert-cache-only") {
+        if (scope != "kv-only" && scope != "expert-cache-only" &&
+                scope != "kv-and-expert") {
             fail("unsupported runtime rebalance scope", ERROR_TYPE_INVALID_REQUEST);
             break;
         }
@@ -3260,34 +3281,15 @@ void server_context::process_single_task(server_task&& task) {
             }
         }
 
-        bool mutated = false;
-        if (scope == "expert-cache-only") {
-            if (!llama_expert_cache_resize(ctx, target_expert_cache)) {
-                fail(
-                    "expert-cache replacement failed; the original cache remains active",
-                    ERROR_TYPE_SERVER);
-                break;
-            }
-            mutated = previous_expert_cache != target_expert_cache;
-        } else {
-            if (!llama_kv_cache_resize(ctx, target_context)) {
-                fail(
-                    "KV resize transaction failed; the original cache remains active",
-                    ERROR_TYPE_SERVER);
-                break;
-            }
-            for (server_slot & slot : slots) {
-                slot.n_ctx = int32_t(target_slot_context);
-                if (slot.cache_tokens.size() > target_slot_context) {
-                    slot.cache_tokens.resize(target_slot_context);
-                }
-            }
-            n_ctx = int32_t(target_context);
-            n_ctx_published.store(n_ctx, std::memory_order_release);
-            mutated = previous_context != target_context;
-        }
-        publish_resource_plan_json(task.data.at("target_plan").dump());
+        const bool replace_kv = scope == "kv-only" || scope == "kv-and-expert";
+        const bool replace_expert = scope == "expert-cache-only" || scope == "kv-and-expert";
+        const bool mutated = (replace_kv && previous_context != target_context) ||
+                (replace_expert && previous_expert_cache != target_expert_cache);
 
+        // Allocate every response and logical-plan object before publication.
+        // Once the old pools are finalized, the remaining logical commit is a
+        // sequence of scalar writes, vector shrinks, and ownership moves.
+        std::string target_plan_text = task.data.at("target_plan").dump();
         server_task_result result;
         result.id = task.id;
         result.id_multi = task.id_multi;
@@ -3297,15 +3299,144 @@ void server_context::process_single_task(server_task&& task) {
             {"status", "committed"},
             {"dry_run", false},
             {"mutated", mutated},
-            {"transaction", "prepare-migrate-commit"},
+            {"transaction", "prepare-publish-finalize"},
             {"scope", scope},
             {"previous_context", previous_context},
-            {"current_context", llama_kv_cache_size(ctx)},
+            {"current_context", replace_kv ? target_context : previous_context},
             {"previous_expert_cache_bytes_per_device", previous_expert_cache},
             {"current_expert_cache_bytes_per_device",
-                scope == "expert-cache-only" ? target_expert_cache : previous_expert_cache},
+                replace_expert ? target_expert_cache : previous_expert_cache},
             {"current_plan", task.data.at("target_plan")},
         };
+
+        struct transaction_scope {
+            llama_kv_cache_transaction_t kv = nullptr;
+            llama_expert_cache_transaction_t expert = nullptr;
+            bool kv_published = false;
+            bool expert_published = false;
+
+            ~transaction_scope() noexcept {
+                clear();
+            }
+
+            bool roll_back() noexcept {
+                bool restored = true;
+                if (expert_published) {
+                    restored &= llama_expert_cache_transaction_rollback(expert);
+                    expert_published = false;
+                }
+                if (kv_published) {
+                    restored &= llama_kv_cache_transaction_rollback(kv);
+                    kv_published = false;
+                }
+                return restored;
+            }
+
+            void clear() noexcept {
+                llama_expert_cache_transaction_free(expert);
+                expert = nullptr;
+                llama_kv_cache_transaction_free(kv);
+                kv = nullptr;
+            }
+        } transaction;
+
+        const auto abort_transaction = [&](const char * message) {
+            const bool restored = transaction.roll_back();
+            transaction.clear();
+            if (!restored) {
+                GGML_ABORT("resource transaction rollback invariant failed\n");
+            }
+            // Construct the error only after every reversible owner is gone.
+            fail(message, ERROR_TYPE_SERVER);
+        };
+
+        if (replace_kv) {
+            transaction.kv = llama_kv_cache_prepare_resize(ctx, target_context);
+            if (transaction.kv == nullptr) {
+                abort_transaction(
+                    "KV preparation failed; the original resources remain active");
+                break;
+            }
+            if (server_resource_rebalance_fail_at("after-kv-prepare")) {
+                abort_transaction(
+                    "injected failure after KV preparation; the original resources remain active");
+                break;
+            }
+        }
+
+        if (replace_expert) {
+            transaction.expert = llama_expert_cache_prepare_resize(ctx, target_expert_cache);
+            if (transaction.expert == nullptr) {
+                abort_transaction(
+                    "expert-cache preparation failed; the original resources remain active");
+                break;
+            }
+            if (server_resource_rebalance_fail_at("after-expert-prepare")) {
+                abort_transaction(
+                    "injected failure after expert-cache preparation; the original resources remain active");
+                break;
+            }
+        }
+
+        if (replace_kv) {
+            if (!llama_kv_cache_transaction_publish(transaction.kv)) {
+                abort_transaction(
+                    "KV publication failed; the original resources remain active");
+                break;
+            }
+            transaction.kv_published = true;
+            if (server_resource_rebalance_fail_at("after-kv-publish")) {
+                abort_transaction(
+                    "injected failure after KV publication; the original resources were restored");
+                break;
+            }
+        }
+
+        if (replace_expert) {
+            if (!llama_expert_cache_transaction_publish(transaction.expert)) {
+                abort_transaction(
+                    "expert-cache publication failed; the original resources were restored");
+                break;
+            }
+            transaction.expert_published = true;
+        }
+
+        if (server_resource_rebalance_fail_at("before-logical-publish")) {
+            abort_transaction(
+                "injected failure before logical publication; the original resources were restored");
+            break;
+        }
+
+        // Both physical pools are live and still reversible. Acquire the
+        // logical publication lock before making either pool irreversible;
+        // lock failure therefore unwinds through the scope and rolls both back.
+        // Everything after finalization is a no-allocation scalar write,
+        // vector shrink, or ownership move under one reader-visible snapshot.
+        {
+            std::lock_guard<std::mutex> logical_publish_lock(resource_plan_mutex);
+            if (replace_expert &&
+                    !llama_expert_cache_transaction_finalize(transaction.expert)) {
+                GGML_ABORT("expert-cache transaction reached an invalid finalization state\n");
+            }
+            transaction.expert_published = false;
+            if (replace_kv && !llama_kv_cache_transaction_finalize(transaction.kv)) {
+                GGML_ABORT("KV transaction reached an invalid finalization state\n");
+            }
+            transaction.kv_published = false;
+
+            if (replace_kv) {
+                for (server_slot & slot : slots) {
+                    slot.n_ctx = int32_t(target_slot_context);
+                    if (slot.cache_tokens.size() > target_slot_context) {
+                        slot.cache_tokens.resize(target_slot_context);
+                    }
+                }
+                n_ctx = int32_t(target_context);
+            }
+            params_base.resolved_resource_plan_json = std::move(target_plan_text);
+            n_ctx_published.store(n_ctx, std::memory_order_release);
+        }
+        transaction.clear();
         queue_results.send(std::move(result));
     } break;
     case SERVER_TASK_TYPE_SLOT_SAVE:
