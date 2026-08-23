@@ -92,13 +92,31 @@ array index is a CUDA backend index, negative route sentinels must be skipped by
 the active-expert fallback bitmap, and temporary cache redirects must be
 restored before graph metadata is recycled.
 
+The bounded VRAM cache also supports models whose expert tensor type or geometry
+changes between layers. Slot capacity is derived from the largest observed
+component layout instead of extrapolating from the first layer. Each component
+reuses one bounded allocation across its layouts, drains outstanding leases and
+compute before switching metadata, and invalidates the affected ready bits.
+Compact staging is fail-closed: an initialization failure cannot fall back to
+the original full-tensor offsets inside a compact allocation.
+
 On the local `TinyMoE-100m-2x8-fixed-f16.gguf` fixture, a deterministic 16-token
 run produced byte-identical text with and without a one-GPU/one-CPU split. The
 single-GPU decode changed from `65.15` to `103.04` tokens/s; async graph scheduling
 changed from `44.64` to `58.37` tokens/s. These are development-fixture results,
 not published product benchmarks, and primarily prove end-to-end execution and
-parity. Larger-model numerical parity and production benchmark selection remain
-Phase B gates.
+parity.
+
+A deterministic two-token DeepSeek-V4-Flash `UD-IQ1_S` validation then exercised
+43 deferred MoE layers, four distinct expert layouts, three mixed-generation
+GPUs, the 4 GiB bounded RAM cache, and a 256 MiB bounded VRAM cache on each GPU.
+The established path and a one-GPU-position hybrid split produced byte-identical
+output (`SHA-256 62b805db2808dd609730a26b3ed8c9f631274e9071bea28267866d1854372658`).
+The hybrid run reported zero forced host-tensor fallbacks and stayed inside each
+configured cache bound. Its short-run wall time changed from 65.81 seconds to
+4.14 seconds, but this cold, two-token correctness trial is not a publishable
+throughput benchmark. Longer steady-state benchmarking and live route/event
+instrumentation remain Phase B gates.
 
 ## Later phases
 
