@@ -62,7 +62,7 @@ DEFAULT_HARDWARE_BENCH = Path("build/bin") / (
 )
 KNOWN_KV_TYPES = ("auto", "f16", "q8_0", "q4_0")
 POLICIES = ("auto", "resident", "hybrid", "cache", "stream")
-HYBRID_VERIFICATION_VERSION = 2
+HYBRID_VERIFICATION_VERSION = 3
 HYBRID_MAX_CALIBRATION_DRIFT = 4.0
 
 
@@ -307,6 +307,10 @@ def _recorded_hybrid_telemetry_is_valid(record: dict[str, Any]) -> bool:
         "forced_fallbacks",
         "predicted_upload_ns_per_expert",
         "upload_calibration_drift_ppm",
+        "cpu_compute_ns",
+        "cpu_compute_calls",
+        "predicted_cpu_ns_per_expert",
+        "cpu_calibration_drift_ppm",
     )
     for field in required_nonnegative:
         value = summary.get(field)
@@ -318,7 +322,12 @@ def _recorded_hybrid_telemetry_is_valid(record: dict[str, Any]) -> bool:
         and 0 < summary["gpu_route_positions"] < summary["route_positions"]
         and summary["forced_fallbacks"] == 0
         and summary["predicted_upload_ns_per_expert"] > 0
+        and summary["cpu_compute_ns"] > 0
+        and summary["cpu_compute_calls"] >= 3
+        and summary["predicted_cpu_ns_per_expert"] > 0
         and summary["upload_calibration_drift_ppm"]
+        <= round(HYBRID_MAX_CALIBRATION_DRIFT * 1_000_000)
+        and summary["cpu_calibration_drift_ppm"]
         <= round(HYBRID_MAX_CALIBRATION_DRIFT * 1_000_000)
     )
 
@@ -845,7 +854,9 @@ def calibrated_hybrid_gpu_experts(
     return _solve_calibrated_hybrid(profile, layouts, expert_used)
 
 
-def _calibrated_upload_ns_per_expert_bound(model: ModelInfo, profile_path: Path) -> float:
+def _calibrated_expert_cost_bounds(
+    model: ModelInfo, profile_path: Path
+) -> tuple[float, float]:
     try:
         profile = load_hardware_profile(profile_path)
     except HardwareProfileError as exc:
@@ -855,11 +866,12 @@ def _calibrated_upload_ns_per_expert_bound(model: ModelInfo, profile_path: Path)
     devices = contention.get("devices", []) if isinstance(contention, dict) else []
     if not layouts or not isinstance(devices, list) or not devices:
         raise ESEError("calibration has no model upload-cost matrix")
-    predicted: list[float] = []
+    predicted_cpu: list[float] = []
+    predicted_upload: list[float] = []
     for device in devices:
         if not isinstance(device, dict) or not isinstance(device.get("profiles"), list):
             raise ESEError("calibration has an invalid device upload-cost matrix")
-        costs: dict[tuple[int, int, int, int], float] = {}
+        costs: dict[tuple[int, int, int, int], tuple[float, float]] = {}
         for entry in device["profiles"]:
             if not isinstance(entry, dict):
                 continue
@@ -870,19 +882,32 @@ def _calibrated_upload_ns_per_expert_bound(model: ModelInfo, profile_path: Path)
                     "expert_width",
                     "bytes_per_expert_component",
                 ))
-                value = float(entry["upload_ns_per_expert_component"])
+                cpu_value = float(entry["cpu_ns_per_expert_component"])
+                upload_value = float(entry["upload_ns_per_expert_component"])
             except (KeyError, TypeError, ValueError):
                 continue
-            if math.isfinite(value) and value > 0:
-                costs[key] = value
+            if (
+                math.isfinite(cpu_value)
+                and cpu_value > 0
+                and math.isfinite(upload_value)
+                and upload_value > 0
+            ):
+                costs[key] = (cpu_value, upload_value)
         for components in layouts:
             try:
-                predicted.append(sum(costs[tuple(component)] for component in components))
+                component_costs = [costs[tuple(component)] for component in components]
             except KeyError as exc:
-                raise ESEError("calibration has no exact upload cost for a model component") from exc
-    if not predicted or not all(math.isfinite(value) and value > 0 for value in predicted):
-        raise ESEError("calibration produced no valid expert upload-cost bound")
-    return max(predicted)
+                raise ESEError("calibration has no exact cost for a model component") from exc
+            predicted_cpu.append(sum(cost[0] for cost in component_costs))
+            predicted_upload.append(sum(cost[1] for cost in component_costs))
+    if (
+        not predicted_cpu
+        or not predicted_upload
+        or not all(math.isfinite(value) and value > 0 for value in predicted_cpu)
+        or not all(math.isfinite(value) and value > 0 for value in predicted_upload)
+    ):
+        raise ESEError("calibration produced no valid expert cost bounds")
+    return max(predicted_cpu), max(predicted_upload)
 
 
 def inspect_model(path: Path) -> ModelInfo:
@@ -1337,6 +1362,8 @@ def _validated_hybrid_telemetry(telemetry: dict[str, Any]) -> dict[str, int]:
         "transfer_submit_ns",
         "transfer_wait_ns",
         "load_bytes",
+        "cpu_compute_ns",
+        "cpu_compute_calls",
     )
     sums = {field: 0 for field in layer_fields}
     seen_layers: set[int] = set()
@@ -1362,6 +1389,8 @@ def _validated_hybrid_telemetry(telemetry: dict[str, Any]) -> dict[str, int]:
         "transfer_submit_ns",
         "transfer_wait_ns",
         "load_bytes",
+        "cpu_compute_ns",
+        "cpu_compute_calls",
     ):
         value = total.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1406,6 +1435,29 @@ def _validated_calibration_drift(
     if not math.isfinite(drift) or drift > HYBRID_MAX_CALIBRATION_DRIFT:
         raise ESEError(
             "live upload-path timing contradicts calibration "
+            f"({drift:.3f}x observed/predicted; limit {HYBRID_MAX_CALIBRATION_DRIFT:.1f}x)"
+        )
+    return drift
+
+
+def _validated_cpu_calibration_drift(
+    telemetry_summary: dict[str, int],
+    predicted_cpu_ns_per_expert: float,
+    cpu_route_positions: int,
+) -> float:
+    if not math.isfinite(predicted_cpu_ns_per_expert) or predicted_cpu_ns_per_expert <= 0:
+        raise ESEError("calibrated expert CPU prediction is invalid")
+    if cpu_route_positions <= 0:
+        raise ESEError("hybrid plan has no CPU route positions")
+    calls = telemetry_summary.get("cpu_compute_calls", 0)
+    observed_ns = telemetry_summary.get("cpu_compute_ns", 0)
+    if calls < 3 or observed_ns <= 0:
+        raise ESEError("hybrid workload observed too little CPU-branch timing data")
+    predicted_ns = predicted_cpu_ns_per_expert * cpu_route_positions * calls
+    drift = observed_ns / predicted_ns
+    if not math.isfinite(drift) or drift > HYBRID_MAX_CALIBRATION_DRIFT:
+        raise ESEError(
+            "live CPU-branch timing contradicts calibration "
             f"({drift:.3f}x observed/predicted; limit {HYBRID_MAX_CALIBRATION_DRIFT:.1f}x)"
         )
     return drift
@@ -1595,12 +1647,20 @@ def _validate_hybrid(args: argparse.Namespace) -> int:
         telemetry_summary = _validated_hybrid_telemetry(
             hybrid_result["expert_cache_telemetry"]
         )
-        predicted_upload_ns = _calibrated_upload_ns_per_expert_bound(
+        predicted_cpu_ns, predicted_upload_ns = _calibrated_expert_cost_bounds(
             candidate.model, args.hardware_profile
         )
         telemetry_summary["predicted_upload_ns_per_expert"] = round(predicted_upload_ns)
         telemetry_summary["upload_calibration_drift_ppm"] = round(
             _validated_calibration_drift(telemetry_summary, predicted_upload_ns) * 1_000_000
+        )
+        telemetry_summary["predicted_cpu_ns_per_expert"] = round(predicted_cpu_ns)
+        cpu_positions = (candidate.model.expert_used_count or 0) - candidate.hybrid_gpu_experts
+        telemetry_summary["cpu_calibration_drift_ppm"] = round(
+            _validated_cpu_calibration_drift(
+                telemetry_summary, predicted_cpu_ns, cpu_positions
+            )
+            * 1_000_000
         )
         telemetry_valid = True
     except ESEError as exc:

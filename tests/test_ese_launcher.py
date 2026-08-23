@@ -36,6 +36,7 @@ from tools.ese import (
     _solve_calibrated_hybrid,
     _validated_hybrid_telemetry,
     _validated_calibration_drift,
+    _validated_cpu_calibration_drift,
     hybrid_verification_reason,
     model_fingerprint,
 )
@@ -106,6 +107,10 @@ def verified_telemetry_summary() -> dict[str, int]:
         "forced_fallbacks": 0,
         "predicted_upload_ns_per_expert": 100,
         "upload_calibration_drift_ppm": 1_000_000,
+        "cpu_compute_ns": 1_000,
+        "cpu_compute_calls": 8,
+        "predicted_cpu_ns_per_expert": 100,
+        "cpu_calibration_drift_ppm": 1_250_000,
     }
 
 
@@ -275,13 +280,15 @@ class LauncherTests(unittest.TestCase):
             "route_readback_ns": 100, "hits": 3, "misses": 3,
             "lease_acquire_ns": 200, "lease_uploads": 9,
             "transfer_submit_ns": 300, "transfer_wait_ns": 400,
-            "load_bytes": 500,
+            "load_bytes": 500, "cpu_compute_ns": 600,
+            "cpu_compute_calls": 6,
         }
         total = {
             "level": "vram-total", "hits": 3, "misses": 3,
             "lease_uploads": 9, "transfer_submit_ns": 300,
             "transfer_wait_ns": 400, "load_bytes": 500,
-            "forced_fallbacks": 0,
+            "forced_fallbacks": 0, "cpu_compute_ns": 600,
+            "cpu_compute_calls": 6,
         }
         with tempfile.TemporaryDirectory() as temp:
             log = Path(temp) / "server.log"
@@ -295,6 +302,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(summary["layers"], 1)
         self.assertEqual(summary["gpu_route_positions"], 6)
         self.assertLess(_validated_calibration_drift(summary, 400.0), 4.0)
+        self.assertLess(_validated_cpu_calibration_drift(summary, 100.0, 2), 4.0)
 
         broken = json.loads(json.dumps(telemetry))
         broken["totals"][0]["load_bytes"] = 499
@@ -306,6 +314,8 @@ class LauncherTests(unittest.TestCase):
             _validated_hybrid_telemetry(fallback)
         with self.assertRaisesRegex(ESEError, "contradicts calibration"):
             _validated_calibration_drift(summary, 10.0)
+        with self.assertRaisesRegex(ESEError, "CPU-branch timing contradicts"):
+            _validated_cpu_calibration_drift(summary, 1.0, 2)
 
     def test_calibrated_hybrid_solver_is_conservative_across_devices(self) -> None:
         key = {

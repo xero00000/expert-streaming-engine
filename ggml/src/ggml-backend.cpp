@@ -1293,6 +1293,8 @@ struct ggml_active_expert_cache_layer_stats {
     uint64_t transfer_submit_ns = 0;
     uint64_t transfer_wait_ns = 0;
     uint64_t load_bytes = 0;
+    uint64_t cpu_compute_ns = 0;
+    uint64_t cpu_compute_calls = 0;
 };
 
 struct ggml_active_expert_cache_redirect {
@@ -1512,6 +1514,16 @@ static int ggml_active_expert_cache_layer_from_name(const char * name) {
     }
 
     return (int) parsed_layer;
+}
+
+static int ggml_ese_callback_layer_from_name(const char * name) {
+    if (!name || !name[0]) return -1;
+    const char * separator = std::strrchr(name, '-');
+    if (!separator || !separator[1]) return -1;
+    char * end = nullptr;
+    const long layer = std::strtol(separator + 1, &end, 10);
+    if (end == separator + 1 || *end != '\0' || layer < 0 || layer > INT_MAX) return -1;
+    return (int) layer;
 }
 
 static int ggml_active_expert_cache_component_from_name(const ggml_tensor * tensor, int * layer) {
@@ -3459,6 +3471,24 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
 }
 
 static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_backend_t split_backend, ggml_backend_sched_split * split) {
+    int cpu_hybrid_layer = -1;
+    if (sched->has_reduce && sched->active_expert_cache_slots >= 1 &&
+            ggml_backend_is_cpu(split_backend)) {
+        for (int index = 0; index < split->graph.n_nodes; ++index) {
+            const ggml_tensor * node = split->graph.nodes[index];
+            if (ggml_ese_tensor_get_role(node) != GGML_ESE_ROUTE_CPU) continue;
+            const int layer = ggml_ese_callback_layer_from_name(ggml_get_name(node));
+            if (layer < 0 || (cpu_hybrid_layer >= 0 && cpu_hybrid_layer != layer)) {
+                cpu_hybrid_layer = -2;
+                break;
+            }
+            cpu_hybrid_layer = layer;
+        }
+    }
+    std::chrono::steady_clock::time_point eval_start;
+    if (cpu_hybrid_layer >= 0) {
+        eval_start = std::chrono::steady_clock::now();
+    }
     if (!sched->callback_eval) {
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
@@ -3506,6 +3536,14 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
             }
 
             j0 = j1;
+        }
+    }
+    if (cpu_hybrid_layer >= 0) {
+        const auto found = sched->active_expert_cache_layer_stats.find(cpu_hybrid_layer);
+        if (found != sched->active_expert_cache_layer_stats.end()) {
+            found->second.cpu_compute_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - eval_start).count());
+            ++found->second.cpu_compute_calls;
         }
     }
     ggml_active_expert_cache_record_compute(sched, split_backend);
@@ -3957,13 +3995,18 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         ggml_active_expert_cache_release(sched->active_expert_caches[i]);
     }
     if (sched->active_expert_cache_slots >= 1) {
+        uint64_t cpu_compute_ns = 0;
+        uint64_t cpu_compute_calls = 0;
         for (const auto & item : sched->active_expert_cache_layer_stats) {
             const auto & stats = item.second;
+            cpu_compute_ns += stats.cpu_compute_ns;
+            cpu_compute_calls += stats.cpu_compute_calls;
             fprintf(stderr, "expert_cache_stats: {\"level\":\"vram-layer\",\"layer\":%d,"
                     "\"routes\":%llu,\"route_positions\":%llu,\"gpu_route_positions\":%llu,"
                     "\"route_readback_ns\":%llu,\"hits\":%llu,\"misses\":%llu,"
                     "\"lease_acquire_ns\":%llu,\"lease_uploads\":%llu,"
-                    "\"transfer_submit_ns\":%llu,\"transfer_wait_ns\":%llu,\"load_bytes\":%llu}\n",
+                    "\"transfer_submit_ns\":%llu,\"transfer_wait_ns\":%llu,\"load_bytes\":%llu,"
+                    "\"cpu_compute_ns\":%llu,\"cpu_compute_calls\":%llu}\n",
                     item.first,
                     (unsigned long long) stats.routes,
                     (unsigned long long) stats.route_positions,
@@ -3975,7 +4018,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
                     (unsigned long long) stats.lease_uploads,
                     (unsigned long long) stats.transfer_submit_ns,
                     (unsigned long long) stats.transfer_wait_ns,
-                    (unsigned long long) stats.load_bytes);
+                    (unsigned long long) stats.load_bytes,
+                    (unsigned long long) stats.cpu_compute_ns,
+                    (unsigned long long) stats.cpu_compute_calls);
         }
         fprintf(stderr, "ggml active-expert cache: %llu hits, %llu misses, %llu host-to-GPU expert uploads\n",
                 (unsigned long long) sched->active_expert_cache_hits,
@@ -3994,7 +4039,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
                 "\"forced_fallbacks\":%llu,\"rejected_admissions\":%llu,"
                 "\"transfer_submit_ns\":%llu,\"transfer_wait_ns\":%llu,"
                 "\"route_observations\":%llu,\"route_prediction_matches\":%llu,\"prediction_admission_contributions\":%llu,"
-                "\"reuse_distance_sum\":%llu,\"load_bytes\":%llu,\"eviction_cost_bytes\":%llu}\n",
+                "\"reuse_distance_sum\":%llu,\"load_bytes\":%llu,\"eviction_cost_bytes\":%llu,"
+                "\"cpu_compute_ns\":%llu,\"cpu_compute_calls\":%llu}\n",
                 (unsigned long long) sched->active_expert_cache_hits,
                 (unsigned long long) sched->active_expert_cache_misses,
                 (unsigned long long) sched->active_expert_cache_admissions,
@@ -4010,7 +4056,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
                 (unsigned long long) sched->active_expert_cache_prediction_admissions,
                 (unsigned long long) sched->active_expert_cache_reuse_distance_sum,
                 (unsigned long long) sched->active_expert_cache_load_bytes,
-                (unsigned long long) sched->active_expert_cache_eviction_cost_bytes);
+                (unsigned long long) sched->active_expert_cache_eviction_cost_bytes,
+                (unsigned long long) cpu_compute_ns,
+                (unsigned long long) cpu_compute_calls);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);

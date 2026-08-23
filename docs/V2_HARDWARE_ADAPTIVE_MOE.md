@@ -74,16 +74,17 @@ stored.
 
 Approval also requires reconciled live `vram-layer`/`vram-total` telemetry from
 the hybrid server, at least three cache misses, mixed CPU/GPU route positions,
-and zero forced host-tensor fallbacks. The validator sums lease acquisition,
-upload submission, and event-wait time and compares that measured upload path
-with the most conservative matching calibrated device/layout prediction. More
-than `4x` drift is treated as a contradiction and cannot authorize automatic
-routing. Missing, stale, malformed, parity-failed, telemetry-failed, slower, or
-contradictory evidence leaves the established path unchanged.
+and zero forced host-tensor fallbacks. The native scheduler also times every
+explicitly tagged CPU hybrid branch without adding a GPU synchronization point.
+The validator compares both CPU compute and the sum of lease acquisition,
+upload submission, and event-wait time with the most conservative matching
+calibrated device/layout predictions. More than `4x` drift on either path is
+treated as a contradiction and cannot authorize automatic routing. Missing,
+stale, malformed, parity-failed, telemetry-failed, slower, or contradictory
+evidence leaves the established path unchanged.
 
 ### Remaining Phase A gate
 
-- Add native per-layer CPU-branch compute timing so the validator can compare both sides of the calibrated balance; upload-side route/event contradictions already fail closed.
 - Extend the preflight workload window into a periodically refreshed serving-time window before allowing automatic split changes during a long-lived server.
 - Keep the launcher and native calibrated split solvers covered by shared golden cases as the controller evolves.
 
@@ -147,9 +148,10 @@ merged `ggml_moe_up_gate` graphs and requires bit-exact output parity.
 At context shutdown, the scheduler emits one `vram-layer` JSON telemetry record
 per exercised MoE layer. It reports route readback latency, active and explicitly
 GPU-owned route positions, cache hits and misses, bounded-lease acquisition
-latency, lease-backed upload count, upload submission time, event-wait time, and
-bytes loaded. These timers observe the existing asynchronous path and do not add
-a synchronization point. The aggregate `vram-total` record remains available for
+latency, lease-backed upload count, upload submission time, event-wait time,
+bytes loaded, tagged CPU-branch compute time, and CPU-branch call count. These
+timers observe the existing asynchronous path and do not add a GPU
+synchronization point. The aggregate `vram-total` record remains available for
 whole-request accounting.
 
 On the local `TinyMoE-100m-2x8-fixed-f16.gguf` fixture, a deterministic 16-token
@@ -167,23 +169,24 @@ output (`SHA-256 62b805db2808dd609730a26b3ed8c9f631274e9071bea28267866d185437265
 The hybrid run reported zero forced host-tensor fallbacks and stayed inside each
 configured cache bound. Its short-run wall time changed from 65.81 seconds to
 4.14 seconds, but this cold, two-token correctness trial is not a publishable
-throughput benchmark. Longer steady-state benchmarking and live route/event
-comparison against the calibrated prediction remain Phase B gates.
+throughput benchmark. Longer schema-v3 validation on this larger model remains
+a Phase B gate.
 
 The fail-closed workload validator has also run end-to-end on the local TinyMoE
 fixture with three measured four-token samples after warmup. The established
-path median was `69.72` tokens/s and the one-GPU-position hybrid median was
-`93.25` tokens/s (`1.337x`), with exact output hashes for every paired sample.
+path median was `71.36` tokens/s and the one-GPU-position hybrid median was
+`92.23` tokens/s (`1.293x`), with exact output hashes for every paired sample.
 All 10 layers reconciled with the aggregate telemetry, 130 of 260 route
 positions exercised the GPU partition, all 53 misses accounted for 159
-lease-backed component uploads, and forced fallbacks remained zero. Observed
-upload-path time was `2.880x` the conservative development-profile prediction,
-inside the `4x` fail-closed bound. This uses a tiny fixture and a test profile;
+lease-backed component uploads, all 130 CPU branch calls were timed, and forced
+fallbacks remained zero. Observed CPU and upload-path time were respectively
+`0.375x` and `2.921x` their conservative development-profile predictions,
+inside the `4x` fail-closed bounds. This uses a tiny fixture and a test profile;
 it is gate-development evidence, not a product benchmark.
 
 ## Later phases
 
-1. Finish Phase B native CPU-branch telemetry, two-sided contradiction handling, and longer workload validation.
+1. Finish Phase B longer workload validation and serving-time evidence refresh.
 2. Phase C: double-buffered prefill streaming.
 3. Phase D: live KV/expert/transient resource rebalancing.
 4. Phase E: optional aligned FastStore sidecar bound to GGUF identity.

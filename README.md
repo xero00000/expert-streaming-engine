@@ -216,11 +216,11 @@ established path with identical deterministic output:
 ```
 
 The validator stores no prompts or generated text. It also requires reconciled
-per-layer cache telemetry, mixed CPU/GPU routing, zero forced fallbacks, and
-upload timing that remains within a conservative bound of calibration. Its
-local evidence is private to the user (`0600`) and becomes stale when the
-sampled model contents, hardware topology, or performance-relevant
-configuration changes.
+per-layer cache telemetry, mixed CPU/GPU routing, zero forced fallbacks, and CPU
+compute/upload timing that remains within conservative bounds of calibration.
+Its local evidence is private to the user (`0600`) and becomes stale when the
+sampled model contents, hardware topology, or performance-relevant configuration
+changes.
 
 Use `./ese plan MODEL.gguf --json` for machine-readable launcher output. Pass
 native `llama-server` options after `--`:
