@@ -31,7 +31,7 @@ Profiles default to `~/.cache/ese/hardware-profile.json`. They are versioned, wr
 | Sustained host copy | native timed `memcpy` | No; baseline only |
 | H2D/D2H | `ggml_backend_tensor_set/get` on every detected CUDA backend | No; needs confidence scoring |
 | H2D under host-memory contention | Per-device CUDA upload concurrent with host copy | No; baseline only |
-| CPU MoE | Real `ggml_mul_mat_id` over two actual GGUF expert payloads for every discovered type/geometry, checked against both single-thread execution and an independently dequantized scalar matvec | No; requires sufficiently confident samples for every format |
+| CPU MoE | Real `ggml_mul_mat_id` over two actual GGUF expert payloads for every discovered type/geometry, checked against both single-thread execution and an independently dequantized scalar matvec; separate and merged fused gate/up layouts have a bit-exact native regression | No; requires sufficiently confident samples for every format |
 | Adaptive expert-cache upload | Separate page-cache-cold and warm steady-state real split-GGUF payload distributions read through a bounded production RAM-cache lease, uploaded with the production async primitive on every CUDA backend, synchronized while the lease is held, then released | No; still needs live scheduler route/event timing |
 | CPU MoE + cache upload contention | Per-device concurrent model-format routed matvec and warm steady-state exact `pread` → bounded RAM lease → production async upload path | No; still needs a separately labeled cold distribution and the live scheduler's route/event timing |
 
@@ -53,7 +53,6 @@ the only distribution consumed by automatic split selection.
 
 ### Remaining Phase A gate
 
-- Resolve and test the standalone fused `ggml_moe_up_gate` probe; its first calibration harness exposed allocator corruption, so Phase A currently uses the stable routed `ggml_mul_mat_id` primitive.
 - Compare the calibrated cost prediction against the live per-layer route/event telemetry and fail closed when sustained runtime behavior contradicts the selected split.
 - Keep the launcher and native calibrated split solvers covered by shared golden cases as the controller evolves.
 
@@ -105,6 +104,12 @@ reuses one bounded allocation across its layouts, drains outstanding leases and
 compute before switching metadata, and invalidates the affected ready bits.
 Compact staging is fail-closed: an initialization failure cannot fall back to
 the original full-tensor offsets inside a compact allocation.
+
+The CPU fused-MoE workspace planner now keys activation conversion storage from
+the activation tensor itself. The previous condition incorrectly depended on a
+separate gate tensor, so merged gate/up layouts could omit required workspace
+and corrupt the allocator arena. A native regression executes separate and
+merged `ggml_moe_up_gate` graphs and requires bit-exact output parity.
 
 At context shutdown, the scheduler emits one `vram-layer` JSON telemetry record
 per exercised MoE layer. It reports route readback latency, active and explicitly

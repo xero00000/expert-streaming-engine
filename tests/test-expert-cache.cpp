@@ -454,6 +454,89 @@ void test_route_partition_is_complementary() {
     }
 }
 
+std::vector<float> compute_cpu_fused_moe_layout(
+        bool merged,
+        const std::vector<ggml_fp16_t> & up_weights,
+        const std::vector<ggml_fp16_t> & gate_weights,
+        const std::vector<float> & input_values) {
+    constexpr int64_t k = 384;
+    constexpr int64_t m = 128;
+    constexpr int64_t n_experts = 2;
+    constexpr int64_t n_used = 2;
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr);
+    struct backend_cleanup { ggml_backend_t value; ~backend_cleanup() { ggml_backend_free(value); } } free_backend{backend};
+
+    ggml_init_params params = {
+        ggml_tensor_overhead()*20 + ggml_graph_overhead_custom(16, false), nullptr, true
+    };
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    struct context_cleanup { ggml_context * value; ~context_cleanup() { ggml_free(value); } } free_ctx{ctx};
+
+    ggml_tensor * up = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F16, k, merged ? 2*m : m, n_experts);
+    ggml_tensor * gate = merged ? nullptr : ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F16, k, m, n_experts);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
+    ggml_tensor * output = ggml_moe_up_gate(ctx, up, gate, input, ids, GGML_UNARY_OP_SILU);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    REQUIRE(buffer != nullptr);
+    struct buffer_cleanup {
+        ggml_backend_buffer_t value;
+        ~buffer_cleanup() { ggml_backend_buffer_free(value); }
+    } free_buffer{buffer};
+
+    REQUIRE(up_weights.size() == size_t(k*m*n_experts));
+    REQUIRE(gate_weights.size() == up_weights.size());
+    if (merged) {
+        std::vector<ggml_fp16_t> merged_weights(2*up_weights.size());
+        const size_t expert_elements = size_t(k*m);
+        for (int expert = 0; expert < n_experts; ++expert) {
+            auto * destination = merged_weights.data() + size_t(expert)*2*expert_elements;
+            std::copy_n(gate_weights.data() + size_t(expert)*expert_elements, expert_elements, destination);
+            std::copy_n(up_weights.data() + size_t(expert)*expert_elements, expert_elements,
+                    destination + expert_elements);
+        }
+        ggml_backend_tensor_set(up, merged_weights.data(), 0, merged_weights.size()*sizeof(merged_weights[0]));
+    } else {
+        ggml_backend_tensor_set(up, up_weights.data(), 0, up_weights.size()*sizeof(up_weights[0]));
+        ggml_backend_tensor_set(gate, gate_weights.data(), 0, gate_weights.size()*sizeof(gate_weights[0]));
+    }
+    REQUIRE(input_values.size() == size_t(k*n_used));
+    const std::array<int32_t, n_used> route = {{1, 0}};
+    ggml_backend_tensor_set(input, input_values.data(), 0, input_values.size()*sizeof(input_values[0]));
+    ggml_backend_tensor_set(ids, route.data(), 0, sizeof(route));
+
+    REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> result(size_t(ggml_nelements(output)));
+    ggml_backend_tensor_get(output, result.data(), 0, result.size()*sizeof(result[0]));
+    return result;
+}
+
+void test_cpu_fused_moe_merged_workspace() {
+    constexpr int64_t k = 384;
+    constexpr int64_t m = 128;
+    constexpr int64_t n_experts = 2;
+    std::vector<ggml_fp16_t> up(size_t(k*m*n_experts));
+    std::vector<ggml_fp16_t> gate(up.size());
+    for (size_t i = 0; i < up.size(); ++i) {
+        up[i] = ggml_fp32_to_fp16(float(int((i*17 + i/31) % 257) - 128)/64.0f);
+        gate[i] = ggml_fp32_to_fp16(float(int((i*29 + i/19) % 251) - 125)/64.0f);
+    }
+    std::vector<float> input(size_t(k*2));
+    for (size_t i = 0; i < input.size(); ++i) {
+        input[i] = float(int((i*13) % 97) - 48)/24.0f;
+    }
+    const auto separate = compute_cpu_fused_moe_layout(false, up, gate, input);
+    const auto merged = compute_cpu_fused_moe_layout(true, up, gate, input);
+    REQUIRE(merged == separate);
+}
+
 std::vector<float> compute_cuda_mul_mat_id(
         ggml_backend_t backend,
         const std::vector<ggml_fp16_t> & weights,
@@ -727,6 +810,7 @@ int main() {
         test_concurrent_single_fill();
         test_cpu_kernel_exact_parity_and_no_original_fallback();
         test_route_partition_is_complementary();
+        test_cpu_fused_moe_merged_workspace();
         test_cuda_compact_remap_exact_parity();
         std::cout << "PASS: checked bounded expert caches and exact full/compact CUDA parity\n";
         return 0;
