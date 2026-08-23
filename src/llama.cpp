@@ -1174,6 +1174,7 @@ struct llama_context::Prev {
     llama_mtp_op_type mtp_op_type;
     int32_t mtp_step_idx;
     int32_t mtp_n_heads;
+    enum ggml_backend_expert_hybrid_guard_status expert_hybrid_guard_status;
     ggml_cgraph * graph;
 };
 
@@ -1198,6 +1199,11 @@ static void why_not_reuse_previous(const llama_batch & u_batch, const llama_cont
     if (ctx.cparams.mtp_op_type != the_prev->mtp_op_type) { printf("    mtp_op_type is not the same\n"); return; }
     if (ctx.mtp_step_idx != the_prev->mtp_step_idx) { printf("    mtp_step_idx is not the same\n"); return; }
     if (ctx.mtp_n_heads != the_prev->mtp_n_heads) { printf("    mtp_n_heads is not the same\n"); return; }
+    if (ggml_backend_sched_get_expert_hybrid_guard_status(ctx.sched) !=
+            the_prev->expert_hybrid_guard_status) {
+        printf("    expert hybrid guard status changed\n");
+        return;
+    }
     printf("    update_cache_copies() must have failed\n");
 }
 
@@ -1219,6 +1225,8 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
            cparams.mtp_op_type == the_prev->mtp_op_type &&
            mtp_step_idx == the_prev->mtp_step_idx &&
            mtp_n_heads == the_prev->mtp_n_heads &&
+           ggml_backend_sched_get_expert_hybrid_guard_status(sched) ==
+                   the_prev->expert_hybrid_guard_status &&
            update_cache_copies();
     if (false && !result) {
         printf("%s(%d):", __func__, cparams.mtp_op_type);
@@ -7084,7 +7092,8 @@ static int llama_decode_internal(
                         (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)kv_self_used.n,
                         (int)u_batch.n_tokens,
                         kv_self_used.save_per_step_ssm, kv_self_used.ckpt.per_step_max_allocated,
-                        cparams.mtp_op_type, lctx.mtp_step_idx, lctx.mtp_n_heads, gf});
+                        cparams.mtp_op_type, lctx.mtp_step_idx, lctx.mtp_n_heads,
+                        ggml_backend_sched_get_expert_hybrid_guard_status(lctx.sched), gf});
             }
         } else {
             //printf("Reusing graph with type = %d, n_kv = %d, n_tokens = %d\n", cparams.mtp_op_type, (int)prev->n_kv, (int)prev->n_tokens);
@@ -8262,6 +8271,10 @@ struct llama_context_params llama_context_default_params() {
         /*.expert_vram_reserve_bytes   =*/ 0,
         /*.expert_cache_min_observations =*/ 2,
         /*.expert_hybrid_gpu_experts   =*/ 0,
+        /*.expert_hybrid_cpu_ns_per_expert =*/ 0,
+        /*.expert_hybrid_upload_ns_per_expert =*/ 0,
+        /*.expert_hybrid_maximum_drift_ppm =*/ 4000000,
+        /*.expert_hybrid_minimum_cpu_calls =*/ 64,
     };
 
     return result;
@@ -8772,6 +8785,10 @@ struct llama_context * llama_init_from_model(
     cparams.expert_vram_reserve_bytes = params.expert_vram_reserve_bytes;
     cparams.expert_cache_min_observations = params.expert_cache_min_observations;
     cparams.expert_hybrid_gpu_experts = params.expert_hybrid_gpu_experts;
+    cparams.expert_hybrid_cpu_ns_per_expert = params.expert_hybrid_cpu_ns_per_expert;
+    cparams.expert_hybrid_upload_ns_per_expert = params.expert_hybrid_upload_ns_per_expert;
+    cparams.expert_hybrid_maximum_drift_ppm = params.expert_hybrid_maximum_drift_ppm;
+    cparams.expert_hybrid_minimum_cpu_calls = params.expert_hybrid_minimum_cpu_calls;
 
     cparams.reduce_type      = params.type_reduce;
     cparams.graph_attn_precision = params.type_graph_attn;
@@ -9254,6 +9271,16 @@ struct llama_context * llama_init_from_model(
                         cparams.expert_vram_cache_bytes,
                         cparams.expert_vram_reserve_bytes,
                         cparams.expert_cache_min_observations);
+                const uint32_t cpu_positions = model->hparams.n_expert_used >
+                        cparams.expert_hybrid_gpu_experts ?
+                        model->hparams.n_expert_used - cparams.expert_hybrid_gpu_experts : 0;
+                ggml_backend_sched_set_expert_hybrid_guard(
+                        ctx->sched,
+                        cparams.expert_hybrid_cpu_ns_per_expert,
+                        cpu_positions,
+                        cparams.expert_hybrid_upload_ns_per_expert,
+                        cparams.expert_hybrid_maximum_drift_ppm,
+                        cparams.expert_hybrid_minimum_cpu_calls);
                 if (model->expert_ram_cache) {
                     ggml_backend_sched_set_expert_lease_callbacks(
                             ctx->sched,
@@ -9434,6 +9461,26 @@ const struct llama_vocab* llama_model_get_vocab(const struct llama_model* model)
 
 const struct llama_model * llama_get_model(const struct llama_context * ctx) {
     return &ctx->model;
+}
+
+enum llama_expert_hybrid_guard_status
+llama_get_expert_hybrid_guard_status(const struct llama_context * ctx) {
+    if (!ctx || !ctx->sched) {
+        return LLAMA_EXPERT_HYBRID_GUARD_DISABLED;
+    }
+    switch (ggml_backend_sched_get_expert_hybrid_guard_status(ctx->sched)) {
+        case GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING:
+            return LLAMA_EXPERT_HYBRID_GUARD_MONITORING;
+        case GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_FALLBACK:
+            return LLAMA_EXPERT_HYBRID_GUARD_REVOKED_FALLBACK;
+        case GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_CPU_DRIFT:
+            return LLAMA_EXPERT_HYBRID_GUARD_REVOKED_CPU_DRIFT;
+        case GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_UPLOAD_DRIFT:
+            return LLAMA_EXPERT_HYBRID_GUARD_REVOKED_UPLOAD_DRIFT;
+        case GGML_BACKEND_EXPERT_HYBRID_GUARD_DISABLED:
+        default:
+            return LLAMA_EXPERT_HYBRID_GUARD_DISABLED;
+    }
 }
 
 const struct llama_vocab * llama_get_vocab(const struct llama_context * ctx) {

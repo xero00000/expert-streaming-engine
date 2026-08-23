@@ -798,6 +798,44 @@ void test_cuda_compact_remap_exact_parity() {
     REQUIRE(compact_fused == full_fused);
 }
 
+void test_hybrid_runtime_guard_is_one_way_and_fail_closed() {
+    ggml_backend_expert_hybrid_guard_window window = {};
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 0, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_DISABLED);
+
+    // Prefill can exercise the bounded upload path before any mixed decode.
+    // It must not revoke a guard whose CPU branch has not executed yet.
+    window = { 3, 0, 50000, 50000, 50000, 0, 0 };
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 100, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING);
+
+    window = { 3, 0, 1000, 1000, 1000, 1600, 8 };
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 100, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING);
+
+    window.forced_fallbacks = 1;
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 100, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_FALLBACK);
+
+    window.forced_fallbacks = 0;
+    window.cpu_compute_ns = 6401;
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 100, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_CPU_DRIFT);
+
+    window.cpu_compute_ns = 1600;
+    window.lease_acquire_ns = 12001;
+    window.transfer_submit_ns = 0;
+    window.transfer_wait_ns = 0;
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 100, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_UPLOAD_DRIFT);
+}
+
 } // namespace
 
 int main() {
@@ -812,6 +850,7 @@ int main() {
         test_route_partition_is_complementary();
         test_cpu_fused_moe_merged_workspace();
         test_cuda_compact_remap_exact_parity();
+        test_hybrid_runtime_guard_is_one_way_and_fail_closed();
         std::cout << "PASS: checked bounded expert caches and exact full/compact CUDA parity\n";
         return 0;
     } catch (const std::exception & error) {

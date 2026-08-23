@@ -64,6 +64,10 @@ struct llama_cparams {
     uint64_t expert_vram_reserve_bytes;
     uint32_t expert_cache_min_observations;
     uint32_t expert_hybrid_gpu_experts;
+    uint64_t expert_hybrid_cpu_ns_per_expert;
+    uint64_t expert_hybrid_upload_ns_per_expert;
+    uint32_t expert_hybrid_maximum_drift_ppm;
+    uint32_t expert_hybrid_minimum_cpu_calls;
 
     enum ggml_type reduce_type;
     enum ggml_type graph_attn_precision;

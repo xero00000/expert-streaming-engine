@@ -242,6 +242,42 @@ extern "C" {
             uint64_t reserve_bytes_per_device,
             uint32_t minimum_observations);
 
+    enum ggml_backend_expert_hybrid_guard_status {
+        GGML_BACKEND_EXPERT_HYBRID_GUARD_DISABLED = 0,
+        GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING,
+        GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_FALLBACK,
+        GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_CPU_DRIFT,
+        GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_UPLOAD_DRIFT,
+    };
+
+    struct ggml_backend_expert_hybrid_guard_window {
+        uint64_t misses;
+        uint64_t forced_fallbacks;
+        uint64_t lease_acquire_ns;
+        uint64_t transfer_submit_ns;
+        uint64_t transfer_wait_ns;
+        uint64_t cpu_compute_ns;
+        uint64_t cpu_compute_calls;
+    };
+
+    GGML_API enum ggml_backend_expert_hybrid_guard_status
+    ggml_backend_expert_hybrid_guard_evaluate(
+            const struct ggml_backend_expert_hybrid_guard_window * window,
+            uint64_t cpu_ns_per_expert,
+            uint32_t cpu_route_positions,
+            uint64_t upload_ns_per_expert,
+            uint32_t maximum_drift_ppm,
+            uint32_t minimum_cpu_calls);
+    GGML_API void ggml_backend_sched_set_expert_hybrid_guard(
+            ggml_backend_sched_t sched,
+            uint64_t cpu_ns_per_expert,
+            uint32_t cpu_route_positions,
+            uint64_t upload_ns_per_expert,
+            uint32_t maximum_drift_ppm,
+            uint32_t minimum_cpu_calls);
+    GGML_API enum ggml_backend_expert_hybrid_guard_status
+    ggml_backend_sched_get_expert_hybrid_guard_status(ggml_backend_sched_t sched);
+
     // prefetch mmap'd MoE expert weights into the page cache
     GGML_API bool                 ggml_backend_prefetch_init(int n_threads);
     GGML_API void                 ggml_backend_prefetch_register_mapping(const void * addr, size_t size);

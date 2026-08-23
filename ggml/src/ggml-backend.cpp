@@ -16,6 +16,7 @@
 #include <set>
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <barrier>
 #include <map>
@@ -1387,6 +1388,7 @@ struct ggml_backend_sched {
     uint64_t active_expert_cache_lease_uploads = 0;
     uint64_t active_expert_cache_forced_fallbacks = 0;
     uint64_t active_expert_cache_rejected_admissions = 0;
+    uint64_t active_expert_cache_lease_acquire_ns = 0;
     uint64_t active_expert_cache_transfer_submit_ns = 0;
     uint64_t active_expert_cache_transfer_wait_ns = 0;
     uint64_t active_expert_cache_route_observations = 0;
@@ -1395,6 +1397,8 @@ struct ggml_backend_sched {
     uint64_t active_expert_cache_reuse_distance_sum = 0;
     uint64_t active_expert_cache_load_bytes = 0;
     uint64_t active_expert_cache_eviction_cost_bytes = 0;
+    uint64_t active_expert_cache_cpu_compute_ns = 0;
+    uint64_t active_expert_cache_cpu_compute_calls = 0;
     std::map<int, ggml_active_expert_cache_layer_stats> active_expert_cache_layer_stats;
     ggml_backend_expert_acquire_callback expert_lease_acquire = nullptr;
     ggml_backend_expert_release_callback expert_lease_release = nullptr;
@@ -1403,7 +1407,53 @@ struct ggml_backend_sched {
     uint64_t active_expert_cache_capacity_bytes = 0;
     uint64_t active_expert_cache_reserve_bytes = 0;
     uint32_t active_expert_cache_min_observations = 1;
+    uint64_t expert_hybrid_guard_cpu_ns_per_expert = 0;
+    uint64_t expert_hybrid_guard_upload_ns_per_expert = 0;
+    uint32_t expert_hybrid_guard_cpu_route_positions = 0;
+    uint32_t expert_hybrid_guard_maximum_drift_ppm = 0;
+    uint32_t expert_hybrid_guard_minimum_cpu_calls = 0;
+    std::atomic<enum ggml_backend_expert_hybrid_guard_status> expert_hybrid_guard_status {
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_DISABLED };
+    struct ggml_backend_expert_hybrid_guard_window expert_hybrid_guard_baseline = {};
 };
+
+enum ggml_backend_expert_hybrid_guard_status ggml_backend_expert_hybrid_guard_evaluate(
+        const struct ggml_backend_expert_hybrid_guard_window * window,
+        uint64_t cpu_ns_per_expert,
+        uint32_t cpu_route_positions,
+        uint64_t upload_ns_per_expert,
+        uint32_t maximum_drift_ppm,
+        uint32_t minimum_cpu_calls) {
+    if (!window || cpu_ns_per_expert == 0 || cpu_route_positions == 0 ||
+            upload_ns_per_expert == 0 || maximum_drift_ppm < 1000000 ||
+            minimum_cpu_calls == 0) {
+        return GGML_BACKEND_EXPERT_HYBRID_GUARD_DISABLED;
+    }
+    if (window->forced_fallbacks > 0) {
+        return GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_FALLBACK;
+    }
+    if (window->cpu_compute_calls >= minimum_cpu_calls) {
+        const long double predicted = (long double) cpu_ns_per_expert *
+                cpu_route_positions * window->cpu_compute_calls;
+        const long double allowed = predicted * maximum_drift_ppm / 1000000.0L;
+        if (window->cpu_compute_ns == 0 || (long double) window->cpu_compute_ns > allowed) {
+            return GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_CPU_DRIFT;
+        }
+    }
+    // Prefill and established-path cache traffic can occur before the first
+    // mixed decode graph.  Only judge upload drift in a window that also
+    // proves the hybrid CPU branch executed.
+    if (window->cpu_compute_calls > 0 && window->misses >= 3) {
+        const long double observed = (long double) window->lease_acquire_ns +
+                window->transfer_submit_ns + window->transfer_wait_ns;
+        const long double predicted = (long double) upload_ns_per_expert * window->misses;
+        const long double allowed = predicted * maximum_drift_ppm / 1000000.0L;
+        if (observed == 0 || observed > allowed) {
+            return GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_UPLOAD_DRIFT;
+        }
+    }
+    return GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING;
+}
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
     int int_op = (int)op;
@@ -1472,6 +1522,104 @@ void ggml_backend_sched_set_expert_cache_capacity(
         // tensor's checked expert stride before allocation.
         sched->active_expert_cache_slots = 64;
     }
+}
+
+void ggml_backend_sched_set_expert_hybrid_guard(
+        ggml_backend_sched_t sched,
+        uint64_t cpu_ns_per_expert,
+        uint32_t cpu_route_positions,
+        uint64_t upload_ns_per_expert,
+        uint32_t maximum_drift_ppm,
+        uint32_t minimum_cpu_calls) {
+    if (!sched) return;
+    sched->expert_hybrid_guard_cpu_ns_per_expert = cpu_ns_per_expert;
+    sched->expert_hybrid_guard_cpu_route_positions = cpu_route_positions;
+    sched->expert_hybrid_guard_upload_ns_per_expert = upload_ns_per_expert;
+    sched->expert_hybrid_guard_maximum_drift_ppm = maximum_drift_ppm;
+    sched->expert_hybrid_guard_minimum_cpu_calls = minimum_cpu_calls;
+    sched->expert_hybrid_guard_baseline = {
+        sched->active_expert_cache_misses,
+        sched->active_expert_cache_forced_fallbacks,
+        sched->active_expert_cache_lease_acquire_ns,
+        sched->active_expert_cache_transfer_submit_ns,
+        sched->active_expert_cache_transfer_wait_ns,
+        sched->active_expert_cache_cpu_compute_ns,
+        sched->active_expert_cache_cpu_compute_calls,
+    };
+    const struct ggml_backend_expert_hybrid_guard_window empty = {};
+    sched->expert_hybrid_guard_status.store(ggml_backend_expert_hybrid_guard_evaluate(
+            &empty, cpu_ns_per_expert, cpu_route_positions, upload_ns_per_expert,
+            maximum_drift_ppm, minimum_cpu_calls), std::memory_order_release);
+}
+
+enum ggml_backend_expert_hybrid_guard_status
+ggml_backend_sched_get_expert_hybrid_guard_status(ggml_backend_sched_t sched) {
+    return sched ? sched->expert_hybrid_guard_status.load(std::memory_order_acquire) :
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_DISABLED;
+}
+
+static void ggml_backend_sched_evaluate_expert_hybrid_guard(ggml_backend_sched_t sched) {
+    if (!sched || sched->expert_hybrid_guard_status.load(std::memory_order_acquire) !=
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING) {
+        return;
+    }
+    auto & baseline = sched->expert_hybrid_guard_baseline;
+    const struct ggml_backend_expert_hybrid_guard_window window = {
+        sched->active_expert_cache_misses - baseline.misses,
+        sched->active_expert_cache_forced_fallbacks - baseline.forced_fallbacks,
+        sched->active_expert_cache_lease_acquire_ns - baseline.lease_acquire_ns,
+        sched->active_expert_cache_transfer_submit_ns - baseline.transfer_submit_ns,
+        sched->active_expert_cache_transfer_wait_ns - baseline.transfer_wait_ns,
+        sched->active_expert_cache_cpu_compute_ns - baseline.cpu_compute_ns,
+        sched->active_expert_cache_cpu_compute_calls - baseline.cpu_compute_calls,
+    };
+    const auto status = ggml_backend_expert_hybrid_guard_evaluate(
+            &window,
+            sched->expert_hybrid_guard_cpu_ns_per_expert,
+            sched->expert_hybrid_guard_cpu_route_positions,
+            sched->expert_hybrid_guard_upload_ns_per_expert,
+            sched->expert_hybrid_guard_maximum_drift_ppm,
+            sched->expert_hybrid_guard_minimum_cpu_calls);
+    if (status != GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING) {
+        sched->expert_hybrid_guard_status.store(status, std::memory_order_release);
+        const char * reason = status == GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_FALLBACK ?
+                "forced-fallback" :
+                status == GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_CPU_DRIFT ?
+                "cpu-drift" : "upload-drift";
+        fprintf(stderr,
+                "expert_hybrid_guard: {\"status\":\"revoked\",\"reason\":\"%s\","
+                "\"status_code\":%d,\"misses\":%llu,"
+                "\"forced_fallbacks\":%llu,\"cpu_compute_ns\":%llu,"
+                "\"cpu_compute_calls\":%llu,\"lease_acquire_ns\":%llu,"
+                "\"transfer_submit_ns\":%llu,\"transfer_wait_ns\":%llu,"
+                "\"cpu_ns_per_expert\":%llu,\"cpu_route_positions\":%u,"
+                "\"upload_ns_per_expert\":%llu,\"maximum_drift_ppm\":%u}\n",
+                reason,
+                (int) status,
+                (unsigned long long) window.misses,
+                (unsigned long long) window.forced_fallbacks,
+                (unsigned long long) window.cpu_compute_ns,
+                (unsigned long long) window.cpu_compute_calls,
+                (unsigned long long) window.lease_acquire_ns,
+                (unsigned long long) window.transfer_submit_ns,
+                (unsigned long long) window.transfer_wait_ns,
+                (unsigned long long) sched->expert_hybrid_guard_cpu_ns_per_expert,
+                sched->expert_hybrid_guard_cpu_route_positions,
+                (unsigned long long) sched->expert_hybrid_guard_upload_ns_per_expert,
+                sched->expert_hybrid_guard_maximum_drift_ppm);
+        return;
+    }
+    if (window.cpu_compute_calls >= sched->expert_hybrid_guard_minimum_cpu_calls) {
+        baseline.cpu_compute_ns = sched->active_expert_cache_cpu_compute_ns;
+        baseline.cpu_compute_calls = sched->active_expert_cache_cpu_compute_calls;
+    }
+    if (window.misses >= 3) {
+        baseline.misses = sched->active_expert_cache_misses;
+        baseline.lease_acquire_ns = sched->active_expert_cache_lease_acquire_ns;
+        baseline.transfer_submit_ns = sched->active_expert_cache_transfer_submit_ns;
+        baseline.transfer_wait_ns = sched->active_expert_cache_transfer_wait_ns;
+    }
+    baseline.forced_fallbacks = sched->active_expert_cache_forced_fallbacks;
 }
 
 bool ggml_backend_prefetch_init(int n_threads) {
@@ -2389,9 +2537,10 @@ static bool ggml_active_expert_cache_stage(
             const auto acquire_start = std::chrono::steady_clock::now();
             const bool acquired = sched->expert_lease_acquire(
                     sched->expert_lease_user_data, layer, route->experts[i], component_index, &lease);
-            sched->active_expert_cache_layer_stats[layer].lease_acquire_ns += uint64_t(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - acquire_start).count());
+            const uint64_t acquire_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - acquire_start).count());
+            sched->active_expert_cache_lease_acquire_ns += acquire_ns;
+            sched->active_expert_cache_layer_stats[layer].lease_acquire_ns += acquire_ns;
             if (acquired && lease.data && lease.handle && lease.size == input->nb[2]) {
                 upload_source = lease.data;
                 route->cache->lease_handles.push_back(lease.handle);
@@ -3541,9 +3690,12 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
     if (cpu_hybrid_layer >= 0) {
         const auto found = sched->active_expert_cache_layer_stats.find(cpu_hybrid_layer);
         if (found != sched->active_expert_cache_layer_stats.end()) {
-            found->second.cpu_compute_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            const uint64_t compute_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - eval_start).count());
+            found->second.cpu_compute_ns += compute_ns;
             ++found->second.cpu_compute_calls;
+            sched->active_expert_cache_cpu_compute_ns += compute_ns;
+            ++sched->active_expert_cache_cpu_compute_calls;
         }
     }
     ggml_active_expert_cache_record_compute(sched, split_backend);
@@ -3755,6 +3907,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
         ggml_active_expert_cache_reset_pass(sched);
+        ggml_backend_sched_evaluate_expert_hybrid_guard(sched);
         return GGML_STATUS_SUCCESS;
 
     }
@@ -3897,6 +4050,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
 
     ggml_active_expert_cache_reset_pass(sched);
+    ggml_backend_sched_evaluate_expert_hybrid_guard(sched);
     return GGML_STATUS_SUCCESS;
 }
 

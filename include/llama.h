@@ -537,6 +537,18 @@ extern "C" {
         uint64_t expert_vram_reserve_bytes; // per-device reserve that cache allocation must preserve
         uint32_t expert_cache_min_observations; // route observations before GPU admission
         uint32_t expert_hybrid_gpu_experts; // decode top-k positions assigned to the GPU branch; 0 disables
+        uint64_t expert_hybrid_cpu_ns_per_expert; // conservative calibrated CPU cost used by runtime guard
+        uint64_t expert_hybrid_upload_ns_per_expert; // conservative calibrated upload cost used by runtime guard
+        uint32_t expert_hybrid_maximum_drift_ppm; // one-way runtime revocation threshold
+        uint32_t expert_hybrid_minimum_cpu_calls; // minimum rolling-window CPU samples
+    };
+
+    enum llama_expert_hybrid_guard_status {
+        LLAMA_EXPERT_HYBRID_GUARD_DISABLED = 0,
+        LLAMA_EXPERT_HYBRID_GUARD_MONITORING,
+        LLAMA_EXPERT_HYBRID_GUARD_REVOKED_FALLBACK,
+        LLAMA_EXPERT_HYBRID_GUARD_REVOKED_CPU_DRIFT,
+        LLAMA_EXPERT_HYBRID_GUARD_REVOKED_UPLOAD_DRIFT,
     };
 
     // model quantization parameters
@@ -643,6 +655,8 @@ extern "C" {
 
 
     LLAMA_API const struct llama_model * llama_get_model(const struct llama_context * ctx);
+    LLAMA_API enum llama_expert_hybrid_guard_status
+        llama_get_expert_hybrid_guard_status(const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);

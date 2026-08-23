@@ -1104,6 +1104,15 @@ int main(int argc, char ** argv) {
         }
         std::string tmpl_default = common_chat_templates_source(ctx_server.chat_params.tmpls.get(), "");
         std::string tmpl_tools = common_chat_templates_source(ctx_server.chat_params.tmpls.get(), "tool_use");
+        const auto hybrid_guard_code = llama_get_expert_hybrid_guard_status(ctx_server.ctx);
+        const char * hybrid_guard_status = hybrid_guard_code == LLAMA_EXPERT_HYBRID_GUARD_MONITORING ?
+                "monitoring" : hybrid_guard_code == LLAMA_EXPERT_HYBRID_GUARD_DISABLED ?
+                "disabled" : "revoked";
+        const char * hybrid_guard_reason = hybrid_guard_code == LLAMA_EXPERT_HYBRID_GUARD_REVOKED_FALLBACK ?
+                "forced-fallback" : hybrid_guard_code == LLAMA_EXPERT_HYBRID_GUARD_REVOKED_CPU_DRIFT ?
+                "cpu-drift" : hybrid_guard_code == LLAMA_EXPERT_HYBRID_GUARD_REVOKED_UPLOAD_DRIFT ?
+                "upload-drift" : hybrid_guard_code == LLAMA_EXPERT_HYBRID_GUARD_MONITORING ?
+                "within-calibrated-bounds" : "not-active";
 
         json data = {
             { "system_prompt",               ctx_server.system_prompt.c_str() },
@@ -1123,6 +1132,15 @@ int main(int argc, char ** argv) {
             } },
             { "n_ctx",                       ctx_server.n_ctx },
             { "cors_proxy_enabled",          ctx_server.params_base.webui_mcp_proxy},
+            { "expert_hybrid_guard", json {
+                { "status", hybrid_guard_status },
+                { "reason", hybrid_guard_reason },
+                { "gpu_route_positions", ctx_server.params_base.expert_hybrid_gpu_experts },
+                { "cpu_ns_per_expert", ctx_server.params_base.expert_hybrid_cpu_ns_per_expert },
+                { "upload_ns_per_expert", ctx_server.params_base.expert_hybrid_upload_ns_per_expert },
+                { "maximum_drift_ppm", ctx_server.params_base.expert_hybrid_maximum_drift_ppm },
+                { "minimum_cpu_calls", ctx_server.params_base.expert_hybrid_minimum_cpu_calls },
+            } },
 
         };
 

@@ -228,6 +228,12 @@ Its local evidence is private to the user (`0600`) and becomes stale when the
 sampled model contents, hardware topology, or performance-relevant configuration
 changes.
 
+Passing evidence also configures a one-way native serving guard. Rolling CPU and
+upload windows are checked against the calibrated bounds after transfer events
+complete; any contradiction or forced fallback permanently returns subsequent
+graphs to the established path. `GET /props` reports the live
+`expert_hybrid_guard` state and reason for ESE Studio and operators.
+
 Use `./ese plan MODEL.gguf --json` for machine-readable launcher output. Pass
 native `llama-server` options after `--`:
 
@@ -317,7 +323,7 @@ validation.
 | Expert hierarchy | mmap/pread parity, forced eviction, sanitizer coverage, and 1/2/3-GPU execution |
 | CUDA hardware | RTX 2080 SUPER (`sm_75`), RTX 3060 Ti (`sm_86`), and RTX 3080 (`sm_86`) |
 | Global controller | CPU plus real Turing+Ampere three-GPU model load with explicit 1 GiB reserves |
-| Hardware-adaptive MoE | Schema-v3 parity and telemetry gate on 43-layer DeepSeek-V4-Flash; one-position hybrid candidate measured 7.54x over the established route |
+| Hardware-adaptive MoE | Schema-v3 DeepSeek-V4-Flash gate measured 7.54x; model-backed one-way live revocation and `/props` status reporting |
 | Transient/speculation | CPU, Turing, Ampere, and model-backed image→text module swapping |
 | Turbo KV foundation | CPU/CUDA codecs, direct attention paths, lifecycle tests, and quality sweeps |
 

@@ -1644,7 +1644,9 @@ llm_expert_gating_func_type   gating_op,
     const int64_t graph_tokens = lctx.inp_tokens ? lctx.inp_tokens->ne[0] :
             lctx.inp_embd ? lctx.inp_embd->ne[1] : n_tokens;
     const bool use_hybrid = graph_tokens == 1 && n_tokens == 1 && hybrid_gpu_experts > 0 &&
-            hybrid_gpu_experts < n_expert_used && lctx.cparams.expert_vram_cache_bytes > 0;
+            hybrid_gpu_experts < n_expert_used && lctx.cparams.expert_vram_cache_bytes > 0 &&
+            ggml_backend_sched_get_expert_hybrid_guard_status(lctx.sched) ==
+                    GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING;
     if (!use_hybrid) {
         return build_expert_branch(selected_experts, add_input);
     }

@@ -716,6 +716,13 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
         }
     }
 
+    if (params.expert_hybrid_gpu_experts > 0 &&
+            (params.expert_hybrid_cpu_ns_per_expert == 0 ||
+             params.expert_hybrid_upload_ns_per_expert == 0)) {
+        throw std::invalid_argument(
+                "error: --expert-hybrid-gpu-experts requires calibrated CPU and upload guard costs");
+    }
+
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
@@ -2298,6 +2305,36 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--expert-hybrid-cpu-ns-per-expert" ||
+            arg == "--expert-hybrid-upload-ns-per-expert") {
+        CHECK_ARG;
+        const uint64_t value = std::stoull(argv[i]);
+        if (value == 0) {
+            fprintf(stderr, "error: %s must be >= 1\n", arg.c_str());
+            invalid_param = true;
+        } else if (arg == "--expert-hybrid-cpu-ns-per-expert") {
+            params.expert_hybrid_cpu_ns_per_expert = value;
+        } else {
+            params.expert_hybrid_upload_ns_per_expert = value;
+        }
+        return true;
+    }
+    if (arg == "--expert-hybrid-maximum-drift-ppm" ||
+            arg == "--expert-hybrid-minimum-cpu-calls") {
+        CHECK_ARG;
+        const uint64_t value = std::stoull(argv[i]);
+        if (value > UINT32_MAX ||
+                (arg == "--expert-hybrid-maximum-drift-ppm" && value < 1000000) ||
+                (arg == "--expert-hybrid-minimum-cpu-calls" && value < 1)) {
+            fprintf(stderr, "error: invalid value for %s\n", arg.c_str());
+            invalid_param = true;
+        } else if (arg == "--expert-hybrid-maximum-drift-ppm") {
+            params.expert_hybrid_maximum_drift_ppm = (uint32_t) value;
+        } else {
+            params.expert_hybrid_minimum_cpu_calls = (uint32_t) value;
+        }
+        return true;
+    }
     if (arg == "--prefetch-experts") {
         params.prefetch_experts = true;
         return true;
@@ -3442,6 +3479,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --expert-vram-reserve-mib N", "VRAM that the expert cache must leave unallocated per device"});
     options.push_back({ "*",           "       --expert-cache-min-observations N", "minimum routes before GPU-cache admission (default: 2)"});
     options.push_back({ "*",           "       --expert-hybrid-gpu-experts N", "decode top-k positions assigned to the GPU branch (default: disabled)"});
+    options.push_back({ "*",           "       --expert-hybrid-cpu-ns-per-expert N", "calibrated conservative CPU cost required by the live hybrid guard"});
+    options.push_back({ "*",           "       --expert-hybrid-upload-ns-per-expert N", "calibrated conservative upload cost required by the live hybrid guard"});
+    options.push_back({ "*",           "       --expert-hybrid-maximum-drift-ppm N", "one-way live hybrid revocation threshold (default: 4000000)"});
+    options.push_back({ "*",           "       --expert-hybrid-minimum-cpu-calls N", "rolling CPU timing window before live guard evaluation (default: 64)"});
     options.push_back({ "*",           "       --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
     options.push_back({ "*",           "       --prefetch-experts-threads N",
                                                                         "number of expert prefetch workers, tune to drive speed/type (default: auto)"});
@@ -4694,6 +4735,10 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.expert_vram_reserve_bytes = uint64_t(params.expert_vram_reserve_mib)*expert_mib;
     cparams.expert_cache_min_observations = uint32_t(params.expert_cache_min_observations);
     cparams.expert_hybrid_gpu_experts = uint32_t(params.expert_hybrid_gpu_experts);
+    cparams.expert_hybrid_cpu_ns_per_expert = params.expert_hybrid_cpu_ns_per_expert;
+    cparams.expert_hybrid_upload_ns_per_expert = params.expert_hybrid_upload_ns_per_expert;
+    cparams.expert_hybrid_maximum_drift_ppm = params.expert_hybrid_maximum_drift_ppm;
+    cparams.expert_hybrid_minimum_cpu_calls = params.expert_hybrid_minimum_cpu_calls;
     cparams.mtp               = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     cparams.mtp_op_type      = MTP_OP_NONE;
 

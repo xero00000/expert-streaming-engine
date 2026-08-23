@@ -1075,6 +1075,10 @@ def build_launch_plan(
     expert_storage_backend: str | None = None,
     expert_cache_min_observations: int = 2,
     hybrid_gpu_experts: int = 0,
+    hybrid_cpu_ns_per_expert: int = 0,
+    hybrid_upload_ns_per_expert: int = 0,
+    hybrid_maximum_drift_ppm: int = 4_000_000,
+    hybrid_minimum_cpu_calls: int = 64,
     hybrid_selection: str = "automatic hybrid routing was not evaluated",
     extra_args: Sequence[str] = (),
 ) -> LaunchPlan:
@@ -1094,6 +1098,14 @@ def build_launch_plan(
         raise ESEError("--expert-cache-min-observations must be at least 1")
     if hybrid_gpu_experts < 0 or hybrid_gpu_experts > 64:
         raise ESEError("hybrid GPU experts must be between 0 and 64")
+    if hybrid_gpu_experts and (
+        hybrid_cpu_ns_per_expert <= 0 or hybrid_upload_ns_per_expert <= 0
+    ):
+        raise ESEError("hybrid routing requires positive calibrated runtime guard costs")
+    if hybrid_maximum_drift_ppm < 1_000_000:
+        raise ESEError("hybrid runtime guard drift must be at least 1000000 ppm")
+    if hybrid_minimum_cpu_calls < 1:
+        raise ESEError("hybrid runtime guard requires at least one CPU call")
 
     args: list[str] = [
         "-m",
@@ -1213,7 +1225,20 @@ def build_launch_plan(
                 )
             )
             if hybrid_gpu_experts:
-                args.extend(("--expert-hybrid-gpu-experts", str(hybrid_gpu_experts)))
+                args.extend(
+                    (
+                        "--expert-hybrid-gpu-experts",
+                        str(hybrid_gpu_experts),
+                        "--expert-hybrid-cpu-ns-per-expert",
+                        str(hybrid_cpu_ns_per_expert),
+                        "--expert-hybrid-upload-ns-per-expert",
+                        str(hybrid_upload_ns_per_expert),
+                        "--expert-hybrid-maximum-drift-ppm",
+                        str(hybrid_maximum_drift_ppm),
+                        "--expert-hybrid-minimum-cpu-calls",
+                        str(hybrid_minimum_cpu_calls),
+                    )
+                )
         elif hybrid_gpu_experts:
             hybrid_gpu_experts = 0
             hybrid_selection = "automatic hybrid routing disabled: expert VRAM cache is unavailable"
@@ -1276,11 +1301,20 @@ def _plan_with_port(plan: LaunchPlan, port: int) -> LaunchPlan:
 
 def _baseline_hybrid_plan(plan: LaunchPlan) -> LaunchPlan:
     arguments = list(plan.arguments)
-    try:
-        position = arguments.index("--expert-hybrid-gpu-experts")
-    except ValueError as exc:
-        raise ESEError("calibration did not produce a mixed hybrid plan to validate") from exc
-    del arguments[position : position + 2]
+    if "--expert-hybrid-gpu-experts" not in arguments:
+        raise ESEError("calibration did not produce a mixed hybrid plan to validate")
+    for option in (
+        "--expert-hybrid-gpu-experts",
+        "--expert-hybrid-cpu-ns-per-expert",
+        "--expert-hybrid-upload-ns-per-expert",
+        "--expert-hybrid-maximum-drift-ppm",
+        "--expert-hybrid-minimum-cpu-calls",
+    ):
+        try:
+            position = arguments.index(option)
+        except ValueError:
+            continue
+        del arguments[position : position + 2]
     return dataclasses.replace(
         plan,
         arguments=tuple(arguments),
@@ -1320,13 +1354,24 @@ def _http_json(
 
 def _parse_expert_cache_telemetry(log_path: Path) -> dict[str, Any]:
     prefix = "expert_cache_stats: "
+    guard_prefix = "expert_hybrid_guard: "
     layers: list[dict[str, Any]] = []
     totals: list[dict[str, Any]] = []
+    guard_failures: list[dict[str, Any]] = []
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as exc:
         raise ESEError(f"cannot read server telemetry: {exc}") from exc
     for line in lines:
+        guard_position = line.find(guard_prefix)
+        if guard_position >= 0:
+            try:
+                guard = json.loads(line[guard_position + len(guard_prefix) :])
+            except json.JSONDecodeError as exc:
+                raise ESEError(f"server emitted malformed hybrid-guard telemetry: {exc}") from exc
+            if not isinstance(guard, dict):
+                raise ESEError("server emitted non-object hybrid-guard telemetry")
+            guard_failures.append(guard)
         position = line.find(prefix)
         if position < 0:
             continue
@@ -1340,12 +1385,43 @@ def _parse_expert_cache_telemetry(log_path: Path) -> dict[str, Any]:
             layers.append(item)
         elif item.get("level") == "vram-total":
             totals.append(item)
-    return {"layers": layers, "totals": totals}
+    return {"layers": layers, "totals": totals, "guard_failures": guard_failures}
 
 
 def _validated_hybrid_telemetry(telemetry: dict[str, Any]) -> dict[str, int]:
     layers = telemetry.get("layers")
     totals = telemetry.get("totals")
+    guard_failures = telemetry.get("guard_failures")
+    if not isinstance(guard_failures, list):
+        raise ESEError("hybrid server omitted runtime-guard telemetry state")
+    if guard_failures:
+        first = guard_failures[0]
+        reason = first.get("reason", "unknown") if isinstance(first, dict) else "unknown"
+        detail = ""
+        if isinstance(first, dict) and reason == "cpu-drift":
+            observed = first.get("cpu_compute_ns")
+            calls = first.get("cpu_compute_calls")
+            predicted = first.get("cpu_ns_per_expert")
+            positions = first.get("cpu_route_positions")
+            if all(isinstance(value, int) and value > 0 for value in (observed, calls, predicted, positions)):
+                drift = observed / (calls * predicted * positions)
+                detail = f", observed/predicted={drift:.3f}x"
+        elif isinstance(first, dict) and reason == "upload-drift":
+            misses = first.get("misses")
+            predicted = first.get("upload_ns_per_expert")
+            observed_values = [first.get(name) for name in (
+                "lease_acquire_ns", "transfer_submit_ns", "transfer_wait_ns"
+            )]
+            if (
+                isinstance(misses, int) and misses > 0
+                and isinstance(predicted, int) and predicted > 0
+                and all(isinstance(value, int) and value >= 0 for value in observed_values)
+            ):
+                drift = sum(observed_values) / (misses * predicted)
+                detail = f", observed/predicted={drift:.3f}x"
+        raise ESEError(
+            f"hybrid runtime guard revoked the mixed route during validation ({reason}{detail})"
+        )
     if not isinstance(layers, list) or not layers:
         raise ESEError("hybrid server emitted no per-layer expert-cache telemetry")
     if not isinstance(totals, list) or len(totals) != 1 or not isinstance(totals[0], dict):
@@ -2198,6 +2274,14 @@ def _plan_from_args(
                 f"advanced evidence-gated candidate selected {hybrid_candidate} GPU and "
                 f"{expert_used - hybrid_candidate} CPU route positions"
             )
+    hybrid_cpu_ns_per_expert = 0
+    hybrid_upload_ns_per_expert = 0
+    if hybrid_gpu_experts > 0:
+        predicted_cpu_ns, predicted_upload_ns = _calibrated_expert_cost_bounds(
+            model, args.hardware_profile
+        )
+        hybrid_cpu_ns_per_expert = max(1, round(predicted_cpu_ns))
+        hybrid_upload_ns_per_expert = max(1, round(predicted_upload_ns))
     plan_arguments = dict(
         model=model,
         hardware=hardware,
@@ -2222,6 +2306,8 @@ def _plan_from_args(
         expert_storage_backend=args.expert_storage_backend,
         expert_cache_min_observations=args.expert_cache_min_observations,
         hybrid_gpu_experts=hybrid_gpu_experts,
+        hybrid_cpu_ns_per_expert=hybrid_cpu_ns_per_expert,
+        hybrid_upload_ns_per_expert=hybrid_upload_ns_per_expert,
         hybrid_selection=hybrid_selection,
         extra_args=args.extra,
     )

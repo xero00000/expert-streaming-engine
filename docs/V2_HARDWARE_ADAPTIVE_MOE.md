@@ -90,10 +90,22 @@ never directly activates routing: that exact candidate still needs matching
 schema-v3 workload evidence, and normal automatic planning remains
 conservative.
 
-### Remaining Phase A gate
+### Long-lived serving guard
 
-- Extend the preflight workload window into a periodically refreshed serving-time window before allowing automatic split changes during a long-lived server.
-- Keep the launcher and native calibrated split solvers covered by shared golden cases as the controller evolves.
+Passing preflight evidence now supplies its conservative CPU and upload costs to
+the native scheduler. The scheduler evaluates independent rolling windows after
+outstanding upload events have completed, including the asynchronous
+multi-backend path. A forced host-tensor fallback or CPU/upload drift above the
+same `4x` bound permanently revokes mixed routing for that process. Subsequent
+graphs use the already-reserved established path; noisy recovery cannot
+oscillate the process back into hybrid mode. Prefill-only cache traffic is
+excluded until an actual mixed CPU branch has executed.
+
+`GET /props` exposes the live state as `disabled`, `monitoring`, or `revoked`
+with the revocation reason and calibrated bounds. A validator run that observes
+revocation is rejected even when its output parity and median speedup would
+otherwise pass. The launcher/native solvers and guard parameter boundary remain
+covered by shared surface and golden tests as the controller evolves.
 
 ## Phase B: heterogeneous decode execution
 
@@ -192,12 +204,20 @@ fallbacks remained zero. Observed CPU and upload-path time were respectively
 inside the `4x` fail-closed bounds. This uses a tiny fixture and a test profile;
 it is gate-development evidence, not a product benchmark.
 
+A later one-GPU RTX 3080 calibration intentionally provided a negative live
+guard trial. `/props` began in `monitoring`; after 70 timed CPU branch calls the
+observed CPU window was `11.61x` its calibrated prediction and the native guard
+changed to `revoked` with reason `cpu-drift`. A second request stayed revoked,
+and shutdown telemetry showed 70 GPU route positions—all before the first
+request's revocation—while the later request used the established path. Output parity still
+matched and the three-sample hybrid median was `1.034x`, demonstrating that a
+short apparent speed win cannot bypass contradictory serving telemetry.
+
 ## Later phases
 
-1. Finish Phase B serving-time evidence refresh for long-lived processes.
-2. Phase C: double-buffered prefill streaming.
-3. Phase D: live KV/expert/transient resource rebalancing.
-4. Phase E: optional aligned FastStore sidecar bound to GGUF identity.
-5. Phase F: semantic cache anchors and newer hardware kernels.
+1. Phase C: double-buffered prefill streaming.
+2. Phase D: live KV/expert/transient resource rebalancing.
+3. Phase E: optional aligned FastStore sidecar bound to GGUF identity.
+4. Phase F: semantic cache anchors and newer hardware kernels.
 
 Each phase needs correctness tests, local benchmark evidence, documented hardware coverage and limitations, and a clean private review checkpoint before it is proposed for public `main`.

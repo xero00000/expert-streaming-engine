@@ -144,6 +144,10 @@ class LauncherTests(unittest.TestCase):
                     "tools.ese.calibrated_hybrid_gpu_experts",
                     return_value=(1, "calibrated"),
                 ),
+                mock.patch(
+                    "tools.ese._calibrated_expert_cost_bounds",
+                    return_value=(100.0, 200.0),
+                ),
             ):
                 blocked = _plan_from_args(args)
                 self.assertEqual(blocked.hybrid_gpu_experts, 0)
@@ -208,6 +212,8 @@ class LauncherTests(unittest.TestCase):
                 expert_storage_backend="pread",
                 expert_vram_cache=256 * 1024**2,
                 hybrid_gpu_experts=1,
+                hybrid_cpu_ns_per_expert=100,
+                hybrid_upload_ns_per_expert=200,
             )
             evidence = root / "hybrid.json"
             identity = {"cpu": {"model": "test"}, "gpus": [{"uuid": "GPU-test"}]}
@@ -237,6 +243,8 @@ class LauncherTests(unittest.TestCase):
                 expert_storage_backend="pread",
                 expert_vram_cache=256 * 1024**2,
                 hybrid_gpu_experts=1,
+                hybrid_cpu_ns_per_expert=100,
+                hybrid_upload_ns_per_expert=200,
             )
             self.assertIn(
                 "no matching workload A/B verification",
@@ -259,9 +267,12 @@ class LauncherTests(unittest.TestCase):
                 model=model, hardware=hardware(20), binary=Path("/server"), policy="cache",
                 expert_storage_backend="pread", expert_vram_cache=256 * 1024**2,
                 hybrid_gpu_experts=1,
+                hybrid_cpu_ns_per_expert=100, hybrid_upload_ns_per_expert=200,
             )
             baseline = _baseline_hybrid_plan(plan)
             self.assertNotIn("--expert-hybrid-gpu-experts", baseline.arguments)
+            self.assertNotIn("--expert-hybrid-cpu-ns-per-expert", baseline.arguments)
+            self.assertNotIn("--expert-hybrid-upload-ns-per-expert", baseline.arguments)
             identity = {"cpu": {}, "gpus": []}
             evidence = Path(temp) / "hybrid.json"
             _save_hybrid_verification(evidence, plan, identity, {
@@ -330,6 +341,10 @@ class LauncherTests(unittest.TestCase):
         fallback["totals"][0]["forced_fallbacks"] = 1
         with self.assertRaisesRegex(ESEError, "forbidden host-tensor fallback"):
             _validated_hybrid_telemetry(fallback)
+        revoked = json.loads(json.dumps(telemetry))
+        revoked["guard_failures"] = [{"status": 3}]
+        with self.assertRaisesRegex(ESEError, "runtime guard revoked"):
+            _validated_hybrid_telemetry(revoked)
         with self.assertRaisesRegex(ESEError, "contradicts calibration"):
             _validated_calibration_drift(summary, 10.0)
         with self.assertRaisesRegex(ESEError, "CPU-branch timing contradicts"):
@@ -425,10 +440,16 @@ class LauncherTests(unittest.TestCase):
             expert_vram_cache=256 * 1024**2,
             expert_storage_backend="pread",
             hybrid_gpu_experts=2,
+            hybrid_cpu_ns_per_expert=100,
+            hybrid_upload_ns_per_expert=200,
             hybrid_selection="verified test profile",
         )
         position = plan.arguments.index("--expert-hybrid-gpu-experts")
         self.assertEqual(plan.arguments[position + 1], "2")
+        cpu_guard = plan.arguments.index("--expert-hybrid-cpu-ns-per-expert")
+        upload_guard = plan.arguments.index("--expert-hybrid-upload-ns-per-expert")
+        self.assertEqual(plan.arguments[cpu_guard + 1], "100")
+        self.assertEqual(plan.arguments[upload_guard + 1], "200")
         self.assertEqual(plan.hybrid_gpu_experts, 2)
         self.assertEqual(plan.as_dict()["hybrid_routing"]["selection"], "verified test profile")
 
@@ -439,6 +460,8 @@ class LauncherTests(unittest.TestCase):
             policy="cache",
             expert_vram_cache=256 * 1024**2,
             hybrid_gpu_experts=2,
+            hybrid_cpu_ns_per_expert=100,
+            hybrid_upload_ns_per_expert=200,
         )
         self.assertNotIn("--expert-hybrid-gpu-experts", mmap_plan.arguments)
         self.assertIn("pread bounded-lease", mmap_plan.hybrid_selection)

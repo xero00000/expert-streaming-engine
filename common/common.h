@@ -469,6 +469,10 @@ struct gpt_params {
     ggml_type resolved_resource_kv_type = GGML_TYPE_COUNT;
     int expert_cache_min_observations = 2;
     int expert_hybrid_gpu_experts = 0;
+    uint64_t expert_hybrid_cpu_ns_per_expert = 0;
+    uint64_t expert_hybrid_upload_ns_per_expert = 0;
+    uint32_t expert_hybrid_maximum_drift_ppm = 4000000;
+    uint32_t expert_hybrid_minimum_cpu_calls = 64;
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
     bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)
     bool split_mode_graph_scheduling = false; // if true, force split mode graph scheduling
