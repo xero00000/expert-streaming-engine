@@ -1039,19 +1039,35 @@ int main(int argc, char ** argv) {
                 return;
             }
 
+            const bool context_change = current.context != target.context;
             bool expert_cache_change = false;
             for (size_t index = 0; index < current.devices.size(); ++index) {
                 expert_cache_change |= current.devices[index].expert_cache_bytes !=
                     target.devices[index].expert_cache_bytes;
             }
-            if (expert_cache_change) {
+            if (context_change && expert_cache_change) {
                 res_err(res, format_error_response(
-                    "live expert-cache replacement is not enabled yet; use dry_run to validate that target",
+                    "combined KV/expert mutation is not enabled yet; submit one resource class per transaction",
                     ERROR_TYPE_NOT_SUPPORTED));
                 return;
             }
 
-            target.reason = "idle-only runtime KV rebalance target";
+            if (!context_change && !expert_cache_change) {
+                res_ok(res, {
+                    {"status", "committed"},
+                    {"dry_run", false},
+                    {"mutated", false},
+                    {"transaction", "prepare-migrate-commit"},
+                    {"scope", "none"},
+                    {"current_plan", current_json},
+                });
+                return;
+            }
+
+            const std::string scope = expert_cache_change ? "expert-cache-only" : "kv-only";
+            target.reason = expert_cache_change
+                ? "idle-only prepared expert-cache replacement target"
+                : "idle-only runtime KV rebalance target";
             target_json = json::parse(common_resource_plan_json(target));
             server_task task;
             task.id = ctx_server.queue_tasks.get_new_id();
@@ -1060,6 +1076,10 @@ int main(int argc, char ** argv) {
             task.type = SERVER_TASK_TYPE_RESOURCE_REBALANCE;
             task.data = {
                 {"target_context", target.context},
+                {"target_expert_cache_bytes_per_device",
+                    request.set_expert_cache_bytes_per_device
+                        ? request.expert_cache_bytes_per_device : uint64_t(0)},
+                {"scope", scope},
                 {"previous_plan", current_json},
                 {"target_plan", target_json},
             };

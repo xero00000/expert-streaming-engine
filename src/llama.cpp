@@ -10689,6 +10689,26 @@ bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size) {
     return llama_kv_cache_replace(ctx, type_k.data(), type_v.data(), n_layers, size);
 }
 
+bool llama_expert_cache_resize(
+        struct llama_context * ctx,
+        uint64_t bytes_per_device) {
+    if (ctx == nullptr) return false;
+    if (bytes_per_device == ctx->cparams.expert_vram_cache_bytes) return true;
+
+    llama_synchronize(ctx);
+    if (!ggml_backend_sched_replace_expert_cache(
+                ctx->sched,
+                bytes_per_device,
+                ctx->cparams.expert_vram_reserve_bytes,
+                ctx->cparams.expert_cache_min_observations)) {
+        LLAMA_LOG_ERROR("%s: target expert cache allocation failed; original cache retained\n", __func__);
+        return false;
+    }
+    ctx->cparams.expert_vram_cache_bytes = bytes_per_device;
+    ctx->reset_scheduler();
+    return true;
+}
+
 uint32_t llama_resource_device_count(const struct llama_context * ctx) {
     if (ctx == nullptr) return 0;
     const size_t count = ggml_backend_sched_get_resource_device_count(ctx->sched);

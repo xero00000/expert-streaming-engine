@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 #include <set>
@@ -1217,6 +1218,22 @@ enum ggml_active_expert_cache_component {
     GGML_ACTIVE_EXPERT_CACHE_COMPONENT_COUNT = 4,
 };
 
+// Scheduler graph tensors are rebuilt in a scratch context on every split.
+// Keep only the immutable expert geometry needed to prepare a replacement
+// cache; retaining graph tensor pointers here would become a use-after-free on
+// the next graph rebuild.  The model is fixed for a scheduler lifetime, so the
+// catalog can monotonically collect every layout observed by prompt/decode
+// graphs and remains available while the live cache is disabled.
+struct ggml_active_expert_cache_layout {
+    enum ggml_type type = GGML_TYPE_COUNT;
+    int64_t ne0 = 0;
+    int64_t ne1 = 0;
+    int64_t logical_experts = 0;
+    size_t nb0 = 0;
+    size_t nb1 = 0;
+    size_t nb2 = 0;
+};
+
 static constexpr size_t GGML_ACTIVE_EXPERT_CACHE_BASE_ROUTE_COUNT = 64;
 static constexpr size_t GGML_ACTIVE_EXPERT_CACHE_ID_STRIDE = 256;
 static constexpr size_t GGML_ACTIVE_EXPERT_CACHE_BASE_ID_BYTES =
@@ -1242,6 +1259,7 @@ struct ggml_active_expert_cache_device {
     bool ready = false;
     int backend_id = -1;
     int slots = 0;
+    int64_t logical_experts = 0;
     uint64_t clock = 0;
     uint64_t allocated_bytes = 0;
     uint64_t capacity_bytes = 0;
@@ -1418,6 +1436,9 @@ struct ggml_backend_sched {
     // transfer-only behavior.  Values 4..64 enable that many slots per GPU.
     int active_expert_cache_slots = 0;
     std::array<ggml_active_expert_cache_device, GGML_SCHED_MAX_BACKENDS> active_expert_caches;
+    std::array<std::vector<ggml_active_expert_cache_layout>,
+            GGML_ACTIVE_EXPERT_CACHE_COMPONENT_COUNT> active_expert_cache_layout_catalog;
+    size_t active_expert_cache_route_capacity = GGML_ACTIVE_EXPERT_CACHE_BASE_ROUTE_COUNT;
     std::vector<ggml_active_expert_cache_route> active_expert_routes;
     std::vector<ggml_active_expert_cache_redirect> active_expert_redirects;
     uint64_t active_expert_cache_hits = 0;
@@ -2004,6 +2025,10 @@ static ggml_tensor * ggml_active_expert_cache_compact_copy(
     return compact;
 }
 
+static bool ggml_active_expert_cache_same_layout(
+        const ggml_tensor * left,
+        const ggml_tensor * right);
+
 static void ggml_active_expert_cache_drain_leases(
         ggml_backend_sched_t sched,
         ggml_active_expert_cache_device & cache) {
@@ -2066,6 +2091,7 @@ static void ggml_active_expert_cache_release(ggml_active_expert_cache_device & c
         cache.ctx = nullptr;
     }
     cache.entries.clear();
+    cache.logical_experts = 0;
     cache.allocated_bytes = 0;
     cache.capacity_bytes = 0;
     cache.used_this_pass = false;
@@ -2082,6 +2108,7 @@ static bool ggml_active_expert_cache_init(
     }
     cache.attempted = true;
     cache.backend_id = backend_id;
+    cache.logical_experts = source == nullptr ? 0 : source->ne[2];
     cache.capacity_bytes = sched->active_expert_cache_capacity_bytes;
 #ifdef GGML_USE_CUDA
     if (cache.capacity_bytes != 0 && ggml_backend_is_cuda(sched->backends[backend_id])) {
@@ -2103,7 +2130,8 @@ static bool ggml_active_expert_cache_init(
         if (node->src[ids_index]) graph_routes.insert(node->src[ids_index]);
     }
     const size_t route_capacity = std::max(
-            GGML_ACTIVE_EXPERT_CACHE_BASE_ROUTE_COUNT, graph_routes.size());
+            sched->active_expert_cache_route_capacity,
+            std::max(GGML_ACTIVE_EXPERT_CACHE_BASE_ROUTE_COUNT, graph_routes.size()));
     if (route_capacity > UINT64_MAX/GGML_ACTIVE_EXPERT_CACHE_ID_STRIDE) return false;
     cache.ids_bytes = uint64_t(route_capacity)*GGML_ACTIVE_EXPERT_CACHE_ID_STRIDE;
     if (cache.ids_bytes > SIZE_MAX) return false;
@@ -2181,7 +2209,7 @@ static bool ggml_active_expert_cache_init(
 #ifdef GGML_USE_CUDA
     if (ggml_backend_is_cuda(event_backend)) {
         cache.transfer_backend = ggml_backend_cuda_init(
-                ggml_backend_cuda_get_device(event_backend), nullptr, &cache);
+                ggml_backend_cuda_get_device(event_backend), nullptr, cache.ctx);
         if (cache.transfer_backend) event_backend = cache.transfer_backend;
     }
 #endif
@@ -2215,12 +2243,14 @@ static bool ggml_active_expert_cache_init_component(
     const auto matching_layout = std::find_if(
             component.layouts.begin(), component.layouts.end(),
             [&](const ggml_tensor * layout) {
-                return layout->type == source->type && layout->ne[0] == source->ne[0] &&
-                        layout->ne[1] == source->ne[1] && layout->nb[2] == source->nb[2];
+                return ggml_active_expert_cache_same_layout(layout, source);
             });
     ggml_tensor * layout = matching_layout == component.layouts.end() ? nullptr : *matching_layout;
     if (!layout) {
-        layout = ggml_new_tensor_3d(cache.ctx, source->type, source->ne[0], source->ne[1], cache.slots);
+        layout = ggml_dup_tensor_layout(cache.ctx, source);
+        layout->ne[2] = cache.slots;
+        layout->ne[3] = 1;
+        layout->nb[3] = layout->nb[2]*size_t(cache.slots);
         component.layouts.push_back(layout);
     }
 
@@ -2467,6 +2497,343 @@ static void ggml_active_expert_cache_reset_pass(ggml_backend_sched_t sched) {
         }
         device.used_this_split.fill(false);
     }
+}
+
+static int64_t ggml_active_expert_cache_replace_failure_step() {
+    const char * value = getenv("ESE_EXPERT_CACHE_REPLACE_FAIL_AFTER_STEPS");
+    if (value == nullptr || value[0] == '\0') return -1;
+    char * end = nullptr;
+    const long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && parsed >= 0 ? parsed : -1;
+}
+
+static int64_t ggml_active_expert_cache_replace_failure_copy() {
+    const char * value = getenv("ESE_EXPERT_CACHE_REPLACE_FAIL_AFTER_COPIES");
+    if (value == nullptr || value[0] == '\0') return -1;
+    char * end = nullptr;
+    const long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && parsed >= 0 ? parsed : -1;
+}
+
+static int64_t ggml_active_expert_cache_replace_failure_device() {
+    const char * value = getenv("ESE_EXPERT_CACHE_REPLACE_FAIL_AFTER_DEVICES");
+    if (value == nullptr || value[0] == '\0') return -1;
+    char * end = nullptr;
+    const long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && parsed >= 0 ? parsed : -1;
+}
+
+static bool ggml_active_expert_cache_same_layout(
+        const ggml_tensor * left,
+        const ggml_tensor * right) {
+    return left && right && left->type == right->type &&
+            left->ne[0] == right->ne[0] && left->ne[1] == right->ne[1] &&
+            left->nb[0] == right->nb[0] && left->nb[1] == right->nb[1] &&
+            left->nb[2] == right->nb[2];
+}
+
+static ggml_active_expert_cache_layout ggml_active_expert_cache_describe_layout(
+        const ggml_tensor * source) {
+    return {
+        source->type,
+        source->ne[0],
+        source->ne[1],
+        source->ne[2],
+        source->nb[0],
+        source->nb[1],
+        source->nb[2],
+    };
+}
+
+static bool ggml_active_expert_cache_same_layout(
+        const ggml_active_expert_cache_layout & left,
+        const ggml_active_expert_cache_layout & right) {
+    return left.type == right.type && left.ne0 == right.ne0 && left.ne1 == right.ne1 &&
+            left.nb0 == right.nb0 && left.nb1 == right.nb1 && left.nb2 == right.nb2;
+}
+
+static bool ggml_active_expert_cache_materialize_layout(
+        const ggml_active_expert_cache_layout & descriptor,
+        ggml_tensor * layout) {
+    if (!layout || int(descriptor.type) < 0 || descriptor.type >= GGML_TYPE_COUNT ||
+            descriptor.ne0 < 1 || descriptor.ne1 < 1 || descriptor.logical_experts < 2 ||
+            descriptor.nb0 == 0 || descriptor.nb1 == 0 || descriptor.nb2 == 0 ||
+            uint64_t(descriptor.logical_experts) > SIZE_MAX/descriptor.nb2) {
+        return false;
+    }
+    *layout = {};
+    layout->type = descriptor.type;
+    layout->ne[0] = descriptor.ne0;
+    layout->ne[1] = descriptor.ne1;
+    layout->ne[2] = descriptor.logical_experts;
+    layout->ne[3] = 1;
+    layout->nb[0] = descriptor.nb0;
+    layout->nb[1] = descriptor.nb1;
+    layout->nb[2] = descriptor.nb2;
+    layout->nb[3] = descriptor.nb2*size_t(descriptor.logical_experts);
+    return true;
+}
+
+static bool ggml_backend_sched_replace_expert_cache_impl(
+        ggml_backend_sched_t sched,
+        uint64_t bytes_per_device,
+        uint64_t reserve_bytes_per_device,
+        uint32_t minimum_observations) {
+    if (!sched || (bytes_per_device > 0 && sched->n_backends <= 1)) return false;
+    minimum_observations = std::max<uint32_t>(1, minimum_observations);
+    if (sched->active_expert_cache_capacity_bytes == bytes_per_device &&
+            sched->active_expert_cache_reserve_bytes == reserve_bytes_per_device &&
+            sched->active_expert_cache_min_observations == minimum_observations) {
+        return true;
+    }
+
+    // Cache redirects and borrowed host leases belong to the completed graph
+    // pass. Settle them before any replacement allocation or residency copy.
+    ggml_backend_sched_synchronize(sched);
+    ggml_active_expert_cache_reset_pass(sched);
+    ggml_backend_sched_synchronize(sched);
+
+    const uint64_t previous_capacity = sched->active_expert_cache_capacity_bytes;
+    const uint64_t previous_reserve = sched->active_expert_cache_reserve_bytes;
+    const uint32_t previous_minimum = sched->active_expert_cache_min_observations;
+    const int previous_slots = sched->active_expert_cache_slots;
+    sched->active_expert_cache_capacity_bytes = bytes_per_device;
+    sched->active_expert_cache_reserve_bytes = reserve_bytes_per_device;
+    sched->active_expert_cache_min_observations = minimum_observations;
+    sched->active_expert_cache_slots = bytes_per_device > 0 ? 64 : 0;
+
+    std::array<ggml_active_expert_cache_device, GGML_SCHED_MAX_BACKENDS> prepared;
+    const int64_t failure_step = ggml_active_expert_cache_replace_failure_step();
+    const int64_t failure_copy = ggml_active_expert_cache_replace_failure_copy();
+    const int64_t failure_device = ggml_active_expert_cache_replace_failure_device();
+    int64_t completed_steps = 0;
+    int64_t completed_copies = 0;
+    int prepared_devices = 0;
+    int required_devices = 0;
+    bool success = true;
+    auto inject_failure = [&]() {
+        if (completed_steps == failure_step) return true;
+        ++completed_steps;
+        return false;
+    };
+
+    if (bytes_per_device > 0) {
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            if (ggml_backend_is_cpu(sched->backends[backend_id])) continue;
+            ++required_devices;
+            auto & current_slot = sched->active_expert_caches[backend_id];
+
+            // A growing replacement needs the model's logical expert count,
+            // not the compact slot count stored in the old cache tensor.
+            ggml_tensor logical_layout = {};
+            const ggml_tensor * logical_source = nullptr;
+            for (const auto & component : sched->active_expert_cache_layout_catalog) {
+                if (!component.empty() && ggml_active_expert_cache_materialize_layout(
+                            component.front(), &logical_layout)) {
+                    logical_source = &logical_layout;
+                    break;
+                }
+            }
+            if (!logical_source && current_slot.ready && current_slot.logical_experts > 1) {
+                for (int component = 0; component < GGML_ACTIVE_EXPERT_CACHE_COMPONENT_COUNT; ++component) {
+                    const ggml_tensor * active = current_slot.components[size_t(component)].tensor;
+                    if (!active) continue;
+                    if (active->nb[2] == 0 ||
+                            uint64_t(current_slot.logical_experts) > SIZE_MAX/active->nb[2]) {
+                        success = false;
+                        break;
+                    }
+                    logical_layout = *active;
+                    logical_layout.ne[2] = current_slot.logical_experts;
+                    logical_layout.nb[3] =
+                            active->nb[2]*size_t(current_slot.logical_experts);
+                    logical_source = &logical_layout;
+                    break;
+                }
+            }
+            if (!success) break;
+            if (!logical_source) {
+                success = false;
+                break;
+            }
+
+            // Temporarily detach the current owner so the existing allocation
+            // remains untouched while the normal checked initializer builds a
+            // second cache in the scheduler slot.
+            ggml_active_expert_cache_device current;
+            std::swap(current, current_slot);
+            auto & building = sched->active_expert_caches[backend_id];
+            bool device_success = false;
+            try {
+                device_success = ggml_active_expert_cache_init(sched, backend_id, logical_source);
+                device_success &= building.ready && building.capacity_bytes == bytes_per_device;
+                if (device_success && inject_failure()) device_success = false;
+
+                // Allocate every layout used by this backend before publication so
+                // a later layer cannot reveal a deferred capacity failure.
+                for (int component = 0;
+                        device_success && component < GGML_ACTIVE_EXPERT_CACHE_COMPONENT_COUNT;
+                        ++component) {
+                    for (const auto & descriptor :
+                            sched->active_expert_cache_layout_catalog[size_t(component)]) {
+                        ggml_tensor source = {};
+                        if (!ggml_active_expert_cache_materialize_layout(descriptor, &source) ||
+                                !ggml_active_expert_cache_init_component(
+                                    sched, building, component, &source) ||
+                                building.allocated_bytes > bytes_per_device || inject_failure()) {
+                            device_success = false;
+                            break;
+                        }
+                    }
+                    const ggml_tensor * active = current.components[size_t(component)].tensor;
+                    if (device_success && active &&
+                            !ggml_active_expert_cache_init_component(
+                                    sched, building, component, active)) {
+                        device_success = false;
+                    }
+                    if (device_success && active && building.allocated_bytes > bytes_per_device) {
+                        device_success = false;
+                    }
+                }
+
+                if (device_success) {
+                    building.clock = current.clock;
+                    building.observations = current.observations;
+                    building.admission_thresholds = current.admission_thresholds;
+                    building.last_observed_route = current.last_observed_route;
+                    building.previous_route = current.previous_route;
+                    building.route_clock = current.route_clock;
+
+                    std::vector<int> residents;
+                    residents.reserve(current.entries.size());
+                    for (int slot = 0; slot < int(current.entries.size()); ++slot) {
+                        if (current.entries[size_t(slot)].layer >= 0 &&
+                                current.entries[size_t(slot)].expert >= 0) {
+                            residents.push_back(slot);
+                        }
+                    }
+                    std::stable_sort(residents.begin(), residents.end(), [&](int left, int right) {
+                        return current.entries[size_t(left)].last_used >
+                                current.entries[size_t(right)].last_used;
+                    });
+                    if (residents.size() > size_t(building.slots)) residents.resize(size_t(building.slots));
+
+                    for (size_t destination_slot = 0;
+                            device_success && destination_slot < residents.size();
+                            ++destination_slot) {
+                        const int source_slot = residents[destination_slot];
+                        const auto & source_entry = current.entries[size_t(source_slot)];
+                        auto & destination_entry = building.entries[destination_slot];
+                        destination_entry = source_entry;
+                        destination_entry.ready_mask = 0;
+                        for (int component = 0;
+                                component < GGML_ACTIVE_EXPERT_CACHE_COMPONENT_COUNT;
+                                ++component) {
+                            const uint8_t mask = uint8_t(1u << component);
+                            if ((source_entry.ready_mask & mask) == 0) continue;
+                            const auto & source_component = current.components[size_t(component)];
+                            const auto & destination_component = building.components[size_t(component)];
+                            if (!source_component.tensor || !destination_component.tensor ||
+                                    source_component.expert_bytes != destination_component.expert_bytes ||
+                                    !ggml_active_expert_cache_same_layout(
+                                        source_component.tensor, destination_component.tensor) ||
+                                    inject_failure() || completed_copies == failure_copy) {
+                                device_success = false;
+                                break;
+                            }
+                            ggml_tensor source_view = *source_component.tensor;
+                            ggml_tensor destination_view = *destination_component.tensor;
+                            source_view.ne[2] = destination_view.ne[2] = 1;
+                            source_view.nb[3] = source_view.nb[2];
+                            destination_view.nb[3] = destination_view.nb[2];
+                            source_view.data = (uint8_t *) source_component.tensor->data +
+                                    size_t(source_slot)*source_component.expert_bytes;
+                            destination_view.data = (uint8_t *) destination_component.tensor->data +
+                                    destination_slot*destination_component.expert_bytes;
+                            ggml_backend_tensor_copy(&source_view, &destination_view);
+                            ++completed_copies;
+                            destination_entry.ready_mask |= mask;
+                        }
+                    }
+                }
+            } catch (const std::exception & exception) {
+                fprintf(stderr,
+                        "ggml active-expert cache: replacement preparation exception on backend %d: %s\n",
+                        backend_id, exception.what());
+                device_success = false;
+            } catch (...) {
+                fprintf(stderr,
+                        "ggml active-expert cache: replacement preparation exception on backend %d\n",
+                        backend_id);
+                device_success = false;
+            }
+
+            if (device_success && prepared_devices == failure_device) {
+                device_success = false;
+            }
+            if (device_success) {
+                std::swap(prepared[size_t(backend_id)], building);
+                ++prepared_devices;
+            } else {
+                ggml_active_expert_cache_drain_leases(sched, building);
+                ggml_active_expert_cache_release(building);
+            }
+            std::swap(current, sched->active_expert_caches[backend_id]);
+            if (!device_success) {
+                success = false;
+                break;
+            }
+        }
+        if (required_devices == 0 || prepared_devices != required_devices) success = false;
+    }
+
+    if (!success) {
+        for (auto & cache : prepared) {
+            ggml_active_expert_cache_drain_leases(sched, cache);
+            ggml_active_expert_cache_release(cache);
+        }
+        sched->active_expert_cache_capacity_bytes = previous_capacity;
+        sched->active_expert_cache_reserve_bytes = previous_reserve;
+        sched->active_expert_cache_min_observations = previous_minimum;
+        sched->active_expert_cache_slots = previous_slots;
+        fprintf(stderr, "ggml active-expert cache: replacement preparation failed; prior cache retained\n");
+        return false;
+    }
+
+    // All fallible work is complete. Swap every device first, publish the
+    // target policy, then retire the detached old allocations.
+    ggml_backend_sched_synchronize(sched);
+    for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+        std::swap(sched->active_expert_caches[backend_id], prepared[size_t(backend_id)]);
+    }
+    sched->active_expert_cache_capacity_bytes = bytes_per_device;
+    sched->active_expert_cache_reserve_bytes = reserve_bytes_per_device;
+    sched->active_expert_cache_min_observations = minimum_observations;
+    sched->active_expert_cache_slots = bytes_per_device > 0 ? 64 : 0;
+    for (auto & cache : prepared) {
+        ggml_active_expert_cache_drain_leases(sched, cache);
+        ggml_active_expert_cache_release(cache);
+    }
+    fprintf(stderr,
+            "ggml active-expert cache: committed prepared replacement at %.1f MiB per device (%d prepared devices)\n",
+            bytes_per_device/1024.0/1024.0, prepared_devices);
+    return true;
+}
+
+bool ggml_backend_sched_replace_expert_cache(
+        ggml_backend_sched_t sched,
+        uint64_t bytes_per_device,
+        uint64_t reserve_bytes_per_device,
+        uint32_t minimum_observations) {
+    try {
+        return ggml_backend_sched_replace_expert_cache_impl(
+                sched, bytes_per_device, reserve_bytes_per_device, minimum_observations);
+    } catch (const std::exception & exception) {
+        fprintf(stderr, "ggml active-expert cache: replacement exception: %s\n", exception.what());
+    } catch (...) {
+        fprintf(stderr, "ggml active-expert cache: replacement exception\n");
+    }
+    return false;
 }
 
 static bool ggml_active_expert_cache_prepare_route(
@@ -3358,8 +3725,15 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
     sched->active_expert_component_max_bytes.fill(0);
     sched->expert_prefill_layer_bytes.clear();
     sched->expert_prefill_lane_bytes = 0;
+    std::unordered_set<const ggml_tensor *> expert_routes;
     for (int node_index = 0; node_index < graph->n_nodes; ++node_index) {
         const ggml_tensor * node = graph->nodes[node_index];
+        if (node->op == GGML_OP_MOE_FUSED_UP_GATE || node->op == GGML_OP_MUL_MAT_ID) {
+            const int ids_index = node->op == GGML_OP_MOE_FUSED_UP_GATE ? 3 : 2;
+            if (node->src[ids_index]) {
+                expert_routes.insert(node->src[ids_index]);
+            }
+        }
         for (int source_index = 0; source_index < GGML_MAX_SRC; ++source_index) {
             const ggml_tensor * source = node->src[source_index];
             int layer = -1;
@@ -3367,12 +3741,29 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
             if (component >= 0 && source->ne[2] > 1 && source->nb[2] > 0) {
                 sched->active_expert_component_max_bytes[component] = std::max<uint64_t>(
                         sched->active_expert_component_max_bytes[component], source->nb[2]);
+                if (ggml_active_expert_cache_is_host_expert_weight(source)) {
+                    const auto descriptor = ggml_active_expert_cache_describe_layout(source);
+                    auto & catalog = sched->active_expert_cache_layout_catalog[size_t(component)];
+                    const auto known = std::find_if(
+                            catalog.begin(), catalog.end(),
+                            [&](const ggml_active_expert_cache_layout & candidate) {
+                                return ggml_active_expert_cache_same_layout(candidate, descriptor);
+                            });
+                    if (known == catalog.end()) {
+                        catalog.push_back(descriptor);
+                    } else {
+                        known->logical_experts = std::max(
+                                known->logical_experts, descriptor.logical_experts);
+                    }
+                }
                 auto & layer_bytes = sched->expert_prefill_layer_bytes[layer];
                 layer_bytes[component] = std::max<uint64_t>(
                         layer_bytes[component], ggml_nbytes(source));
             }
         }
     }
+    sched->active_expert_cache_route_capacity = std::max(
+            sched->active_expert_cache_route_capacity, expert_routes.size());
     sched->active_expert_set_bytes = 0;
     for (const uint64_t bytes : sched->active_expert_component_max_bytes) {
         if (bytes > UINT64_MAX - sched->active_expert_set_bytes) {

@@ -1034,6 +1034,13 @@ extern "C" {
     // reports the new active graph/KV geometry.
     LLAMA_API bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size);
 
+    // Failure-atomically replace the bounded per-device expert cache while the
+    // context is quiescent. Resident experts are migrated into the prepared
+    // replacement before it becomes visible; false retains the prior cache.
+    LLAMA_API bool llama_expert_cache_resize(
+            struct llama_context * ctx,
+            uint64_t bytes_per_device);
+
     // Live resource-pool accounting for control planes. This is a read-only
     // snapshot and does not synchronize a device. Call it from the context
     // owner thread (the server routes it through its task queue).

@@ -241,6 +241,16 @@ extern "C" {
             uint64_t bytes_per_device,
             uint64_t reserve_bytes_per_device,
             uint32_t minimum_observations);
+
+    // Failure-atomically replace every prepared per-device expert cache. The
+    // scheduler must be quiescent and owned by the calling thread. Resident
+    // entries are migrated into a complete replacement before publication;
+    // false leaves the prior cache and policy active.
+    GGML_API bool ggml_backend_sched_replace_expert_cache(
+            ggml_backend_sched_t sched,
+            uint64_t bytes_per_device,
+            uint64_t reserve_bytes_per_device,
+            uint32_t minimum_observations);
     GGML_API void ggml_backend_sched_set_expert_prefill_staging(
             ggml_backend_sched_t sched,
             uint64_t bytes_per_device,

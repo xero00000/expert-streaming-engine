@@ -55,8 +55,8 @@ curl -X POST http://127.0.0.1:8080/v1/ese/resources/rebalance \
 ```
 
 The dry run validates budget, device reserves, slot divisibility, live KV
-occupancy, and the server's load-time KV maximum. An idle server can commit a
-KV-only target with `"dry_run":false`:
+occupancy, and the server's load-time KV maximum. An idle server can commit one
+resource class at a time with `"dry_run":false`. For example, a KV target is:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/ese/resources/rebalance \
@@ -66,15 +66,34 @@ curl -X POST http://127.0.0.1:8080/v1/ese/resources/rebalance \
 
 The server prepares and migrates the replacement KV cache off to the side,
 publishes it only after every occupied row succeeds, and leaves the original
-cache usable after allocation or injected migration failure. All slots must be
-idle and the deferred queue must be empty. Live expert-cache replacement is not
-enabled yet; targets that change it remain dry-run-only.
+cache usable after allocation or injected migration failure. The bounded
+per-device expert cache uses the same prepare/migrate/commit contract:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/ese/resources/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{"dry_run":false,"expert_cache_bytes_per_device":2147483648}'
+```
+
+The hottest resident experts and their admission history are migrated into a
+fully allocated replacement before publication. A value of zero disables the
+cache; a later nonzero request prepares it again. All slots must be idle and
+the deferred queue must be empty. A request that changes KV and expert-cache
+geometry together is rejected until the shared combined commit boundary is
+implemented, so it cannot leave a partially applied plan.
 
 Run the model-backed commit, busy-safe-point, and injected-failure gate with:
 
 ```bash
 scripts/validate-phase-d-rebalance.py --model MODEL.gguf
+scripts/validate-phase-d-rebalance.py --model MOE.gguf --gpu-layers 99 \
+  --expert-initial-mib 8 --expert-target-mib 4
 ```
+
+For a mixed multi-GPU gate, add the normal `--tensor-split` server arguments
+and `--expert-failure-after-devices 1`. This injects failure only after one
+device candidate is fully prepared and verifies that every live device retains
+identical capacity, allocation, residency, and deterministic output afterward.
 
 ```
 usage: ./llama-server [options]

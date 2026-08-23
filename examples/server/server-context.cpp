@@ -3145,7 +3145,9 @@ void server_context::process_single_task(server_task&& task) {
             {"devices", std::move(devices)},
             {"runtime_rebalance", {
                 {"mutation_enabled", true},
-                {"mode", "idle-kv-only"},
+                {"mode", "idle-single-pool"},
+                {"mutable_pools", {"kv", "expert-cache"}},
+                {"combined_mutation", false},
                 {"dry_run_endpoint", "/v1/ese/resources/rebalance"},
             }},
         };
@@ -3217,6 +3219,11 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
 
+        const std::string scope = task.data.at("scope").get<std::string>();
+        if (scope != "kv-only" && scope != "expert-cache-only") {
+            fail("unsupported runtime rebalance scope", ERROR_TYPE_INVALID_REQUEST);
+            break;
+        }
         const uint32_t target_context = task.data.at("target_context").get<uint32_t>();
         if (target_context == 0 || slots.empty() || target_context % slots.size() != 0) {
             fail(
@@ -3240,21 +3247,45 @@ void server_context::process_single_task(server_task&& task) {
         }
 
         const uint32_t previous_context = llama_kv_cache_size(ctx);
-        if (!llama_kv_cache_resize(ctx, target_context)) {
-            fail(
-                "KV resize transaction failed; the original cache remains active",
-                ERROR_TYPE_SERVER);
-            break;
-        }
-
-        for (server_slot & slot : slots) {
-            slot.n_ctx = int32_t(target_slot_context);
-            if (slot.cache_tokens.size() > target_slot_context) {
-                slot.cache_tokens.resize(target_slot_context);
+        const uint64_t target_expert_cache =
+            task.data.at("target_expert_cache_bytes_per_device").get<uint64_t>();
+        uint64_t previous_expert_cache = 0;
+        const json & previous_plan = task.data.at("previous_plan");
+        if (previous_plan.contains("devices") && previous_plan.at("devices").is_array()) {
+            for (const auto & device : previous_plan.at("devices")) {
+                if (device.value("id", -1) >= 0) {
+                    previous_expert_cache = device.value("expert_cache_bytes", uint64_t(0));
+                    break;
+                }
             }
         }
-        n_ctx = int32_t(target_context);
-        n_ctx_published.store(n_ctx, std::memory_order_release);
+
+        bool mutated = false;
+        if (scope == "expert-cache-only") {
+            if (!llama_expert_cache_resize(ctx, target_expert_cache)) {
+                fail(
+                    "expert-cache replacement failed; the original cache remains active",
+                    ERROR_TYPE_SERVER);
+                break;
+            }
+            mutated = previous_expert_cache != target_expert_cache;
+        } else {
+            if (!llama_kv_cache_resize(ctx, target_context)) {
+                fail(
+                    "KV resize transaction failed; the original cache remains active",
+                    ERROR_TYPE_SERVER);
+                break;
+            }
+            for (server_slot & slot : slots) {
+                slot.n_ctx = int32_t(target_slot_context);
+                if (slot.cache_tokens.size() > target_slot_context) {
+                    slot.cache_tokens.resize(target_slot_context);
+                }
+            }
+            n_ctx = int32_t(target_context);
+            n_ctx_published.store(n_ctx, std::memory_order_release);
+            mutated = previous_context != target_context;
+        }
         publish_resource_plan_json(task.data.at("target_plan").dump());
 
         server_task_result result;
@@ -3265,11 +3296,14 @@ void server_context::process_single_task(server_task&& task) {
         result.data = {
             {"status", "committed"},
             {"dry_run", false},
-            {"mutated", previous_context != target_context},
+            {"mutated", mutated},
             {"transaction", "prepare-migrate-commit"},
-            {"scope", "kv-only"},
+            {"scope", scope},
             {"previous_context", previous_context},
-            {"current_context", target_context},
+            {"current_context", llama_kv_cache_size(ctx)},
+            {"previous_expert_cache_bytes_per_device", previous_expert_cache},
+            {"current_expert_cache_bytes_per_device",
+                scope == "expert-cache-only" ? target_expert_cache : previous_expert_cache},
             {"current_plan", task.data.at("target_plan")},
         };
         queue_results.send(std::move(result));

@@ -264,9 +264,8 @@ figures are regression evidence rather than general performance claims.
 
 ## Phase D: runtime resource rebalancing (in progress)
 
-The resource snapshot remains read-only. `GET
-/v1/ese/resources` is routed through the inference task queue and reports a
-coherent owner-thread snapshot without synchronizing a device. It includes
+`GET /v1/ese/resources` is routed through the inference task queue and reports
+a coherent owner-thread snapshot without synchronizing a device. It includes
 actual KV capacity, occupied cells and allocation bytes; bounded expert-RAM
 capacity, residency and active leases; and per-device expert-cache and prefill
 staging capacity, allocation and residency alongside the resolved global plan.
@@ -275,13 +274,23 @@ staging capacity, allocation and residency alongside the resolved global plan.
 `expert_cache_bytes_per_device`, prove integer accounting and per-device reserve
 bounds, reject targets smaller than live KV occupancy, and return current and
 target plans. Dry runs also prove the server's immutable load-time KV maximum.
-An explicit `"dry_run": false` can commit a KV-only target while every slot is
-idle and the deferred queue is empty. The existing off-to-the-side KV
+An explicit `"dry_run": false` can commit one resource class while every slot
+is idle and the deferred queue is empty. The existing off-to-the-side KV
 replacement migrates occupied rows before publication; allocation, conversion,
 or injected migration failure leaves the old cache and logical plan active.
-Per-slot logical limits are changed only after publication. Unknown fields,
-signed/overflowing values, non-whole per-slot context, reserve violations, and
-live expert-cache changes fail closed.
+Per-slot logical limits are changed only after publication.
+
+The per-device expert cache now has an equivalent prepared replacement. It
+allocates every backend layout at the target bound while the old cache remains
+active, migrates the most recently used resident entries and admission history,
+then publishes all devices together. Allocation, metadata-copy, resident-copy,
+or injected preparation failure releases the new allocations and restores the
+old configuration. Zero disables the cache, and a later nonzero target prepares
+it from a persistent value-only layout and route-capacity catalog (never
+scratch-graph tensor pointers). Unknown fields, signed/overflowing values,
+non-whole per-slot context, reserve violations, and unavailable target
+allocations fail closed. A request that changes both KV and expert-cache
+geometry is explicitly rejected until the common publication boundary exists.
 
 A local CPU TinyMoE endpoint trial reported the actual 30 MiB KV allocation and
 64 MiB bounded RAM tier. After a 1,502-token prompt, a two-token target was
@@ -306,9 +315,18 @@ resource plan tracked each committed geometry. The native lifecycle test also
 decodes at the shrunken geometry before regrowing, preventing a cache/graph
 context mismatch from escaping the gate.
 
-The next step is an equivalent prepared expert-cache replacement, followed by a
-single combined commit boundary and transient-pool policy. Phase D remains
-incomplete until those resources meet the same failure-atomic endpoint gate.
+The same validator can add the expert-cache transaction matrix on CUDA with
+`--expert-initial-mib` and `--expert-target-mib`. That gate covers shrink, grow,
+disable, re-enable, preserved deterministic output, retained residency, an
+injected preparation failure, and continued use of the old engine. The local
+single-Ampere and mixed Turing/Ampere gates both passed 8 MiB -> 4 MiB ->
+8 MiB replacement, disable -> inference -> re-enable, and exact pre/post
+failure accounting. The mixed gate prepared all three devices and additionally
+failed after one complete device preparation to prove cleanup of an earlier
+candidate. Use `--expert-failure-after-devices 1` for that multi-device gate.
+The next step is a single combined KV/expert commit boundary followed by
+transient-pool policy. Phase D remains incomplete until those resources meet
+the same failure-atomic endpoint gate.
 
 ## Later phases
 
