@@ -205,6 +205,20 @@ host RAM, and current per-GPU VRAM before choosing a native policy.
 ./ese serve MODEL.gguf --policy stream --expert-storage-backend pread
 ```
 
+Hardware calibration can propose a mixed CPU/GPU expert split, but ESE will not
+activate it until the exact model, hardware, and launch configuration beats the
+established path with identical deterministic output:
+
+```bash
+./ese calibrate --model MODEL.gguf
+./ese validate-hybrid MODEL.gguf --policy stream
+./ese serve MODEL.gguf --policy stream
+```
+
+The validator stores no prompts or generated text. Its local evidence is private
+to the user (`0600`) and becomes stale when the sampled model contents, hardware
+topology, or performance-relevant configuration changes.
+
 Use `./ese plan MODEL.gguf --json` for machine-readable launcher output. Pass
 native `llama-server` options after `--`:
 

@@ -21,15 +21,24 @@ import argparse
 import ctypes
 import dataclasses
 import glob
+import hashlib
 import json
+import math
 import os
 import platform
 import re
 import shlex
 import shutil
+import socket
+import statistics
 import struct
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Sequence
 
@@ -38,6 +47,7 @@ from tools.hardware_profile import (
     build_hardware_profile,
     collect_hardware_identity,
     default_profile_path,
+    hardware_fingerprint,
     load_hardware_profile,
     planner_profile_reasons,
     save_hardware_profile,
@@ -52,6 +62,12 @@ DEFAULT_HARDWARE_BENCH = Path("build/bin") / (
 )
 KNOWN_KV_TYPES = ("auto", "f16", "q8_0", "q4_0")
 POLICIES = ("auto", "resident", "hybrid", "cache", "stream")
+HYBRID_VERIFICATION_VERSION = 1
+
+
+def default_hybrid_verification_path() -> Path:
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache_root / "ese" / "hybrid-verifications.json"
 
 
 class ESEError(RuntimeError):
@@ -203,6 +219,152 @@ class LaunchPlan:
             "command": list(self.command()),
             "shell_command": self.shell_command(),
         }
+
+
+def model_fingerprint(model: ModelInfo) -> str:
+    """Bind verification to shard contents without hashing a multi-hundred-GB model."""
+    digest = hashlib.sha256()
+    sample_bytes = 64 * 1024
+    for index, shard in enumerate(model.shards):
+        size = shard.stat().st_size
+        digest.update(struct.pack("<IQ", index, size))
+        with shard.open("rb") as handle:
+            first = handle.read(min(sample_bytes, size))
+            digest.update(struct.pack("<Q", len(first)))
+            digest.update(first)
+            if size > sample_bytes:
+                handle.seek(max(0, size - sample_bytes))
+                last = handle.read(sample_bytes)
+                digest.update(struct.pack("<Q", len(last)))
+                digest.update(last)
+    return digest.hexdigest()
+
+
+def _hybrid_plan_signature(plan: LaunchPlan) -> str:
+    # Model contents are bound separately. The listener address does not affect
+    # decode, but context, KV, batching, threading, cache bounds, and native
+    # overrides all remain part of the workload evidence.
+    ignored_with_value = {
+        "-m", "--host", "--port", "--max-ram",
+    }
+    relevant: list[str] = []
+    arguments = list(plan.arguments)
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value in ignored_with_value and index + 1 < len(arguments):
+            index += 2
+            continue
+        relevant.append(value)
+        index += 1
+    payload = {
+        "policy": plan.policy,
+        "arguments": relevant,
+        "environment": dict(sorted(plan.environment.items())),
+        "hybrid_gpu_experts": plan.hybrid_gpu_experts,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _hybrid_verification_key(
+    plan: LaunchPlan, current_identity: dict[str, Any]
+) -> tuple[str, str, str, str]:
+    model_id = model_fingerprint(plan.model)
+    hardware_id = hardware_fingerprint(current_identity)
+    plan_id = _hybrid_plan_signature(plan)
+    key = hashlib.sha256(f"{model_id}:{hardware_id}:{plan_id}".encode("ascii")).hexdigest()
+    return key, model_id, hardware_id, plan_id
+
+
+def _load_hybrid_verifications(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"version": HYBRID_VERIFICATION_VERSION, "entries": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ESEError(f"cannot read hybrid verification evidence: {exc}") from exc
+    if (
+        not isinstance(data, dict)
+        or data.get("version") != HYBRID_VERIFICATION_VERSION
+        or not isinstance(data.get("entries"), dict)
+    ):
+        raise ESEError("hybrid verification evidence has an unsupported schema")
+    return data
+
+
+def hybrid_verification_reason(
+    plan: LaunchPlan,
+    current_identity: dict[str, Any],
+    path: Path,
+) -> str | None:
+    try:
+        evidence = _load_hybrid_verifications(path)
+        key, model_id, hardware_id, plan_id = _hybrid_verification_key(plan, current_identity)
+    except (ESEError, OSError) as exc:
+        return str(exc)
+    record = evidence["entries"].get(key)
+    if not isinstance(record, dict):
+        return "no matching workload A/B verification is recorded"
+    if (
+        record.get("model_fingerprint") != model_id
+        or record.get("hardware_fingerprint") != hardware_id
+        or record.get("plan_signature") != plan_id
+    ):
+        return "workload A/B verification does not match the current model, hardware, or plan"
+    if record.get("output_parity") is not True:
+        return "workload A/B verification failed deterministic output parity"
+    if record.get("passed") is not True:
+        return "measured hybrid workload did not beat the established path"
+    speedup = record.get("speedup")
+    minimum = record.get("minimum_speedup")
+    if (
+        isinstance(speedup, bool)
+        or isinstance(minimum, bool)
+        or not isinstance(speedup, (int, float))
+        or not isinstance(minimum, (int, float))
+        or not math.isfinite(float(speedup))
+        or not math.isfinite(float(minimum))
+        or minimum <= 1.0
+        or speedup < minimum
+    ):
+        return "workload A/B verification has invalid performance evidence"
+    return None
+
+
+def _save_hybrid_verification(
+    path: Path,
+    plan: LaunchPlan,
+    current_identity: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    evidence = _load_hybrid_verifications(path)
+    key, model_id, hardware_id, plan_id = _hybrid_verification_key(plan, current_identity)
+    record = {
+        **result,
+        "model_fingerprint": model_id,
+        "hardware_fingerprint": hardware_id,
+        "plan_signature": plan_id,
+        "gpu_experts": plan.hybrid_gpu_experts,
+        "verified_at": datetime.now(timezone.utc).isoformat(),
+    }
+    evidence["entries"][key] = record
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(evidence, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _first_positive_int(metadata: dict[str, Any], keys: Iterable[str]) -> int | None:
@@ -1006,6 +1168,260 @@ def _execution_environment(plan: LaunchPlan) -> dict[str, str]:
     return environment
 
 
+def _plan_with_port(plan: LaunchPlan, port: int) -> LaunchPlan:
+    arguments = list(plan.arguments)
+    try:
+        position = arguments.index("--port")
+        arguments[position + 1] = str(port)
+    except (ValueError, IndexError) as exc:
+        raise ESEError("planned server command has no valid --port option") from exc
+    return dataclasses.replace(plan, arguments=tuple(arguments))
+
+
+def _baseline_hybrid_plan(plan: LaunchPlan) -> LaunchPlan:
+    arguments = list(plan.arguments)
+    try:
+        position = arguments.index("--expert-hybrid-gpu-experts")
+    except ValueError as exc:
+        raise ESEError("calibration did not produce a mixed hybrid plan to validate") from exc
+    del arguments[position : position + 2]
+    return dataclasses.replace(
+        plan,
+        arguments=tuple(arguments),
+        hybrid_gpu_experts=0,
+        hybrid_selection="workload A/B established-path control",
+    )
+
+
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _http_json(
+    port: int,
+    path: str,
+    payload: dict[str, Any] | None,
+    timeout: float,
+) -> dict[str, Any]:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=data,
+        headers={"Content-Type": "application/json"} if data is not None else {},
+        method="POST" if data is not None else "GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            parsed = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise ESEError(f"server request {path} failed: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ESEError(f"server request {path} returned non-object JSON")
+    return parsed
+
+
+def _completion_result(
+    port: int, prompt: str, tokens: int, seed: int, timeout: float
+) -> tuple[str, float]:
+    response = _http_json(
+        port,
+        "/completion",
+        {
+            "prompt": prompt,
+            "n_predict": tokens,
+            "temperature": 0,
+            "seed": seed,
+            "cache_prompt": False,
+        },
+        timeout,
+    )
+    content = response.get("content")
+    timings = response.get("timings")
+    if not isinstance(content, str) or not isinstance(timings, dict):
+        raise ESEError("completion response omitted content or timings")
+    speed = timings.get("predicted_per_second")
+    if (
+        isinstance(speed, bool)
+        or not isinstance(speed, (int, float))
+        or not math.isfinite(float(speed))
+        or speed <= 0
+    ):
+        predicted_n = timings.get("predicted_n")
+        predicted_ms = timings.get("predicted_ms")
+        if (
+            not isinstance(predicted_n, bool)
+            and not isinstance(predicted_ms, bool)
+            and isinstance(predicted_n, (int, float))
+            and isinstance(predicted_ms, (int, float))
+            and math.isfinite(float(predicted_n))
+            and math.isfinite(float(predicted_ms))
+            and predicted_n > 0
+            and predicted_ms > 0
+        ):
+            speed = predicted_n * 1000.0 / predicted_ms
+        else:
+            raise ESEError("completion response omitted valid decode throughput")
+    return hashlib.sha256(content.encode("utf-8")).hexdigest(), float(speed)
+
+
+def _run_hybrid_validation_server(
+    plan: LaunchPlan,
+    *,
+    label: str,
+    prompt: str,
+    tokens: int,
+    samples: int,
+    warmups: int,
+    startup_timeout: float,
+    request_timeout: float,
+    log_path: Path,
+) -> dict[str, Any]:
+    port = _free_tcp_port()
+    plan = _plan_with_port(plan, port)
+    with log_path.open("wb") as log:
+        process = subprocess.Popen(
+            plan.command(),
+            env=_execution_environment(plan),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + startup_timeout
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise ESEError(
+                        f"{label} server exited during startup with code {process.returncode}"
+                    )
+                try:
+                    _http_json(port, "/health", None, 2.0)
+                    break
+                except ESEError:
+                    time.sleep(0.25)
+            else:
+                raise ESEError(
+                    f"{label} server did not become healthy within {startup_timeout:.0f}s"
+                )
+
+            for index in range(warmups):
+                _completion_result(
+                    port, f"{prompt}\nWarmup {index}.", tokens, 1234 + index, request_timeout
+                )
+            hashes: list[str] = []
+            speeds: list[float] = []
+            for index in range(samples):
+                output_hash, speed = _completion_result(
+                    port,
+                    f"{prompt}\nMeasured trial {index}.",
+                    tokens,
+                    4321 + index,
+                    request_timeout,
+                )
+                hashes.append(output_hash)
+                speeds.append(speed)
+            return {
+                "output_hashes": hashes,
+                "tokens_per_second_samples": speeds,
+                "tokens_per_second_median": statistics.median(speeds),
+            }
+        except ESEError as exc:
+            log.flush()
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
+            except OSError:
+                tail = []
+            detail = "\n".join(tail)
+            raise ESEError(f"{exc}\n{detail}" if detail else str(exc)) from exc
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+
+
+def _validate_hybrid(args: argparse.Namespace) -> int:
+    if args.samples < 3:
+        raise ESEError("--samples must be at least 3")
+    if args.tokens < 2:
+        raise ESEError("--tokens must be at least 2")
+    if args.warmups < 0:
+        raise ESEError("--warmups cannot be negative")
+    if not math.isfinite(args.minimum_speedup) or args.minimum_speedup <= 1.0:
+        raise ESEError("--minimum-speedup must be greater than 1.0")
+    if not math.isfinite(args.startup_timeout) or args.startup_timeout <= 0:
+        raise ESEError("--startup-timeout must be positive")
+    if not math.isfinite(args.request_timeout) or args.request_timeout <= 0:
+        raise ESEError("--request-timeout must be positive")
+
+    candidate = _plan_from_args(args, require_hybrid_verification=False)
+    if candidate.hybrid_gpu_experts <= 0:
+        raise ESEError(candidate.hybrid_selection)
+    baseline = _baseline_hybrid_plan(candidate)
+    current_identity = collect_hardware_identity()
+    evidence_path = args.hybrid_verification.expanduser().resolve()
+    prompt = args.prompt or (
+        "A careful local ESE benchmark validates deterministic expert routing, "
+        "output parity, and stable decode throughput. " * 32
+    )
+    with tempfile.TemporaryDirectory(prefix="ese-hybrid-validation-") as temporary:
+        root = Path(temporary)
+        baseline_result = _run_hybrid_validation_server(
+            baseline,
+            label="established-path",
+            prompt=prompt,
+            tokens=args.tokens,
+            samples=args.samples,
+            warmups=args.warmups,
+            startup_timeout=args.startup_timeout,
+            request_timeout=args.request_timeout,
+            log_path=root / "baseline.log",
+        )
+        hybrid_result = _run_hybrid_validation_server(
+            candidate,
+            label="hybrid",
+            prompt=prompt,
+            tokens=args.tokens,
+            samples=args.samples,
+            warmups=args.warmups,
+            startup_timeout=args.startup_timeout,
+            request_timeout=args.request_timeout,
+            log_path=root / "hybrid.log",
+        )
+
+    output_parity = baseline_result["output_hashes"] == hybrid_result["output_hashes"]
+    baseline_speed = float(baseline_result["tokens_per_second_median"])
+    hybrid_speed = float(hybrid_result["tokens_per_second_median"])
+    speedup = hybrid_speed / baseline_speed
+    passed = output_parity and speedup >= args.minimum_speedup
+    result = {
+        "passed": passed,
+        "output_parity": output_parity,
+        "output_hashes": hybrid_result["output_hashes"] if output_parity else [],
+        "baseline_tokens_per_second": baseline_speed,
+        "hybrid_tokens_per_second": hybrid_speed,
+        "speedup": speedup,
+        "minimum_speedup": args.minimum_speedup,
+        "samples": args.samples,
+        "warmups": args.warmups,
+        "tokens_per_sample": args.tokens,
+    }
+    _save_hybrid_verification(evidence_path, candidate, current_identity, result)
+    output = {**result, "evidence": str(evidence_path), "gpu_experts": candidate.hybrid_gpu_experts}
+    if args.json:
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        print(f"Hybrid workload verification: {'PASS' if passed else 'FAIL'}")
+        print(f"Output parity: {'exact' if output_parity else 'failed'}")
+        print(f"Established path: {baseline_speed:.3f} tok/s")
+        print(f"Hybrid path:      {hybrid_speed:.3f} tok/s ({speedup:.3f}x)")
+        print(f"Evidence: {evidence_path}")
+    return 0 if passed else 2
+
+
 def _resolve_binary(value: str | None, build_dir: Path | None = None) -> Path:
     server_name = "llama-server.exe" if os.name == "nt" else "llama-server"
     if value:
@@ -1380,6 +1796,12 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="disable calibrated CPU/GPU expert route splitting",
     )
+    parser.add_argument(
+        "--hybrid-verification",
+        type=Path,
+        default=default_hybrid_verification_path(),
+        help="hardware/model/config-bound workload A/B verification evidence",
+    )
     parser.add_argument("--json", action="store_true")
 
 
@@ -1425,6 +1847,19 @@ def _make_parser() -> argparse.ArgumentParser:
     profile.add_argument("--profile", type=Path, default=default_profile_path())
     profile.add_argument("--json", action="store_true")
 
+    validate_hybrid = commands.add_parser(
+        "validate-hybrid",
+        help="A/B test calibrated hybrid decode before allowing automatic activation",
+    )
+    _add_plan_arguments(validate_hybrid)
+    validate_hybrid.add_argument("--samples", type=int, default=5)
+    validate_hybrid.add_argument("--warmups", type=int, default=1)
+    validate_hybrid.add_argument("--tokens", type=int, default=16)
+    validate_hybrid.add_argument("--minimum-speedup", type=float, default=1.02)
+    validate_hybrid.add_argument("--prompt")
+    validate_hybrid.add_argument("--startup-timeout", type=float, default=600.0)
+    validate_hybrid.add_argument("--request-timeout", type=float, default=600.0)
+
     plan = commands.add_parser("plan", help="inspect the policy and native command")
     _add_plan_arguments(plan)
 
@@ -1434,7 +1869,9 @@ def _make_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
+def _plan_from_args(
+    args: argparse.Namespace, *, require_hybrid_verification: bool = True
+) -> LaunchPlan:
     if args.context <= 0:
         raise ESEError("--context must be positive")
     if args.slots <= 0:
@@ -1444,15 +1881,17 @@ def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
     model = inspect_model(args.model)
     hardware = detect_hardware()
     hybrid_gpu_experts = 0
+    current_identity: dict[str, Any] | None = None
     selected_policy, _ = select_policy(model, hardware, args.policy)
     hybrid_selection = "automatic hybrid routing is not used by the selected policy"
     if selected_policy in ("cache", "stream") and args.no_auto_hybrid:
         hybrid_selection = "automatic hybrid routing disabled by --no-auto-hybrid"
     elif selected_policy in ("cache", "stream"):
+        current_identity = collect_hardware_identity()
         hybrid_gpu_experts, hybrid_selection = calibrated_hybrid_gpu_experts(
-            model, args.hardware_profile, collect_hardware_identity()
+            model, args.hardware_profile, current_identity
         )
-    return build_launch_plan(
+    plan_arguments = dict(
         model=model,
         hardware=hardware,
         binary=_resolve_binary(args.binary),
@@ -1479,6 +1918,20 @@ def _plan_from_args(args: argparse.Namespace) -> LaunchPlan:
         hybrid_selection=hybrid_selection,
         extra_args=args.extra,
     )
+    plan = build_launch_plan(**plan_arguments)
+    if require_hybrid_verification and plan.hybrid_gpu_experts > 0:
+        if current_identity is None:
+            current_identity = collect_hardware_identity()
+        reason = hybrid_verification_reason(
+            plan, current_identity, args.hybrid_verification.expanduser().resolve()
+        )
+        if reason:
+            plan_arguments["hybrid_gpu_experts"] = 0
+            plan_arguments["hybrid_selection"] = (
+                f"automatic hybrid routing disabled: {reason}; run `ese validate-hybrid`"
+            )
+            plan = build_launch_plan(**plan_arguments)
+    return plan
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1490,10 +1943,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         native_args = raw[separator + 1 :]
         raw = raw[:separator]
     args = parser.parse_args(raw)
-    if args.command in ("plan", "serve"):
+    if args.command in ("plan", "serve", "validate-hybrid"):
         args.extra = native_args
     elif native_args:
-        parser.error("native arguments after -- are supported only by plan and serve")
+        parser.error(
+            "native arguments after -- are supported only by plan, serve, and validate-hybrid"
+        )
 
     try:
         if args.command == "doctor":
@@ -1508,6 +1963,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _calibrate(args)
         if args.command == "hardware-profile":
             return _hardware_profile_status(args)
+        if args.command == "validate-hybrid":
+            return _validate_hybrid(args)
         plan = _plan_from_args(args)
         _print_plan(plan, args.json)
         if args.command == "plan" or args.dry_run:

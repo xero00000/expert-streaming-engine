@@ -31,9 +31,9 @@ Profiles default to `~/.cache/ese/hardware-profile.json`. They are versioned, wr
 | Sustained host copy | native timed `memcpy` | No; baseline only |
 | H2D/D2H | `ggml_backend_tensor_set/get` on every detected CUDA backend | No; needs confidence scoring |
 | H2D under host-memory contention | Per-device CUDA upload concurrent with host copy | No; baseline only |
-| CPU MoE | Real `ggml_mul_mat_id` over two actual GGUF expert payloads for every discovered type/geometry, checked against both single-thread execution and an independently dequantized scalar matvec; separate and merged fused gate/up layouts have a bit-exact native regression | No; requires sufficiently confident samples for every format |
-| Adaptive expert-cache upload | Separate page-cache-cold and warm steady-state real split-GGUF payload distributions read through a bounded production RAM-cache lease, uploaded with the production async primitive on every CUDA backend, synchronized while the lease is held, then released | No; still needs live scheduler route/event timing |
-| CPU MoE + cache upload contention | Per-device concurrent model-format routed matvec and warm steady-state exact `pread` → bounded RAM lease → production async upload path | No; still needs a separately labeled cold distribution and the live scheduler's route/event timing |
+| CPU MoE | Real `ggml_mul_mat_id` over two actual GGUF expert payloads for every discovered type/geometry, checked against both single-thread execution and an independently dequantized scalar matvec; separate and merged fused gate/up layouts have a bit-exact native regression | Yes, only with sufficiently confident samples for every format |
+| Adaptive expert-cache upload | Separate page-cache-cold and warm steady-state real split-GGUF payload distributions read through a bounded production RAM-cache lease, uploaded with the production async primitive on every CUDA backend, synchronized while the lease is held, then released | Yes, with complete per-device evidence and the workload A/B gate |
+| CPU MoE + cache upload contention | Per-device concurrent model-format routed matvec and warm steady-state exact `pread` → bounded RAM lease → production async upload path, plus separately labeled page-cache-cold upload distributions and live per-layer route/event telemetry | Yes, with complete per-device evidence and the workload A/B gate |
 
 The planner must not consume Phase A data until the last two rows use their production paths and results are keyed by expert GGML type, geometry, GPU, and NUMA node.
 Baseline profiles therefore carry `benchmark_source.planner_ready: false`.
@@ -50,6 +50,28 @@ extent with `POSIX_FADV_DONTNEED` before every sample and labels the resulting
 series `page-cache-cold`. Platforms that cannot provide that operation report
 the cold series as unavailable; the warm planner series remains present and is
 the only distribution consumed by automatic split selection.
+
+### Runtime verification gate
+
+Calibration alone cannot activate mixed routing. Before `ese plan` or
+`ese serve` adds `--expert-hybrid-gpu-experts`, the exact model, hardware, and
+performance-relevant launch configuration must pass a deterministic workload
+A/B test:
+
+```sh
+./ese validate-hybrid MODEL.gguf --hardware-profile ~/.cache/ese/hardware-profile.json
+```
+
+The validator starts separate established-path and hybrid servers, performs
+warmups followed by at least three identical seeded decode samples, requires
+exact generated-output hashes, and requires the hybrid median to exceed the
+established path by at least 2% by default. Passing and failing results are
+written atomically with mode `0600` to
+`~/.cache/ese/hybrid-verifications.json`. Evidence is bound to sampled model
+contents, the full topology fingerprint, and context, KV, batching, threading,
+cache, routing, and native-override settings. Prompts and generated text are not
+stored. Missing, stale, malformed, parity-failed, or slower evidence leaves the
+established path unchanged.
 
 ### Remaining Phase A gate
 
@@ -89,7 +111,9 @@ the native split option. Automatic activation also requires the calibrated
 mode must select it explicitly. `--hardware-profile PATH` selects another profile and
 `--no-auto-hybrid` opts out. Missing, stale, incomplete, all-CPU, and all-GPU
 solutions leave the established execution path unchanged and report the reason
-in JSON under `hybrid_routing`.
+in JSON under `hybrid_routing`. A mixed calibrated result is still only a
+candidate: it must also pass the model/hardware/configuration-bound workload A/B
+gate described above.
 
 The integration also closes three scheduler lifetime/correctness gaps exposed
 only by a real model graph: heterogeneous reduction sources cannot assume their
@@ -137,9 +161,15 @@ configured cache bound. Its short-run wall time changed from 65.81 seconds to
 throughput benchmark. Longer steady-state benchmarking and live route/event
 comparison against the calibrated prediction remain Phase B gates.
 
+The fail-closed workload validator has also run end-to-end on the local TinyMoE
+fixture with three measured four-token samples after warmup. The established
+path median was `71.34` tokens/s and the one-GPU-position hybrid median was
+`90.66` tokens/s (`1.271x`), with exact output hashes for every paired sample.
+This is gate-development evidence on a tiny fixture, not a product benchmark.
+
 ## Later phases
 
-1. Complete Phase B live native CPU/GPU hybrid decode co-execution.
+1. Finish Phase B sustained telemetry-to-calibration contradiction handling and longer workload validation.
 2. Phase C: double-buffered prefill streaming.
 3. Phase D: live KV/expert/transient resource rebalancing.
 4. Phase E: optional aligned FastStore sidecar bound to GGUF identity.
