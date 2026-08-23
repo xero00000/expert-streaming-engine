@@ -54,9 +54,27 @@ curl -X POST http://127.0.0.1:8080/v1/ese/resources/rebalance \
   -d '{"dry_run":true,"context":65536,"expert_cache_bytes_per_device":4294967296}'
 ```
 
-This development endpoint currently validates only budget, device reserves,
-slot divisibility, and live KV occupancy. It always returns `"mutated": false`;
-live commits remain disabled until transactional rollback validation is complete.
+The dry run validates budget, device reserves, slot divisibility, live KV
+occupancy, and the server's load-time KV maximum. An idle server can commit a
+KV-only target with `"dry_run":false`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/ese/resources/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{"dry_run":false,"context":32768}'
+```
+
+The server prepares and migrates the replacement KV cache off to the side,
+publishes it only after every occupied row succeeds, and leaves the original
+cache usable after allocation or injected migration failure. All slots must be
+idle and the deferred queue must be empty. Live expert-cache replacement is not
+enabled yet; targets that change it remain dry-run-only.
+
+Run the model-backed commit, busy-safe-point, and injected-failure gate with:
+
+```bash
+scripts/validate-phase-d-rebalance.py --model MODEL.gguf
+```
 
 ```
 usage: ./llama-server [options]

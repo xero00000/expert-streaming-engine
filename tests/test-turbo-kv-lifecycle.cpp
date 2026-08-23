@@ -142,6 +142,7 @@ int main(int argc, char ** argv) {
     assert(llama_kv_cache_size(ctx) == 512);
     assert(!llama_kv_cache_resize(ctx, 256));
     assert(llama_kv_cache_size(ctx) == 512);
+    assert(llama_n_ctx(ctx) == 512);
     assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
 #if defined(_WIN32)
     _putenv_s("ESE_TURBO_RETIER_FAIL_AFTER_ROWS", "");
@@ -150,21 +151,37 @@ int main(int argc, char ** argv) {
 #endif
     assert(llama_kv_cache_resize(ctx, 256));
     assert(llama_kv_cache_size(ctx) == 256);
+    assert(llama_n_ctx(ctx) == 256);
     assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
+
+    llama_batch resized_batch = llama_batch_init(1, 0, 1);
+    resized_batch.n_tokens = 1;
+    resized_batch.token[0] = prompt.back();
+    resized_batch.pos[0] = shifted_position + 1;
+    resized_batch.n_seq_id[0] = 1;
+    resized_batch.seq_id[0][0] = 0;
+    resized_batch.logits[0] = 1;
+    assert(llama_decode(ctx, resized_batch) == 0);
+    llama_synchronize(ctx);
+    llama_batch_free(resized_batch);
+    const llama_pos resized_position = shifted_position + 1;
+    assert(llama_kv_cache_seq_pos_max(ctx, 0) == resized_position);
+
     assert(llama_kv_cache_resize(ctx, 512));
     assert(llama_kv_cache_size(ctx) == 512);
-    assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
+    assert(llama_n_ctx(ctx) == 512);
+    assert(llama_kv_cache_seq_pos_max(ctx, 0) == resized_position);
 
     const auto q8_checkpoint = save_sequence(ctx, 0);
     assert(llama_kv_cache_seq_rm(ctx, 0, -1, -1));
     assert(llama_state_seq_set_data(ctx, q8_checkpoint.data(), q8_checkpoint.size(), 0, 0) == q8_checkpoint.size());
-    assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
+    assert(llama_kv_cache_seq_pos_max(ctx, 0) == resized_position);
     assert(llama_kv_cache_seq_pos_min(ctx, 1) < 0);
 
     std::vector<ggml_type> f16(layers, GGML_TYPE_F16);
     assert(llama_kv_cache_retier(ctx, f16.data(), f16.data(), layers));
     require_all_types(ctx, GGML_TYPE_F16);
-    assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
+    assert(llama_kv_cache_seq_pos_max(ctx, 0) == resized_position);
     assert(llama_kv_cache_seq_pos_min(ctx, 1) < 0);
 
     llama_free(ctx);

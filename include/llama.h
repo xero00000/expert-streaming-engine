@@ -1028,8 +1028,10 @@ extern "C" {
             const enum ggml_type * type_v_layers,
             uint32_t n_layers);
 
-    // Resize the storage while preserving every occupied cell. The requested
-    // size must respect backend padding and cannot exceed the context limit.
+    // Failure-atomically replace the active KV storage while preserving every
+    // occupied cell. The requested size must respect backend padding and cannot
+    // exceed the immutable load-time context limit. On success llama_n_ctx()
+    // reports the new active graph/KV geometry.
     LLAMA_API bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size);
 
     // Live resource-pool accounting for control planes. This is a read-only
@@ -1043,6 +1045,7 @@ extern "C" {
         uint64_t expert_ram_resident_bytes;
         uint64_t expert_ram_active_leases;
         uint32_t device_count;
+        uint32_t kv_max_capacity_tokens;
     };
 
     struct llama_resource_device_snapshot {

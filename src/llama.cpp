@@ -8807,6 +8807,7 @@ struct llama_context * llama_init_from_model(
 
     // this is necessary due to kv_self.n being padded later during inference
     cparams.n_ctx            = GGML_PAD(cparams.n_ctx, llama_kv_cache_get_padding(cparams));
+    ctx->n_ctx_max           = cparams.n_ctx;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch          = hparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -10539,7 +10540,7 @@ static bool llama_kv_cache_replace(
         return true;
     }
 
-    if (target_size > ctx->cparams.n_ctx ||
+    if (target_size > ctx->n_ctx_max ||
             target_size % llama_kv_cache_get_padding(ctx->cparams) != 0) {
         LLAMA_LOG_ERROR("%s: target size %u exceeds the context limit or backend padding contract\n",
                 __func__, target_size);
@@ -10651,6 +10652,7 @@ static bool llama_kv_cache_replace(
     current.ckpt.release();
     prepared.ckpt.release();
     llama_kv_cache_swap_storage(current, prepared);
+    ctx->cparams.n_ctx = target_size;
     ctx->reset_scheduler();
     for (auto & copy : ctx->cache_copies) copy = {};
     for (auto & copy : ctx->dsa_cache_copies) copy = {};
@@ -10712,6 +10714,7 @@ bool llama_resource_get_snapshot(
         ram.resident_bytes,
         ram.active_leases,
         count,
+        ctx->n_ctx_max,
     };
 
     std::vector<ggml_backend_sched_resource_device_stats> native(count);

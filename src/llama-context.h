@@ -305,6 +305,9 @@ struct llama_context {
     const struct llama_model & model;
 
     struct llama_cparams        cparams;
+    // Immutable load-time ceiling. cparams.n_ctx is the active graph/KV
+    // geometry and may change after a committed runtime KV transaction.
+    uint32_t                    n_ctx_max = 0;
     struct llama_sampling       sampling;
     struct llama_kv_cache       kv_self;
     struct llama_context      * mtp_target_ctx   = nullptr;

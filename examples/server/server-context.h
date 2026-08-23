@@ -6,7 +6,9 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 
@@ -259,7 +261,10 @@ struct server_context {
     mtmd_context_params mctx_params = mtmd_context_params_default();
     std::unique_ptr<common_transient_module_manager> transient_manager;
 
-    int32_t n_ctx; // total context for all clients / slots
+    int32_t n_ctx;     // owner-thread active context for all clients / slots
+    int32_t n_ctx_max; // immutable load-time ceiling
+    std::atomic<int32_t> n_ctx_published{0}; // cross-thread HTTP view
+    mutable std::mutex resource_plan_mutex;
 
     // system prompt
     bool system_need_update = false;
@@ -294,6 +299,8 @@ struct server_context {
     void init();
 
     bool transient_enabled() const;
+    std::string resource_plan_json() const;
+    void publish_resource_plan_json(std::string value);
     uint64_t acquire_transient(bool multimodal, std::string & error);
     void release_transient(uint64_t lease, bool success = true);
 

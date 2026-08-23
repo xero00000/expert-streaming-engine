@@ -264,32 +264,51 @@ figures are regression evidence rather than general performance claims.
 
 ## Phase D: runtime resource rebalancing (in progress)
 
-The first control-plane boundary is read-only and validation-only. `GET
+The resource snapshot remains read-only. `GET
 /v1/ese/resources` is routed through the inference task queue and reports a
 coherent owner-thread snapshot without synchronizing a device. It includes
 actual KV capacity, occupied cells and allocation bytes; bounded expert-RAM
 capacity, residency and active leases; and per-device expert-cache and prefill
 staging capacity, allocation and residency alongside the resolved global plan.
 
-`POST /v1/ese/resources/rebalance` currently requires `"dry_run": true`. It can
-derive a target `context` and `expert_cache_bytes_per_device`, prove integer
-accounting and per-device reserve bounds, reject targets smaller than live KV
-occupancy, and return current and target plans. It explicitly returns
-`"mutated": false` and labels this stage `budget-and-occupancy-only`; live
-allocation and commit are not enabled yet. Unknown fields, signed/overflowing
-values, non-whole per-slot context, reserve violations, and mutation requests
-fail closed.
+`POST /v1/ese/resources/rebalance` can derive a target `context` and
+`expert_cache_bytes_per_device`, prove integer accounting and per-device reserve
+bounds, reject targets smaller than live KV occupancy, and return current and
+target plans. Dry runs also prove the server's immutable load-time KV maximum.
+An explicit `"dry_run": false` can commit a KV-only target while every slot is
+idle and the deferred queue is empty. The existing off-to-the-side KV
+replacement migrates occupied rows before publication; allocation, conversion,
+or injected migration failure leaves the old cache and logical plan active.
+Per-slot logical limits are changed only after publication. Unknown fields,
+signed/overflowing values, non-whole per-slot context, reserve violations, and
+live expert-cache changes fail closed.
 
 A local CPU TinyMoE endpoint trial reported the actual 30 MiB KV allocation and
 64 MiB bounded RAM tier. After a 1,502-token prompt, a two-token target was
 rejected because it would discard occupied cells. Both that failure and a valid
 2,048-token dry run left the live capacity and current plan at 4,096 tokens.
 
-The next step is idle-only transactional prepare/migrate/commit/rollback. It
-will reuse the existing off-to-the-side KV replacement primitive and planner
-rollback hooks, then add an equivalent prepared expert-cache replacement. The
-mutation endpoint remains disabled until deterministic continuation, injected
-allocation failure, and old-engine-usability tests pass.
+The model-backed transaction gate is automated by:
+
+```sh
+scripts/validate-phase-d-rebalance.py --model MODEL.gguf
+```
+
+On the checked TinyMoE fixture, both CPU and mixed RTX 2080 SUPER/RTX 3060
+Ti/RTX 3080 (`20,30,50`) trials shrank an occupied 1,024-token F16 cache to 512
+tokens and grew it back to 1,024 while all three seeded completions retained the
+same output hash. A concurrent 256-token generation kept the endpoint at the
+old geometry and received the required HTTP 503 idle-safe-point rejection.
+With failure injected after the first migrated row, the endpoint returned HTTP
+500, retained both the 1,024-token allocation and logical plan, reproduced the
+pre-failure output hash, and remained healthy. `/props`, `/models`, and the live
+resource plan tracked each committed geometry. The native lifecycle test also
+decodes at the shrunken geometry before regrowing, preventing a cache/graph
+context mismatch from escaping the gate.
+
+The next step is an equivalent prepared expert-cache replacement, followed by a
+single combined commit boundary and transient-pool policy. Phase D remains
+incomplete until those resources meet the same failure-atomic endpoint gate.
 
 ## Later phases
 

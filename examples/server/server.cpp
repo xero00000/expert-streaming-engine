@@ -938,22 +938,26 @@ int main(int argc, char ** argv) {
         res_ok(res, result.data.at("resources"));
     };
 
-    const auto handle_ese_rebalance = [&ctx_server, &request_ese_resources](
+    std::mutex ese_rebalance_mutex;
+    const auto handle_ese_rebalance = [&ctx_server, &request_ese_resources, &ese_rebalance_mutex](
             const httplib::Request & req, httplib::Response & res) {
+        std::lock_guard<std::mutex> rebalance_lock(ese_rebalance_mutex);
         try {
-            if (ctx_server.params_base.resolved_resource_plan_json.empty()) {
+            const std::string current_plan_text = ctx_server.resource_plan_json();
+            if (current_plan_text.empty()) {
                 res_err(res, format_error_response(
                     "runtime rebalance requires a resolved ESE resource plan",
                     ERROR_TYPE_NOT_SUPPORTED));
                 return;
             }
             const json body = json::parse(req.body);
-            if (!body.is_object() || body.value("dry_run", false) != true) {
+            if (!body.is_object() || !body.contains("dry_run") || !body["dry_run"].is_boolean()) {
                 res_err(res, format_error_response(
-                    "rebalance is validation-only for now; dry_run must be true",
+                    "dry_run must be an explicit boolean",
                     ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
+            const bool dry_run = body["dry_run"].get<bool>();
             static const std::set<std::string> allowed = {
                 "dry_run", "context", "expert_cache_bytes_per_device",
             };
@@ -990,7 +994,7 @@ int main(int argc, char ** argv) {
                     body["expert_cache_bytes_per_device"].get<uint64_t>();
             }
 
-            const json current_json = json::parse(ctx_server.params_base.resolved_resource_plan_json);
+            const json current_json = json::parse(current_plan_text);
             common_resource_plan current;
             common_resource_plan target;
             std::string error;
@@ -1013,15 +1017,62 @@ int main(int argc, char ** argv) {
                     ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
-            res_ok(res, {
-                {"status", "validated"},
-                {"dry_run", true},
-                {"mutated", false},
-                {"validation_scope", "budget-and-occupancy-only"},
-                {"safe_point", resources.at("safe_point")},
-                {"current_plan", current_json},
-                {"target_plan", json::parse(common_resource_plan_json(target))},
-            });
+            const uint64_t max_context = resources.at("kv").at("max_capacity_tokens").get<uint64_t>();
+            if (target.context > max_context) {
+                res_err(res, format_error_response(
+                    "target context exceeds the server's load-time KV maximum",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+
+            json target_json = json::parse(common_resource_plan_json(target));
+            if (dry_run) {
+                res_ok(res, {
+                    {"status", "validated"},
+                    {"dry_run", true},
+                    {"mutated", false},
+                    {"validation_scope", "budget-occupancy-and-runtime-limit"},
+                    {"safe_point", resources.at("safe_point")},
+                    {"current_plan", current_json},
+                    {"target_plan", target_json},
+                });
+                return;
+            }
+
+            bool expert_cache_change = false;
+            for (size_t index = 0; index < current.devices.size(); ++index) {
+                expert_cache_change |= current.devices[index].expert_cache_bytes !=
+                    target.devices[index].expert_cache_bytes;
+            }
+            if (expert_cache_change) {
+                res_err(res, format_error_response(
+                    "live expert-cache replacement is not enabled yet; use dry_run to validate that target",
+                    ERROR_TYPE_NOT_SUPPORTED));
+                return;
+            }
+
+            target.reason = "idle-only runtime KV rebalance target";
+            target_json = json::parse(common_resource_plan_json(target));
+            server_task task;
+            task.id = ctx_server.queue_tasks.get_new_id();
+            task.id_multi = -1;
+            task.id_target = -1;
+            task.type = SERVER_TASK_TYPE_RESOURCE_REBALANCE;
+            task.data = {
+                {"target_context", target.context},
+                {"previous_plan", current_json},
+                {"target_plan", target_json},
+            };
+            ctx_server.queue_results.add_waiting_task_id(task.id);
+            ctx_server.queue_tasks.post(std::move(task));
+            server_task_result result = ctx_server.queue_results.recv(task.id);
+            ctx_server.queue_results.remove_waiting_task_id(task.id);
+            if (result.error) {
+                res_err(res, result.data);
+                return;
+            }
+            result.data["previous_plan"] = current_json;
+            res_ok(res, result.data);
         } catch (const std::exception & exception) {
             res_err(res, format_error_response(
                 std::string("invalid rebalance request: ") + exception.what(),
@@ -1090,7 +1141,8 @@ int main(int argc, char ** argv) {
             },{
                     {"name",  "kv_cache_usage_ratio"},
                     {"help",  "KV-cache usage. 1 means 100 percent usage."},
-                    {"value",  1. * kv_cache_used_cells / params.n_ctx}
+                    {"value",  1. * kv_cache_used_cells /
+                        data.at("resources").at("kv").at("capacity_tokens").get<uint64_t>()}
             },{
                     {"name",  "kv_cache_tokens"},
                     {"help",  "KV-cache tokens."},
@@ -1106,8 +1158,9 @@ int main(int argc, char ** argv) {
             }}}
         };
 
-        if (!ctx_server.params_base.resolved_resource_plan_json.empty()) {
-            const json resource_plan = json::parse(ctx_server.params_base.resolved_resource_plan_json);
+        const std::string plan_json = ctx_server.resource_plan_json();
+        if (!plan_json.empty()) {
+            const json resource_plan = json::parse(plan_json);
             auto & gauges = all_metrics_def["gauge"];
             gauges.push_back({
                 {"name", "resource_context_tokens"},
@@ -1300,7 +1353,8 @@ int main(int argc, char ** argv) {
                 {"vision", ctx_server.chat_params.allow_image},
                 {"audio",  ctx_server.chat_params.allow_audio},
             } },
-            { "n_ctx",                       ctx_server.n_ctx },
+            { "n_ctx",                       ctx_server.n_ctx_published.load(std::memory_order_acquire) },
+            { "n_ctx_max",                   ctx_server.n_ctx_max },
             { "cors_proxy_enabled",          ctx_server.params_base.webui_mcp_proxy},
             { "expert_hybrid_guard", json {
                 { "status", hybrid_guard_status },
@@ -1314,8 +1368,9 @@ int main(int argc, char ** argv) {
 
         };
 
-        if (!ctx_server.params_base.resolved_resource_plan_json.empty()) {
-            data["resource_plan"] = json::parse(ctx_server.params_base.resolved_resource_plan_json);
+        const std::string plan_json = ctx_server.resource_plan_json();
+        if (!plan_json.empty()) {
+            data["resource_plan"] = json::parse(plan_json);
         }
 
         if (ctx_server.params_base.use_jinja) {
@@ -1343,7 +1398,8 @@ int main(int argc, char ** argv) {
                 {"vision", ctx_server.chat_params.allow_image},
                 {"audio",  ctx_server.chat_params.allow_audio},
             } },
-             { "n_ctx",                       ctx_server.n_ctx }
+             { "n_ctx",                       ctx_server.n_ctx_published.load(std::memory_order_acquire) },
+             { "n_ctx_max",                   ctx_server.n_ctx_max }
         };
         res.set_content(data.dump(), "application/json; charset=utf-8");
     };
@@ -1556,7 +1612,8 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_COMPLETION);
     };
 
-    const auto handle_models = [&params, &model_meta](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_models = [&params, &model_meta, &ctx_server](const httplib::Request & req, httplib::Response & res) {
+        const int32_t active_context = ctx_server.n_ctx_published.load(std::memory_order_acquire);
         json codex_model = {
             {"slug", params.model_alias},
             {"display_name", params.model_alias},
@@ -1582,13 +1639,14 @@ int main(int argc, char ** argv) {
             {"web_search_tool_type", "text"},
             {"truncation_policy", {
                 {"mode", "tokens"},
-                {"limit", params.n_ctx},
+                {"limit", active_context},
             }},
             {"supports_parallel_tool_calls", false},
             {"supports_image_detail_original", false},
-            {"context_window", params.n_ctx},
-            {"max_context_window", params.n_ctx},
-            {"auto_compact_token_limit", (params.n_ctx * 9) / 10},
+            {"context_window", active_context},
+            {"max_context_window", active_context},
+            {"load_time_max_context_window", ctx_server.n_ctx_max},
+            {"auto_compact_token_limit", (active_context * 9) / 10},
             {"effective_context_window_percent", 95},
             {"experimental_supported_tools", json::array()},
             {"input_modalities", json::array({"text"})},
@@ -1608,7 +1666,7 @@ int main(int argc, char ** argv) {
                      {"created",  std::time(0)},
                      {"owned_by", "llamacpp"},
                      {"meta",     model_meta},
-                     {"max_model_len", params.n_ctx}, //vllm specs
+                     {"max_model_len", active_context}, //vllm specs
                  },
              }},
             {"models", json::array({codex_model})},

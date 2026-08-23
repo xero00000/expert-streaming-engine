@@ -212,6 +212,8 @@ bool server_context::load_model(const gpt_params& params_) {
     }
 
     n_ctx = llama_n_ctx(ctx);
+    n_ctx_max = n_ctx;
+    n_ctx_published.store(n_ctx, std::memory_order_release);
 
     add_bos_token = llama_should_add_bos_token(model);
     has_eos_token = llama_add_eos_token(model) != 1;
@@ -272,6 +274,16 @@ bool server_context::load_model(const gpt_params& params_) {
     }
 
     return true;
+}
+
+std::string server_context::resource_plan_json() const {
+    std::lock_guard<std::mutex> lock(resource_plan_mutex);
+    return params_base.resolved_resource_plan_json;
+}
+
+void server_context::publish_resource_plan_json(std::string value) {
+    std::lock_guard<std::mutex> lock(resource_plan_mutex);
+    params_base.resolved_resource_plan_json = std::move(value);
 }
 
 void server_context::init() {
@@ -3121,6 +3133,7 @@ void server_context::process_single_task(server_task&& task) {
             }},
             {"kv", {
                 {"capacity_tokens", resource.kv_capacity_tokens},
+                {"max_capacity_tokens", resource.kv_max_capacity_tokens},
                 {"used_cells", resource.kv_used_cells},
                 {"allocated_bytes", resource.kv_allocated_bytes},
             }},
@@ -3131,13 +3144,14 @@ void server_context::process_single_task(server_task&& task) {
             }},
             {"devices", std::move(devices)},
             {"runtime_rebalance", {
-                {"mutation_enabled", false},
-                {"mode", "validation-only"},
+                {"mutation_enabled", true},
+                {"mode", "idle-kv-only"},
                 {"dry_run_endpoint", "/v1/ese/resources/rebalance"},
             }},
         };
-        if (!params_base.resolved_resource_plan_json.empty()) {
-            res.data["resources"]["plan"] = json::parse(params_base.resolved_resource_plan_json);
+        const std::string plan_json = resource_plan_json();
+        if (!plan_json.empty()) {
+            res.data["resources"]["plan"] = json::parse(plan_json);
         }
 
         if (transient_manager != nullptr) {
@@ -3171,6 +3185,94 @@ void server_context::process_single_task(server_task&& task) {
             metrics.reset_bucket();
         }
         queue_results.send(res);
+    } break;
+    case SERVER_TASK_TYPE_RESOURCE_REBALANCE:
+    {
+        const auto fail = [&](const std::string & message, enum error_type type) {
+            server_task_result result;
+            result.id = task.id;
+            result.id_multi = task.id_multi;
+            result.stop = true;
+            result.error = true;
+            result.data = format_error_response(message, type);
+            queue_results.send(std::move(result));
+        };
+        bool slots_idle = true;
+        for (const server_slot & slot : slots) {
+            if (!slot.available()) {
+                slots_idle = false;
+                fail(
+                    "runtime rebalance requires every server slot to be idle",
+                    ERROR_TYPE_UNAVAILABLE);
+                break;
+            }
+        }
+        if (!slots_idle) {
+            break;
+        }
+        if (!queue_tasks.queue_tasks_deferred.empty()) {
+            fail(
+                "runtime rebalance requires an empty deferred task queue",
+                ERROR_TYPE_UNAVAILABLE);
+            break;
+        }
+
+        const uint32_t target_context = task.data.at("target_context").get<uint32_t>();
+        if (target_context == 0 || slots.empty() || target_context % slots.size() != 0) {
+            fail(
+                "target context must divide evenly across every server slot",
+                ERROR_TYPE_INVALID_REQUEST);
+            break;
+        }
+        const uint32_t target_slot_context = target_context / uint32_t(slots.size());
+        bool slot_too_large = false;
+        for (const server_slot & slot : slots) {
+            if (slot.n_past > int32_t(target_slot_context)) {
+                slot_too_large = true;
+                break;
+            }
+        }
+        if (slot_too_large) {
+            fail(
+                "target context is smaller than a live slot continuation",
+                ERROR_TYPE_INVALID_REQUEST);
+            break;
+        }
+
+        const uint32_t previous_context = llama_kv_cache_size(ctx);
+        if (!llama_kv_cache_resize(ctx, target_context)) {
+            fail(
+                "KV resize transaction failed; the original cache remains active",
+                ERROR_TYPE_SERVER);
+            break;
+        }
+
+        for (server_slot & slot : slots) {
+            slot.n_ctx = int32_t(target_slot_context);
+            if (slot.cache_tokens.size() > target_slot_context) {
+                slot.cache_tokens.resize(target_slot_context);
+            }
+        }
+        n_ctx = int32_t(target_context);
+        n_ctx_published.store(n_ctx, std::memory_order_release);
+        publish_resource_plan_json(task.data.at("target_plan").dump());
+
+        server_task_result result;
+        result.id = task.id;
+        result.id_multi = task.id_multi;
+        result.stop = true;
+        result.error = false;
+        result.data = {
+            {"status", "committed"},
+            {"dry_run", false},
+            {"mutated", previous_context != target_context},
+            {"transaction", "prepare-migrate-commit"},
+            {"scope", "kv-only"},
+            {"previous_context", previous_context},
+            {"current_context", target_context},
+            {"current_plan", task.data.at("target_plan")},
+        };
+        queue_results.send(std::move(result));
     } break;
     case SERVER_TASK_TYPE_SLOT_SAVE:
     {
