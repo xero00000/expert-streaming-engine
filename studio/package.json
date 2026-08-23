@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "stage-runtime": "node scripts/stage-runtime.mjs",
+    "test": "node --test tests/*.test.mjs",
     "build": "pnpm stage-runtime && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"

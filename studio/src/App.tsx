@@ -7,6 +7,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { Activity, AppWindow, Bot, Box, Bug, ChevronDown, ChevronRight, ChevronUp, CloudDownload, Download, Gauge, HardDrive, Heart, Library, MessageSquare, Play, Plus, RefreshCw, RotateCcw, Search, Send, Settings, ShieldCheck, SlidersHorizontal, Sparkles, SquareTerminal, StopCircle, Trash2, User, X } from "lucide-react";
 import { TerminalPane } from "./components/TerminalPane";
+import { privacySafeError } from "./privacy";
 import type { AppProfile, ChatStatus, DownloadStatus, HubModel, HubModelDetails, ModelProfile, StudioSnapshot, SweepPlan, SweepStatus, TerminalTab, View } from "./types";
 import "./App.css";
 
@@ -73,14 +74,6 @@ function formatSpeed(bytesPerSecond: number) {
   return bytesPerSecond >= 1024 ** 3
     ? `${(bytesPerSecond / 1024 ** 3).toFixed(1)} GB/s`
     : `${(bytesPerSecond / 1024 ** 2).toFixed(1)} MB/s`;
-}
-
-function privacySafeError(value: string) {
-  return value
-    .replace(/(?:[A-Za-z]:[\\/]|\\\\)[^\r\n"'<>|]*/g, "[local Windows path]")
-    .replace(/\/(?:home|Users)\/[^\s:;,]+/gi, "[local path]")
-    .replace(/\b(username|user|hostname|host)\s*[=:]\s*[^\s,;]+/gi, "$1=[redacted]")
-    .slice(0, 800);
 }
 
 const familyOrder = [
