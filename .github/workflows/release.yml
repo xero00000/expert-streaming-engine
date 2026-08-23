@@ -121,15 +121,20 @@ jobs:
         shell: pwsh
         run: .\.github\scripts\setup-cuda-windows.ps1
 
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja -y
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: studio/src-tauri
 
       - name: Build bundled ESE CPU + CUDA runtime
-        shell: pwsh
+        shell: cmd
         run: |
-          cmake -S . -B build-release-runtime -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON -A x64
-          cmake --build build-release-runtime --config Release --target llama-server -j 2
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build-release-runtime -G "Ninja Multi-Config" -DGGML_CUDA=ON -DGGML_NATIVE=OFF "-DCMAKE_CUDA_ARCHITECTURES=61;70;75;80;86;89" -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON
+          cmake --build build-release-runtime --config Release --target llama-server -j 4
 
       - name: Build standalone Windows ESE launcher
         shell: pwsh
