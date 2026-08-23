@@ -10687,6 +10687,49 @@ bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size) {
     return llama_kv_cache_replace(ctx, type_k.data(), type_v.data(), n_layers, size);
 }
 
+uint32_t llama_resource_device_count(const struct llama_context * ctx) {
+    if (ctx == nullptr) return 0;
+    const size_t count = ggml_backend_sched_get_resource_device_count(ctx->sched);
+    return count > UINT32_MAX ? UINT32_MAX : uint32_t(count);
+}
+
+bool llama_resource_get_snapshot(
+        const struct llama_context * ctx,
+        struct llama_resource_snapshot * snapshot,
+        struct llama_resource_device_snapshot * devices,
+        uint32_t device_capacity) {
+    if (ctx == nullptr || snapshot == nullptr) return false;
+    const uint32_t count = llama_resource_device_count(ctx);
+    if (count > 0 && (devices == nullptr || device_capacity < count)) return false;
+
+    llama_expert_cache::cache_stats ram = {};
+    if (ctx->model.expert_ram_cache) ram = ctx->model.expert_ram_cache->stats();
+    *snapshot = {
+        ctx->kv_self.size,
+        ctx->kv_self.used,
+        uint64_t(ctx->kv_self.total_size()),
+        ram.capacity_bytes,
+        ram.resident_bytes,
+        ram.active_leases,
+        count,
+    };
+
+    std::vector<ggml_backend_sched_resource_device_stats> native(count);
+    if (!ggml_backend_sched_get_resource_device_stats(
+            ctx->sched, native.data(), native.size())) return false;
+    for (uint32_t index = 0; index < count; ++index) {
+        devices[index] = {
+            native[index].backend_id,
+            native[index].expert_cache_capacity_bytes,
+            native[index].expert_cache_allocated_bytes,
+            native[index].expert_cache_resident_bytes,
+            native[index].expert_prefill_capacity_bytes,
+            native[index].expert_prefill_allocated_bytes,
+        };
+    }
+    return true;
+}
+
 // deprecated
 size_t llama_get_state_size(struct llama_context * ctx) {
     return llama_state_get_size(ctx);

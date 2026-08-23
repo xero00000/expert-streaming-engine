@@ -3088,6 +3088,58 @@ void server_context::process_single_task(server_task&& task) {
             { "slots",                           slots_data },
         };
 
+        llama_resource_snapshot resource = {};
+        const uint32_t device_count = llama_resource_device_count(ctx);
+        std::vector<llama_resource_device_snapshot> resource_devices(device_count);
+        if (!llama_resource_get_snapshot(
+                ctx, &resource, resource_devices.data(), resource_devices.size())) {
+            send_error(task, "failed to collect live resource snapshot", ERROR_TYPE_SERVER);
+            break;
+        }
+        json devices = json::array();
+        for (const auto & device : resource_devices) {
+            devices.push_back({
+                {"id", device.device_id},
+                {"expert_cache", {
+                    {"capacity_bytes", device.expert_cache_capacity_bytes},
+                    {"allocated_bytes", device.expert_cache_allocated_bytes},
+                    {"resident_bytes", device.expert_cache_resident_bytes},
+                }},
+                {"expert_prefill_staging", {
+                    {"capacity_bytes", device.expert_prefill_capacity_bytes},
+                    {"allocated_bytes", device.expert_prefill_allocated_bytes},
+                }},
+            });
+        }
+        res.data["resources"] = {
+            {"schema", 1},
+            {"safe_point", n_processing_slots == 0},
+            {"slots", {
+                {"idle", n_idle_slots},
+                {"processing", n_processing_slots},
+                {"deferred", queue_tasks.queue_tasks_deferred.size()},
+            }},
+            {"kv", {
+                {"capacity_tokens", resource.kv_capacity_tokens},
+                {"used_cells", resource.kv_used_cells},
+                {"allocated_bytes", resource.kv_allocated_bytes},
+            }},
+            {"expert_ram", {
+                {"capacity_bytes", resource.expert_ram_capacity_bytes},
+                {"resident_bytes", resource.expert_ram_resident_bytes},
+                {"active_leases", resource.expert_ram_active_leases},
+            }},
+            {"devices", std::move(devices)},
+            {"runtime_rebalance", {
+                {"mutation_enabled", false},
+                {"mode", "validation-only"},
+                {"dry_run_endpoint", "/v1/ese/resources/rebalance"},
+            }},
+        };
+        if (!params_base.resolved_resource_plan_json.empty()) {
+            res.data["resources"]["plan"] = json::parse(params_base.resolved_resource_plan_json);
+        }
+
         if (transient_manager != nullptr) {
             const auto transient = transient_manager->snapshot();
             json modules = json::array();

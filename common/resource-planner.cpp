@@ -91,6 +91,17 @@ uint64_t mul_div_floor(uint64_t a, uint64_t b, uint64_t divisor) {
 #endif
 }
 
+bool mul_div_ceil_checked(uint64_t a, uint32_t b, uint32_t divisor, uint64_t & result) {
+    if (divisor == 0) return false;
+    const uint64_t whole = a/divisor;
+    const uint64_t remainder = a%divisor;
+    if (b != 0 && whole > std::numeric_limits<uint64_t>::max()/b) return false;
+    result = whole*b;
+    const uint64_t remainder_product = remainder*uint64_t(b);
+    const uint64_t rounded = remainder_product/divisor + (remainder_product%divisor != 0 ? 1 : 0);
+    return add_checked(result, rounded);
+}
+
 common_memory_policy resolve_policy(const common_resource_plan_input & input) {
     if (input.requested_policy != COMMON_MEMORY_POLICY_AUTO) {
         return input.requested_policy;
@@ -834,6 +845,78 @@ bool common_expert_split_solve_calibrated(
     }
     input.calibration_complete = true;
     return common_expert_split_solve(input, plan, error);
+}
+
+bool common_resource_rebalance_target(
+        const common_resource_plan & current,
+        const common_resource_rebalance_request & request,
+        common_resource_plan & target,
+        std::string & error) {
+    error.clear();
+    if (current.context == 0 || current.slots == 0 || current.devices.empty()) {
+        error = "current resource plan is incomplete";
+        return false;
+    }
+    const uint32_t context = request.context == 0 ? current.context : request.context;
+    if (context < current.slots || context%current.slots != 0) {
+        error = "target context must provide an equal whole-token capacity for every slot";
+        return false;
+    }
+    if (request.set_expert_cache_bytes_per_device &&
+            request.expert_cache_bytes_per_device > 0 &&
+            current.policy == COMMON_MEMORY_POLICY_RESIDENT) {
+        error = "resident policy has no mutable deferred-expert cache";
+        return false;
+    }
+
+    target = current;
+    target.context = context;
+    bool has_accelerator = false;
+    for (auto & device : target.devices) {
+        if (device.capacity_bytes < device.reserve_bytes) {
+            error = "device capacity is below its immutable reserve";
+            return false;
+        }
+        uint64_t kv_bytes = 0;
+        if (!mul_div_ceil_checked(device.kv_bytes, context, current.context, kv_bytes)) {
+            error = "target KV allocation overflows 64-bit accounting";
+            return false;
+        }
+        device.kv_bytes = kv_bytes;
+        if (device.id >= 0) {
+            has_accelerator = true;
+            if (request.set_expert_cache_bytes_per_device) {
+                device.expert_cache_bytes = request.expert_cache_bytes_per_device;
+            }
+        } else if (request.set_expert_cache_bytes_per_device) {
+            device.expert_cache_bytes = 0;
+        }
+
+        uint64_t planned = 0;
+        if (!add_checked(planned, device.dense_bytes) ||
+                !add_checked(planned, device.graph_bytes) ||
+                !add_checked(planned, device.kv_bytes) ||
+                !add_checked(planned, device.expert_cache_bytes) ||
+                !add_checked(planned, device.expert_prefill_staging_bytes) ||
+                !add_checked(planned, device.transient_bytes)) {
+            error = "target device plan overflows 64-bit accounting";
+            return false;
+        }
+        const uint64_t usable = device.capacity_bytes - device.reserve_bytes;
+        if (planned > usable) {
+            error = "target KV/expert allocation crosses a device reserve";
+            return false;
+        }
+        device.planned_bytes = planned;
+        device.headroom_bytes = usable - planned;
+    }
+    if (request.set_expert_cache_bytes_per_device &&
+            request.expert_cache_bytes_per_device > 0 && !has_accelerator) {
+        error = "target expert cache requires an accelerator";
+        return false;
+    }
+    target.reason = "validated runtime KV/expert rebalance target; no resources mutated";
+    return true;
 }
 
 std::string common_resource_plan_json(const common_resource_plan & plan) {

@@ -173,6 +173,44 @@ void test_atomic_rollback() {
     REQUIRE(error.find("injected commit failure") != std::string::npos);
 }
 
+void test_runtime_rebalance_target_is_pure_and_reserve_bounded() {
+    auto input = base_input();
+    common_resource_plan current;
+    std::string error;
+    REQUIRE(common_resource_plan_solve(input, current, error));
+    const std::string original = common_resource_plan_json(current);
+
+    common_resource_rebalance_request request;
+    request.context = current.context/2;
+    request.set_expert_cache_bytes_per_device = true;
+    request.expert_cache_bytes_per_device = 256*MiB;
+    common_resource_plan target;
+    REQUIRE(common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(target.context == current.context/2);
+    REQUIRE(common_resource_plan_json(current) == original);
+    for (size_t index = 0; index < target.devices.size(); ++index) {
+        REQUIRE(target.devices[index].expert_cache_bytes == 256*MiB);
+        REQUIRE(target.devices[index].kv_bytes <= current.devices[index].kv_bytes);
+        REQUIRE(target.devices[index].planned_bytes + target.devices[index].reserve_bytes <=
+                target.devices[index].capacity_bytes);
+    }
+
+    request.context = current.slots + 1;
+    REQUIRE(!common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(error.find("whole-token capacity") != std::string::npos);
+    REQUIRE(common_resource_plan_json(current) == original);
+
+    request.context = current.context;
+    request.expert_cache_bytes_per_device = std::numeric_limits<uint64_t>::max();
+    REQUIRE(!common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(error.find("overflows") != std::string::npos || error.find("reserve") != std::string::npos);
+    REQUIRE(common_resource_plan_json(current) == original);
+
+    request.expert_cache_bytes_per_device = 0;
+    REQUIRE(common_resource_rebalance_target(current, request, target, error));
+    for (const auto & device : target.devices) REQUIRE(device.expert_cache_bytes == 0);
+}
+
 void test_interface_parsers() {
     uint64_t bytes = 0;
     uint32_t tokens = 0;
@@ -452,6 +490,7 @@ int main() {
     test_preference_tradeoff();
     test_no_silent_fallbacks();
     test_atomic_rollback();
+    test_runtime_rebalance_target_is_pure_and_reserve_bounded();
     test_interface_parsers();
     test_compatibility_presets_and_host_budget();
     test_auto_unlimited_ram_and_minimum_expert_component();

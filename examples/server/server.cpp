@@ -6,6 +6,7 @@
 #include "chat.h"
 
 #include "common.h"
+#include "resource-planner.h"
 #include "speculative.h"
 #include "mtmd.h"
 #include "sampling.h"
@@ -491,6 +492,58 @@ static void log_prompt(const gpt_params & params_base, const json & body) {
     }
 }
 
+static bool server_parse_resource_plan(
+        const json & value,
+        common_resource_plan & plan,
+        std::string & error) {
+    try {
+        if (!value.is_object() || !value.at("devices").is_array()) {
+            error = "resolved resource plan is not an object with devices";
+            return false;
+        }
+        if (!common_parse_memory_policy(value.at("policy").get<std::string>(), plan.policy) ||
+                !common_parse_resource_backend(value.at("backend").get<std::string>(), plan.backend) ||
+                !common_parse_kv_quality(value.at("kv_quality").get<std::string>(), plan.kv_quality)) {
+            error = "resolved resource plan contains an unknown policy, backend, or KV quality";
+            return false;
+        }
+        plan.context = value.at("context").get<uint32_t>();
+        plan.slots = value.at("slots").get<uint32_t>();
+        plan.batch = value.at("batch").get<uint32_t>();
+        plan.ubatch = value.at("ubatch").get<uint32_t>();
+        plan.ram_capacity_bytes = value.at("ram_capacity_bytes").get<uint64_t>();
+        plan.ram_planned_bytes = value.at("ram_planned_bytes").get<uint64_t>();
+        plan.expert_ram_bytes = value.at("expert_ram_bytes").get<uint64_t>();
+        plan.aux_ram_bytes = value.at("aux_ram_bytes").get<uint64_t>();
+        plan.io_staging_bytes = value.at("io_staging_bytes").get<uint64_t>();
+        plan.transient_capacity_bytes = value.at("transient_capacity_bytes").get<uint64_t>();
+        plan.expert_prefill_staging_enabled = value.at("expert_prefill_staging_enabled").get<bool>();
+        plan.transient_swap = value.at("transient_swap").get<bool>();
+        plan.draft_resident = value.at("draft_resident").get<bool>();
+        plan.reason = value.at("reason").get<std::string>();
+        plan.devices.clear();
+        for (const auto & item : value.at("devices")) {
+            plan.devices.push_back({
+                item.at("id").get<int>(),
+                item.at("capacity_bytes").get<uint64_t>(),
+                item.at("reserve_bytes").get<uint64_t>(),
+                item.at("dense_bytes").get<uint64_t>(),
+                item.at("graph_bytes").get<uint64_t>(),
+                item.at("kv_bytes").get<uint64_t>(),
+                item.at("expert_cache_bytes").get<uint64_t>(),
+                item.at("expert_prefill_staging_bytes").get<uint64_t>(),
+                item.at("transient_bytes").get<uint64_t>(),
+                item.at("planned_bytes").get<uint64_t>(),
+                item.at("headroom_bytes").get<uint64_t>(),
+            });
+        }
+        return true;
+    } catch (const std::exception & exception) {
+        error = std::string("cannot parse resolved resource plan: ") + exception.what();
+        return false;
+    }
+}
+
 int main(int argc, char ** argv) {
 #if SERVER_VERBOSE != 1
     log_disable();
@@ -857,6 +910,123 @@ int main(int argc, char ** argv) {
 
         res.set_content(result.data.at("slots").dump(), "application/json");
         res.status = 200; // HTTP OK
+    };
+
+    const auto request_ese_resources = [&ctx_server]() {
+        server_task task;
+        task.id = ctx_server.queue_tasks.get_new_id();
+        task.id_multi = -1;
+        task.id_target = -1;
+        task.type = SERVER_TASK_TYPE_METRICS;
+
+        ctx_server.queue_results.add_waiting_task_id(task.id);
+        ctx_server.queue_tasks.post(std::move(task));
+        server_task_result result = ctx_server.queue_results.recv(task.id);
+        ctx_server.queue_results.remove_waiting_task_id(task.id);
+        return result;
+    };
+
+    const auto handle_ese_resources = [&request_ese_resources](const httplib::Request &, httplib::Response & res) {
+        // Resource internals are owned by the inference loop. Route the read
+        // through its task queue so the HTTP worker never races graph/cache
+        // mutation and the snapshot itself adds no device synchronization.
+        server_task_result result = request_ese_resources();
+        if (result.error) {
+            res_err(res, result.data);
+            return;
+        }
+        res_ok(res, result.data.at("resources"));
+    };
+
+    const auto handle_ese_rebalance = [&ctx_server, &request_ese_resources](
+            const httplib::Request & req, httplib::Response & res) {
+        try {
+            if (ctx_server.params_base.resolved_resource_plan_json.empty()) {
+                res_err(res, format_error_response(
+                    "runtime rebalance requires a resolved ESE resource plan",
+                    ERROR_TYPE_NOT_SUPPORTED));
+                return;
+            }
+            const json body = json::parse(req.body);
+            if (!body.is_object() || body.value("dry_run", false) != true) {
+                res_err(res, format_error_response(
+                    "rebalance is validation-only for now; dry_run must be true",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            static const std::set<std::string> allowed = {
+                "dry_run", "context", "expert_cache_bytes_per_device",
+            };
+            for (const auto & item : body.items()) {
+                if (allowed.count(item.key()) == 0) {
+                    res_err(res, format_error_response(
+                        "unknown rebalance field: " + item.key(),
+                        ERROR_TYPE_INVALID_REQUEST));
+                    return;
+                }
+            }
+
+            common_resource_rebalance_request request;
+            if (body.contains("context")) {
+                if (!body["context"].is_number_unsigned() ||
+                        body["context"].get<uint64_t>() == 0 ||
+                        body["context"].get<uint64_t>() > UINT32_MAX) {
+                    res_err(res, format_error_response(
+                        "context must be an unsigned 32-bit token count",
+                        ERROR_TYPE_INVALID_REQUEST));
+                    return;
+                }
+                request.context = body["context"].get<uint32_t>();
+            }
+            if (body.contains("expert_cache_bytes_per_device")) {
+                if (!body["expert_cache_bytes_per_device"].is_number_unsigned()) {
+                    res_err(res, format_error_response(
+                        "expert_cache_bytes_per_device must be an unsigned byte count",
+                        ERROR_TYPE_INVALID_REQUEST));
+                    return;
+                }
+                request.set_expert_cache_bytes_per_device = true;
+                request.expert_cache_bytes_per_device =
+                    body["expert_cache_bytes_per_device"].get<uint64_t>();
+            }
+
+            const json current_json = json::parse(ctx_server.params_base.resolved_resource_plan_json);
+            common_resource_plan current;
+            common_resource_plan target;
+            std::string error;
+            if (!server_parse_resource_plan(current_json, current, error) ||
+                    !common_resource_rebalance_target(current, request, target, error)) {
+                res_err(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+
+            server_task_result live = request_ese_resources();
+            if (live.error) {
+                res_err(res, live.data);
+                return;
+            }
+            const json & resources = live.data.at("resources");
+            const uint64_t used_cells = resources.at("kv").at("used_cells").get<uint64_t>();
+            if (target.context < used_cells) {
+                res_err(res, format_error_response(
+                    "target context is smaller than the occupied KV cell count",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            res_ok(res, {
+                {"status", "validated"},
+                {"dry_run", true},
+                {"mutated", false},
+                {"validation_scope", "budget-and-occupancy-only"},
+                {"safe_point", resources.at("safe_point")},
+                {"current_plan", current_json},
+                {"target_plan", json::parse(common_resource_plan_json(target))},
+            });
+        } catch (const std::exception & exception) {
+            res_err(res, format_error_response(
+                std::string("invalid rebalance request: ") + exception.what(),
+                ERROR_TYPE_INVALID_REQUEST));
+        }
     };
 
     const auto handle_metrics = [&](const httplib::Request &, httplib::Response & res) {
@@ -2222,6 +2392,8 @@ int main(int argc, char ** argv) {
     svr->Get ("/metrics",             handle_metrics);
     svr->Get ("/props",               handle_props);
     svr->Get("/v1/props",             handle_props_simple);
+    svr->Get("/v1/ese/resources",     handle_ese_resources);
+    svr->Post("/v1/ese/resources/rebalance", handle_ese_rebalance);
     svr->Get ("/v1/models",           handle_models);
     svr->Get ("/models",              handle_models);
     svr->Post("/completion",          handle_completions); // legacy

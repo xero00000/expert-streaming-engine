@@ -1032,6 +1032,36 @@ extern "C" {
     // size must respect backend padding and cannot exceed the context limit.
     LLAMA_API bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size);
 
+    // Live resource-pool accounting for control planes. This is a read-only
+    // snapshot and does not synchronize a device. Call it from the context
+    // owner thread (the server routes it through its task queue).
+    struct llama_resource_snapshot {
+        uint32_t kv_capacity_tokens;
+        uint32_t kv_used_cells;
+        uint64_t kv_allocated_bytes;
+        uint64_t expert_ram_capacity_bytes;
+        uint64_t expert_ram_resident_bytes;
+        uint64_t expert_ram_active_leases;
+        uint32_t device_count;
+    };
+
+    struct llama_resource_device_snapshot {
+        int32_t device_id;
+        uint64_t expert_cache_capacity_bytes;
+        uint64_t expert_cache_allocated_bytes;
+        uint64_t expert_cache_resident_bytes;
+        uint64_t expert_prefill_capacity_bytes;
+        uint64_t expert_prefill_allocated_bytes;
+    };
+
+    LLAMA_API uint32_t llama_resource_device_count(const struct llama_context * ctx);
+
+    LLAMA_API bool llama_resource_get_snapshot(
+            const struct llama_context * ctx,
+            struct llama_resource_snapshot * snapshot,
+            struct llama_resource_device_snapshot * devices,
+            uint32_t device_capacity);
+
     // Apply the KV cache updates (such as K-shifts, defragmentation, etc.)
     // Positive return values does not mean a fatal error, but rather a warning.
     //    0 - success

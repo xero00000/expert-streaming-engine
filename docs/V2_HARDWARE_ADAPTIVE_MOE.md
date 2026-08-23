@@ -253,9 +253,38 @@ coalesced 321 H2D components into 216 batches, reused 42 components through D2D
 copies, and reported zero fallbacks. This is correctness and development-fixture
 evidence, not a general product benchmark.
 
+## Phase D: runtime resource rebalancing (in progress)
+
+The first control-plane boundary is read-only and validation-only. `GET
+/v1/ese/resources` is routed through the inference task queue and reports a
+coherent owner-thread snapshot without synchronizing a device. It includes
+actual KV capacity, occupied cells and allocation bytes; bounded expert-RAM
+capacity, residency and active leases; and per-device expert-cache and prefill
+staging capacity, allocation and residency alongside the resolved global plan.
+
+`POST /v1/ese/resources/rebalance` currently requires `"dry_run": true`. It can
+derive a target `context` and `expert_cache_bytes_per_device`, prove integer
+accounting and per-device reserve bounds, reject targets smaller than live KV
+occupancy, and return current and target plans. It explicitly returns
+`"mutated": false` and labels this stage `budget-and-occupancy-only`; live
+allocation and commit are not enabled yet. Unknown fields, signed/overflowing
+values, non-whole per-slot context, reserve violations, and mutation requests
+fail closed.
+
+A local CPU TinyMoE endpoint trial reported the actual 30 MiB KV allocation and
+64 MiB bounded RAM tier. After a 1,502-token prompt, a two-token target was
+rejected because it would discard occupied cells. Both that failure and a valid
+2,048-token dry run left the live capacity and current plan at 4,096 tokens.
+
+The next step is idle-only transactional prepare/migrate/commit/rollback. It
+will reuse the existing off-to-the-side KV replacement primitive and planner
+rollback hooks, then add an equivalent prepared expert-cache replacement. The
+mutation endpoint remains disabled until deterministic continuation, injected
+allocation failure, and old-engine-usability tests pass.
+
 ## Later phases
 
-1. Phase D: live KV/expert/transient resource rebalancing.
+1. Complete Phase D live KV/expert/transient resource rebalancing.
 2. Phase E: optional aligned FastStore sidecar bound to GGUF identity.
 3. Phase F: semantic cache anchors and newer hardware kernels.
 

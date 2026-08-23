@@ -41,6 +41,23 @@ The resolved JSON plan is printed before serving and returned by `/props`.
 `--metrics` adds plan capacity/headroom gauges. See
 [`PHASE4_GLOBAL_RESOURCE_CONTROLLER.md`](../../docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md).
 
+V2 resource-control clients can query a coherent live snapshot with `GET
+/v1/ese/resources`. The response distinguishes planned capacity, actual
+allocation, residency/occupancy, and whether the server is at an idle safe
+point. Snapshot collection runs on the inference owner thread.
+
+Target validation is available without mutation:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/ese/resources/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{"dry_run":true,"context":65536,"expert_cache_bytes_per_device":4294967296}'
+```
+
+This development endpoint currently validates only budget, device reserves,
+slot divisibility, and live KV occupancy. It always returns `"mutated": false`;
+live commits remain disabled until transactional rollback validation is complete.
+
 ```
 usage: ./llama-server [options]
 

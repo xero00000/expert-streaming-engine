@@ -85,6 +85,27 @@ class NativeSurfaceTests(unittest.TestCase):
         self.assertIn('"cpu-drift"', server)
         self.assertIn('"upload-drift"', server)
 
+    def test_resource_snapshot_is_collected_on_the_inference_owner_thread(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        public_header = (root / "include" / "llama.h").read_text(encoding="utf-8")
+        backend_header = (root / "ggml" / "include" / "ggml-backend.h").read_text(
+            encoding="utf-8"
+        )
+        server = (root / "examples" / "server" / "server.cpp").read_text(
+            encoding="utf-8"
+        )
+        context = (root / "examples" / "server" / "server-context.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("llama_resource_get_snapshot", public_header)
+        self.assertIn("ggml_backend_sched_get_resource_device_stats", backend_header)
+        self.assertIn('svr->Get("/v1/ese/resources"', server)
+        self.assertIn('svr->Post("/v1/ese/resources/rebalance"', server)
+        self.assertIn("task.type = SERVER_TASK_TYPE_METRICS", server)
+        self.assertIn("common_resource_rebalance_target", server)
+        self.assertIn('res.data["resources"]', context)
+        self.assertIn('"mutation_enabled", false', context)
+
     def test_graph_reuse_observes_hybrid_guard_transitions(self) -> None:
         root = Path(__file__).resolve().parents[1]
         llama = (root / "src" / "llama.cpp").read_text(encoding="utf-8")

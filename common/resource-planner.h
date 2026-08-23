@@ -130,6 +130,14 @@ struct common_resource_transition_stats {
     uint64_t commit_failures = 0;
 };
 
+// A zero context leaves the current context unchanged. Expert-cache changes
+// are explicit because zero is itself a valid request that disables the pool.
+struct common_resource_rebalance_request {
+    uint32_t context = 0;
+    bool set_expert_cache_bytes_per_device = false;
+    uint64_t expert_cache_bytes_per_device = 0;
+};
+
 struct common_expert_split_input {
     uint32_t misses = 0;
     // Contended costs from a complete, topology-current hardware profile.
@@ -179,6 +187,14 @@ struct common_expert_calibration_profile {
 bool common_resource_plan_solve(
     const common_resource_plan_input & input,
     common_resource_plan & plan,
+    std::string & error);
+
+// Pure target derivation for a running plan. This performs no allocation and
+// never mutates current; callers can expose it as a safe dry-run boundary.
+bool common_resource_rebalance_target(
+    const common_resource_plan & current,
+    const common_resource_rebalance_request & request,
+    common_resource_plan & target,
     std::string & error);
 
 bool common_expert_split_solve(

@@ -246,6 +246,24 @@ extern "C" {
             uint64_t bytes_per_device,
             uint64_t reserve_bytes_per_device);
 
+    // Read-only pool accounting. Call from the scheduler owner thread or an
+    // otherwise quiescent context; the scheduler does not introduce a device
+    // synchronization merely to collect these counters.
+    struct ggml_backend_sched_resource_device_stats {
+        int32_t backend_id;
+        uint64_t expert_cache_capacity_bytes;
+        uint64_t expert_cache_allocated_bytes;
+        uint64_t expert_cache_resident_bytes;
+        uint64_t expert_prefill_capacity_bytes;
+        uint64_t expert_prefill_allocated_bytes;
+    };
+
+    GGML_API size_t ggml_backend_sched_get_resource_device_count(ggml_backend_sched_t sched);
+    GGML_API bool ggml_backend_sched_get_resource_device_stats(
+            ggml_backend_sched_t sched,
+            struct ggml_backend_sched_resource_device_stats * stats,
+            size_t capacity);
+
     enum ggml_backend_expert_hybrid_guard_status {
         GGML_BACKEND_EXPERT_HYBRID_GUARD_DISABLED = 0,
         GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING,

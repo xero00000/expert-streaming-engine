@@ -1590,6 +1590,43 @@ void ggml_backend_sched_set_expert_prefill_staging(
     sched->expert_prefill_staging_reserve_bytes = reserve_bytes_per_device;
 }
 
+size_t ggml_backend_sched_get_resource_device_count(ggml_backend_sched_t sched) {
+    return sched && sched->n_backends > 0 ? size_t(sched->n_backends - 1) : 0;
+}
+
+bool ggml_backend_sched_get_resource_device_stats(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_resource_device_stats * stats,
+        size_t capacity) {
+    const size_t count = ggml_backend_sched_get_resource_device_count(sched);
+    if (!sched || (count > 0 && (!stats || capacity < count))) return false;
+    for (size_t backend_id = 0; backend_id < count; ++backend_id) {
+        const auto & cache = sched->active_expert_caches[backend_id];
+        uint64_t resident_bytes = 0;
+        if (cache.ready) {
+            for (const auto & entry : cache.entries) {
+                if (entry.layer < 0 || entry.expert < 0) continue;
+                for (size_t component = 0; component < cache.components.size(); ++component) {
+                    if ((entry.ready_mask & uint8_t(1u << component)) == 0) continue;
+                    const uint64_t bytes = cache.components[component].expert_bytes;
+                    resident_bytes = bytes > UINT64_MAX - resident_bytes
+                        ? UINT64_MAX : resident_bytes + bytes;
+                }
+            }
+        }
+        const auto & prefill = sched->expert_prefill_devices[backend_id];
+        stats[backend_id] = {
+            int32_t(backend_id),
+            sched->active_expert_cache_capacity_bytes,
+            cache.ready ? cache.allocated_bytes : 0,
+            resident_bytes,
+            sched->expert_prefill_staging_capacity_bytes,
+            prefill.ready ? prefill.allocated_bytes : 0,
+        };
+    }
+    return true;
+}
+
 void ggml_backend_sched_set_expert_hybrid_guard(
         ggml_backend_sched_t sched,
         uint64_t cpu_ns_per_expert,
