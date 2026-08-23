@@ -2885,6 +2885,7 @@ static bool ggml_active_expert_cache_prepare_route(
         ggml_tensor * input,
         ggml_tensor * ids_source,
         int layer,
+        bool full_tensor_fallback_available,
         ggml_active_expert_cache_route ** out_route) {
     const int64_t n_ids = ids_source->ne[0];
     if (ids_source->type != GGML_TYPE_I32 || n_ids < 1 || n_ids > 64 || ids_source->ne[1] != 1 ||
@@ -3000,8 +3001,11 @@ static bool ggml_active_expert_cache_prepare_route(
         }
     }
     const bool calibrated_gpu_partition = ggml_ese_route_get_role(ids_source) == GGML_ESE_ROUTE_GPU;
+    // Admission hysteresis may defer a route only while the scheduler retained
+    // the original full expert tensor.  A compact cache-backed graph has no
+    // correct CPU fallback, so its first route must be admitted immediately.
     if (!admission_ready && !sched->expert_lease_required && !calibrated_gpu_partition &&
-            sched->active_expert_cache_capacity_bytes == 0) {
+            sched->active_expert_cache_capacity_bytes == 0 && full_tensor_fallback_available) {
         ++sched->active_expert_cache_rejected_admissions;
         return false;
     }
@@ -3085,7 +3089,10 @@ static bool ggml_active_expert_cache_stage(
 
     auto ids_backend = ggml_backend_sched_get_tensor_backend(sched, ids_source);
     ggml_active_expert_cache_route * route = nullptr;
-    if (!ggml_active_expert_cache_prepare_route(sched, ids_backend, split_backend, split_backend_id, input, ids_source, layer, &route)) {
+    const bool full_tensor_fallback_available = input_cpy->ne[2] == input->ne[2];
+    if (!ggml_active_expert_cache_prepare_route(
+            sched, ids_backend, split_backend, split_backend_id, input, ids_source, layer,
+            full_tensor_fallback_available, &route)) {
         return false;
     }
 

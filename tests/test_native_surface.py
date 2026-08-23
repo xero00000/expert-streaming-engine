@@ -157,6 +157,26 @@ class NativeSurfaceTests(unittest.TestCase):
             llama,
         )
 
+    def test_compact_expert_cache_preserves_safe_graph_fallbacks(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        backend = (root / "ggml" / "src" / "ggml-backend.cpp").read_text(
+            encoding="utf-8"
+        )
+        llama = (root / "src" / "llama.cpp").read_text(encoding="utf-8")
+        self.assertIn(
+            "const bool full_tensor_fallback_available = input_cpy->ne[2] == input->ne[2]",
+            backend,
+        )
+        self.assertIn(
+            "sched->active_expert_cache_capacity_bytes == 0 && full_tensor_fallback_available",
+            backend,
+        )
+        self.assertIn(
+            "cparams.expert_vram_cache_bytes > 0 || legacy_expert_cache_requested()",
+            llama,
+        )
+        self.assertIn("ctx->cparams.fused_mmad = false", llama)
+
 
 if __name__ == "__main__":
     unittest.main()

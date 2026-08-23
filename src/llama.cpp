@@ -57,6 +57,14 @@ void llama_set_mtp_n_heads(struct llama_context * ctx, int32_t mtp_n_heads);
 
 namespace {
 
+bool legacy_expert_cache_requested() {
+    const char * cache_slots = std::getenv("LLAMA_EXPERT_GPU_CACHE_SLOTS");
+    if (!cache_slots) return false;
+    char * end = nullptr;
+    const long parsed = std::strtol(cache_slots, &end, 10);
+    return end != cache_slots && *end == '\0' && parsed >= 4 && parsed <= 64;
+}
+
 bool expert_prefetch_is_topk(const ggml_tensor * tensor) {
     static constexpr char prefix[] = "ffn_moe_topk-";
     return std::strncmp(ggml_get_name(tensor), prefix, sizeof(prefix) - 1) == 0;
@@ -8791,6 +8799,14 @@ struct llama_context * llama_init_from_model(
     cparams.expert_hybrid_upload_ns_per_expert = params.expert_hybrid_upload_ns_per_expert;
     cparams.expert_hybrid_maximum_drift_ppm = params.expert_hybrid_maximum_drift_ppm;
     cparams.expert_hybrid_minimum_cpu_calls = params.expert_hybrid_minimum_cpu_calls;
+    if (cparams.fused_mmad &&
+            (cparams.expert_vram_cache_bytes > 0 || legacy_expert_cache_requested())) {
+        // Compact expert remapping does not yet preserve full-graph numerical
+        // parity through fused mul_multi_add. Keep the exact unfused reduction
+        // until that combination has its own model-level parity proof.
+        LLAMA_LOG_WARN("%s: adaptive expert cache disables experimental fused_mmad for output parity\n", __func__);
+        cparams.fused_mmad = false;
+    }
 
     cparams.reduce_type      = params.type_reduce;
     cparams.graph_attn_precision = params.type_graph_attn;
@@ -10704,6 +10720,10 @@ bool llama_expert_cache_resize(
         return false;
     }
     ctx->cparams.expert_vram_cache_bytes = bytes_per_device;
+    if (bytes_per_device > 0 && ctx->cparams.fused_mmad) {
+        LLAMA_LOG_WARN("%s: adaptive expert cache disables experimental fused_mmad for output parity\n", __func__);
+        ctx->cparams.fused_mmad = false;
+    }
     ctx->reset_scheduler();
     return true;
 }

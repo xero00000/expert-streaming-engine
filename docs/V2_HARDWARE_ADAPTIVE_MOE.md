@@ -324,6 +324,13 @@ single-Ampere and mixed Turing/Ampere gates both passed 8 MiB -> 4 MiB ->
 failure accounting. The mixed gate prepared all three devices and additionally
 failed after one complete device preparation to prove cleanup of an earlier
 candidate. Use `--expert-failure-after-devices 1` for that multi-device gate.
+The compact-cache path currently disables the experimental fused
+`mul_multi_add` reduction. A seeded TinyMoE model-level gate found that compact
+remapping plus that fusion changed the first generated token, while the
+unfused reduction reproduced the uncached output exactly. Both bounded byte
+capacity and legacy `LLAMA_EXPERT_GPU_CACHE_SLOTS=4` launches are covered by
+the parity gate; the fusion must remain off until an equivalent full-model
+proof passes.
 The next step is a single combined KV/expert commit boundary followed by
 transient-pool policy. Phase D remains incomplete until those resources meet
 the same failure-atomic endpoint gate.

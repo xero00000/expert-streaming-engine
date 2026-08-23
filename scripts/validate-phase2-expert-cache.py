@@ -278,8 +278,30 @@ def main() -> int:
             "-ot", ".ffn_.*_exps.=CPU",
             *multi_gpu,
         ]
+        gpu_resident = run_cli(args.cli, args.model, [
+            "-ngl", "99", "-ub", "1", *multi_gpu,
+        ], env)
+        require_success(gpu_resident, f"{count}-GPU resident reference")
+        if gpu_resident["generated"] != baseline["generated"]:
+            raise RuntimeError(f"{count}-GPU resident reference output differs from CPU baseline")
         gpu_baseline = run_cli(args.cli, args.model, gpu_common, env)
         require_success(gpu_baseline, f"{count}-GPU baseline")
+        legacy_env = dict(env)
+        legacy_env["LLAMA_EXPERT_GPU_CACHE_SLOTS"] = "4"
+        legacy = run_cli(args.cli, args.model, gpu_common, legacy_env)
+        require_success(legacy, f"{count}-GPU legacy slot cache")
+        legacy_totals = [
+            item for item in legacy["stats"] if item.get("level") == "vram-total"
+        ]
+        if legacy["generated"] != baseline["generated"]:
+            raise RuntimeError(f"{count}-GPU legacy slot cache output differs from baseline")
+        if (
+            not legacy_totals
+            or legacy_totals[-1]["forced_fallbacks"] != 0
+            or legacy_totals[-1]["admissions"] == 0
+            or legacy_totals[-1]["uploads"] == 0
+        ):
+            raise RuntimeError(f"{count}-GPU legacy slot cache did not complete compact staging")
         vram_policy = [
             "--expert-storage-backend", "pread",
             # TinyMoE uses top-2 routing; 4 MiB yields two full expert slots,
@@ -303,6 +325,8 @@ def main() -> int:
         require_success(hysteresis_repeat, f"{count}-GPU hysteresis repeat")
         if hysteresis_repeat["generated"] != hysteresis["generated"]:
             raise RuntimeError(f"{count}-GPU hysteresis output is not deterministic")
+        if hysteresis["generated"] != baseline["generated"]:
+            raise RuntimeError(f"{count}-GPU hysteresis output differs from baseline")
         hysteresis_totals = [item for item in hysteresis["stats"] if item.get("level") == "vram-total"]
         if (
             not hysteresis_totals
@@ -324,6 +348,8 @@ def main() -> int:
         require_success(result_repeat, f"{count}-GPU repeat")
         if result_repeat["generated"] != result["generated"]:
             raise RuntimeError(f"{count}-GPU cache output is not deterministic")
+        if result["generated"] != baseline["generated"]:
+            raise RuntimeError(f"{count}-GPU cache output differs from baseline")
         vram = [item for item in result["stats"] if item.get("level") == "vram"]
         totals = [item for item in result["stats"] if item.get("level") == "vram-total"]
         devices = {item.get("device") for item in vram}
@@ -361,7 +387,13 @@ def main() -> int:
             "status": "pass",
             "split_mode": "layer" if count > 1 else "single-device",
             "physical_gpus": selected_gpus,
-            "cache_disabled_output": gpu_baseline["generated"],
+            "gpu_resident_reference_output": gpu_resident["generated"],
+            "host_active_copy_reference_output": gpu_baseline["generated"],
+            "legacy_slot_cache": {
+                "slots": 4,
+                "output": legacy["generated"],
+                "total": legacy_totals[-1],
+            },
             "hysteresis_output": hysteresis["generated"],
             "cached_output": result["generated"],
             "parity": "exact repeated generation; full-vs-compact CUDA operator parity is enforced by test-expert-cache",
