@@ -87,8 +87,8 @@ jobs:
 
   windows-studio:
     name: Build Windows Studio installers
-    runs-on: windows-2025
-    timeout-minutes: 60
+    runs-on: windows-2022
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -117,14 +117,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: "12.4.1"
+          method: network
+          sub-packages: '["nvcc", "cudart", "crt", "cccl", "nvrtc", "cublas", "cublas_dev", "visual_studio_integration"]'
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: studio/src-tauri
 
-      - name: Build bundled ESE CPU runtime
+      - name: Build bundled ESE CPU + CUDA runtime
         shell: pwsh
         run: |
-          cmake -S . -B build-release-runtime -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON -A x64
+          cmake -S . -B build-release-runtime -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON -A x64
           cmake --build build-release-runtime --config Release --target llama-server -j 2
 
       - name: Build standalone Windows ESE launcher
@@ -142,6 +149,16 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm tauri build --bundles nsis,msi
+
+      - name: Verify CUDA runtime in installer staging
+        shell: pwsh
+        run: |
+          if (-not (Get-ChildItem studio\runtime\ese\build\bin\cudart64_*.dll)) { throw "CUDA runtime was not staged" }
+          if (-not (Get-ChildItem studio\runtime\ese\build\bin\cublas64_*.dll)) { throw "cuBLAS runtime was not staged" }
+          if ((Get-Content studio\runtime\ese\build\bin\ese-runtime.json | ConvertFrom-Json).cuda -ne $true) { throw "CUDA runtime manifest was not staged" }
+          if (-not (Select-String -Path build-release-runtime\CMakeCache.txt -Pattern '^GGML_CUDA:BOOL=ON$')) { throw "runtime was not configured with CUDA" }
+          .\studio\runtime\ese\ese.exe doctor --json
+          .\studio\runtime\ese\build\bin\llama-server.exe --version
 
       - name: Prepare Windows assets
         shell: pwsh

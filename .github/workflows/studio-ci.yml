@@ -130,8 +130,8 @@ jobs:
 
   windows-studio:
     name: Studio frontend, Rust, and Windows installers
-    runs-on: windows-2025
-    timeout-minutes: 60
+    runs-on: windows-2022
+    timeout-minutes: 120
     defaults:
       run:
         working-directory: studio
@@ -154,6 +154,13 @@ jobs:
         with:
           components: clippy,rustfmt
 
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: "12.4.1"
+          method: network
+          sub-packages: '["nvcc", "cudart", "crt", "cccl", "nvrtc", "cublas", "cublas_dev", "visual_studio_integration"]'
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: studio/src-tauri
@@ -161,11 +168,11 @@ jobs:
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build bundled ESE CPU runtime
+      - name: Build bundled ESE CPU + CUDA runtime
         working-directory: .
         shell: pwsh
         run: |
-          cmake -S . -B build-package -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON -A x64
+          cmake -S . -B build-package -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON -A x64
           cmake --build build-package --config Release --target llama-server -j 2
 
       - name: Build standalone Windows ESE launcher
@@ -196,6 +203,12 @@ jobs:
         run: |
           if (-not (Test-Path runtime\ese\ese.exe)) { throw "standalone ese.exe was not staged" }
           if (-not (Test-Path runtime\ese\build\bin\llama-server.exe)) { throw "llama-server.exe was not staged" }
+          if (-not (Get-ChildItem runtime\ese\build\bin\cudart64_*.dll)) { throw "CUDA runtime was not staged" }
+          if (-not (Get-ChildItem runtime\ese\build\bin\cublas64_*.dll)) { throw "cuBLAS runtime was not staged" }
+          if ((Get-Content runtime\ese\build\bin\ese-runtime.json | ConvertFrom-Json).cuda -ne $true) { throw "CUDA runtime manifest was not staged" }
+          if (-not (Select-String -Path ..\build-package\CMakeCache.txt -Pattern '^GGML_CUDA:BOOL=ON$')) { throw "runtime was not configured with CUDA" }
+          .\runtime\ese\ese.exe doctor --json
+          .\runtime\ese\build\bin\llama-server.exe --version
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check

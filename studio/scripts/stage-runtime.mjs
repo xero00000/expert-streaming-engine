@@ -1,4 +1,4 @@
-import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,6 +54,24 @@ if (serverBuildRoot) {
         pending.push(source);
       } else if (runtimeExtensions.some((extension) => entry.name.includes(extension))) {
         cpSync(source, join(destination, "build", "bin", basename(source)));
+      }
+    }
+  }
+
+  const cache = join(serverBuildRoot, "CMakeCache.txt");
+  const cuda = existsSync(cache) && /^GGML_CUDA:BOOL=ON\s*$/m.test(readFileSync(cache, "utf8"));
+  writeFileSync(
+    join(destination, "build", "bin", "ese-runtime.json"),
+    `${JSON.stringify({ cuda }, null, 2)}\n`,
+  );
+}
+
+if (process.platform === "win32" && process.env.CUDA_PATH) {
+  const cudaBin = join(process.env.CUDA_PATH, "bin");
+  if (existsSync(cudaBin)) {
+    for (const entry of readdirSync(cudaBin)) {
+      if (/^(?:cudart64_|cublas64_|cublasLt64_).*\.dll$/i.test(entry)) {
+        cpSync(join(cudaBin, entry), join(destination, "build", "bin", entry));
       }
     }
   }

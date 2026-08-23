@@ -16,6 +16,7 @@ This foundation includes:
 - one-click promotion of verified context, KV, and batch settings into future model launches;
 - optional, off-by-default sharing of sanitized verified-sweep summaries through **Help improve ESE**;
 - a bundled ESE launcher/native runtime and signed in-app updates with visible progress;
+- privacy-safe prefilled GitHub bug reports from visible errors;
 - portable TOML configuration under `~/.config/ese/studio.toml`.
 
 Sweep previews only describe the search matrix and never count as evidence. A verified result is shown only after Studio has launched the real ESE-planned `llama-server`, passed its health check, and measured completion throughput. Interrupted matching sweeps resume from their last per-trial checkpoint.
@@ -43,7 +44,7 @@ are recognized rather than overwritten. Use `HF_TOKEN` or
 
 ## Linux install
 
-The v0.1.1 AppImage, DEB, and RPM packages contain both Studio and ESE. Use the
+The v0.1.2 AppImage, DEB, and RPM packages contain both Studio and ESE. Use the
 AppImage for signed in-app updating, or use the distribution package and apply
 future package updates through APT/DNF.
 
@@ -69,6 +70,12 @@ pnpm tauri dev
 ```
 
 ## Windows source install
+
+The Windows installer bundles a CUDA-enabled ESE runtime for NVIDIA GPUs and
+falls back to the CPU backend when CUDA hardware is unavailable. Users do not
+need CMake, a compiler, Python, or the CUDA toolkit to run the installed app.
+The CUDA toolkit is only required when building the Windows package from
+source.
 
 Open PowerShell in `studio` and run:
 
