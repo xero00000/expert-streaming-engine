@@ -230,6 +230,8 @@ def validate_success(args: argparse.Namespace) -> dict:
         dry = rebalance(args.port, args.target_context, True)
         if dry.get("mutated") is not False or dry.get("target_plan", {}).get("context") != args.target_context:
             raise RuntimeError("dry run did not return the requested immutable target")
+        if not dry.get("preparation_peak", {}).get("prepares_kv"):
+            raise RuntimeError("KV dry run omitted double-buffer preparation-peak accounting")
 
         before = completion(args.port, args.predict, args.request_timeout)
         shrink = rebalance(args.port, args.target_context, False)
@@ -376,6 +378,10 @@ def validate_expert_success(args: argparse.Namespace) -> dict:
             for item in target_devices
         ):
             raise RuntimeError("expert-cache dry run did not preserve the requested target")
+        if not dry.get("preparation_peak", {}).get("prepares_expert_cache"):
+            raise RuntimeError(
+                "expert-cache dry run omitted double-buffer preparation-peak accounting"
+            )
 
         shrink = rebalance_expert(port, target, False)
         if shrink.get("status") != "committed" or shrink.get("scope") != "expert-cache-only":

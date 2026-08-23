@@ -1025,16 +1025,25 @@ int main(int argc, char ** argv) {
                 return;
             }
 
+            common_resource_preparation_peak preparation_peak;
+            if (!common_resource_rebalance_preparation_peak(
+                        current, target, preparation_peak, error)) {
+                res_err(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            const json preparation_peak_json = json::parse(
+                    common_resource_preparation_peak_json(preparation_peak));
             json target_json = json::parse(common_resource_plan_json(target));
             if (dry_run) {
                 res_ok(res, {
                     {"status", "validated"},
                     {"dry_run", true},
                     {"mutated", false},
-                    {"validation_scope", "budget-occupancy-and-runtime-limit"},
+                    {"validation_scope", "budget-occupancy-runtime-and-preparation-peak"},
                     {"safe_point", resources.at("safe_point")},
                     {"current_plan", current_json},
                     {"target_plan", target_json},
+                    {"preparation_peak", preparation_peak_json},
                 });
                 return;
             }
@@ -1092,6 +1101,7 @@ int main(int argc, char ** argv) {
                 return;
             }
             result.data["previous_plan"] = current_json;
+            result.data["preparation_peak"] = preparation_peak_json;
             res_ok(res, result.data);
         } catch (const std::exception & exception) {
             res_err(res, format_error_response(
