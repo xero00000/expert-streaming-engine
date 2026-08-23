@@ -54,7 +54,7 @@ the only distribution consumed by automatic split selection.
 ### Remaining Phase A gate
 
 - Resolve and test the standalone fused `ggml_moe_up_gate` probe; its first calibration harness exposed allocator corruption, so Phase A currently uses the stable routed `ggml_mul_mat_id` primitive.
-- Instrument the live scheduler route/events around the exact leased upload path.
+- Compare the calibrated cost prediction against the live per-layer route/event telemetry and fail closed when sustained runtime behavior contradicts the selected split.
 - Keep the launcher and native calibrated split solvers covered by shared golden cases as the controller evolves.
 
 ## Phase B: heterogeneous decode execution
@@ -106,6 +106,14 @@ compute before switching metadata, and invalidates the affected ready bits.
 Compact staging is fail-closed: an initialization failure cannot fall back to
 the original full-tensor offsets inside a compact allocation.
 
+At context shutdown, the scheduler emits one `vram-layer` JSON telemetry record
+per exercised MoE layer. It reports route readback latency, active and explicitly
+GPU-owned route positions, cache hits and misses, bounded-lease acquisition
+latency, lease-backed upload count, upload submission time, event-wait time, and
+bytes loaded. These timers observe the existing asynchronous path and do not add
+a synchronization point. The aggregate `vram-total` record remains available for
+whole-request accounting.
+
 On the local `TinyMoE-100m-2x8-fixed-f16.gguf` fixture, a deterministic 16-token
 run produced byte-identical text with and without a one-GPU/one-CPU split. The
 single-GPU decode changed from `65.15` to `103.04` tokens/s; async graph scheduling
@@ -122,7 +130,7 @@ The hybrid run reported zero forced host-tensor fallbacks and stayed inside each
 configured cache bound. Its short-run wall time changed from 65.81 seconds to
 4.14 seconds, but this cold, two-token correctness trial is not a publishable
 throughput benchmark. Longer steady-state benchmarking and live route/event
-instrumentation remain Phase B gates.
+comparison against the calibrated prediction remain Phase B gates.
 
 ## Later phases
 

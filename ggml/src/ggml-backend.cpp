@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>
 #include <barrier>
+#include <map>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -1267,6 +1268,7 @@ struct ggml_active_expert_cache_device {
     std::unordered_map<uint64_t, uint64_t> last_observed_route;
     std::unordered_map<int, std::vector<int32_t>> previous_route;
     uint64_t route_clock = 0;
+    int pending_upload_layer = -1;
 };
 
 struct ggml_active_expert_cache_route {
@@ -1277,6 +1279,20 @@ struct ggml_active_expert_cache_route {
     std::vector<int32_t> experts;
     std::vector<int> slots;
     ggml_tensor * mapped_ids = nullptr;
+};
+
+struct ggml_active_expert_cache_layer_stats {
+    uint64_t routes = 0;
+    uint64_t route_positions = 0;
+    uint64_t gpu_route_positions = 0;
+    uint64_t route_readback_ns = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t lease_acquire_ns = 0;
+    uint64_t lease_uploads = 0;
+    uint64_t transfer_submit_ns = 0;
+    uint64_t transfer_wait_ns = 0;
+    uint64_t load_bytes = 0;
 };
 
 struct ggml_active_expert_cache_redirect {
@@ -1377,6 +1393,7 @@ struct ggml_backend_sched {
     uint64_t active_expert_cache_reuse_distance_sum = 0;
     uint64_t active_expert_cache_load_bytes = 0;
     uint64_t active_expert_cache_eviction_cost_bytes = 0;
+    std::map<int, ggml_active_expert_cache_layer_stats> active_expert_cache_layer_stats;
     ggml_backend_expert_acquire_callback expert_lease_acquire = nullptr;
     ggml_backend_expert_release_callback expert_lease_release = nullptr;
     void * expert_lease_user_data = nullptr;
@@ -1666,13 +1683,18 @@ static void ggml_active_expert_cache_drain_leases(
     GGML_ASSERT(cache.lease_event != nullptr && cache.lease_event_recorded);
     const auto wait_start = std::chrono::steady_clock::now();
     ggml_backend_event_synchronize(cache.lease_event);
-    sched->active_expert_cache_transfer_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    const uint64_t wait_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - wait_start).count());
+    sched->active_expert_cache_transfer_wait_ns += wait_ns;
+    if (cache.pending_upload_layer >= 0) {
+        sched->active_expert_cache_layer_stats[cache.pending_upload_layer].transfer_wait_ns += wait_ns;
+    }
     for (void * handle : cache.lease_handles) {
         sched->expert_lease_release(sched->expert_lease_user_data, handle);
     }
     cache.lease_handles.clear();
     cache.lease_event_recorded = false;
+    cache.pending_upload_layer = -1;
 }
 
 static void ggml_active_expert_cache_release(ggml_active_expert_cache_device & cache) {
@@ -2133,6 +2155,7 @@ static bool ggml_active_expert_cache_prepare_route(
         return false;
     }
 
+    const auto route_readback_start = std::chrono::steady_clock::now();
     std::vector<int32_t> expert_ids(size_t(n_ids), -1);
     if (ids_source->buffer && ggml_backend_buffer_is_host(ids_source->buffer)) {
         ggml_backend_tensor_get(ids_source, expert_ids.data(), 0, expert_ids.size()*sizeof(expert_ids[0]));
@@ -2149,6 +2172,9 @@ static bool ggml_active_expert_cache_prepare_route(
         ggml_backend_event_synchronize(route_event);
         ggml_backend_event_free(route_event);
     }
+    auto & layer_stats = sched->active_expert_cache_layer_stats[layer];
+    layer_stats.route_readback_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - route_readback_start).count());
 
     // Thresholded top-k routing pads the ID tensor with negative sentinels.
     // Preserve those positions in the remap tensor, but size the residency
@@ -2167,6 +2193,11 @@ static bool ggml_active_expert_cache_prepare_route(
     }
     if (active_experts.empty() || active_experts.size() > size_t(cache.slots)) {
         return false;
+    }
+    ++layer_stats.routes;
+    layer_stats.route_positions += active_experts.size();
+    if (ggml_ese_route_get_role(ids_source) == GGML_ESE_ROUTE_GPU) {
+        layer_stats.gpu_route_positions += active_experts.size();
     }
 
     bool admission_ready = true;
@@ -2249,9 +2280,11 @@ static bool ggml_active_expert_cache_prepare_route(
                 cache, layer, expert, route.slots, &hit, &evicted, &eviction_cost);
         if (hit) {
             ++sched->active_expert_cache_hits;
+            ++layer_stats.hits;
         } else {
             ++sched->active_expert_cache_misses;
             ++sched->active_expert_cache_admissions;
+            ++layer_stats.misses;
             if (evicted) {
                 ++sched->active_expert_cache_evictions;
                 sched->active_expert_cache_eviction_cost_bytes += eviction_cost;
@@ -2341,13 +2374,18 @@ static bool ggml_active_expert_cache_stage(
         const void * upload_source = (const uint8_t *) input->data + source_offset;
         if (sched->expert_lease_acquire && route->cache->lease_event) {
             ggml_backend_expert_lease lease = {};
+            const auto acquire_start = std::chrono::steady_clock::now();
             const bool acquired = sched->expert_lease_acquire(
                     sched->expert_lease_user_data, layer, route->experts[i], component_index, &lease);
+            sched->active_expert_cache_layer_stats[layer].lease_acquire_ns += uint64_t(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - acquire_start).count());
             if (acquired && lease.data && lease.handle && lease.size == input->nb[2]) {
                 upload_source = lease.data;
                 route->cache->lease_handles.push_back(lease.handle);
                 staged_from_lease = true;
                 ++sched->active_expert_cache_lease_uploads;
+                ++sched->active_expert_cache_layer_stats[layer].lease_uploads;
             } else {
                 if (acquired && lease.handle) {
                     sched->expert_lease_release(sched->expert_lease_user_data, lease.handle);
@@ -2363,9 +2401,13 @@ static bool ggml_active_expert_cache_stage(
         const auto submit_start = std::chrono::steady_clock::now();
         ggml_backend_expert_cache_upload_async(upload_backend, component.tensor,
                 upload_source, cache_offset, input->nb[2]);
-        sched->active_expert_cache_transfer_submit_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        const uint64_t submit_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - submit_start).count());
+        sched->active_expert_cache_transfer_submit_ns += submit_ns;
         sched->active_expert_cache_load_bytes += input->nb[2];
+        auto & layer_stats = sched->active_expert_cache_layer_stats[layer];
+        layer_stats.transfer_submit_ns += submit_ns;
+        layer_stats.load_bytes += input->nb[2];
         uploaded = true;
         entry.ready_mask |= component_mask;
         ++sched->active_expert_cache_uploads;
@@ -2373,7 +2415,10 @@ static bool ggml_active_expert_cache_stage(
     if (uploaded && route->cache->lease_event) {
         ggml_backend_event_record(route->cache->lease_event);
         ggml_backend_event_wait(split_backend, route->cache->lease_event);
-        if (staged_from_lease) route->cache->lease_event_recorded = true;
+        if (staged_from_lease) {
+            route->cache->lease_event_recorded = true;
+            route->cache->pending_upload_layer = layer;
+        }
     }
 
     ggml_active_expert_cache_redirect_input(sched, input_cpy, input, component.tensor->data);
@@ -3912,6 +3957,26 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         ggml_active_expert_cache_release(sched->active_expert_caches[i]);
     }
     if (sched->active_expert_cache_slots >= 1) {
+        for (const auto & item : sched->active_expert_cache_layer_stats) {
+            const auto & stats = item.second;
+            fprintf(stderr, "expert_cache_stats: {\"level\":\"vram-layer\",\"layer\":%d,"
+                    "\"routes\":%llu,\"route_positions\":%llu,\"gpu_route_positions\":%llu,"
+                    "\"route_readback_ns\":%llu,\"hits\":%llu,\"misses\":%llu,"
+                    "\"lease_acquire_ns\":%llu,\"lease_uploads\":%llu,"
+                    "\"transfer_submit_ns\":%llu,\"transfer_wait_ns\":%llu,\"load_bytes\":%llu}\n",
+                    item.first,
+                    (unsigned long long) stats.routes,
+                    (unsigned long long) stats.route_positions,
+                    (unsigned long long) stats.gpu_route_positions,
+                    (unsigned long long) stats.route_readback_ns,
+                    (unsigned long long) stats.hits,
+                    (unsigned long long) stats.misses,
+                    (unsigned long long) stats.lease_acquire_ns,
+                    (unsigned long long) stats.lease_uploads,
+                    (unsigned long long) stats.transfer_submit_ns,
+                    (unsigned long long) stats.transfer_wait_ns,
+                    (unsigned long long) stats.load_bytes);
+        }
         fprintf(stderr, "ggml active-expert cache: %llu hits, %llu misses, %llu host-to-GPU expert uploads\n",
                 (unsigned long long) sched->active_expert_cache_hits,
                 (unsigned long long) sched->active_expert_cache_misses,
