@@ -328,6 +328,34 @@ The next step is a single combined KV/expert commit boundary followed by
 transient-pool policy. Phase D remains incomplete until those resources meet
 the same failure-atomic endpoint gate.
 
+### Combined KV/expert publication contract
+
+The planner now rejects a target unless the current live allocation plus every
+changed replacement pool fits below each immutable device reserve. Dry-run and
+commit responses expose the per-device preparation peak and remaining
+headroom. Final-fit accounting alone is intentionally insufficient because the
+old pools remain live until the transaction is irreversible.
+
+The combined implementation is split into reversible pool transactions. Each
+pool has four states: prepare off-side, publish by ownership swap, roll back by
+the inverse swap, and finalize by retiring the old allocation. The owner thread
+must prepare both pools, synchronize their migrations, publish KV, publish all
+expert devices, then update context/configuration and the serialized plan as a
+single final step. No inference task can run between those operations.
+
+Failure injection must cover both preparation and reversible publication:
+
+1. after KV preparation;
+2. after expert-cache preparation;
+3. after KV publication;
+4. after expert device N publication;
+5. after both physical pools publish but before logical configuration publish.
+
+Every failure gate must retain the old context, per-device cache accounting,
+resource-plan JSON, deterministic output hash, and a usable inference engine.
+Only after this matrix passes on one Ampere GPU and the mixed Turing/Ampere
+topology may the endpoint stop rejecting combined requests.
+
 ## Later phases
 
 1. Complete Phase D live KV/expert/transient resource rebalancing.
