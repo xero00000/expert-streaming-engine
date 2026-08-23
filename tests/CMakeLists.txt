@@ -219,6 +219,7 @@ llama_test(test-turbo-kv-policy)
 # Phase 2 expert hierarchy: checked descriptors and bounded lease lifetime.
 llama_build(test-expert-cache.cpp)
 llama_test(test-expert-cache)
+llama_build(test-expert-cache-transaction.cpp)
 
 # Phase 3 transient residency: bounded, failure-atomic module transactions.
 llama_build(test-transient-module-manager.cpp)

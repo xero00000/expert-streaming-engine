@@ -1072,9 +1072,34 @@ extern "C" {
     // reports the new active graph/KV geometry.
     LLAMA_API bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size);
 
+    struct llama_expert_cache_transaction;
+    typedef struct llama_expert_cache_transaction * llama_expert_cache_transaction_t;
+
+    // Prepare a complete expert-cache replacement without changing context
+    // parameters or graph policy. The opaque handle may be held beside other
+    // prepared resource transactions by the context owner.
+    //
+    // publish() installs the prepared scheduler cache, publishes the target
+    // context parameters, and resets graph reuse. rollback() restores both the
+    // previous cache and context policy. finalize() irreversibly retires the
+    // old cache but retains a finalized handle for free(). Freeing a prepared
+    // transaction discards it; freeing a published transaction rolls it back.
+    LLAMA_API llama_expert_cache_transaction_t llama_expert_cache_prepare_resize(
+            struct llama_context * ctx,
+            uint64_t bytes_per_device);
+    LLAMA_API bool llama_expert_cache_transaction_publish(
+            llama_expert_cache_transaction_t transaction);
+    LLAMA_API bool llama_expert_cache_transaction_rollback(
+            llama_expert_cache_transaction_t transaction);
+    LLAMA_API bool llama_expert_cache_transaction_finalize(
+            llama_expert_cache_transaction_t transaction);
+    LLAMA_API void llama_expert_cache_transaction_free(
+            llama_expert_cache_transaction_t transaction);
+
     // Failure-atomically replace the bounded per-device expert cache while the
     // context is quiescent. Resident experts are migrated into the prepared
     // replacement before it becomes visible; false retains the prior cache.
+    // This convenience API composes prepare -> publish -> finalize.
     LLAMA_API bool llama_expert_cache_resize(
             struct llama_context * ctx,
             uint64_t bytes_per_device);

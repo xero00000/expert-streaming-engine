@@ -304,6 +304,19 @@ non-whole per-slot context, reserve violations, and unavailable target
 allocations fail closed. A request that changes both KV and expert-cache
 geometry is explicitly rejected until the common publication boundary exists.
 
+The replacement is exposed as an opaque reversible transaction at both the
+GGML scheduler and public llama-context boundaries: `prepare` owns complete
+off-side allocations without changing live policy, `publish` performs only
+no-throw swaps and scalar assignments, `rollback` restores the old cache and
+policy, and `finalize` retires the off-side owner. The llama handle remains
+valid after finalization until `free`, while freeing a published handle
+automatically rolls it back. Only one transaction may be open for a scheduler
+or context. Context teardown releases it before scheduler/backend destruction.
+A monotonic layout/route catalog generation rejects a prepared cache if graph
+geometry changed before publication, and the legacy one-call replacement
+remains a prepare -> publish -> finalize wrapper. This is the expert-cache half
+of the next combined KV/expert commit boundary.
+
 A local CPU TinyMoE endpoint trial reported the actual 30 MiB KV allocation and
 64 MiB bounded RAM tier. After a 1,502-token prompt, a two-token target was
 rejected because it would discard occupied cells. Both that failure and a valid

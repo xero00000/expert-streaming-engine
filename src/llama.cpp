@@ -682,6 +682,9 @@ expert_prefetch_mode expert_prefetch_requested() {
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
+static void llama_expert_cache_transaction_release_for_context_teardown(
+        struct llama_context * ctx) noexcept;
+
 //
 // helpers
 //
@@ -1411,6 +1414,13 @@ llama_context::~llama_context() {
         expert_prefetch_failures += expert_prefetch_worker->failure_count();
     }
     expert_prefetch_worker.reset();
+
+    // A published transaction still owns the previous cache and policy needed
+    // for rollback. The prefetch worker is joined first so no background work
+    // can race the scheduler reset; the transaction is then released before
+    // either scheduler or any backend is destroyed.
+    llama_expert_cache_transaction_release_for_context_teardown(this);
+
     if (expert_prefetch_enabled) {
         LLAMA_LOG_INFO("%s: mode=%s, route callbacks=%" PRIu64 ", successful slices=%" PRIu64 ", advised=%.2f MiB, failures=%" PRIu64 "\n",
                 __func__,
@@ -10946,26 +10956,238 @@ bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size) {
     return false;
 }
 
-bool llama_expert_cache_resize(
+enum class llama_expert_cache_transaction_state : uint8_t {
+    prepared,
+    published,
+    rolled_back,
+    finalized,
+};
+
+struct llama_expert_cache_transaction {
+    llama_context * ctx = nullptr;
+    ggml_backend_sched_expert_cache_txn_t backend = nullptr;
+    llama_expert_cache_transaction_state state =
+            llama_expert_cache_transaction_state::prepared;
+    uint64_t previous_bytes_per_device = 0;
+    uint64_t target_bytes_per_device = 0;
+    bool previous_fused_mmad = false;
+};
+
+static llama_expert_cache_transaction_t llama_expert_cache_prepare_resize_impl(
         struct llama_context * ctx,
         uint64_t bytes_per_device) {
-    if (ctx == nullptr) return false;
+    if (ctx == nullptr || ctx->active_expert_cache_transaction != nullptr) {
+        return nullptr;
+    }
 
     llama_synchronize(ctx);
-    if (!ggml_backend_sched_replace_expert_cache(
+    std::unique_ptr<llama_expert_cache_transaction> transaction(
+            new llama_expert_cache_transaction);
+    transaction->ctx = ctx;
+    transaction->previous_bytes_per_device = ctx->cparams.expert_vram_cache_bytes;
+    transaction->target_bytes_per_device = bytes_per_device;
+    transaction->previous_fused_mmad = ctx->cparams.fused_mmad;
+    transaction->backend = ggml_backend_sched_expert_cache_prepare(
                 ctx->sched,
                 bytes_per_device,
                 ctx->cparams.expert_vram_reserve_bytes,
-                ctx->cparams.expert_cache_min_observations)) {
+                ctx->cparams.expert_cache_min_observations);
+    if (!transaction->backend) return nullptr;
+    ctx->active_expert_cache_transaction = transaction.get();
+    return transaction.release();
+}
+
+static bool llama_expert_cache_transaction_publish_impl(
+        llama_expert_cache_transaction_t transaction) {
+    if (!transaction || !transaction->ctx || !transaction->backend ||
+            transaction->ctx->active_expert_cache_transaction != transaction ||
+            transaction->state != llama_expert_cache_transaction_state::prepared) {
+        return false;
+    }
+    if (!ggml_backend_sched_expert_cache_publish(transaction->backend)) return false;
+
+    transaction->ctx->cparams.expert_vram_cache_bytes =
+            transaction->target_bytes_per_device;
+    if (transaction->target_bytes_per_device > 0) {
+        // One-way safety guard: the CPU-expert -> CUDA fused MMAD boundary is
+        // not correct with a live adaptive cache. Disabling the cache later
+        // must not silently re-enable an unproven path.
+        transaction->ctx->cparams.fused_mmad = false;
+    }
+    transaction->ctx->reset_scheduler();
+    transaction->state = llama_expert_cache_transaction_state::published;
+    return true;
+}
+
+static bool llama_expert_cache_transaction_rollback_impl(
+        llama_expert_cache_transaction_t transaction) {
+    if (!transaction || !transaction->ctx || !transaction->backend ||
+            transaction->ctx->active_expert_cache_transaction != transaction ||
+            transaction->state != llama_expert_cache_transaction_state::published) {
+        return false;
+    }
+    if (!ggml_backend_sched_expert_cache_rollback(transaction->backend)) return false;
+
+    transaction->ctx->cparams.expert_vram_cache_bytes =
+            transaction->previous_bytes_per_device;
+    transaction->ctx->cparams.fused_mmad = transaction->previous_fused_mmad;
+    transaction->ctx->reset_scheduler();
+    transaction->state = llama_expert_cache_transaction_state::rolled_back;
+    return true;
+}
+
+static bool llama_expert_cache_transaction_finalize_impl(
+        llama_expert_cache_transaction_t transaction) {
+    if (!transaction || !transaction->ctx || !transaction->backend ||
+            transaction->ctx->active_expert_cache_transaction != transaction ||
+            transaction->state != llama_expert_cache_transaction_state::published) {
+        return false;
+    }
+    if (!ggml_backend_sched_expert_cache_finalize(transaction->backend)) return false;
+    transaction->backend = nullptr;
+    transaction->state = llama_expert_cache_transaction_state::finalized;
+    return true;
+}
+
+static bool llama_expert_cache_transaction_free_impl(
+        llama_expert_cache_transaction_t transaction) {
+    if (!transaction) return true;
+    if (!transaction->ctx ||
+            transaction->ctx->active_expert_cache_transaction != transaction) {
+        return false;
+    }
+    if (transaction->state == llama_expert_cache_transaction_state::published &&
+            !llama_expert_cache_transaction_rollback_impl(transaction)) {
+        return false;
+    }
+    if (transaction->backend &&
+            !ggml_backend_sched_expert_cache_finalize(transaction->backend)) {
+        return false;
+    }
+    transaction->backend = nullptr;
+    transaction->ctx->active_expert_cache_transaction = nullptr;
+    transaction->ctx = nullptr;
+    delete transaction;
+    return true;
+}
+
+static void llama_expert_cache_transaction_release_for_context_teardown(
+        struct llama_context * ctx) noexcept {
+    if (!ctx || !ctx->active_expert_cache_transaction) return;
+    try {
+        if (llama_expert_cache_transaction_free_impl(
+                ctx->active_expert_cache_transaction)) {
+            return;
+        }
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: transaction release exception: %s\n",
+                __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown transaction release exception\n", __func__);
+    }
+
+    // Context destruction cannot return an error to the caller. If ordinary
+    // rollback/release failed, sever the public shell deterministically and
+    // ask the lower scheduler transaction to retire its off-side owner. If
+    // that lower call also fails, the scheduler still owns the lower handle
+    // and its destructor performs the final retirement before backend teardown.
+    auto * transaction = ctx->active_expert_cache_transaction;
+    LLAMA_LOG_ERROR(
+            "%s: forcing transaction retirement during context teardown\n",
+            __func__);
+    if (transaction->backend &&
+            !ggml_backend_sched_expert_cache_finalize(transaction->backend)) {
+        LLAMA_LOG_ERROR(
+                "%s: scheduler retains lower transaction for teardown\n",
+                __func__);
+    }
+    transaction->backend = nullptr;
+    transaction->ctx = nullptr;
+    ctx->active_expert_cache_transaction = nullptr;
+    delete transaction;
+}
+
+llama_expert_cache_transaction_t llama_expert_cache_prepare_resize(
+        struct llama_context * ctx,
+        uint64_t bytes_per_device) {
+    try {
+        return llama_expert_cache_prepare_resize_impl(ctx, bytes_per_device);
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
+    }
+    return nullptr;
+}
+
+bool llama_expert_cache_transaction_publish(
+        llama_expert_cache_transaction_t transaction) {
+    try {
+        return llama_expert_cache_transaction_publish_impl(transaction);
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
+    }
+    return false;
+}
+
+bool llama_expert_cache_transaction_rollback(
+        llama_expert_cache_transaction_t transaction) {
+    try {
+        return llama_expert_cache_transaction_rollback_impl(transaction);
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
+    }
+    return false;
+}
+
+bool llama_expert_cache_transaction_finalize(
+        llama_expert_cache_transaction_t transaction) {
+    try {
+        return llama_expert_cache_transaction_finalize_impl(transaction);
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
+    }
+    return false;
+}
+
+void llama_expert_cache_transaction_free(
+        llama_expert_cache_transaction_t transaction) {
+    try {
+        if (!llama_expert_cache_transaction_free_impl(transaction)) {
+            LLAMA_LOG_ERROR("%s: unable to safely release transaction\n", __func__);
+        }
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
+    }
+}
+
+bool llama_expert_cache_resize(
+        struct llama_context * ctx,
+        uint64_t bytes_per_device) {
+    auto * transaction = llama_expert_cache_prepare_resize(ctx, bytes_per_device);
+    if (!transaction) {
         LLAMA_LOG_ERROR("%s: target expert cache allocation failed; original cache retained\n", __func__);
         return false;
     }
-    ctx->cparams.expert_vram_cache_bytes = bytes_per_device;
-    if (bytes_per_device > 0 && ctx->cparams.fused_mmad) {
-        LLAMA_LOG_WARN("%s: adaptive expert cache disables experimental fused_mmad for output parity\n", __func__);
-        ctx->cparams.fused_mmad = false;
+    if (!llama_expert_cache_transaction_publish(transaction)) {
+        llama_expert_cache_transaction_free(transaction);
+        LLAMA_LOG_ERROR("%s: target expert cache publication failed; original cache retained\n", __func__);
+        return false;
     }
-    ctx->reset_scheduler();
+    if (!llama_expert_cache_transaction_finalize(transaction)) {
+        llama_expert_cache_transaction_free(transaction);
+        LLAMA_LOG_ERROR("%s: target expert cache finalization failed; original cache restored\n", __func__);
+        return false;
+    }
+    llama_expert_cache_transaction_free(transaction);
     return true;
 }
 

@@ -4,6 +4,10 @@
 #include "ggml-backend.h"
 #include "ggml-ese.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -836,6 +840,139 @@ void test_hybrid_runtime_guard_is_one_way_and_fail_closed() {
             GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_UPLOAD_DRIFT);
 }
 
+void test_expert_cache_transaction_state_machine() {
+    REQUIRE(ggml_backend_sched_expert_cache_prepare(nullptr, 0, 0, 1) == nullptr);
+    REQUIRE(!ggml_backend_sched_expert_cache_publish(nullptr));
+    REQUIRE(!ggml_backend_sched_expert_cache_rollback(nullptr));
+    REQUIRE(!ggml_backend_sched_expert_cache_finalize(nullptr));
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    REQUIRE(cpu != nullptr);
+    struct cpu_cleanup {
+        ggml_backend_t value;
+        ~cpu_cleanup() { ggml_backend_free(value); }
+    } free_cpu{cpu};
+
+    ggml_backend_t backends[] = {cpu};
+    ggml_backend_sched_t scheduler = ggml_backend_sched_new(
+            backends, nullptr, 1, 64, false);
+    REQUIRE(scheduler != nullptr);
+    struct scheduler_cleanup {
+        ggml_backend_sched_t value;
+        ~scheduler_cleanup() { ggml_backend_sched_free(value); }
+    } free_scheduler{scheduler};
+
+    auto * transaction = ggml_backend_sched_expert_cache_prepare(
+            scheduler, 0, 0, 1);
+    REQUIRE(transaction != nullptr);
+    REQUIRE(ggml_backend_sched_expert_cache_prepare(scheduler, 0, 0, 1) == nullptr);
+    REQUIRE(!ggml_backend_sched_expert_cache_rollback(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_publish(transaction));
+    REQUIRE(!ggml_backend_sched_expert_cache_publish(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_rollback(transaction));
+    REQUIRE(!ggml_backend_sched_expert_cache_rollback(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_finalize(transaction));
+
+    transaction = ggml_backend_sched_expert_cache_prepare(scheduler, 0, 0, 1);
+    REQUIRE(transaction != nullptr);
+    REQUIRE(ggml_backend_sched_expert_cache_finalize(transaction));
+
+    transaction = ggml_backend_sched_expert_cache_prepare(scheduler, 0, 0, 1);
+    REQUIRE(transaction != nullptr);
+    REQUIRE(ggml_backend_sched_expert_cache_publish(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_finalize(transaction));
+    REQUIRE(ggml_backend_sched_replace_expert_cache(scheduler, 0, 0, 1));
+
+    // A non-zero cache requires at least one device backend, and must fail
+    // without leaving an outstanding scheduler transaction.
+    REQUIRE(ggml_backend_sched_expert_cache_prepare(scheduler, 1, 0, 1) == nullptr);
+    REQUIRE(ggml_backend_sched_replace_expert_cache(scheduler, 0, 0, 1));
+}
+
+void test_expert_cache_partial_publication_rollback() {
+#ifdef GGML_USE_CUDA
+    if (ggml_backend_cuda_get_device_count() < 2) {
+        std::cout << "SKIP: partial expert-cache publication requires two CUDA devices\n";
+        return;
+    }
+
+    ggml_backend_t cuda0 = ggml_backend_cuda_init(0, nullptr, nullptr);
+    ggml_backend_t cuda1 = ggml_backend_cuda_init(1, nullptr, nullptr);
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    REQUIRE(cuda0 != nullptr && cuda1 != nullptr && cpu != nullptr);
+    struct backend_cleanup {
+        ggml_backend_t cuda0;
+        ggml_backend_t cuda1;
+        ggml_backend_t cpu;
+        ~backend_cleanup() {
+            ggml_backend_free(cuda0);
+            ggml_backend_free(cuda1);
+            ggml_backend_free(cpu);
+        }
+    } free_backends{cuda0, cuda1, cpu};
+
+    ggml_backend_t backends[] = {cuda0, cuda1, cpu};
+    ggml_backend_sched_t scheduler = ggml_backend_sched_new(
+            backends, nullptr, 3, 64, false);
+    REQUIRE(scheduler != nullptr);
+    struct scheduler_cleanup {
+        ggml_backend_sched_t value;
+        ~scheduler_cleanup() { ggml_backend_sched_free(value); }
+    } free_scheduler{scheduler};
+
+    ggml_backend_sched_set_expert_cache_capacity(scheduler, 0, 17, 3);
+    ggml_backend_sched_expert_cache_policy before_policy = {};
+    REQUIRE(ggml_backend_sched_expert_cache_get_policy(scheduler, &before_policy));
+    std::array<ggml_backend_sched_resource_device_stats, 2> before_devices = {};
+    REQUIRE(ggml_backend_sched_get_resource_device_stats(
+            scheduler, before_devices.data(), before_devices.size()));
+
+    auto * transaction = ggml_backend_sched_expert_cache_prepare(
+            scheduler, 0, 31, 5);
+    REQUIRE(transaction != nullptr);
+#if defined(_WIN32)
+    _putenv_s("ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES", "1");
+#else
+    setenv("ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES", "1", 1);
+#endif
+    REQUIRE(!ggml_backend_sched_expert_cache_publish(transaction));
+#if defined(_WIN32)
+    _putenv_s("ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES", "");
+#else
+    unsetenv("ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES");
+#endif
+
+    ggml_backend_sched_expert_cache_policy after_policy = {};
+    REQUIRE(ggml_backend_sched_expert_cache_get_policy(scheduler, &after_policy));
+    REQUIRE(after_policy.capacity_bytes_per_device == before_policy.capacity_bytes_per_device);
+    REQUIRE(after_policy.reserve_bytes_per_device == before_policy.reserve_bytes_per_device);
+    REQUIRE(after_policy.minimum_observations == before_policy.minimum_observations);
+    REQUIRE(after_policy.slots == before_policy.slots);
+    std::array<ggml_backend_sched_resource_device_stats, 2> after_devices = {};
+    REQUIRE(ggml_backend_sched_get_resource_device_stats(
+            scheduler, after_devices.data(), after_devices.size()));
+    for (size_t index = 0; index < before_devices.size(); ++index) {
+        REQUIRE(after_devices[index].backend_id == before_devices[index].backend_id);
+        REQUIRE(after_devices[index].expert_cache_capacity_bytes ==
+                before_devices[index].expert_cache_capacity_bytes);
+        REQUIRE(after_devices[index].expert_cache_allocated_bytes ==
+                before_devices[index].expert_cache_allocated_bytes);
+        REQUIRE(after_devices[index].expert_cache_resident_bytes ==
+                before_devices[index].expert_cache_resident_bytes);
+    }
+
+    // The failed publish remains a prepared owner: it is exclusive, can be
+    // retried after the test fault is removed, and then finalizes normally.
+    REQUIRE(ggml_backend_sched_expert_cache_prepare(scheduler, 0, 17, 3) == nullptr);
+    REQUIRE(ggml_backend_sched_expert_cache_publish(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_finalize(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_get_policy(scheduler, &after_policy));
+    REQUIRE(after_policy.capacity_bytes_per_device == 0);
+    REQUIRE(after_policy.reserve_bytes_per_device == 31);
+    REQUIRE(after_policy.minimum_observations == 5);
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -851,6 +988,8 @@ int main() {
         test_cpu_fused_moe_merged_workspace();
         test_cuda_compact_remap_exact_parity();
         test_hybrid_runtime_guard_is_one_way_and_fail_closed();
+        test_expert_cache_transaction_state_machine();
+        test_expert_cache_partial_publication_rollback();
         std::cout << "PASS: checked bounded expert caches and exact full/compact CUDA parity\n";
         return 0;
     } catch (const std::exception & error) {

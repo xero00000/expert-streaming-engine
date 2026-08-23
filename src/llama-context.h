@@ -677,6 +677,12 @@ struct llama_context {
     std::vector<CacheCopy> openpangu_cache_copies;
     std::vector<CacheCopy> openpangu_cache_copies_mtp;
 
+    // The context owns at most one open expert-cache transaction. Keeping this
+    // as the final data member prevents overlapping publication candidates and
+    // lets teardown roll a published candidate back while its scheduler and
+    // backends are still alive.
+    llama_expert_cache_transaction_t active_expert_cache_transaction = nullptr;
+
     bool update_cache_copies();
 
     bool ensure_dflash_kv_cache_tensors(int32_t cross_ctx);

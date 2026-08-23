@@ -176,6 +176,10 @@ extern "C" {
     struct ggml_backend_sched;
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
+    struct ggml_backend_sched_expert_cache_txn;
+    typedef struct ggml_backend_sched_expert_cache_txn *
+            ggml_backend_sched_expert_cache_txn_t;
+
     // when ask == true, the scheduler wants to know if the user wants to observe this node
     // this allows the scheduler to batch nodes together in order to evaluate them in a single call
     //
@@ -241,6 +245,47 @@ extern "C" {
             uint64_t bytes_per_device,
             uint64_t reserve_bytes_per_device,
             uint32_t minimum_observations);
+
+    struct ggml_backend_sched_expert_cache_policy {
+        uint64_t capacity_bytes_per_device;
+        uint64_t reserve_bytes_per_device;
+        uint32_t minimum_observations;
+        int32_t slots;
+    };
+
+    // Read the complete published policy from a quiescent scheduler. This is
+    // primarily useful to control planes that verify a multi-resource commit.
+    GGML_API bool ggml_backend_sched_expert_cache_get_policy(
+            ggml_backend_sched_t sched,
+            struct ggml_backend_sched_expert_cache_policy * policy);
+
+    // Prepare a complete replacement cache without changing the scheduler's
+    // active cache or its published policy. Only one transaction may be open
+    // for a scheduler. The caller must own a quiescent scheduler until the
+    // transaction is finalized.
+    //
+    // publish() installs the prepared cache using allocation-free swaps.
+    // rollback() reverses a published swap without allocation. finalize()
+    // consumes the handle and retires whichever cache is off-side: the old
+    // cache after publish, or the replacement after rollback/no publication.
+    // A transaction handle must not outlive its scheduler.
+    //
+    // Test-only fault injection may set
+    // ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES=N. A publish
+    // failure reverses all completed device swaps and restores the prior
+    // policy before returning false; the prepared handle remains finalizable.
+    GGML_API ggml_backend_sched_expert_cache_txn_t
+    ggml_backend_sched_expert_cache_prepare(
+            ggml_backend_sched_t sched,
+            uint64_t bytes_per_device,
+            uint64_t reserve_bytes_per_device,
+            uint32_t minimum_observations);
+    GGML_API bool ggml_backend_sched_expert_cache_publish(
+            ggml_backend_sched_expert_cache_txn_t transaction);
+    GGML_API bool ggml_backend_sched_expert_cache_rollback(
+            ggml_backend_sched_expert_cache_txn_t transaction);
+    GGML_API bool ggml_backend_sched_expert_cache_finalize(
+            ggml_backend_sched_expert_cache_txn_t transaction);
 
     // Failure-atomically replace every prepared per-device expert cache. The
     // scheduler must be quiescent and owned by the calling thread. Resident
