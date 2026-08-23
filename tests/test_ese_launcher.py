@@ -29,10 +29,13 @@ from tools.ese import (
     select_policy,
     _execution_environment,
     _baseline_hybrid_plan,
+    _parse_expert_cache_telemetry,
     _plan_from_args,
     _repo_root,
     _save_hybrid_verification,
     _solve_calibrated_hybrid,
+    _validated_hybrid_telemetry,
+    _validated_calibration_drift,
     hybrid_verification_reason,
     model_fingerprint,
 )
@@ -94,6 +97,18 @@ def hardware(*free_gib: int, ram_available: int = 100) -> HardwareInfo:
     )
 
 
+def verified_telemetry_summary() -> dict[str, int]:
+    return {
+        "layers": 4,
+        "misses": 8,
+        "route_positions": 16,
+        "gpu_route_positions": 8,
+        "forced_fallbacks": 0,
+        "predicted_upload_ns_per_expert": 100,
+        "upload_calibration_drift_ppm": 1_000_000,
+    }
+
+
 class LauncherTests(unittest.TestCase):
     def test_automatic_plan_requires_matching_workload_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -131,7 +146,8 @@ class LauncherTests(unittest.TestCase):
                 candidate = _plan_from_args(args, require_hybrid_verification=False)
                 _save_hybrid_verification(evidence, candidate, identity, {
                     "passed": True, "output_parity": True, "speedup": 1.2,
-                    "minimum_speedup": 1.02,
+                    "minimum_speedup": 1.02, "telemetry_valid": True,
+                    "telemetry_summary": verified_telemetry_summary(),
                 })
                 allowed = _plan_from_args(args)
                 self.assertEqual(allowed.hybrid_gpu_experts, 1)
@@ -177,6 +193,8 @@ class LauncherTests(unittest.TestCase):
                 "output_parity": True,
                 "speedup": 1.25,
                 "minimum_speedup": 1.02,
+                "telemetry_valid": True,
+                "telemetry_summary": verified_telemetry_summary(),
             }
             _save_hybrid_verification(evidence, plan, identity, result)
             self.assertIsNone(hybrid_verification_reason(plan, identity, evidence))
@@ -224,8 +242,17 @@ class LauncherTests(unittest.TestCase):
             identity = {"cpu": {}, "gpus": []}
             evidence = Path(temp) / "hybrid.json"
             _save_hybrid_verification(evidence, plan, identity, {
-                "passed": False, "output_parity": True, "speedup": 0.95,
+                "passed": True, "output_parity": True, "speedup": 1.2,
                 "minimum_speedup": 1.02,
+            })
+            self.assertIn(
+                "failed live hybrid telemetry checks",
+                hybrid_verification_reason(plan, identity, evidence) or "",
+            )
+            _save_hybrid_verification(evidence, plan, identity, {
+                "passed": False, "output_parity": True, "speedup": 0.95,
+                "minimum_speedup": 1.02, "telemetry_valid": True,
+                "telemetry_summary": verified_telemetry_summary(),
             })
             self.assertIn(
                 "did not beat",
@@ -233,12 +260,52 @@ class LauncherTests(unittest.TestCase):
             )
             _save_hybrid_verification(evidence, plan, identity, {
                 "passed": True, "output_parity": True, "speedup": float("nan"),
-                "minimum_speedup": 1.02,
+                "minimum_speedup": 1.02, "telemetry_valid": True,
+                "telemetry_summary": verified_telemetry_summary(),
             })
             self.assertIn(
                 "invalid performance evidence",
                 hybrid_verification_reason(plan, identity, evidence) or "",
             )
+
+    def test_hybrid_telemetry_must_reconcile_and_prove_mixed_routing(self) -> None:
+        layer = {
+            "level": "vram-layer", "layer": 4, "routes": 6,
+            "route_positions": 12, "gpu_route_positions": 6,
+            "route_readback_ns": 100, "hits": 3, "misses": 3,
+            "lease_acquire_ns": 200, "lease_uploads": 9,
+            "transfer_submit_ns": 300, "transfer_wait_ns": 400,
+            "load_bytes": 500,
+        }
+        total = {
+            "level": "vram-total", "hits": 3, "misses": 3,
+            "lease_uploads": 9, "transfer_submit_ns": 300,
+            "transfer_wait_ns": 400, "load_bytes": 500,
+            "forced_fallbacks": 0,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "server.log"
+            log.write_text(
+                "noise\nexpert_cache_stats: " + json.dumps(layer) +
+                "\nexpert_cache_stats: " + json.dumps(total) + "\n",
+                encoding="utf-8",
+            )
+            telemetry = _parse_expert_cache_telemetry(log)
+        summary = _validated_hybrid_telemetry(telemetry)
+        self.assertEqual(summary["layers"], 1)
+        self.assertEqual(summary["gpu_route_positions"], 6)
+        self.assertLess(_validated_calibration_drift(summary, 400.0), 4.0)
+
+        broken = json.loads(json.dumps(telemetry))
+        broken["totals"][0]["load_bytes"] = 499
+        with self.assertRaisesRegex(ESEError, "does not reconcile"):
+            _validated_hybrid_telemetry(broken)
+        fallback = json.loads(json.dumps(telemetry))
+        fallback["totals"][0]["forced_fallbacks"] = 1
+        with self.assertRaisesRegex(ESEError, "forbidden host-tensor fallback"):
+            _validated_hybrid_telemetry(fallback)
+        with self.assertRaisesRegex(ESEError, "contradicts calibration"):
+            _validated_calibration_drift(summary, 10.0)
 
     def test_calibrated_hybrid_solver_is_conservative_across_devices(self) -> None:
         key = {

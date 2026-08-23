@@ -70,12 +70,21 @@ written atomically with mode `0600` to
 `~/.cache/ese/hybrid-verifications.json`. Evidence is bound to sampled model
 contents, the full topology fingerprint, and context, KV, batching, threading,
 cache, routing, and native-override settings. Prompts and generated text are not
-stored. Missing, stale, malformed, parity-failed, or slower evidence leaves the
-established path unchanged.
+stored.
+
+Approval also requires reconciled live `vram-layer`/`vram-total` telemetry from
+the hybrid server, at least three cache misses, mixed CPU/GPU route positions,
+and zero forced host-tensor fallbacks. The validator sums lease acquisition,
+upload submission, and event-wait time and compares that measured upload path
+with the most conservative matching calibrated device/layout prediction. More
+than `4x` drift is treated as a contradiction and cannot authorize automatic
+routing. Missing, stale, malformed, parity-failed, telemetry-failed, slower, or
+contradictory evidence leaves the established path unchanged.
 
 ### Remaining Phase A gate
 
-- Compare the calibrated cost prediction against the live per-layer route/event telemetry and fail closed when sustained runtime behavior contradicts the selected split.
+- Add native per-layer CPU-branch compute timing so the validator can compare both sides of the calibrated balance; upload-side route/event contradictions already fail closed.
+- Extend the preflight workload window into a periodically refreshed serving-time window before allowing automatic split changes during a long-lived server.
 - Keep the launcher and native calibrated split solvers covered by shared golden cases as the controller evolves.
 
 ## Phase B: heterogeneous decode execution
@@ -163,13 +172,18 @@ comparison against the calibrated prediction remain Phase B gates.
 
 The fail-closed workload validator has also run end-to-end on the local TinyMoE
 fixture with three measured four-token samples after warmup. The established
-path median was `71.34` tokens/s and the one-GPU-position hybrid median was
-`90.66` tokens/s (`1.271x`), with exact output hashes for every paired sample.
-This is gate-development evidence on a tiny fixture, not a product benchmark.
+path median was `69.72` tokens/s and the one-GPU-position hybrid median was
+`93.25` tokens/s (`1.337x`), with exact output hashes for every paired sample.
+All 10 layers reconciled with the aggregate telemetry, 130 of 260 route
+positions exercised the GPU partition, all 53 misses accounted for 159
+lease-backed component uploads, and forced fallbacks remained zero. Observed
+upload-path time was `2.880x` the conservative development-profile prediction,
+inside the `4x` fail-closed bound. This uses a tiny fixture and a test profile;
+it is gate-development evidence, not a product benchmark.
 
 ## Later phases
 
-1. Finish Phase B sustained telemetry-to-calibration contradiction handling and longer workload validation.
+1. Finish Phase B native CPU-branch telemetry, two-sided contradiction handling, and longer workload validation.
 2. Phase C: double-buffered prefill streaming.
 3. Phase D: live KV/expert/transient resource rebalancing.
 4. Phase E: optional aligned FastStore sidecar bound to GGUF identity.

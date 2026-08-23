@@ -62,7 +62,8 @@ DEFAULT_HARDWARE_BENCH = Path("build/bin") / (
 )
 KNOWN_KV_TYPES = ("auto", "f16", "q8_0", "q4_0")
 POLICIES = ("auto", "resident", "hybrid", "cache", "stream")
-HYBRID_VERIFICATION_VERSION = 1
+HYBRID_VERIFICATION_VERSION = 2
+HYBRID_MAX_CALIBRATION_DRIFT = 4.0
 
 
 def default_hybrid_verification_path() -> Path:
@@ -294,6 +295,34 @@ def _load_hybrid_verifications(path: Path) -> dict[str, Any]:
     return data
 
 
+def _recorded_hybrid_telemetry_is_valid(record: dict[str, Any]) -> bool:
+    summary = record.get("telemetry_summary")
+    if not isinstance(summary, dict):
+        return False
+    required_nonnegative = (
+        "layers",
+        "misses",
+        "route_positions",
+        "gpu_route_positions",
+        "forced_fallbacks",
+        "predicted_upload_ns_per_expert",
+        "upload_calibration_drift_ppm",
+    )
+    for field in required_nonnegative:
+        value = summary.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return False
+    return (
+        summary["layers"] > 0
+        and summary["misses"] >= 3
+        and 0 < summary["gpu_route_positions"] < summary["route_positions"]
+        and summary["forced_fallbacks"] == 0
+        and summary["predicted_upload_ns_per_expert"] > 0
+        and summary["upload_calibration_drift_ppm"]
+        <= round(HYBRID_MAX_CALIBRATION_DRIFT * 1_000_000)
+    )
+
+
 def hybrid_verification_reason(
     plan: LaunchPlan,
     current_identity: dict[str, Any],
@@ -315,6 +344,8 @@ def hybrid_verification_reason(
         return "workload A/B verification does not match the current model, hardware, or plan"
     if record.get("output_parity") is not True:
         return "workload A/B verification failed deterministic output parity"
+    if record.get("telemetry_valid") is not True or not _recorded_hybrid_telemetry_is_valid(record):
+        return "workload A/B verification failed live hybrid telemetry checks"
     if record.get("passed") is not True:
         return "measured hybrid workload did not beat the established path"
     speedup = record.get("speedup")
@@ -814,6 +845,46 @@ def calibrated_hybrid_gpu_experts(
     return _solve_calibrated_hybrid(profile, layouts, expert_used)
 
 
+def _calibrated_upload_ns_per_expert_bound(model: ModelInfo, profile_path: Path) -> float:
+    try:
+        profile = load_hardware_profile(profile_path)
+    except HardwareProfileError as exc:
+        raise ESEError(f"cannot load calibrated upload costs: {exc}") from exc
+    layouts = inspect_expert_layer_formats(model.requested_path)
+    contention = profile.get("measurements", {}).get("cpu_cache_contention", {})
+    devices = contention.get("devices", []) if isinstance(contention, dict) else []
+    if not layouts or not isinstance(devices, list) or not devices:
+        raise ESEError("calibration has no model upload-cost matrix")
+    predicted: list[float] = []
+    for device in devices:
+        if not isinstance(device, dict) or not isinstance(device.get("profiles"), list):
+            raise ESEError("calibration has an invalid device upload-cost matrix")
+        costs: dict[tuple[int, int, int, int], float] = {}
+        for entry in device["profiles"]:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                key = tuple(int(entry[name]) for name in (
+                    "ggml_type_id",
+                    "input_width",
+                    "expert_width",
+                    "bytes_per_expert_component",
+                ))
+                value = float(entry["upload_ns_per_expert_component"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0:
+                costs[key] = value
+        for components in layouts:
+            try:
+                predicted.append(sum(costs[tuple(component)] for component in components))
+            except KeyError as exc:
+                raise ESEError("calibration has no exact upload cost for a model component") from exc
+    if not predicted or not all(math.isfinite(value) and value > 0 for value in predicted):
+        raise ESEError("calibration produced no valid expert upload-cost bound")
+    return max(predicted)
+
+
 def inspect_model(path: Path) -> ModelInfo:
     shards = discover_model_shards(path)
     try:
@@ -1222,6 +1293,124 @@ def _http_json(
     return parsed
 
 
+def _parse_expert_cache_telemetry(log_path: Path) -> dict[str, Any]:
+    prefix = "expert_cache_stats: "
+    layers: list[dict[str, Any]] = []
+    totals: list[dict[str, Any]] = []
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise ESEError(f"cannot read server telemetry: {exc}") from exc
+    for line in lines:
+        position = line.find(prefix)
+        if position < 0:
+            continue
+        try:
+            item = json.loads(line[position + len(prefix) :])
+        except json.JSONDecodeError as exc:
+            raise ESEError(f"server emitted malformed expert-cache telemetry: {exc}") from exc
+        if not isinstance(item, dict):
+            raise ESEError("server emitted non-object expert-cache telemetry")
+        if item.get("level") == "vram-layer":
+            layers.append(item)
+        elif item.get("level") == "vram-total":
+            totals.append(item)
+    return {"layers": layers, "totals": totals}
+
+
+def _validated_hybrid_telemetry(telemetry: dict[str, Any]) -> dict[str, int]:
+    layers = telemetry.get("layers")
+    totals = telemetry.get("totals")
+    if not isinstance(layers, list) or not layers:
+        raise ESEError("hybrid server emitted no per-layer expert-cache telemetry")
+    if not isinstance(totals, list) or len(totals) != 1 or not isinstance(totals[0], dict):
+        raise ESEError("hybrid server did not emit exactly one aggregate expert-cache record")
+    total = totals[0]
+    layer_fields = (
+        "routes",
+        "route_positions",
+        "gpu_route_positions",
+        "hits",
+        "misses",
+        "lease_acquire_ns",
+        "lease_uploads",
+        "transfer_submit_ns",
+        "transfer_wait_ns",
+        "load_bytes",
+    )
+    sums = {field: 0 for field in layer_fields}
+    seen_layers: set[int] = set()
+    for item in layers:
+        if not isinstance(item, dict):
+            raise ESEError("hybrid server emitted a non-object per-layer telemetry record")
+        layer = item.get("layer")
+        if isinstance(layer, bool) or not isinstance(layer, int) or layer < 0:
+            raise ESEError("hybrid server emitted an invalid telemetry layer index")
+        if layer in seen_layers:
+            raise ESEError(f"hybrid server emitted duplicate telemetry for layer {layer}")
+        seen_layers.add(layer)
+        for field in layer_fields:
+            value = item.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ESEError(f"hybrid layer telemetry has invalid {field}")
+            sums[field] += value
+
+    for field in (
+        "hits",
+        "misses",
+        "lease_uploads",
+        "transfer_submit_ns",
+        "transfer_wait_ns",
+        "load_bytes",
+    ):
+        value = total.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ESEError(f"hybrid aggregate telemetry has invalid {field}")
+        if value != sums[field]:
+            raise ESEError(f"hybrid per-layer {field} does not reconcile with its aggregate")
+    forced_fallbacks = total.get("forced_fallbacks")
+    if (
+        isinstance(forced_fallbacks, bool)
+        or not isinstance(forced_fallbacks, int)
+        or forced_fallbacks < 0
+    ):
+        raise ESEError("hybrid aggregate telemetry has invalid forced_fallbacks")
+    if forced_fallbacks != 0:
+        raise ESEError("hybrid execution used a forbidden host-tensor fallback")
+    if sums["routes"] <= 0 or sums["route_positions"] <= 0:
+        raise ESEError("hybrid telemetry did not observe routed expert work")
+    if not 0 < sums["gpu_route_positions"] < sums["route_positions"]:
+        raise ESEError("hybrid telemetry did not prove both CPU and GPU route partitions")
+    return {
+        "layers": len(seen_layers),
+        **sums,
+        "forced_fallbacks": forced_fallbacks,
+    }
+
+
+def _validated_calibration_drift(
+    telemetry_summary: dict[str, int], predicted_upload_ns_per_expert: float
+) -> float:
+    if not math.isfinite(predicted_upload_ns_per_expert) or predicted_upload_ns_per_expert <= 0:
+        raise ESEError("calibrated expert upload prediction is invalid")
+    misses = telemetry_summary.get("misses", 0)
+    if misses < 3:
+        raise ESEError("hybrid workload observed too few cache misses to validate calibration")
+    observed_ns = sum(
+        telemetry_summary.get(field, 0)
+        for field in ("lease_acquire_ns", "transfer_submit_ns", "transfer_wait_ns")
+    )
+    if observed_ns <= 0:
+        raise ESEError("hybrid workload reported no measured upload-path time")
+    drift = observed_ns / (predicted_upload_ns_per_expert * misses)
+    if not math.isfinite(drift) or drift > HYBRID_MAX_CALIBRATION_DRIFT:
+        raise ESEError(
+            "live upload-path timing contradicts calibration "
+            f"({drift:.3f}x observed/predicted; limit {HYBRID_MAX_CALIBRATION_DRIFT:.1f}x)"
+        )
+    return drift
+
+
 def _completion_result(
     port: int, prompt: str, tokens: int, seed: int, timeout: float
 ) -> tuple[str, float]:
@@ -1280,6 +1469,7 @@ def _run_hybrid_validation_server(
 ) -> dict[str, Any]:
     port = _free_tcp_port()
     plan = _plan_with_port(plan, port)
+    result: dict[str, Any] | None = None
     with log_path.open("wb") as log:
         process = subprocess.Popen(
             plan.command(),
@@ -1320,7 +1510,7 @@ def _run_hybrid_validation_server(
                 )
                 hashes.append(output_hash)
                 speeds.append(speed)
-            return {
+            result = {
                 "output_hashes": hashes,
                 "tokens_per_second_samples": speeds,
                 "tokens_per_second_median": statistics.median(speeds),
@@ -1341,6 +1531,10 @@ def _run_hybrid_validation_server(
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=10)
+    if result is None:
+        raise ESEError(f"{label} server produced no validation result")
+    result["expert_cache_telemetry"] = _parse_expert_cache_telemetry(log_path)
+    return result
 
 
 def _validate_hybrid(args: argparse.Namespace) -> int:
@@ -1396,11 +1590,31 @@ def _validate_hybrid(args: argparse.Namespace) -> int:
     baseline_speed = float(baseline_result["tokens_per_second_median"])
     hybrid_speed = float(hybrid_result["tokens_per_second_median"])
     speedup = hybrid_speed / baseline_speed
-    passed = output_parity and speedup >= args.minimum_speedup
+    telemetry_reason = None
+    try:
+        telemetry_summary = _validated_hybrid_telemetry(
+            hybrid_result["expert_cache_telemetry"]
+        )
+        predicted_upload_ns = _calibrated_upload_ns_per_expert_bound(
+            candidate.model, args.hardware_profile
+        )
+        telemetry_summary["predicted_upload_ns_per_expert"] = round(predicted_upload_ns)
+        telemetry_summary["upload_calibration_drift_ppm"] = round(
+            _validated_calibration_drift(telemetry_summary, predicted_upload_ns) * 1_000_000
+        )
+        telemetry_valid = True
+    except ESEError as exc:
+        telemetry_summary = {}
+        telemetry_valid = False
+        telemetry_reason = str(exc)
+    passed = output_parity and telemetry_valid and speedup >= args.minimum_speedup
     result = {
         "passed": passed,
         "output_parity": output_parity,
         "output_hashes": hybrid_result["output_hashes"] if output_parity else [],
+        "telemetry_valid": telemetry_valid,
+        "telemetry_reason": telemetry_reason,
+        "telemetry_summary": telemetry_summary,
         "baseline_tokens_per_second": baseline_speed,
         "hybrid_tokens_per_second": hybrid_speed,
         "speedup": speedup,
@@ -1416,6 +1630,7 @@ def _validate_hybrid(args: argparse.Namespace) -> int:
     else:
         print(f"Hybrid workload verification: {'PASS' if passed else 'FAIL'}")
         print(f"Output parity: {'exact' if output_parity else 'failed'}")
+        print(f"Live telemetry: {'valid' if telemetry_valid else telemetry_reason}")
         print(f"Established path: {baseline_speed:.3f} tok/s")
         print(f"Hybrid path:      {hybrid_speed:.3f} tok/s ({speedup:.3f}x)")
         print(f"Evidence: {evidence_path}")
