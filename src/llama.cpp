@@ -1396,6 +1396,14 @@ void llama_context::set_mtp_n_heads(int32_t value) {
 }
 
 llama_context::~llama_context() {
+    // Resolve an abandoned public KV transaction while its scheduler and
+    // cache are still alive. A published transaction rolls back here; a
+    // prepared transaction simply drops its off-side candidate.
+    if (kv_cache_transaction != nullptr) {
+        LLAMA_LOG_WARN("%s: freeing an unresolved KV-cache transaction\n", __func__);
+        llama_kv_cache_transaction_free(kv_cache_transaction);
+    }
+
     // Join the background prefetch worker before reporting its counters or
     // releasing the model mappings it is allowed to touch.
     if (expert_prefetch_worker) {
@@ -10550,16 +10558,18 @@ struct llama_kv_cache_transaction {
     llama_kv_cache_transaction(const llama_kv_cache_transaction &) = delete;
     llama_kv_cache_transaction & operator=(const llama_kv_cache_transaction &) = delete;
 
-    ~llama_kv_cache_transaction() {
+    ~llama_kv_cache_transaction() noexcept {
         // A caller that publishes but does not finalize has not committed. Keep
         // the old cache/checkpoint contract even on an exception or early return.
         if (state == llama_kv_cache_transaction_state::published) {
             rollback();
         }
+        detach_owner();
     }
 
     bool publish() noexcept {
-        if (state != llama_kv_cache_transaction_state::prepared) {
+        if (state != llama_kv_cache_transaction_state::prepared || ctx == nullptr ||
+                ctx->kv_cache_transaction != this) {
             return false;
         }
         if (changes_storage) {
@@ -10576,7 +10586,8 @@ struct llama_kv_cache_transaction {
     }
 
     bool rollback() noexcept {
-        if (state != llama_kv_cache_transaction_state::published) {
+        if (state != llama_kv_cache_transaction_state::published || ctx == nullptr ||
+                ctx->kv_cache_transaction != this) {
             return false;
         }
         if (changes_storage) {
@@ -10585,11 +10596,13 @@ struct llama_kv_cache_transaction {
             llama_kv_cache_reset_graph_bindings(*ctx);
         }
         state = llama_kv_cache_transaction_state::rolled_back;
+        detach_owner();
         return true;
     }
 
     bool finalize() noexcept {
-        if (state != llama_kv_cache_transaction_state::published) {
+        if (state != llama_kv_cache_transaction_state::published || ctx == nullptr ||
+                ctx->kv_cache_transaction != this) {
             return false;
         }
         if (changes_storage) {
@@ -10602,7 +10615,15 @@ struct llama_kv_cache_transaction {
             llama_kv_cache_swap_storage(alternate, retired);
         }
         state = llama_kv_cache_transaction_state::finalized;
+        detach_owner();
         return true;
+    }
+
+    void detach_owner() noexcept {
+        if (ctx != nullptr && ctx->kv_cache_transaction == this) {
+            ctx->kv_cache_transaction = nullptr;
+        }
+        ctx = nullptr;
     }
 
     struct llama_context * ctx;
@@ -10620,16 +10641,17 @@ static bool llama_kv_cache_transaction_fail_after_publish() noexcept {
     return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
-static std::unique_ptr<llama_kv_cache_transaction> llama_kv_cache_transaction_prepare(
+static std::unique_ptr<llama_kv_cache_transaction> llama_kv_cache_prepare_impl(
         struct llama_context * ctx,
         const enum ggml_type * type_k_layers,
         const enum ggml_type * type_v_layers,
         uint32_t n_layers,
         uint32_t target_size) noexcept {
     try {
-        if (ctx == nullptr || n_layers == 0 || n_layers != ctx->kv_self.k_l.size() ||
+        if (ctx == nullptr || ctx->kv_cache_transaction != nullptr ||
+                n_layers == 0 || n_layers != ctx->kv_self.k_l.size() ||
                 (type_k_layers == nullptr && type_v_layers == nullptr) || target_size == 0) {
-            LLAMA_LOG_ERROR("%s: invalid layer map\n", __func__);
+            LLAMA_LOG_ERROR("%s: invalid layer map or another transaction is already open\n", __func__);
             return nullptr;
         }
 
@@ -10775,30 +10797,130 @@ static std::unique_ptr<llama_kv_cache_transaction> llama_kv_cache_transaction_pr
     return nullptr;
 }
 
-static bool llama_kv_cache_replace(
+llama_kv_cache_transaction_t llama_kv_cache_prepare_retier(
         struct llama_context * ctx,
         const enum ggml_type * type_k_layers,
         const enum ggml_type * type_v_layers,
-        uint32_t n_layers,
-        uint32_t target_size) noexcept {
-    auto transaction = llama_kv_cache_transaction_prepare(
-            ctx, type_k_layers, type_v_layers, n_layers, target_size);
-    if (!transaction || !transaction->publish()) {
+        uint32_t n_layers) {
+    try {
+        if (ctx == nullptr) {
+            return nullptr;
+        }
+        auto transaction = llama_kv_cache_prepare_impl(
+                ctx, type_k_layers, type_v_layers, n_layers, ctx->kv_self.size);
+        if (!transaction) {
+            return nullptr;
+        }
+        ctx->kv_cache_transaction = transaction.get();
+        return transaction.release();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: exception while preparing retier transaction: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception while preparing retier transaction\n", __func__);
+    }
+    return nullptr;
+}
+
+llama_kv_cache_transaction_t llama_kv_cache_prepare_resize(
+        struct llama_context * ctx,
+        uint32_t size) {
+    try {
+        if (ctx == nullptr || ctx->kv_self.k_l.empty()) {
+            return nullptr;
+        }
+        const uint32_t n_layers = uint32_t(ctx->kv_self.k_l.size());
+        std::vector<ggml_type> type_k(n_layers, ctx->kv_self.type_k);
+        std::vector<ggml_type> type_v(n_layers, ctx->kv_self.type_v);
+        for (uint32_t layer = 0; layer < n_layers; ++layer) {
+            if (ctx->kv_self.k_l[layer] != nullptr) {
+                type_k[layer] = ctx->kv_self.k_l[layer]->type;
+            }
+            if (layer < ctx->kv_self.v_l.size() && ctx->kv_self.v_l[layer] != nullptr) {
+                type_v[layer] = ctx->kv_self.v_l[layer]->type;
+            }
+        }
+        auto transaction = llama_kv_cache_prepare_impl(
+                ctx, type_k.data(), type_v.data(), n_layers, size);
+        if (!transaction) {
+            return nullptr;
+        }
+        ctx->kv_cache_transaction = transaction.get();
+        return transaction.release();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: exception while preparing resize transaction: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception while preparing resize transaction\n", __func__);
+    }
+    return nullptr;
+}
+
+bool llama_kv_cache_transaction_publish(llama_kv_cache_transaction_t transaction) {
+    try {
+        return transaction != nullptr && transaction->publish();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: publication exception: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown publication exception\n", __func__);
+    }
+    return false;
+}
+
+bool llama_kv_cache_transaction_rollback(llama_kv_cache_transaction_t transaction) {
+    try {
+        return transaction != nullptr && transaction->rollback();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: rollback exception: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown rollback exception\n", __func__);
+    }
+    return false;
+}
+
+bool llama_kv_cache_transaction_finalize(llama_kv_cache_transaction_t transaction) {
+    try {
+        return transaction != nullptr && transaction->finalize();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: finalization exception: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown finalization exception\n", __func__);
+    }
+    return false;
+}
+
+void llama_kv_cache_transaction_free(llama_kv_cache_transaction_t transaction) {
+    if (transaction == nullptr) {
+        return;
+    }
+    try {
+        delete transaction;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: transaction destruction exception: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown transaction destruction exception\n", __func__);
+    }
+}
+
+static bool llama_kv_cache_replace(llama_kv_cache_transaction_t transaction) noexcept {
+    if (transaction == nullptr || !llama_kv_cache_transaction_publish(transaction)) {
+        llama_kv_cache_transaction_free(transaction);
         return false;
     }
     if (transaction->changes_storage && llama_kv_cache_transaction_fail_after_publish()) {
         LLAMA_LOG_WARN("%s: injected failure after reversible publication; rolling back\n", __func__);
-        if (!transaction->rollback()) {
+        if (!llama_kv_cache_transaction_rollback(transaction)) {
             LLAMA_LOG_ERROR("%s: failed to roll back reversible KV publication\n", __func__);
         }
+        llama_kv_cache_transaction_free(transaction);
         return false;
     }
 
     const int64_t migrated_rows = transaction->migrated_rows;
     const size_t peak_staging = transaction->peak_staging;
-    if (!transaction->finalize()) {
+    if (!llama_kv_cache_transaction_finalize(transaction)) {
+        llama_kv_cache_transaction_free(transaction);
         return false;
     }
+    llama_kv_cache_transaction_free(transaction);
     LLAMA_LOG_INFO("%s: committed %lld bounded row migrations (peak host staging %.2f KiB)\n",
             __func__, (long long) migrated_rows, peak_staging / 1024.0);
     return true;
@@ -10809,25 +10931,13 @@ bool llama_kv_cache_retier(
         const enum ggml_type * type_k_layers,
         const enum ggml_type * type_v_layers,
         uint32_t n_layers) {
-    return llama_kv_cache_replace(ctx, type_k_layers, type_v_layers, n_layers,
-            ctx == nullptr ? 0 : ctx->kv_self.size);
+    return llama_kv_cache_replace(llama_kv_cache_prepare_retier(
+            ctx, type_k_layers, type_v_layers, n_layers));
 }
 
 bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size) {
     try {
-        if (ctx == nullptr || ctx->kv_self.k_l.empty()) {
-            return false;
-        }
-        const uint32_t n_layers = uint32_t(ctx->kv_self.k_l.size());
-        std::vector<ggml_type> type_k(n_layers, ctx->kv_self.type_k);
-        std::vector<ggml_type> type_v(n_layers, ctx->kv_self.type_v);
-        for (uint32_t layer = 0; layer < n_layers; ++layer) {
-            if (ctx->kv_self.k_l[layer] != nullptr) type_k[layer] = ctx->kv_self.k_l[layer]->type;
-            if (layer < ctx->kv_self.v_l.size() && ctx->kv_self.v_l[layer] != nullptr) {
-                type_v[layer] = ctx->kv_self.v_l[layer]->type;
-            }
-        }
-        return llama_kv_cache_replace(ctx, type_k.data(), type_v.data(), n_layers, size);
+        return llama_kv_cache_replace(llama_kv_cache_prepare_resize(ctx, size));
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: exception while constructing target layer map: %s\n", __func__, err.what());
     } catch (...) {

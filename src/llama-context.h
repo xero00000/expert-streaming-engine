@@ -310,6 +310,7 @@ struct llama_context {
     uint32_t                    n_ctx_max = 0;
     struct llama_sampling       sampling;
     struct llama_kv_cache       kv_self;
+    llama_kv_cache_transaction_t kv_cache_transaction = nullptr;
     struct llama_context      * mtp_target_ctx   = nullptr;
     struct llama_control_vector cvec;
 

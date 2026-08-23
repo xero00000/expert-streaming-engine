@@ -67,6 +67,9 @@ extern "C" {
 
     struct llama_model;
     struct llama_context;
+    struct llama_kv_cache_transaction;
+
+    typedef struct llama_kv_cache_transaction * llama_kv_cache_transaction_t;
 
     typedef int32_t llama_pos;
     typedef int32_t llama_token;
@@ -1021,6 +1024,41 @@ extern "C" {
             const struct llama_context * ctx,
             struct llama_kv_cache_layer_types * types,
             uint32_t capacity);
+
+    // Prepare replacement KV storage without changing the live cache. The
+    // context must be quiescent and remain owned by the calling thread until
+    // the transaction is resolved. At most one KV transaction may be open per
+    // context. A transaction handle must not outlive its context unless it has
+    // already been rolled back or finalized.
+    //
+    // publish() installs the prepared cache with allocation-free swaps.
+    // rollback() reverses a published swap. finalize() commits a published
+    // swap, retires the old cache/checkpoint, and leaves a small finalized
+    // handle for free(). free() drops a prepared candidate and automatically
+    // rolls back a published-but-unfinalized transaction. State-changing calls
+    // return false outside their documented prepare -> publish ->
+    // rollback/finalize order; free(NULL) is a no-op.
+    LLAMA_API llama_kv_cache_transaction_t llama_kv_cache_prepare_resize(
+            struct llama_context * ctx,
+            uint32_t size);
+
+    LLAMA_API llama_kv_cache_transaction_t llama_kv_cache_prepare_retier(
+            struct llama_context * ctx,
+            const enum ggml_type * type_k_layers,
+            const enum ggml_type * type_v_layers,
+            uint32_t n_layers);
+
+    LLAMA_API bool llama_kv_cache_transaction_publish(
+            llama_kv_cache_transaction_t transaction);
+
+    LLAMA_API bool llama_kv_cache_transaction_rollback(
+            llama_kv_cache_transaction_t transaction);
+
+    LLAMA_API bool llama_kv_cache_transaction_finalize(
+            llama_kv_cache_transaction_t transaction);
+
+    LLAMA_API void llama_kv_cache_transaction_free(
+            llama_kv_cache_transaction_t transaction);
 
     LLAMA_API bool llama_kv_cache_retier(
             struct llama_context * ctx,
