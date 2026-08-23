@@ -2072,6 +2072,14 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         help="disable calibrated CPU/GPU expert route splitting",
     )
     parser.add_argument(
+        "--hybrid-candidate",
+        type=int,
+        help=(
+            "advanced: evaluate a mixed GPU route-position count; it remains disabled "
+            "until this exact candidate passes validate-hybrid"
+        ),
+    )
+    parser.add_argument(
         "--hybrid-verification",
         type=Path,
         default=default_hybrid_verification_path(),
@@ -2159,6 +2167,11 @@ def _plan_from_args(
     current_identity: dict[str, Any] | None = None
     selected_policy, _ = select_policy(model, hardware, args.policy)
     hybrid_selection = "automatic hybrid routing is not used by the selected policy"
+    hybrid_candidate = getattr(args, "hybrid_candidate", None)
+    if hybrid_candidate is not None and selected_policy not in ("cache", "stream"):
+        raise ESEError("--hybrid-candidate requires the cache or stream policy")
+    if args.no_auto_hybrid and hybrid_candidate is not None:
+        raise ESEError("--hybrid-candidate cannot be combined with --no-auto-hybrid")
     if selected_policy in ("cache", "stream") and args.no_auto_hybrid:
         hybrid_selection = "automatic hybrid routing disabled by --no-auto-hybrid"
     elif selected_policy in ("cache", "stream"):
@@ -2166,6 +2179,25 @@ def _plan_from_args(
         hybrid_gpu_experts, hybrid_selection = calibrated_hybrid_gpu_experts(
             model, args.hardware_profile, current_identity
         )
+        if hybrid_candidate is not None:
+            expert_used = model.expert_used_count
+            if expert_used is None or not 1 <= hybrid_candidate < expert_used:
+                raise ESEError(
+                    "--hybrid-candidate must be between 1 and one less than model top-k"
+                )
+            conservative_endpoint = hybrid_selection in (
+                "calibration selected the established all-CPU expert path",
+                "calibration selected the established all-GPU cache path",
+            )
+            if hybrid_gpu_experts <= 0 and not conservative_endpoint:
+                raise ESEError(
+                    f"--hybrid-candidate requires valid exact calibration: {hybrid_selection}"
+                )
+            hybrid_gpu_experts = hybrid_candidate
+            hybrid_selection = (
+                f"advanced evidence-gated candidate selected {hybrid_candidate} GPU and "
+                f"{expert_used - hybrid_candidate} CPU route positions"
+            )
     plan_arguments = dict(
         model=model,
         hardware=hardware,

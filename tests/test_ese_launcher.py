@@ -121,12 +121,13 @@ class LauncherTests(unittest.TestCase):
             model_path = root / "model.gguf"
             write_minimal_gguf(model_path, {
                 "general.architecture": "gpt-oss", "gpt-oss.expert_count": 8,
-                "gpt-oss.expert_used_count": 2, "gpt-oss.block_count": 4,
+                "gpt-oss.expert_used_count": 3, "gpt-oss.block_count": 4,
             })
             evidence = root / "hybrid.json"
             args = argparse.Namespace(
                 model=model_path, context=4096, slots=1, port=8080, policy="cache",
                 no_auto_hybrid=False, hardware_profile=root / "profile.json",
+                hybrid_candidate=None,
                 hybrid_verification=evidence, binary="/server", host="127.0.0.1",
                 threads=4, batch_threads=8, batch_size=64, ubatch_size=32,
                 kv="q8_0", reserve_vram=GIB, gpu_resident_moe=None,
@@ -156,6 +157,23 @@ class LauncherTests(unittest.TestCase):
                 })
                 allowed = _plan_from_args(args)
                 self.assertEqual(allowed.hybrid_gpu_experts, 1)
+
+                args.hybrid_candidate = 2
+                blocked_candidate = _plan_from_args(args)
+                self.assertEqual(blocked_candidate.hybrid_gpu_experts, 0)
+                candidate_two = _plan_from_args(args, require_hybrid_verification=False)
+                self.assertEqual(candidate_two.hybrid_gpu_experts, 2)
+                _save_hybrid_verification(evidence, candidate_two, identity, {
+                    "passed": True, "output_parity": True, "speedup": 1.3,
+                    "minimum_speedup": 1.02, "telemetry_valid": True,
+                    "telemetry_summary": verified_telemetry_summary(),
+                })
+                allowed_candidate = _plan_from_args(args)
+                self.assertEqual(allowed_candidate.hybrid_gpu_experts, 2)
+
+                args.policy = "resident"
+                with self.assertRaisesRegex(ESEError, "cache or stream"):
+                    _plan_from_args(args)
 
     def test_hybrid_workload_evidence_is_model_hardware_and_plan_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

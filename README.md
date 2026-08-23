@@ -215,6 +215,12 @@ established path with identical deterministic output:
 ./ese serve MODEL.gguf --policy stream
 ```
 
+On strongly heterogeneous systems where valid per-device calibration disagrees,
+advanced users can test a specific split with
+`./ese validate-hybrid MODEL.gguf --hybrid-candidate N`. The same option on
+`plan` or `serve` remains inert until that exact candidate has passing evidence;
+it cannot bypass missing or stale calibration.
+
 The validator stores no prompts or generated text. It also requires reconciled
 per-layer cache telemetry, mixed CPU/GPU routing, zero forced fallbacks, and CPU
 compute/upload timing that remains within conservative bounds of calibration.
@@ -311,6 +317,7 @@ validation.
 | Expert hierarchy | mmap/pread parity, forced eviction, sanitizer coverage, and 1/2/3-GPU execution |
 | CUDA hardware | RTX 2080 SUPER (`sm_75`), RTX 3060 Ti (`sm_86`), and RTX 3080 (`sm_86`) |
 | Global controller | CPU plus real Turing+Ampere three-GPU model load with explicit 1 GiB reserves |
+| Hardware-adaptive MoE | Schema-v3 parity and telemetry gate on 43-layer DeepSeek-V4-Flash; one-position hybrid candidate measured 7.54x over the established route |
 | Transient/speculation | CPU, Turing, Ampere, and model-backed image→text module swapping |
 | Turbo KV foundation | CPU/CUDA codecs, direct attention paths, lifecycle tests, and quality sweeps |
 

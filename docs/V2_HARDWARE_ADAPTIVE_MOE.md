@@ -83,6 +83,13 @@ treated as a contradiction and cannot authorize automatic routing. Missing,
 stale, malformed, parity-failed, telemetry-failed, slower, or contradictory
 evidence leaves the established path unchanged.
 
+When heterogeneous devices disagree and the conservative global solver chooses
+an established endpoint, advanced users may evaluate a specific mixed split
+with `--hybrid-candidate N`. This never overrides calibration readiness and
+never directly activates routing: that exact candidate still needs matching
+schema-v3 workload evidence, and normal automatic planning remains
+conservative.
+
 ### Remaining Phase A gate
 
 - Extend the preflight workload window into a periodically refreshed serving-time window before allowing automatic split changes during a long-lived server.
@@ -161,16 +168,17 @@ changed from `44.64` to `58.37` tokens/s. These are development-fixture results,
 not published product benchmarks, and primarily prove end-to-end execution and
 parity.
 
-A deterministic two-token DeepSeek-V4-Flash `UD-IQ1_S` validation then exercised
-43 deferred MoE layers, four distinct expert layouts, three mixed-generation
-GPUs, the 4 GiB bounded RAM cache, and a 256 MiB bounded VRAM cache on each GPU.
-The established path and a one-GPU-position hybrid split produced byte-identical
-output (`SHA-256 62b805db2808dd609730a26b3ed8c9f631274e9071bea28267866d1854372658`).
-The hybrid run reported zero forced host-tensor fallbacks and stayed inside each
-configured cache bound. Its short-run wall time changed from 65.81 seconds to
-4.14 seconds, but this cold, two-token correctness trial is not a publishable
-throughput benchmark. Longer schema-v3 validation on this larger model remains
-a Phase B gate.
+A schema-v3 DeepSeek-V4-Flash `UD-IQ1_S` validation exercised 43 deferred MoE
+layers, four distinct expert layouts, three mixed-generation GPUs, the 4 GiB
+bounded RAM cache, and a 256 MiB bounded VRAM cache on each GPU. Three seeded,
+two-token samples compared the established path with a one-GPU-position hybrid
+candidate. Every corresponding output hash matched. Median generation changed
+from `0.394` to `2.968` tokens/s (`7.54x`). The accepted hybrid run recorded 344
+route positions split evenly between CPU and GPU, 115 misses, 502 lease uploads,
+172 explicitly timed CPU calls, and zero forced fallbacks. Observed CPU and
+upload costs were respectively `0.702x` and `0.388x` their conservative bounds.
+This is real model-backed gate evidence for the tested machine and launch
+signature, not a general product benchmark.
 
 The fail-closed workload validator has also run end-to-end on the local TinyMoE
 fixture with five measured 16-token samples after warmup. The established path
@@ -186,7 +194,7 @@ it is gate-development evidence, not a product benchmark.
 
 ## Later phases
 
-1. Finish Phase B longer workload validation and serving-time evidence refresh.
+1. Finish Phase B serving-time evidence refresh for long-lived processes.
 2. Phase C: double-buffered prefill streaming.
 3. Phase D: live KV/expert/transient resource rebalancing.
 4. Phase E: optional aligned FastStore sidecar bound to GGUF identity.
