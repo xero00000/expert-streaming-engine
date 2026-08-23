@@ -106,6 +106,28 @@ class NativeSurfaceTests(unittest.TestCase):
         self.assertIn('res.data["resources"]', context)
         self.assertIn('"mutation_enabled", false', context)
 
+    def test_ordinary_server_launch_skips_the_speculative_decode_probe(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        context = (root / "examples" / "server" / "server-context.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "if (requested_spec && !params_base.dry_run)",
+            context,
+        )
+
+    def test_fused_moe_staging_allocates_bytes_not_elements(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cuda = (root / "ggml" / "src" / "ggml-cuda.cu").read_text(encoding="utf-8")
+        self.assertIn(
+            "final_dst_contiguous.alloc(ggml_nbytes(next))",
+            cuda,
+        )
+        self.assertNotIn(
+            "final_dst_contiguous.alloc(ggml_nelements(next))",
+            cuda,
+        )
+
     def test_graph_reuse_observes_hybrid_guard_transitions(self) -> None:
         root = Path(__file__).resolve().parents[1]
         llama = (root / "src" / "llama.cpp").read_text(encoding="utf-8")

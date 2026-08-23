@@ -291,7 +291,7 @@ void server_context::init() {
 
     const bool requested_spec = params_base.speculative.has_stage_chain();
     bool can_spec = true;
-    if (!params_base.dry_run) {
+    if (requested_spec && !params_base.dry_run) {
         can_spec = common_speculative_is_compat(ctx);
     }
     if (!can_spec && requested_spec) {

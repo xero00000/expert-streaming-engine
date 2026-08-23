@@ -3191,6 +3191,10 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     const int64_t n_ids = ids->ne[0];
 
     ggml_tensor dst_row = *dst;
+    // dst_row is used as a synthetic MUL_MAT destination below. Do not pass
+    // the fused MoE unary selector as a matrix-multiplication precision mode.
+    dst_row.op = GGML_OP_MUL_MAT;
+    dst_row.op_params[0] = GGML_PREC_DEFAULT;
 
     // The heuristics src1->ne[2] <= 32*src0->ne[2] to use the mul_mat_id implementation instead of the original version
     // is derived from
@@ -3369,7 +3373,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     }
     ggml_cuda_pool_alloc<char> final_dst_contiguous(ctx.pool());
     if (fuse_down) {
-        final_dst.data = final_dst_contiguous.alloc(ggml_nelements(next));
+        final_dst.data = final_dst_contiguous.alloc(ggml_nbytes(next));
         final_dst.src[1] = &dst_row;
     }
 

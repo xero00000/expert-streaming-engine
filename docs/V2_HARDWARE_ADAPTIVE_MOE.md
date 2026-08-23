@@ -253,6 +253,15 @@ coalesced 321 H2D components into 216 batches, reused 42 components through D2D
 copies, and reported zero fallbacks. This is correctness and development-fixture
 evidence, not a general product benchmark.
 
+A later fused-MoE regression trial found that the fuse-down staging pool was
+allocated in elements even though its byte-addressed buffer receives full
+floating-point rows. Allocating `ggml_nbytes(next)` removes the out-of-bounds
+CUDA write. Seeded fused and unfused single-Ampere runs then produced identical
+tokens; fused decode measured 136.4 versus 54.6 tokens/s on the fixture. The
+default fused path also completed on the mixed SM75/SM86 three-GPU split at
+189.7 tokens/s and remained healthy through clean shutdown. These small-model
+figures are regression evidence rather than general performance claims.
+
 ## Phase D: runtime resource rebalancing (in progress)
 
 The first control-plane boundary is read-only and validation-only. `GET
