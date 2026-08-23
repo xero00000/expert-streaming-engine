@@ -454,6 +454,7 @@ struct gpt_params {
     bool expert_sidecar_only = false;
     int64_t expert_vram_cache_mib = 0; // explicit per-device capacity; 0 disables
     int64_t expert_vram_reserve_mib = 0;
+    int64_t expert_prefill_staging_mib = -1; // -1 = native-policy auto, 0 disables, otherwise two-lane total
     int64_t transient_vram_budget_mib = 0; // shared transient-module capacity; 0 disables
     int64_t transient_vram_reserve_mib = 0;
     int64_t transient_mtp_mib = 0;          // measured MTP companion allocation

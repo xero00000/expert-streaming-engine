@@ -19,6 +19,7 @@ class NativeSurfaceTests(unittest.TestCase):
             "--expert-sidecar-only",
             "--expert-vram-cache-mib",
             "--expert-vram-reserve-mib",
+            "--expert-prefill-staging-mib",
             "--expert-cache-min-observations",
             "--expert-hybrid-gpu-experts",
             "--expert-hybrid-cpu-ns-per-expert",
@@ -53,6 +54,28 @@ class NativeSurfaceTests(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 self.assertIn(f"cparams.{field} = params.{field};", common)
+
+    def test_prefill_staging_crosses_the_native_context_boundary(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        common = (root / "common" / "common.cpp").read_text(encoding="utf-8")
+        llama = (root / "src" / "llama.cpp").read_text(encoding="utf-8")
+        public_header = (root / "include" / "llama.h").read_text(encoding="utf-8")
+        backend_header = (root / "ggml" / "include" / "ggml-backend.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("cparams.expert_prefill_staging_bytes =", common)
+        self.assertIn(
+            "cparams.expert_prefill_staging_bytes = params.expert_prefill_staging_bytes;",
+            llama,
+        )
+        self.assertIn("expert_prefill_staging_bytes", public_header)
+        self.assertIn("ggml_backend_sched_set_expert_prefill_staging", backend_header)
+        self.assertIn("llama_model_largest_expert_layer", public_header)
+        backend = (root / "ggml" / "src" / "ggml-backend.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("route_global_sync_fallbacks", backend)
+        self.assertIn("ggml_backend_event_synchronize(route_event)", backend)
 
     def test_server_props_exposes_live_hybrid_guard_state(self) -> None:
         root = Path(__file__).resolve().parents[1]

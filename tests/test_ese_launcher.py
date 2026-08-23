@@ -653,6 +653,34 @@ class LauncherTests(unittest.TestCase):
                 prefetch_tail=1,
             )
 
+    def test_prefill_staging_is_auto_by_default_and_explicitly_controllable(self) -> None:
+        automatic = build_launch_plan(
+            model=moe_model(),
+            hardware=hardware(20),
+            binary=Path("/server"),
+            policy="cache",
+        )
+        self.assertNotIn("--expert-prefill-staging-mib", automatic.arguments)
+
+        explicit = build_launch_plan(
+            model=moe_model(),
+            hardware=hardware(20),
+            binary=Path("/server"),
+            policy="stream",
+            expert_prefill_staging=513 * 1024**2,
+        )
+        position = explicit.arguments.index("--expert-prefill-staging-mib")
+        self.assertEqual(explicit.arguments[position + 1], "513")
+
+        with self.assertRaisesRegex(ESEError, "cache or stream"):
+            build_launch_plan(
+                model=moe_model(),
+                hardware=hardware(20),
+                binary=Path("/server"),
+                policy="resident",
+                expert_prefill_staging=64 * 1024**2,
+            )
+
     def test_dense_oversized_resident_plan_uses_native_fit(self) -> None:
         model = ModelInfo(
             requested_path=Path("/dense.gguf"),

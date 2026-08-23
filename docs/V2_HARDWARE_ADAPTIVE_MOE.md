@@ -213,11 +213,50 @@ request's revocation—while the later request used the established path. Output
 matched and the three-sample hybrid median was `1.034x`, demonstrating that a
 short apparent speed win cannot bypass contradictory serving telemetry.
 
+## Phase C: bounded double-buffered prefill streaming
+
+Prompt MoE layers can now stage only their selected expert components into two
+fixed CUDA lanes per participating device. The lanes are separate from the
+persistent decode cache and are sized from the largest complete expert layer.
+Layer `N+1` uses a dedicated transfer stream while layer `N` computes; explicit
+transfer and compute events fence lane reuse without a backend-wide CUDA
+synchronization. Adjacent host components are coalesced, persistent-cache hits
+use device-to-device copies, and bounded RAM leases remain held until their
+transfer event completes.
+
+The resource planner accounts for the full two-lane allocation independently on
+every device. Automatic staging is optional and is dropped before context or KV
+quality is reduced. An explicit positive `--expert-prefill-staging` request is
+required: an unsupported policy, insufficient planned capacity, allocation
+failure, or loss of the configured VRAM reserve fails closed. `0` disables the
+feature. The native surface is `--expert-prefill-staging-mib`.
+
+Shutdown telemetry records the allocated lanes per device and per-layer/total
+selected components, H2D/D2D components and batches, bytes, lease and transfer
+timings, and fallbacks. Acceptance requires two bounded lanes on every requested
+device, exact output parity, H2D traffic, warm D2D reuse, coalesced batch counts,
+and zero staging or global-synchronization fallbacks. It is automated by:
+
+```sh
+scripts/validate-phase-c-prefill.py \
+  --model MODEL.gguf --staging-mib SIZE --gpu-count COUNT \
+  --tensor-split SPLIT
+```
+
+The local three-GPU TinyMoE development fixture exercised RTX 3060 Ti (SM86),
+RTX 2080 SUPER (SM75), and RTX 3080 (SM86) with a deliberate `20,30,50` split.
+Each device allocated exactly two 13.5 MiB lanes (27 MiB total). Two paired
+seeded runs produced identical output hashes. Median prompt throughput changed
+from `182.10` to `251.32` tokens/s (`1.38x`); decode stayed effectively neutral
+at `30.15` versus `30.75` tokens/s. The staged run selected 363 components,
+coalesced 321 H2D components into 216 batches, reused 42 components through D2D
+copies, and reported zero fallbacks. This is correctness and development-fixture
+evidence, not a general product benchmark.
+
 ## Later phases
 
-1. Phase C: double-buffered prefill streaming.
-2. Phase D: live KV/expert/transient resource rebalancing.
-3. Phase E: optional aligned FastStore sidecar bound to GGUF identity.
-4. Phase F: semantic cache anchors and newer hardware kernels.
+1. Phase D: live KV/expert/transient resource rebalancing.
+2. Phase E: optional aligned FastStore sidecar bound to GGUF identity.
+3. Phase F: semantic cache anchors and newer hardware kernels.
 
 Each phase needs correctness tests, local benchmark evidence, documented hardware coverage and limitations, and a clean private review checkpoint before it is proposed for public `main`.

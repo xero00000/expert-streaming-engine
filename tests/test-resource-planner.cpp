@@ -24,6 +24,7 @@ common_resource_plan_input base_input() {
     input.requested_expert_ram_bytes = 16ULL*1024*MiB;
     input.requested_aux_ram_bytes = 4ULL*1024*MiB;
     input.requested_expert_vram_bytes_per_device = 512*MiB;
+    input.requested_expert_prefill_staging_bytes_per_device = 256*MiB;
     input.io_staging_bytes = 256*MiB;
     input.mtp_bytes = 1200*MiB;
     input.multimodal_bytes = 1500*MiB;
@@ -61,11 +62,44 @@ void test_deterministic_budget_and_json() {
     REQUIRE(first.devices[1].transient_bytes == input.multimodal_bytes);
     for (const auto & device : first.devices) {
         REQUIRE(device.expert_cache_bytes <= input.requested_expert_vram_bytes_per_device);
+        REQUIRE(device.expert_prefill_staging_bytes ==
+                input.requested_expert_prefill_staging_bytes_per_device);
         REQUIRE(device.planned_bytes + device.reserve_bytes <= device.capacity_bytes);
     }
     const std::string json = common_resource_plan_json(first);
     REQUIRE(json.find("\"policy\":\"cache\"") != std::string::npos);
     REQUIRE(json.find("\"kv_quality\":\"turbo8\"") != std::string::npos);
+    REQUIRE(json.find("\"expert_prefill_staging_enabled\":true") != std::string::npos);
+}
+
+void test_optional_prefill_staging_falls_back_without_violating_context_floor() {
+    auto input = base_input();
+    input.devices = {{ 0, 3ULL*1024*MiB, 512*MiB, 512*MiB, 256*MiB }};
+    input.transient_device = 0;
+    input.mtp_bytes = 0;
+    input.multimodal_bytes = 0;
+    input.requested_context = 4096;
+    input.max_context = 4096;
+    input.min_context = 4096;
+    input.kv_bytes_per_token[COMMON_KV_QUALITY_TURBO4] = 128*1024;
+    input.requested_expert_prefill_staging_bytes_per_device = 2ULL*1024*MiB;
+
+    common_resource_plan plan;
+    std::string error;
+    REQUIRE(common_resource_plan_solve(input, plan, error));
+    REQUIRE(!plan.expert_prefill_staging_enabled);
+    REQUIRE(plan.devices.front().expert_prefill_staging_bytes == 0);
+    REQUIRE(plan.reason.find("optional expert prefill staging disabled") != std::string::npos);
+
+    input.require_expert_prefill_staging = true;
+    REQUIRE(!common_resource_plan_solve(input, plan, error));
+    REQUIRE(error.find("required expert prefill staging") != std::string::npos);
+
+    auto resident = base_input();
+    resident.requested_policy = COMMON_MEMORY_POLICY_RESIDENT;
+    resident.require_expert_prefill_staging = true;
+    REQUIRE(!common_resource_plan_solve(resident, plan, error));
+    REQUIRE(error.find("non-resident MoE memory policy") != std::string::npos);
 }
 
 void test_preference_tradeoff() {
@@ -414,6 +448,7 @@ void test_native_calibration_profile_gate() {
 
 int main() {
     test_deterministic_budget_and_json();
+    test_optional_prefill_staging_falls_back_without_violating_context_floor();
     test_preference_tradeoff();
     test_no_silent_fallbacks();
     test_atomic_rollback();

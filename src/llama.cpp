@@ -8269,6 +8269,7 @@ struct llama_context_params llama_context_default_params() {
         /*.cuda_params                 =*/ nullptr,
         /*.expert_vram_cache_bytes     =*/ 0,
         /*.expert_vram_reserve_bytes   =*/ 0,
+        /*.expert_prefill_staging_bytes =*/ 0,
         /*.expert_cache_min_observations =*/ 2,
         /*.expert_hybrid_gpu_experts   =*/ 0,
         /*.expert_hybrid_cpu_ns_per_expert =*/ 0,
@@ -8783,6 +8784,7 @@ struct llama_context * llama_init_from_model(
     cparams.worst_graph_tokens = params.worst_case_tokens;
     cparams.expert_vram_cache_bytes = params.expert_vram_cache_bytes;
     cparams.expert_vram_reserve_bytes = params.expert_vram_reserve_bytes;
+    cparams.expert_prefill_staging_bytes = params.expert_prefill_staging_bytes;
     cparams.expert_cache_min_observations = params.expert_cache_min_observations;
     cparams.expert_hybrid_gpu_experts = params.expert_hybrid_gpu_experts;
     cparams.expert_hybrid_cpu_ns_per_expert = params.expert_hybrid_cpu_ns_per_expert;
@@ -9271,6 +9273,10 @@ struct llama_context * llama_init_from_model(
                         cparams.expert_vram_cache_bytes,
                         cparams.expert_vram_reserve_bytes,
                         cparams.expert_cache_min_observations);
+                ggml_backend_sched_set_expert_prefill_staging(
+                        ctx->sched,
+                        cparams.expert_prefill_staging_bytes,
+                        cparams.expert_vram_reserve_bytes);
                 const uint32_t cpu_positions = model->hparams.n_expert_used >
                         cparams.expert_hybrid_gpu_experts ?
                         model->hparams.n_expert_used - cparams.expert_hybrid_gpu_experts : 0;
@@ -9749,6 +9755,20 @@ uint64_t llama_model_largest_expert_component(const struct llama_model * model) 
     for (const auto & item : model->expert_index.descriptors) {
         largest = std::max(largest, item.second->bytes());
     }
+    return largest;
+}
+
+uint64_t llama_model_largest_expert_layer(const struct llama_model * model) {
+    if (!model) return 0;
+    std::map<uint32_t, uint64_t> layer_bytes;
+    for (const auto & item : model->expert_index.descriptors) {
+        const auto & descriptor = item.second;
+        auto & total = layer_bytes[descriptor->key().layer];
+        if (descriptor->bytes() > UINT64_MAX - total) return UINT64_MAX;
+        total += descriptor->bytes();
+    }
+    uint64_t largest = 0;
+    for (const auto & item : layer_bytes) largest = std::max(largest, item.second);
     return largest;
 }
 

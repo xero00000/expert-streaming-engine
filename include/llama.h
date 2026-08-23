@@ -535,6 +535,7 @@ extern "C" {
         void *              cuda_params;
         uint64_t expert_vram_cache_bytes;   // per-device adaptive expert cache bound
         uint64_t expert_vram_reserve_bytes; // per-device reserve that cache allocation must preserve
+        uint64_t expert_prefill_staging_bytes; // separate two-lane whole-layer prefill staging capacity per device
         uint32_t expert_cache_min_observations; // route observations before GPU admission
         uint32_t expert_hybrid_gpu_experts; // decode top-k positions assigned to the GPU branch; 0 disables
         uint64_t expert_hybrid_cpu_ns_per_expert; // conservative calibrated CPU cost used by runtime guard
@@ -724,6 +725,7 @@ extern "C" {
             uint64_t * dense_bytes,
             uint64_t * expert_bytes);
     LLAMA_API uint64_t llama_model_largest_expert_component(const struct llama_model * model);
+    LLAMA_API uint64_t llama_model_largest_expert_layer(const struct llama_model * model);
 
     LLAMA_API uint64_t llama_model_kv_bytes(
             const struct llama_model * model,

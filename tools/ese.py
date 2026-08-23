@@ -1072,6 +1072,7 @@ def build_launch_plan(
     expert_ram_cache: int | None = None,
     expert_ram_staging: int | None = None,
     expert_vram_cache: int | None = None,
+    expert_prefill_staging: int | None = None,
     expert_storage_backend: str | None = None,
     expert_cache_min_observations: int = 2,
     hybrid_gpu_experts: int = 0,
@@ -1096,6 +1097,10 @@ def build_launch_plan(
         raise ESEError("--expert-storage-backend must be mmap, pread, or io_uring")
     if expert_cache_min_observations < 1:
         raise ESEError("--expert-cache-min-observations must be at least 1")
+    if expert_prefill_staging is not None and expert_prefill_staging < 0:
+        raise ESEError("--expert-prefill-staging cannot be negative")
+    if expert_prefill_staging and selected_policy not in ("cache", "stream"):
+        raise ESEError("--expert-prefill-staging requires cache or stream policy")
     if hybrid_gpu_experts < 0 or hybrid_gpu_experts > 64:
         raise ESEError("hybrid GPU experts must be between 0 and 64")
     if hybrid_gpu_experts and (
@@ -1144,6 +1149,11 @@ def build_launch_plan(
     env: dict[str, str] = {}
     if split:
         args.extend(("--tensor-split", split))
+    if expert_prefill_staging is not None:
+        args.extend((
+            "--expert-prefill-staging-mib",
+            _mib_nonnegative(expert_prefill_staging, "--expert-prefill-staging"),
+        ))
 
     if selected_policy == "resident":
         args.extend(("-ngl", "99"))
@@ -2126,6 +2136,14 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         help="adaptive expert cache per GPU (default: one quarter of free VRAM after reserve, capped at 2GiB)",
     )
     parser.add_argument(
+        "--expert-prefill-staging",
+        type=parse_size,
+        help=(
+            "total two-lane whole-layer prefill staging per GPU; omitted lets "
+            "the native planner size it automatically, 0 disables it"
+        ),
+    )
+    parser.add_argument(
         "--expert-storage-backend",
         choices=("mmap", "pread", "io_uring"),
         help="exact expert source backend (default: mmap for cache, pread for stream)",
@@ -2303,6 +2321,7 @@ def _plan_from_args(
         expert_ram_cache=args.expert_ram_cache,
         expert_ram_staging=args.expert_ram_staging,
         expert_vram_cache=args.expert_vram_cache,
+        expert_prefill_staging=getattr(args, "expert_prefill_staging", None),
         expert_storage_backend=args.expert_storage_backend,
         expert_cache_min_observations=args.expert_cache_min_observations,
         hybrid_gpu_experts=hybrid_gpu_experts,

@@ -62,6 +62,7 @@ struct llama_cparams {
     int  worst_graph_tokens;
     uint64_t expert_vram_cache_bytes;
     uint64_t expert_vram_reserve_bytes;
+    uint64_t expert_prefill_staging_bytes;
     uint32_t expert_cache_min_observations;
     uint32_t expert_hybrid_gpu_experts;
     uint64_t expert_hybrid_cpu_ns_per_expert;

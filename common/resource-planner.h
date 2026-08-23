@@ -58,6 +58,11 @@ struct common_resource_plan_input {
     uint64_t min_expert_ram_bytes = 0;
     uint64_t requested_aux_ram_bytes = 0;
     uint64_t requested_expert_vram_bytes_per_device = 0;
+    // Total bytes for two independent whole-layer prefill staging lanes on
+    // each accelerator. The planner may disable this optional optimization
+    // when it would cross the context/KV quality floor.
+    uint64_t requested_expert_prefill_staging_bytes_per_device = 0;
+    bool require_expert_prefill_staging = false;
     uint64_t io_staging_bytes = 0;
 
     uint64_t mtp_bytes = 0;
@@ -90,6 +95,7 @@ struct common_resource_device_plan {
     uint64_t graph_bytes = 0;
     uint64_t kv_bytes = 0;
     uint64_t expert_cache_bytes = 0;
+    uint64_t expert_prefill_staging_bytes = 0;
     uint64_t transient_bytes = 0;
     uint64_t planned_bytes = 0;
     uint64_t headroom_bytes = 0;
@@ -109,6 +115,7 @@ struct common_resource_plan {
     uint64_t aux_ram_bytes = 0;
     uint64_t io_staging_bytes = 0;
     uint64_t transient_capacity_bytes = 0;
+    bool expert_prefill_staging_enabled = false;
     bool transient_swap = false;
     bool draft_resident = false;
     std::string reason;

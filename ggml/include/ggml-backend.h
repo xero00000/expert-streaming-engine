@@ -241,6 +241,10 @@ extern "C" {
             uint64_t bytes_per_device,
             uint64_t reserve_bytes_per_device,
             uint32_t minimum_observations);
+    GGML_API void ggml_backend_sched_set_expert_prefill_staging(
+            ggml_backend_sched_t sched,
+            uint64_t bytes_per_device,
+            uint64_t reserve_bytes_per_device);
 
     enum ggml_backend_expert_hybrid_guard_status {
         GGML_BACKEND_EXPERT_HYBRID_GUARD_DISABLED = 0,

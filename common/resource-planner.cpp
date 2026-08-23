@@ -136,8 +136,11 @@ bool allocate_context(
         ? input.devices.front().id : input.transient_device;
     const uint64_t transient_need = std::max(input.mtp_bytes, input.multimodal_bytes);
     for (const auto & device : input.devices) {
+        const uint64_t prefill_staging = plan.expert_prefill_staging_enabled && device.id >= 0
+            ? input.requested_expert_prefill_staging_bytes_per_device : 0;
         uint64_t fixed = device.reserve_bytes;
         if (!add_checked(fixed, device.dense_bytes) || !add_checked(fixed, device.graph_bytes) ||
+                !add_checked(fixed, prefill_staging) ||
                 (device.id == transient_device && !add_checked(fixed, transient_need)) ||
                 fixed > device.free_bytes) {
             return false;
@@ -170,7 +173,10 @@ bool allocate_context(
         device.dense_bytes = source.dense_bytes;
         device.graph_bytes = source.graph_bytes;
         device.kv_bytes = share;
-        device.planned_bytes = source.dense_bytes + source.graph_bytes + share;
+        device.expert_prefill_staging_bytes = plan.expert_prefill_staging_enabled && source.id >= 0
+            ? input.requested_expert_prefill_staging_bytes_per_device : 0;
+        device.planned_bytes = source.dense_bytes + source.graph_bytes +
+            device.expert_prefill_staging_bytes + share;
         device.headroom_bytes = source.free_bytes - source.reserve_bytes - device.planned_bytes;
         plan.devices.push_back(device);
     }
@@ -370,6 +376,12 @@ bool common_resource_plan_solve(
     candidate.slots = input.slots;
     candidate.ram_capacity_bytes = input.max_ram_bytes;
     candidate.io_staging_bytes = candidate.policy == COMMON_MEMORY_POLICY_STREAM ? input.io_staging_bytes : 0;
+    candidate.expert_prefill_staging_enabled = candidate.policy != COMMON_MEMORY_POLICY_RESIDENT &&
+        input.requested_expert_prefill_staging_bytes_per_device != 0;
+    if (input.require_expert_prefill_staging && !candidate.expert_prefill_staging_enabled) {
+        error = "required expert prefill staging needs a non-resident MoE memory policy";
+        return false;
+    }
 
     uint64_t ram_fixed = input.dense_ram_bytes;
     if (!add_checked(ram_fixed, candidate.io_staging_bytes) ||
@@ -407,35 +419,30 @@ bool common_resource_plan_solve(
         return false;
     }
 
-    bool context_found = false;
-    common_resource_plan best_candidate;
-    for (const auto quality : qualities_descending(input.min_kv_quality)) {
-        if (input.kv_bytes_per_token[quality] == 0) {
-            continue;
-        }
-        uint32_t low = aligned_minimum/alignment;
-        uint32_t high = aligned_ceiling/alignment;
-        uint32_t best = 0;
-        while (low <= high) {
-            const uint32_t middle_units = low + (high - low)/2;
-            const uint32_t middle = middle_units*alignment;
-            common_resource_plan attempt = candidate;
-            if (allocate_context(input, attempt, middle, quality)) {
-                best = middle;
-                low = middle_units + 1;
-            } else {
-                if (middle_units == 0) break;
-                high = middle_units - 1;
+    auto find_context = [&](const common_resource_plan & base, common_resource_plan & best_candidate) {
+        bool context_found = false;
+        for (const auto quality : qualities_descending(input.min_kv_quality)) {
+            if (input.kv_bytes_per_token[quality] == 0) continue;
+            uint32_t low = aligned_minimum/alignment;
+            uint32_t high = aligned_ceiling/alignment;
+            uint32_t best = 0;
+            while (low <= high) {
+                const uint32_t middle_units = low + (high - low)/2;
+                const uint32_t middle = middle_units*alignment;
+                common_resource_plan attempt = base;
+                if (allocate_context(input, attempt, middle, quality)) {
+                    best = middle;
+                    low = middle_units + 1;
+                } else {
+                    if (middle_units == 0) break;
+                    high = middle_units - 1;
+                }
             }
-        }
-        if (best != 0) {
-            common_resource_plan attempt = candidate;
+            if (best == 0) continue;
+            common_resource_plan attempt = base;
             attempt.kv_quality = quality;
             attempt.context = best;
-            if (!allocate_context(input, attempt, best, quality)) {
-                error = "internal resource planning instability";
-                return false;
-            }
+            if (!allocate_context(input, attempt, best, quality)) return false;
             if (!context_found || better_context_choice(
                     input.preference, aligned_ceiling, best, quality,
                     best_candidate.context, best_candidate.kv_quality)) {
@@ -443,9 +450,22 @@ bool common_resource_plan_solve(
                 context_found = true;
             }
         }
+        return context_found;
+    };
+
+    common_resource_plan best_candidate;
+    bool optional_prefill_staging_dropped = false;
+    bool context_found = find_context(candidate, best_candidate);
+    if (!context_found && candidate.expert_prefill_staging_enabled &&
+            !input.require_expert_prefill_staging) {
+        candidate.expert_prefill_staging_enabled = false;
+        optional_prefill_staging_dropped = true;
+        context_found = find_context(candidate, best_candidate);
     }
     if (!context_found) {
-        error = "no context fits without crossing the declared KV quality floor and device reserves";
+        error = input.require_expert_prefill_staging && candidate.expert_prefill_staging_enabled
+            ? "required expert prefill staging does not fit without crossing the context/KV floor or device reserves"
+            : "no context fits without crossing the declared KV quality floor and device reserves";
         return false;
     }
     candidate = std::move(best_candidate);
@@ -521,6 +541,9 @@ bool common_resource_plan_solve(
     candidate.reason = "deterministic " + common_memory_policy_name(candidate.policy) +
         " plan at " + common_kv_quality_name(candidate.kv_quality) +
         " KV quality with explicit per-device reserves";
+    if (optional_prefill_staging_dropped) {
+        candidate.reason += "; optional expert prefill staging disabled to preserve the context/KV floor";
+    }
     plan = std::move(candidate);
     return true;
 }
@@ -827,6 +850,8 @@ std::string common_resource_plan_json(const common_resource_plan & plan) {
     out << ",\"aux_ram_bytes\":" << plan.aux_ram_bytes;
     out << ",\"io_staging_bytes\":" << plan.io_staging_bytes;
     out << ",\"transient_capacity_bytes\":" << plan.transient_capacity_bytes;
+    out << ",\"expert_prefill_staging_enabled\":"
+        << (plan.expert_prefill_staging_enabled ? "true" : "false");
     out << ",\"transient_swap\":" << (plan.transient_swap ? "true" : "false");
     out << ",\"draft_resident\":" << (plan.draft_resident ? "true" : "false");
     out << ",\"reason\":"; json_string(out, plan.reason);
@@ -841,6 +866,7 @@ std::string common_resource_plan_json(const common_resource_plan & plan) {
             << ",\"graph_bytes\":" << device.graph_bytes
             << ",\"kv_bytes\":" << device.kv_bytes
             << ",\"expert_cache_bytes\":" << device.expert_cache_bytes
+            << ",\"expert_prefill_staging_bytes\":" << device.expert_prefill_staging_bytes
             << ",\"transient_bytes\":" << device.transient_bytes
             << ",\"planned_bytes\":" << device.planned_bytes
             << ",\"headroom_bytes\":" << device.headroom_bytes << '}';
