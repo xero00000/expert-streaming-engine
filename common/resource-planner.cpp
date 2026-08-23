@@ -919,6 +919,109 @@ bool common_resource_rebalance_target(
     return true;
 }
 
+bool common_resource_rebalance_preparation_peak(
+        const common_resource_plan & current,
+        const common_resource_plan & target,
+        common_resource_preparation_peak & report,
+        std::string & error) {
+    error.clear();
+    if (current.devices.empty() || current.devices.size() != target.devices.size()) {
+        error = "current and target resource plans have different device topologies";
+        return false;
+    }
+
+    common_resource_preparation_peak candidate;
+    candidate.prepares_kv = current.context != target.context;
+    for (size_t index = 0; index < current.devices.size(); ++index) {
+        const auto & live = current.devices[index];
+        const auto & next = target.devices[index];
+        if (live.id != next.id || live.capacity_bytes != next.capacity_bytes ||
+                live.reserve_bytes != next.reserve_bytes) {
+            error = "runtime rebalance cannot change device topology, capacity, or reserve";
+            return false;
+        }
+        if (live.dense_bytes != next.dense_bytes || live.graph_bytes != next.graph_bytes ||
+                live.expert_prefill_staging_bytes != next.expert_prefill_staging_bytes ||
+                live.transient_bytes != next.transient_bytes) {
+            error = "runtime KV/expert rebalance cannot change immutable device allocations";
+            return false;
+        }
+        candidate.prepares_kv = candidate.prepares_kv || live.kv_bytes != next.kv_bytes;
+        candidate.prepares_expert_cache = candidate.prepares_expert_cache ||
+            live.expert_cache_bytes != next.expert_cache_bytes;
+    }
+
+    candidate.devices.reserve(current.devices.size());
+    for (size_t index = 0; index < current.devices.size(); ++index) {
+        const auto & live = current.devices[index];
+        const auto & next = target.devices[index];
+        if (live.capacity_bytes < live.reserve_bytes) {
+            error = "device capacity is below its immutable reserve";
+            return false;
+        }
+
+        uint64_t current_live = 0;
+        if (!add_checked(current_live, live.dense_bytes) ||
+                !add_checked(current_live, live.graph_bytes) ||
+                !add_checked(current_live, live.kv_bytes) ||
+                !add_checked(current_live, live.expert_cache_bytes) ||
+                !add_checked(current_live, live.expert_prefill_staging_bytes) ||
+                !add_checked(current_live, live.transient_bytes)) {
+            error = "current device plan overflows 64-bit accounting";
+            return false;
+        }
+        uint64_t target_live = 0;
+        if (!add_checked(target_live, next.dense_bytes) ||
+                !add_checked(target_live, next.graph_bytes) ||
+                !add_checked(target_live, next.kv_bytes) ||
+                !add_checked(target_live, next.expert_cache_bytes) ||
+                !add_checked(target_live, next.expert_prefill_staging_bytes) ||
+                !add_checked(target_live, next.transient_bytes)) {
+            error = "target device plan overflows 64-bit accounting";
+            return false;
+        }
+        if (current_live != live.planned_bytes || target_live != next.planned_bytes) {
+            error = "runtime rebalance received stale device planned-byte accounting";
+            return false;
+        }
+
+        const uint64_t usable = live.capacity_bytes - live.reserve_bytes;
+        if (current_live > usable || target_live > usable) {
+            error = "current or target device plan crosses a device reserve";
+            return false;
+        }
+
+        common_resource_device_preparation_peak device;
+        device.id = live.id;
+        device.capacity_bytes = live.capacity_bytes;
+        device.reserve_bytes = live.reserve_bytes;
+        device.current_live_bytes = current_live;
+        device.target_live_bytes = target_live;
+        device.prepared_kv_bytes = candidate.prepares_kv ? next.kv_bytes : 0;
+        device.prepared_expert_cache_bytes = candidate.prepares_expert_cache
+            ? next.expert_cache_bytes : 0;
+        device.peak_bytes = current_live;
+        if (!add_checked(device.peak_bytes, device.prepared_kv_bytes) ||
+                !add_checked(device.peak_bytes, device.prepared_expert_cache_bytes)) {
+            error = "resource preparation peak overflows 64-bit accounting on device " +
+                std::to_string(device.id);
+            return false;
+        }
+        if (device.peak_bytes > usable) {
+            error = "resource preparation peak crosses the reserve/headroom on device " +
+                std::to_string(device.id) + ": requires " +
+                std::to_string(device.peak_bytes) + " bytes with " +
+                std::to_string(usable) + " usable";
+            return false;
+        }
+        device.peak_headroom_bytes = usable - device.peak_bytes;
+        candidate.devices.push_back(device);
+    }
+
+    report = std::move(candidate);
+    return true;
+}
+
 std::string common_resource_plan_json(const common_resource_plan & plan) {
     std::ostringstream out;
     out << '{';
@@ -953,6 +1056,29 @@ std::string common_resource_plan_json(const common_resource_plan & plan) {
             << ",\"transient_bytes\":" << device.transient_bytes
             << ",\"planned_bytes\":" << device.planned_bytes
             << ",\"headroom_bytes\":" << device.headroom_bytes << '}';
+    }
+    out << "]}";
+    return out.str();
+}
+
+std::string common_resource_preparation_peak_json(const common_resource_preparation_peak & report) {
+    std::ostringstream out;
+    out << '{';
+    out << "\"prepares_kv\":" << (report.prepares_kv ? "true" : "false");
+    out << ",\"prepares_expert_cache\":" << (report.prepares_expert_cache ? "true" : "false");
+    out << ",\"devices\":[";
+    for (size_t i = 0; i < report.devices.size(); ++i) {
+        if (i != 0) out << ',';
+        const auto & device = report.devices[i];
+        out << "{\"id\":" << device.id
+            << ",\"capacity_bytes\":" << device.capacity_bytes
+            << ",\"reserve_bytes\":" << device.reserve_bytes
+            << ",\"current_live_bytes\":" << device.current_live_bytes
+            << ",\"target_live_bytes\":" << device.target_live_bytes
+            << ",\"prepared_kv_bytes\":" << device.prepared_kv_bytes
+            << ",\"prepared_expert_cache_bytes\":" << device.prepared_expert_cache_bytes
+            << ",\"peak_bytes\":" << device.peak_bytes
+            << ",\"peak_headroom_bytes\":" << device.peak_headroom_bytes << '}';
     }
     out << "]}";
     return out.str();

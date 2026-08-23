@@ -138,6 +138,27 @@ struct common_resource_rebalance_request {
     uint64_t expert_cache_bytes_per_device = 0;
 };
 
+// Peak device accounting while a runtime rebalance is still failure-atomic.
+// The current live allocation cannot be released until every replacement pool
+// has been prepared, so prepared bytes are additional to current_live_bytes.
+struct common_resource_device_preparation_peak {
+    int id = 0;
+    uint64_t capacity_bytes = 0;
+    uint64_t reserve_bytes = 0;
+    uint64_t current_live_bytes = 0;
+    uint64_t target_live_bytes = 0;
+    uint64_t prepared_kv_bytes = 0;
+    uint64_t prepared_expert_cache_bytes = 0;
+    uint64_t peak_bytes = 0;
+    uint64_t peak_headroom_bytes = 0;
+};
+
+struct common_resource_preparation_peak {
+    bool prepares_kv = false;
+    bool prepares_expert_cache = false;
+    std::vector<common_resource_device_preparation_peak> devices;
+};
+
 struct common_expert_split_input {
     uint32_t misses = 0;
     // Contended costs from a complete, topology-current hardware profile.
@@ -197,6 +218,16 @@ bool common_resource_rebalance_target(
     common_resource_plan & target,
     std::string & error);
 
+// Validate the double-buffer preparation peak for a derived target. A pool is
+// treated as a whole-plan replacement when its context/allocation differs on
+// any device; its complete target allocation is then counted on every device.
+// report is updated only after all devices pass overflow and reserve checks.
+bool common_resource_rebalance_preparation_peak(
+    const common_resource_plan & current,
+    const common_resource_plan & target,
+    common_resource_preparation_peak & report,
+    std::string & error);
+
 bool common_expert_split_solve(
     const common_expert_split_input & input,
     common_expert_split_plan & plan,
@@ -227,6 +258,7 @@ bool common_expert_split_solve_calibrated(
     std::string & error);
 
 std::string common_resource_plan_json(const common_resource_plan & plan);
+std::string common_resource_preparation_peak_json(const common_resource_preparation_peak & report);
 std::string common_memory_policy_name(common_memory_policy policy);
 std::string common_kv_quality_name(common_kv_quality quality);
 std::string common_resource_backend_name(common_resource_backend backend);

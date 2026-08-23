@@ -44,6 +44,30 @@ common_resource_plan_input base_input() {
     return input;
 }
 
+common_resource_plan runtime_plan(
+        uint64_t capacity,
+        uint64_t reserve,
+        uint64_t fixed,
+        uint64_t kv,
+        uint64_t expert,
+        uint32_t context = 4096) {
+    common_resource_plan plan;
+    plan.policy = COMMON_MEMORY_POLICY_CACHE;
+    plan.context = context;
+    plan.slots = 1;
+    common_resource_device_plan device;
+    device.id = 0;
+    device.capacity_bytes = capacity;
+    device.reserve_bytes = reserve;
+    device.dense_bytes = fixed;
+    device.kv_bytes = kv;
+    device.expert_cache_bytes = expert;
+    device.planned_bytes = fixed + kv + expert;
+    device.headroom_bytes = capacity - reserve - device.planned_bytes;
+    plan.devices.push_back(device);
+    return plan;
+}
+
 void test_deterministic_budget_and_json() {
     auto input = base_input();
     common_resource_plan first;
@@ -209,6 +233,77 @@ void test_runtime_rebalance_target_is_pure_and_reserve_bounded() {
     request.expert_cache_bytes_per_device = 0;
     REQUIRE(common_resource_rebalance_target(current, request, target, error));
     for (const auto & device : target.devices) REQUIRE(device.expert_cache_bytes == 0);
+}
+
+void test_preparation_peak_rejects_final_fit_without_double_buffer_headroom() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 40*MiB, 10*MiB);
+    const auto target = runtime_plan(100*MiB, 10*MiB, 10*MiB, 60*MiB, 10*MiB, 8192);
+    REQUIRE(target.devices.front().planned_bytes + target.devices.front().reserve_bytes <=
+            target.devices.front().capacity_bytes);
+
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(error.find("preparation peak crosses") != std::string::npos);
+}
+
+void test_preparation_peak_detects_u64_overflow_without_mutating_report() {
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    const auto current = runtime_plan(maximum, 0, 0, maximum - 5, 0);
+    const auto target = runtime_plan(maximum, 0, 0, maximum - 6, 0, 8192);
+    common_resource_preparation_peak report;
+    report.prepares_expert_cache = true;
+    report.devices.push_back({});
+    std::string error;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(error.find("preparation peak overflows") != std::string::npos);
+    REQUIRE(report.prepares_expert_cache);
+    REQUIRE(report.devices.size() == 1);
+}
+
+void test_preparation_peak_accepts_exact_reserve_boundary() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 10*MiB);
+    const auto target = runtime_plan(100*MiB, 10*MiB, 10*MiB, 50*MiB, 10*MiB, 8192);
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(report.prepares_kv);
+    REQUIRE(!report.prepares_expert_cache);
+    REQUIRE(report.devices.front().current_live_bytes == 40*MiB);
+    REQUIRE(report.devices.front().prepared_kv_bytes == 50*MiB);
+    REQUIRE(report.devices.front().prepared_expert_cache_bytes == 0);
+    REQUIRE(report.devices.front().peak_bytes == 90*MiB);
+    REQUIRE(report.devices.front().peak_headroom_bytes == 0);
+}
+
+void test_preparation_peak_reports_single_pool_replacement() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 10*MiB);
+    const auto target = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 30*MiB);
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(!report.prepares_kv);
+    REQUIRE(report.prepares_expert_cache);
+    REQUIRE(report.devices.front().prepared_kv_bytes == 0);
+    REQUIRE(report.devices.front().prepared_expert_cache_bytes == 30*MiB);
+    REQUIRE(report.devices.front().peak_bytes == 70*MiB);
+    REQUIRE(report.devices.front().peak_headroom_bytes == 20*MiB);
+
+    const std::string json = common_resource_preparation_peak_json(report);
+    REQUIRE(json.find("\"prepares_kv\":false") != std::string::npos);
+    REQUIRE(json.find("\"prepares_expert_cache\":true") != std::string::npos);
+    REQUIRE(json.find("\"peak_headroom_bytes\":20971520") != std::string::npos);
+}
+
+void test_preparation_peak_rejects_combined_cross_pool_trade() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 50*MiB, 10*MiB);
+    const auto target = runtime_plan(100*MiB, 10*MiB, 10*MiB, 10*MiB, 50*MiB, 8192);
+    REQUIRE(current.devices.front().planned_bytes == target.devices.front().planned_bytes);
+
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(error.find("preparation peak crosses") != std::string::npos);
 }
 
 void test_interface_parsers() {
@@ -491,6 +586,11 @@ int main() {
     test_no_silent_fallbacks();
     test_atomic_rollback();
     test_runtime_rebalance_target_is_pure_and_reserve_bounded();
+    test_preparation_peak_rejects_final_fit_without_double_buffer_headroom();
+    test_preparation_peak_detects_u64_overflow_without_mutating_report();
+    test_preparation_peak_accepts_exact_reserve_boundary();
+    test_preparation_peak_reports_single_pool_replacement();
+    test_preparation_peak_rejects_combined_cross_pool_trade();
     test_interface_parsers();
     test_compatibility_presets_and_host_budget();
     test_auto_unlimited_ram_and_minimum_expert_component();
