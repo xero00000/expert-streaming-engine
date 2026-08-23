@@ -24,6 +24,11 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 using clock_type = std::chrono::steady_clock;
@@ -265,7 +270,9 @@ struct device_contention_result {
 struct leased_upload_result {
     std::string backend;
     size_t spec_index = 0;
-    sample_summary statistics;
+    sample_summary warm_statistics;
+    sample_summary cold_statistics;
+    bool cold_available = false;
 };
 
 class leased_expert_upload_probe {
@@ -274,7 +281,8 @@ public:
             const model_expert_spec & spec,
             ggml_backend_t backend,
             ggml_tensor * destination) :
-        bytes_(spec.bytes), backend_(backend), destination_(destination) {
+        bytes_(spec.bytes), data_offset_(spec.data_offset), source_(spec.source),
+        backend_(backend), destination_(destination) {
         using namespace llama_expert_cache;
         constexpr uint32_t source_id = 0;
         const source_identity identity = identify_file_source(spec.source, source_id);
@@ -315,6 +323,23 @@ public:
         return seconds_since(start);
     }
 
+    bool discard_source_pages() const {
+#if defined(__linux__) && defined(POSIX_FADV_DONTNEED)
+        if (data_offset_ > uint64_t(std::numeric_limits<off_t>::max()) ||
+                bytes_ > uint64_t(std::numeric_limits<off_t>::max()) - data_offset_) {
+            return false;
+        }
+        const int fd = ::open(source_.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        const int result = ::posix_fadvise(
+                fd, static_cast<off_t>(data_offset_), static_cast<off_t>(bytes_), POSIX_FADV_DONTNEED);
+        ::close(fd);
+        return result == 0;
+#else
+        return false;
+#endif
+    }
+
     void validate(size_t expected_reads) const {
         using namespace llama_expert_cache;
         const cache_stats stats = cache_->stats();
@@ -327,6 +352,8 @@ public:
 
 private:
     size_t bytes_;
+    uint64_t data_offset_;
+    std::string source_;
     ggml_backend_t backend_;
     ggml_tensor * destination_;
     std::shared_ptr<llama_expert_cache::file_source> file_;
@@ -334,22 +361,46 @@ private:
     std::unique_ptr<llama_expert_cache::ram_cache> cache_;
 };
 
-sample_summary measure_leased_expert_upload(
+struct leased_upload_measurements {
+    sample_summary warm;
+    sample_summary cold;
+    bool cold_available = false;
+};
+
+leased_upload_measurements measure_leased_expert_upload(
         const model_expert_spec & spec,
         ggml_backend_t backend,
         ggml_tensor * destination,
         int iterations) {
     leased_expert_upload_probe probe(spec, backend, destination);
-    // Planner calibration models recurring decode misses. Keep the cold-start
-    // distribution separate instead of mixing first-use initialization into
-    // a steady-state series and inflating its dispersion.
-    probe.measure_once();
-    std::vector<double> samples;
+    size_t reads = 0;
+    std::vector<double> cold_samples;
     for (int i = 0; i < iterations; ++i) {
-        samples.push_back(probe.measure_once());
+        if (!probe.discard_source_pages()) {
+            cold_samples.clear();
+            break;
+        }
+        cold_samples.push_back(probe.measure_once());
+        ++reads;
     }
-    probe.validate(size_t(iterations) + 1);
-    return summarize(samples);
+
+    // Planner calibration models recurring decode misses. Preserve a separate
+    // warm steady-state series so storage-cold variance cannot drive policy.
+    probe.measure_once();
+    ++reads;
+    std::vector<double> warm_samples;
+    for (int i = 0; i < iterations; ++i) {
+        warm_samples.push_back(probe.measure_once());
+        ++reads;
+    }
+    probe.validate(reads);
+    leased_upload_measurements result;
+    result.warm = summarize(warm_samples);
+    if (!cold_samples.empty()) {
+        result.cold = summarize(cold_samples);
+        result.cold_available = true;
+    }
+    return result;
 }
 
 cpu_moe_result measure_cpu_moe(
@@ -862,12 +913,15 @@ int main(int argc, char ** argv) {
                         allocation_bytes, lease_backend_name, ordinal);
                 if (!lease_probe.backend) break;
                 for (size_t spec_index = 0; spec_index < opts.model_experts.size(); ++spec_index) {
+                    const leased_upload_measurements measured = measure_leased_expert_upload(
+                            opts.model_experts[spec_index], lease_probe.backend,
+                            lease_probe.tensor, opts.iterations);
                     leased_uploads.push_back({
                             lease_backend_name,
                             spec_index,
-                            measure_leased_expert_upload(
-                                    opts.model_experts[spec_index], lease_probe.backend,
-                                    lease_probe.tensor, opts.iterations)});
+                            measured.warm,
+                            measured.cold,
+                            measured.cold_available});
                 }
             }
         }
@@ -888,8 +942,8 @@ int main(int argc, char ** argv) {
         }
         for (const auto & result : leased_uploads) {
             planner_ready = planner_ready && confident(
-                    result.statistics.confidence,
-                    result.statistics.relative_standard_error);
+                    result.warm_statistics.confidence,
+                    result.warm_statistics.relative_standard_error);
         }
         for (const auto & device : device_contentions) {
             planner_ready = planner_ready &&
@@ -1120,7 +1174,7 @@ int main(int argc, char ** argv) {
                     if (i) std::cout << ", ";
                     const auto & result = leased_uploads[i];
                     const auto & spec = opts.model_experts[result.spec_index];
-                    const auto & stats = result.statistics;
+                    const auto & stats = result.warm_statistics;
                     std::cout << "{\"backend\": \"" << json_escape(result.backend)
                               << "\", \"storage_backend\": \"pread\", \"distribution\": \"warm-steady-state\""
                               << ", \"ggml_type_id\": " << spec.type
@@ -1137,6 +1191,40 @@ int main(int argc, char ** argv) {
                               << ", \"confidence\": " << stats.confidence << "}";
                 }
                 std::cout << "]";
+
+                const bool any_cold = std::any_of(
+                        leased_uploads.begin(), leased_uploads.end(),
+                        [](const leased_upload_result & result) { return result.cold_available; });
+                const bool all_cold = std::all_of(
+                        leased_uploads.begin(), leased_uploads.end(),
+                        [](const leased_upload_result & result) { return result.cold_available; });
+                std::cout << ", \"cold_lease_upload_profiles\": [";
+                bool first_cold = true;
+                for (const auto & result : leased_uploads) {
+                    if (!result.cold_available) continue;
+                    if (!first_cold) std::cout << ", ";
+                    first_cold = false;
+                    const auto & spec = opts.model_experts[result.spec_index];
+                    const auto & stats = result.cold_statistics;
+                    std::cout << "{\"backend\": \"" << json_escape(result.backend)
+                              << "\", \"storage_backend\": \"pread\", \"distribution\": \"page-cache-cold\""
+                              << ", \"cache_drop_method\": \"posix_fadvise_dontneed\""
+                              << ", \"ggml_type_id\": " << spec.type
+                              << ", \"ggml_type\": \"" << ggml_type_name(static_cast<ggml_type>(spec.type))
+                              << "\", \"input_width\": " << spec.input_width
+                              << ", \"expert_width\": " << spec.expert_width
+                              << ", \"expert_count\": " << spec.expert_count
+                              << ", \"bytes_per_expert_component\": " << spec.bytes
+                              << ", \"end_to_end_ms_median\": " << stats.median * 1000.0
+                              << ", \"end_to_end_gbps_median\": " << gbps(spec.bytes, stats.median)
+                              << ", \"sample_count\": " << stats.count
+                              << ", \"coefficient_variation\": " << stats.coefficient_variation
+                              << ", \"relative_standard_error\": " << stats.relative_standard_error
+                              << ", \"confidence\": " << stats.confidence << "}";
+                }
+                std::cout << "]"
+                          << ", \"cold_distribution_status\": \""
+                          << (all_cold ? "measured" : any_cold ? "partial" : "unavailable") << "\"";
             }
         } else {
             std::cout << "\"status\": \"unavailable\", \"reason\": \"no CUDA backend\"";

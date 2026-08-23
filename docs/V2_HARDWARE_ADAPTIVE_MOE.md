@@ -32,7 +32,7 @@ Profiles default to `~/.cache/ese/hardware-profile.json`. They are versioned, wr
 | H2D/D2H | `ggml_backend_tensor_set/get` on every detected CUDA backend | No; needs confidence scoring |
 | H2D under host-memory contention | Per-device CUDA upload concurrent with host copy | No; baseline only |
 | CPU MoE | Real `ggml_mul_mat_id` over two actual GGUF expert payloads for every discovered type/geometry, checked against both single-thread execution and an independently dequantized scalar matvec | No; requires sufficiently confident samples for every format |
-| Adaptive expert-cache upload | Warm steady-state real split-GGUF payload read through a bounded production RAM-cache lease, uploaded with the production async primitive on every CUDA backend, synchronized while the lease is held, then released | No; still needs a separately labeled cold distribution and live scheduler route/event timing |
+| Adaptive expert-cache upload | Separate page-cache-cold and warm steady-state real split-GGUF payload distributions read through a bounded production RAM-cache lease, uploaded with the production async primitive on every CUDA backend, synchronized while the lease is held, then released | No; still needs live scheduler route/event timing |
 | CPU MoE + cache upload contention | Per-device concurrent model-format routed matvec and warm steady-state exact `pread` → bounded RAM lease → production async upload path | No; still needs a separately labeled cold distribution and the live scheduler's route/event timing |
 
 The planner must not consume Phase A data until the last two rows use their production paths and results are keyed by expert GGML type, geometry, GPU, and NUMA node.
@@ -44,6 +44,12 @@ The native resource planner now has a pure integer split solver for calibrated d
 A native calibration table parser now independently rejects forged readiness, missing or duplicated device/format coverage, incomplete exact-lease evidence, low confidence, and invalid numerical-reference evidence. Accepted entries are keyed by CUDA backend, GGML type, input width, expert width, and component byte size and expose explicit CPU/upload nanoseconds per expert component. A calibrated split entry point fails closed if any component is missing, sums all components required by one routed expert, then applies the integer solver and hysteresis. The launcher owns topology-fingerprint freshness checks and now mirrors the integer solver to select a conservative split across every calibrated GPU and distinct model layer layout. It passes that result to the native decode graph only for a genuinely mixed plan.
 
 Each timed series records its sample count, raw coefficient of variation, robust relative standard error of the median, and a confidence score combining seven-sample coverage with that uncertainty. The median absolute deviation estimator resists isolated scheduler/interrupt outliers but still penalizes broad or bimodal samples. The profile gate requires at least `0.80` confidence for both CPU and upload on every device/format. Changing the provenance flag alone cannot bypass missing model-backed or per-device evidence.
+
+On Linux, cold upload calibration advises the kernel to discard the exact expert
+extent with `POSIX_FADV_DONTNEED` before every sample and labels the resulting
+series `page-cache-cold`. Platforms that cannot provide that operation report
+the cold series as unavailable; the warm planner series remains present and is
+the only distribution consumed by automatic split selection.
 
 ### Remaining Phase A gate
 
