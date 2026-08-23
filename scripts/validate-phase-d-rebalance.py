@@ -357,6 +357,11 @@ def validate_expert_success(args: argparse.Namespace) -> dict:
             for item in initial_stats["devices"]
             if item["resident_bytes"] > 0
         }
+        reconcile = rebalance_expert(port, initial, False)
+        if reconcile.get("scope") != "expert-cache-only" or reconcile.get("mutated") is not False:
+            raise RuntimeError("explicit same-target expert-cache reconciliation was suppressed")
+        if require_expert_capacity(resources(port), initial, True) != initial_stats:
+            raise RuntimeError("same-target reconciliation changed a realized expert cache")
         combined = request_json(
             f"http://127.0.0.1:{port}/v1/ese/resources/rebalance",
             {
@@ -403,6 +408,10 @@ def validate_expert_success(args: argparse.Namespace) -> dict:
         if disable.get("status") != "committed" or disable.get("scope") != "expert-cache-only":
             raise RuntimeError("expert-cache disable transaction did not commit")
         disabled_stats = require_expert_capacity(resources(port), 0, False)
+        disable_again = rebalance_expert(port, 0, False)
+        if disable_again.get("scope") != "expert-cache-only" or disable_again.get("mutated") is not False:
+            raise RuntimeError("repeated explicit zero was not handled as an owner-thread no-op")
+        require_expert_capacity(resources(port), 0, False)
         after_disable = completion(port, args.predict, args.request_timeout)
 
         enable = rebalance_expert(port, initial, False)

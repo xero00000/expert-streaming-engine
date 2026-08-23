@@ -10693,7 +10693,6 @@ bool llama_expert_cache_resize(
         struct llama_context * ctx,
         uint64_t bytes_per_device) {
     if (ctx == nullptr) return false;
-    if (bytes_per_device == ctx->cparams.expert_vram_cache_bytes) return true;
 
     llama_synchronize(ctx);
     if (!ggml_backend_sched_replace_expert_cache(

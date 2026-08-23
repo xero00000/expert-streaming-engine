@@ -1638,7 +1638,7 @@ bool ggml_backend_sched_get_resource_device_stats(
         const auto & prefill = sched->expert_prefill_devices[backend_id];
         stats[backend_id] = {
             int32_t(backend_id),
-            sched->active_expert_cache_capacity_bytes,
+            cache.ready ? cache.capacity_bytes : 0,
             cache.ready ? cache.allocated_bytes : 0,
             resident_bytes,
             sched->expert_prefill_staging_capacity_bytes,
@@ -2574,6 +2574,46 @@ static bool ggml_active_expert_cache_materialize_layout(
     return true;
 }
 
+static bool ggml_active_expert_cache_target_is_realized(
+        ggml_backend_sched_t sched,
+        uint64_t bytes_per_device) {
+    if (bytes_per_device == 0) {
+        if (sched->active_expert_cache_slots != 0) return false;
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            if (ggml_backend_is_cpu(sched->backends[backend_id])) continue;
+            const auto & cache = sched->active_expert_caches[backend_id];
+            if (cache.ready || cache.allocated_bytes != 0) return false;
+        }
+        return true;
+    }
+    if (sched->n_backends <= 1 || sched->active_expert_cache_slots == 0) return false;
+    for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+        if (ggml_backend_is_cpu(sched->backends[backend_id])) continue;
+        const auto & cache = sched->active_expert_caches[backend_id];
+        if (!cache.ready || cache.capacity_bytes != bytes_per_device ||
+                cache.allocated_bytes > bytes_per_device ||
+                cache.ids_tensors.size() < sched->active_expert_cache_route_capacity) {
+            return false;
+        }
+        for (size_t component = 0;
+                component < sched->active_expert_cache_layout_catalog.size(); ++component) {
+            for (const auto & descriptor : sched->active_expert_cache_layout_catalog[component]) {
+                ggml_tensor source = {};
+                if (!ggml_active_expert_cache_materialize_layout(descriptor, &source) ||
+                        std::none_of(
+                            cache.components[component].layouts.begin(),
+                            cache.components[component].layouts.end(),
+                            [&](const ggml_tensor * layout) {
+                                return ggml_active_expert_cache_same_layout(layout, &source);
+                            })) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static bool ggml_backend_sched_replace_expert_cache_impl(
         ggml_backend_sched_t sched,
         uint64_t bytes_per_device,
@@ -2583,7 +2623,8 @@ static bool ggml_backend_sched_replace_expert_cache_impl(
     minimum_observations = std::max<uint32_t>(1, minimum_observations);
     if (sched->active_expert_cache_capacity_bytes == bytes_per_device &&
             sched->active_expert_cache_reserve_bytes == reserve_bytes_per_device &&
-            sched->active_expert_cache_min_observations == minimum_observations) {
+            sched->active_expert_cache_min_observations == minimum_observations &&
+            ggml_active_expert_cache_target_is_realized(sched, bytes_per_device)) {
         return true;
     }
 

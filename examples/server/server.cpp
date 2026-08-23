@@ -1061,7 +1061,13 @@ int main(int argc, char ** argv) {
                 return;
             }
 
-            if (!context_change && !expert_cache_change) {
+            // An explicit same-plan expert target is a reconciliation request:
+            // the owner thread must verify realized per-device allocations
+            // (and an explicit zero must disable legacy slot mode) instead of
+            // trusting only the serialized policy.
+            const bool expert_cache_operation = expert_cache_change ||
+                    (request.set_expert_cache_bytes_per_device && !context_change);
+            if (!context_change && !expert_cache_operation) {
                 res_ok(res, {
                     {"status", "committed"},
                     {"dry_run", false},
@@ -1073,8 +1079,8 @@ int main(int argc, char ** argv) {
                 return;
             }
 
-            const std::string scope = expert_cache_change ? "expert-cache-only" : "kv-only";
-            target.reason = expert_cache_change
+            const std::string scope = expert_cache_operation ? "expert-cache-only" : "kv-only";
+            target.reason = expert_cache_operation
                 ? "idle-only prepared expert-cache replacement target"
                 : "idle-only runtime KV rebalance target";
             target_json = json::parse(common_resource_plan_json(target));
