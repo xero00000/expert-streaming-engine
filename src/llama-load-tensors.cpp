@@ -5000,7 +5000,8 @@ bool create_tensors_helper::create_tensors() {
             throw std::runtime_error("unknown architecture");
     }
 
-    if (getenv("GGML_CUDA_NO_PINNED") == nullptr) {
+    if (getenv("GGML_CUDA_NO_PINNED") == nullptr &&
+            getenv("GGML_CUDA_NO_MODEL_PINNED") == nullptr) {
         use_mmap_buffer &= !has_buft_overrides;
     }
 

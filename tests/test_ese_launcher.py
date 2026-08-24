@@ -610,7 +610,8 @@ class LauncherTests(unittest.TestCase):
             prefetch_tail=4,
             expert_storage_backend="mmap",
         )
-        self.assertEqual(plan.environment["GGML_CUDA_NO_PINNED"], "1")
+        self.assertEqual(plan.environment["GGML_CUDA_NO_MODEL_PINNED"], "1")
+        self.assertNotIn("GGML_CUDA_NO_PINNED", plan.environment)
         self.assertEqual(plan.environment["LLAMA_EXPERT_PREFETCH"], "1")
         self.assertEqual(plan.environment["LLAMA_EXPERT_PREFETCH_TAIL"], "4")
         self.assertIn("--defer-experts", plan.arguments)

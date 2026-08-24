@@ -1195,7 +1195,10 @@ def build_launch_plan(
     elif selected_policy in ("cache", "stream"):
         if not model.is_moe:
             raise ESEError(f"--policy {selected_policy} requires a sparse MoE model")
-        env["GGML_CUDA_NO_PINNED"] = "1"
+        # Streaming must not pin the model's potentially enormous CPU tensor
+        # storage. Keep bounded exact CUDA staging available independently;
+        # GGML_CUDA_NO_PINNED remains the user's global emergency kill switch.
+        env["GGML_CUDA_NO_MODEL_PINNED"] = "1"
         backend = expert_storage_backend or ("pread" if selected_policy == "stream" else "mmap")
         if hybrid_gpu_experts and backend != "pread":
             hybrid_gpu_experts = 0

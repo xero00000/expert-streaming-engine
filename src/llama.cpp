@@ -915,7 +915,7 @@ ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer) {
 
 #if defined(GGML_USE_CUDA)
     // host buffers should only be used when data is expected to be copied to/from the GPU
-    if (host_buffer) {
+    if (host_buffer && getenv("GGML_CUDA_NO_MODEL_PINNED") == nullptr) {
         buft = ggml_backend_cuda_host_buffer_type();
     }
 #elif defined(GGML_USE_SYCL)
