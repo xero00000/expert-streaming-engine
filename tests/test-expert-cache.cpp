@@ -754,6 +754,14 @@ void test_cuda_compact_remap_exact_parity() {
             backend, compact_weights, n_used, n_experts, remapped, input_values);
     REQUIRE(compact == full);
 
+    // Frontier MoE models can expose hundreds of logical experts while the
+    // bounded cache keeps only the routed experts resident.  The redirected
+    // tensor must accept that compact physical geometry after ids are remapped.
+    constexpr int64_t large_logical_experts = 256;
+    const auto compact_large_logical = compute_cuda_mul_mat_id(
+            backend, compact_weights, n_used, large_logical_experts, remapped, input_values);
+    REQUIRE(compact_large_logical == full);
+
     // A capacity-sized cache may retain entries from multiple logical layers,
     // so a remapped slot can be greater than the model's expert count.  The
     // redirected tensor must expose the physical slot geometry to the kernel.

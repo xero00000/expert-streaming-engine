@@ -2549,7 +2549,13 @@ static void ggml_active_expert_cache_redirect_input(
         void * cache_data,
         ggml_backend_buffer_t cache_buffer,
         int64_t physical_experts) {
-    GGML_ASSERT(physical_experts >= logical_source->ne[2]);
+    // Decode routes use compact cache-local expert ids.  The physical cache
+    // can therefore contain far fewer slots than the model's logical expert
+    // count (for example 64 resident slots for a 256-expert MoE).  Prefill
+    // still supplies the full logical tensor, while both paths require a
+    // non-empty expert dimension.
+    GGML_ASSERT(physical_experts > 0);
+    GGML_ASSERT(logical_source->ne[2] > 0);
     for (const auto & redirect : sched->active_expert_redirects) {
         if (redirect.input_cpy == input_cpy) {
             input_cpy->data = cache_data;
