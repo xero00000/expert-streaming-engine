@@ -464,6 +464,8 @@ class NativeSurfaceTests(unittest.TestCase):
             "exact_prior_mtp_restored",
             "multimodal_committed",
             "validate_deferred_multimodal_cancel",
+            "socket.SO_LINGER",
+            'struct.pack("ii", 1, 0)',
             "require_zero_transient_ownership",
             "cancelled_before_launch",
             "text_rebuilt_fresh_mtp_owner",

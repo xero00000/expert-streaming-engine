@@ -15,6 +15,7 @@ import json
 import os
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -410,8 +411,16 @@ def open_cancellable_json_request(
 
 
 def close_cancellable_request(connection: socket.socket) -> None:
+    # A graceful FIN after a complete HTTP request only says the client will
+    # send no more bytes; the peer can still legally finish the response.  Use
+    # an abortive close so this gate models an actual browser/client request
+    # cancellation and the server observes the disconnect before responding.
     try:
-        connection.shutdown(socket.SHUT_RDWR)
+        connection.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_LINGER,
+            struct.pack("ii", 1, 0),
+        )
     except OSError:
         pass
     connection.close()
