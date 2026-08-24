@@ -1209,9 +1209,9 @@ struct ggml_backend_sched_split {
 //
 // The CUDA MoE kernels already index experts via the I32 top-k tensor.  For a
 // cache hit (or a newly staged miss), we provide a compact replacement ID tensor
-// and point the temporary input at the cache buffer.  Its logical 128-expert
-// layout remains unchanged, but all active IDs are in the small cache-slot
-// range, so CUDA never dereferences the unused tail of the logical tensor.
+// and point the temporary input at the cache buffer.  The redirected tensor
+// exposes the cache's physical slot width, which may be smaller or larger than
+// one layer's logical expert count, and CUDA sees only remapped physical IDs.
 enum ggml_active_expert_cache_component {
     GGML_ACTIVE_EXPERT_CACHE_GATE = 0,
     GGML_ACTIVE_EXPERT_CACHE_UP   = 1,
@@ -2069,7 +2069,10 @@ static int ggml_active_expert_cache_slots_for_policy(
     const uint64_t payload_bytes = capacity_bytes > GGML_ACTIVE_EXPERT_CACHE_BASE_ID_BYTES
             ? capacity_bytes - GGML_ACTIVE_EXPERT_CACHE_BASE_ID_BYTES : 0;
     const uint64_t slots = payload_bytes/expert_set_bytes;
-    return int(std::min<uint64_t>(std::min<uint64_t>(slots, 64), uint64_t(source->ne[2])));
+    // Physical cache slots are shared by (layer, expert) entries.  Limiting
+    // them to the number of logical experts makes a capacity-sized cache hold
+    // only one layer and forces deterministic cross-layer thrashing.
+    return int(std::min<uint64_t>(slots, 64));
 }
 
 static int ggml_active_expert_cache_slots_for(
@@ -2202,12 +2205,11 @@ static bool ggml_active_expert_cache_init_for_policy(
         if (expert_set_bytes == 0) return false;
         const uint64_t payload_bytes = cache.capacity_bytes > cache.ids_bytes
                 ? cache.capacity_bytes - cache.ids_bytes : 0;
-        cache.slots = int(std::min<uint64_t>(64, std::min<uint64_t>(
-                source->ne[2], payload_bytes/expert_set_bytes)));
+        cache.slots = int(std::min<uint64_t>(64, payload_bytes/expert_set_bytes));
     }
 
     if (cache.slots < 1 || cache.slots > 64 || ggml_backend_is_cpu(sched->backends[backend_id]) ||
-            source->ne[2] < cache.slots || source->nb[2] == 0) {
+            (policy.capacity_bytes == 0 && source->ne[2] < cache.slots) || source->nb[2] == 0) {
         return false;
     }
 
@@ -2545,13 +2547,15 @@ static void ggml_active_expert_cache_redirect_input(
         ggml_tensor * input_cpy,
         const ggml_tensor * logical_source,
         void * cache_data,
-        ggml_backend_buffer_t cache_buffer) {
+        ggml_backend_buffer_t cache_buffer,
+        int64_t physical_experts) {
+    GGML_ASSERT(physical_experts >= logical_source->ne[2]);
     for (const auto & redirect : sched->active_expert_redirects) {
         if (redirect.input_cpy == input_cpy) {
             input_cpy->data = cache_data;
             input_cpy->buffer = cache_buffer;
-            input_cpy->ne[2] = logical_source->ne[2];
-            input_cpy->nb[3] = logical_source->nb[3];
+            input_cpy->ne[2] = physical_experts;
+            input_cpy->nb[3] = logical_source->nb[2]*size_t(physical_experts);
             return;
         }
     }
@@ -2568,8 +2572,8 @@ static void ggml_active_expert_cache_redirect_input(
     });
     input_cpy->data = cache_data;
     input_cpy->buffer = cache_buffer;
-    input_cpy->ne[2] = logical_source->ne[2];
-    input_cpy->nb[3] = logical_source->nb[3];
+    input_cpy->ne[2] = physical_experts;
+    input_cpy->nb[3] = logical_source->nb[2]*size_t(physical_experts);
 }
 
 static void ggml_active_expert_cache_reset_pass(ggml_backend_sched_t sched) {
@@ -3555,7 +3559,7 @@ static bool ggml_active_expert_cache_stage(
     }
 
     ggml_active_expert_cache_redirect_input(
-            sched, input_cpy, input, component.tensor->data, component.tensor->buffer);
+            sched, input_cpy, input, component.tensor->data, component.tensor->buffer, route->cache->slots);
     ggml_active_expert_cache_redirect_ids(sched, node, ids_index, ids_source, route->mapped_ids);
     route->cache->used_this_pass = true;
     return true;
@@ -3934,7 +3938,7 @@ static bool ggml_expert_prefill_stage(
         lane.transfers_queued = false;
     }
     ggml_active_expert_cache_redirect_input(
-            sched, input_cpy, input, lane_base + component_offset, lane.buffer);
+            sched, input_cpy, input, lane_base + component_offset, lane.buffer, input->ne[2]);
     device.used_this_split[lane_index] = true;
     return true;
 }

@@ -581,9 +581,9 @@ std::vector<float> compute_cuda_mul_mat_id(
     ggml_backend_tensor_set(input, input_values.data(), 0, input_values.size()*sizeof(input_values[0]));
     ggml_backend_tensor_set(ids, route.data(), 0, sizeof(route));
 
-    // The scheduler keeps the model's logical expert count while redirecting
-    // the tensor data pointer to a smaller slot buffer.  Reproduce that exact
-    // layout, including the original fourth-dimension stride.
+    // Reproduce the scheduler's redirected tensor geometry.  A compact cache
+    // can expose either the model's logical width or a larger capacity-sized
+    // physical slot width, including its matching fourth-dimension stride.
     tensor_weights->ne[2] = logical_experts;
     tensor_weights->nb[3] = tensor_weights->nb[2]*size_t(logical_experts);
 
@@ -754,6 +754,20 @@ void test_cuda_compact_remap_exact_parity() {
             backend, compact_weights, n_used, n_experts, remapped, input_values);
     REQUIRE(compact == full);
 
+    // A capacity-sized cache may retain entries from multiple logical layers,
+    // so a remapped slot can be greater than the model's expert count.  The
+    // redirected tensor must expose the physical slot geometry to the kernel.
+    constexpr int64_t extended_slots = 10;
+    const std::array<int32_t, n_used> extended_route = {{ 8, 9 }};
+    std::vector<ggml_fp16_t> extended_weights(size_t(k*m*extended_slots), ggml_fp32_to_fp16(0.0f));
+    for (int slot = 0; slot < n_used; ++slot) {
+        std::copy_n(full_weights.data() + size_t(route[slot])*size_t(k*m), size_t(k*m),
+                extended_weights.data() + size_t(extended_route[slot])*size_t(k*m));
+    }
+    const auto extended = compute_cuda_mul_mat_id(
+            backend, extended_weights, extended_slots, extended_slots, extended_route, input_values);
+    REQUIRE(extended == full);
+
     // Negative route sentinels turn unassigned route positions into exact
     // zeroes. This permits independent CPU and GPU branches to execute on the
     // same activation and sum back to the unsplit routed result.
@@ -800,6 +814,21 @@ void test_cuda_compact_remap_exact_parity() {
     const auto compact_fused = compute_cuda_fused_moe(
             backend, compact_fused_up, compact_fused_gate, n_used, n_experts, remapped, fused_input);
     REQUIRE(compact_fused == full_fused);
+
+    std::vector<ggml_fp16_t> extended_fused_up(
+            size_t(fused_k*fused_m*extended_slots), ggml_fp32_to_fp16(0.0f));
+    std::vector<ggml_fp16_t> extended_fused_gate(
+            size_t(fused_k*fused_m*extended_slots), ggml_fp32_to_fp16(0.0f));
+    for (int slot = 0; slot < n_used; ++slot) {
+        std::copy_n(full_fused_up.data() + size_t(route[slot])*size_t(fused_k*fused_m), size_t(fused_k*fused_m),
+                extended_fused_up.data() + size_t(extended_route[slot])*size_t(fused_k*fused_m));
+        std::copy_n(full_fused_gate.data() + size_t(route[slot])*size_t(fused_k*fused_m), size_t(fused_k*fused_m),
+                extended_fused_gate.data() + size_t(extended_route[slot])*size_t(fused_k*fused_m));
+    }
+    const auto extended_fused = compute_cuda_fused_moe(
+            backend, extended_fused_up, extended_fused_gate,
+            extended_slots, extended_slots, extended_route, fused_input);
+    REQUIRE(extended_fused == full_fused);
 }
 
 void test_hybrid_runtime_guard_is_one_way_and_fail_closed() {
