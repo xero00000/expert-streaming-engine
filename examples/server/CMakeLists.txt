@@ -85,6 +85,8 @@ if (LLAMA_BUILD_TESTS)
     add_executable(test-server-tokens
         ../../tests/test-server-tokens.cpp
         server-common.cpp
+        server-chat.cpp
+        server-task.cpp
     )
     target_include_directories(test-server-tokens PRIVATE
         ${CMAKE_SOURCE_DIR}

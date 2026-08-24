@@ -1,4 +1,5 @@
 #include "server-common.h"
+#include "server-task.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -25,6 +26,35 @@ static mtmd_input_chunk * make_image_chunk() {
         }},
     };
     return mtmd_input_chunk_from_json(chunk_json);
+}
+
+static void test_protocol_stop_reasons() {
+    server_task_result_cmpl_final result {};
+    result.stop = true;
+    result.stream = false;
+    result.n_decoded = 4;
+    result.n_prompt_tokens = 8;
+
+    result.termination = STOP_TYPE_LIMIT;
+    CHECK(result.to_json_oaicompat_final()["choices"][0]["finish_reason"] == "length");
+    CHECK(result.to_json_oaicompat_chat_final()["choices"][0]["finish_reason"] == "length");
+    CHECK(result.to_json_oaicompat_chat_stream().back()["choices"][0]["finish_reason"] == "length");
+    CHECK(result.to_json_anthropic_final()["stop_reason"] == "max_tokens");
+    CHECK(result.to_json_anthropic_stream()[0]["data"]["delta"]["stop_reason"] == "max_tokens");
+
+    result.termination = STOP_TYPE_EOS;
+    CHECK(result.to_json_oaicompat_final()["choices"][0]["finish_reason"] == "stop");
+    CHECK(result.to_json_oaicompat_chat_final()["choices"][0]["finish_reason"] == "stop");
+    CHECK(result.to_json_oaicompat_chat_stream().back()["choices"][0]["finish_reason"] == "stop");
+    CHECK(result.to_json_anthropic_final()["stop_reason"] == "end_turn");
+    CHECK(result.to_json_anthropic_stream()[0]["data"]["delta"]["stop_reason"] == "end_turn");
+
+    result.termination = STOP_TYPE_WORD;
+    result.stopping_word = "DONE";
+    CHECK(result.to_json_anthropic_stream().back()["event"] == "message_stop");
+    const json anthropic = result.to_json_anthropic_final();
+    CHECK(anthropic["stop_reason"] == "end_turn");
+    CHECK(anthropic["stop_sequence"] == "DONE");
 }
 
 int main() {
@@ -77,6 +107,8 @@ int main() {
     CHECK(tokens.empty());
     CHECK(!tokens.has_mtmd_data());
 
-    std::cout << "server token media-prefix tests: PASS\n";
+    test_protocol_stop_reasons();
+
+    std::cout << "server token and protocol stop-reason tests: PASS\n";
     return 0;
 }

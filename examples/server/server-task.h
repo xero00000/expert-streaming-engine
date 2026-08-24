@@ -164,6 +164,7 @@ struct server_task_result {
     json data;
 
     bool stop;
+    enum stop_type termination = STOP_TYPE_NONE;
     bool error;
     bool final_result = false;
     result_timings timings;

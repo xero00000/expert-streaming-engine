@@ -3035,6 +3035,10 @@ void server_context::send_final_response(server_slot& slot) {
     res->index = slot.task->index;
     res->error = false;
     res->stop = true; // to do: set value
+    res->termination = slot.stopped_word ? STOP_TYPE_WORD
+        : slot.stopped_eos              ? STOP_TYPE_EOS
+        : slot.stopped_limit            ? STOP_TYPE_LIMIT
+                                        : STOP_TYPE_NONE;
     res->stream = slot.params.stream;
     res->include_usage = slot.params.include_usage;
     res->content = slot.generated_text;
