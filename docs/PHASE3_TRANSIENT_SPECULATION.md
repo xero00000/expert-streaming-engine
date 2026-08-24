@@ -10,21 +10,24 @@ vocabulary.
 
 ## Failure-atomic transient transactions
 
-`common_transient_module_manager` owns residency state and per-device budgets. A
-transaction performs these steps while holding the residency lock:
+`common_transient_module_manager` owns residency state and per-device budgets.
+Request and policy changes use prepared exact-owner transactions:
 
 1. validate every requested module and reserve capacity on every affected device;
 2. retain the configured device safety margin;
 3. select least-recently-used victims without changing backend state;
-4. quiesce callbacks only for affected modules;
-5. deactivate victims and activate the requested set;
-6. run the request body;
-7. restore the exact prior residency when requested; and
-8. resume the affected streams in reverse order.
+4. prepare complete off-side owners while the live owners remain usable;
+5. quiesce only affected modules and publish by no-allocation owner swaps;
+6. pin every overlapping consumer into one residency epoch;
+7. roll the epoch back only when every consumer fails or requests restoration,
+   otherwise finalize it and retire the old owners; and
+8. resume affected streams in reverse order.
 
-Reservation failure runs no module callback. Activation or request failure rolls
-back activated modules and restores every displaced module. Callbacks are required
-to be idempotent and to return failure without changing their prior state.
+Reservation or preparation failure leaves live owners untouched. Partial
+publication reverses earlier swaps before returning. Once a published owner set
+is visible, rollback and finalization are invariants: a callback failure is
+fail-stop rather than exposing a mixed or unowned module set. Value-only policy
+metadata and exact MTP/mmproj owners survive scratch-graph and request lifetimes.
 
 Structured telemetry reports transactions, swaps, rollbacks, failures, OOM
 rejections, bytes moved, cumulative swap latency, current resident modules, and
@@ -50,6 +53,21 @@ simultaneous transient residency. A request lease is acquired before slot launch
 and released with that slot on success, cancellation, or failure. Multimodal prompt
 parsing holds an overlapping projector lease so another HTTP worker cannot evict
 the context while it creates media chunks.
+
+Pre-tokenization owner changes are routed through the inference owner thread.
+Each HTTP batch transfers one lease group into its queued tasks: no launched task
+restores the exact prior owner, while any launched task commits the new owner so a
+stale MTP cache cannot be paired with a changed target context. Overlapping image
+requests share that decision through a residency epoch. Temporary contention is
+deferred until a slot or residency change wakes it. Parse, launch, cancellation,
+and graceful-shutdown paths resolve every pin before backend teardown.
+
+Runtime policy is explicit: `off`, `shared`, `mtp-only`, or
+`multimodal-only`. The resource controller prepares a complete policy candidate,
+publishes it with KV/expert transactions when requested, and exposes the policy,
+configured bounds, residency, pins, transactions, swaps, rollback count, and
+latency through `/v1/ese/resources`. `/props` publishes modality capability with
+the same mutex-protected plan snapshot.
 
 Plain server operation is unchanged when the budget is zero. Admission rejects a
 module estimate that exceeds `budget - reserve`; backend allocation failure is
@@ -101,6 +119,10 @@ Before Phase 3 is mergeable, record the following separately:
 - one-slot and multi-slot transaction tests;
 - capacity rejection, activation failure, request failure, and complete restore;
 - image request followed by text/MTP generation with no stale state;
+- failed parse, failed launch, deferred cancellation, overlapping batches, and
+  shutdown with zero remaining pins or leases;
+- all seven non-empty KV/expert/transient rebalance scopes and every reversible
+  publication fault boundary;
 - mapped-head CPU and CUDA operator checks;
 - temperature-zero output bytes with mapped vocabulary on and off;
 - code, prose, tool, multilingual, and long-context acceptance panels; and

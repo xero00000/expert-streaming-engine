@@ -82,23 +82,98 @@ static bool server_prompt_has_multimodal_data(const json & value) {
     return false;
 }
 
+static bool server_resource_plan_allows_multimodal(
+        bool transient_managed,
+        const std::string & plan_text) {
+    if (!transient_managed) {
+        return true;
+    }
+    const json plan = json::parse(plan_text, nullptr, false);
+    if (plan.is_discarded() || !plan.contains("transient_policy")) {
+        return false;
+    }
+    common_transient_policy policy = COMMON_TRANSIENT_POLICY_OFF;
+    if (!common_parse_transient_policy(
+            plan.at("transient_policy").get<std::string>(), policy)) {
+        return false;
+    }
+    return policy == COMMON_TRANSIENT_POLICY_SHARED ||
+        policy == COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY;
+}
+
 struct server_transient_prompt_guard {
     server_context & ctx;
-    uint64_t lease = 0;
+    std::shared_ptr<server_transient_lease_group> group;
+    bool handed_off = false;
 
     server_transient_prompt_guard(server_context & ctx, bool multimodal) : ctx(ctx) {
         if (!multimodal || !ctx.transient_enabled()) {
             return;
         }
+        auto candidate = std::make_shared<server_transient_lease_group>();
+        candidate->leases.reserve(1);
         std::string error;
-        lease = ctx.acquire_transient(true, error);
+        // A normal publish is prepared now so tokenization can use mmproj. It
+        // is rolled back unless ownership is transferred into queued tasks;
+        // successful inference commits it, avoiding restoration of stale MTP
+        // cache state against a target context changed by the image request.
+        const uint64_t lease = ctx.acquire_transient_on_owner(true, false, error);
         if (lease == 0) {
             throw std::runtime_error("multimodal residency is temporarily unavailable: " + error);
         }
+        candidate->leases.push_back(lease);
+        group = std::move(candidate);
+    }
+
+    void prepare_tasks(size_t count) {
+        if (!group) return;
+        if (count == 0) {
+            throw std::runtime_error("multimodal request produced no inference tasks");
+        }
+        group->leases.reserve(count);
+        while (group->leases.size() < count) {
+            std::string error;
+            const uint64_t lease = ctx.acquire_transient_on_owner(
+                true, false, error);
+            if (lease == 0) {
+                throw std::runtime_error(
+                    "failed to pin multimodal residency for inference task: " + error);
+            }
+            group->leases.push_back(lease);
+        }
+        group->remaining = count;
+    }
+
+    void attach_task(server_task & task) const noexcept {
+        if (group) task.transient_lease_group = group;
+    }
+
+    void handoff() noexcept {
+        handed_off = true;
     }
 
     ~server_transient_prompt_guard() {
-        ctx.release_transient(lease);
+        if (!group || handed_off) return;
+        try {
+            // Secondary leases are pins only. Drop them first, then roll back
+            // the transaction-owning first lease because no task was queued.
+            for (size_t i = group->leases.size(); i > 1; --i) {
+                std::string error;
+                if (!ctx.release_transient_on_owner(group->leases[i - 1], false, error)) {
+                    SRV_ERR("failed to release unposted task pin: %s\n", error.c_str());
+                }
+            }
+            if (!group->leases.empty()) {
+                std::string error;
+                if (!ctx.release_transient_on_owner(group->leases.front(), false, error)) {
+                    SRV_ERR("failed to roll back unhanded prompt residency: %s\n", error.c_str());
+                }
+            }
+        } catch (const std::exception & exception) {
+            SRV_ERR("prompt residency owner-thread release threw: %s\n", exception.what());
+        } catch (...) {
+            SRV_ERR("%s\n", "prompt residency owner-thread release threw an unknown exception");
+        }
     }
 };
 
@@ -357,14 +432,20 @@ struct server_response_reader {
     bool cancelled = false;
 
     server_response_reader(server_context& ctx_server) : ctx_server(ctx_server) {}
-    ~server_response_reader() {
+    ~server_response_reader() noexcept {
         stop();
     }
 
     void post_tasks(std::vector<server_task>&& tasks) {       
         id_tasks = server_task::get_list_id(tasks);
-        ctx_server.queue_results.add_waiting_tasks(tasks);
-        ctx_server.queue_tasks.post(std::move(tasks));
+        try {
+            ctx_server.queue_results.add_waiting_tasks(tasks);
+            ctx_server.queue_tasks.post(std::move(tasks));
+        } catch (...) {
+            ctx_server.queue_results.remove_waiting_task_ids(id_tasks);
+            id_tasks.clear();
+            throw;
+        }
     }
     
     bool has_next() {
@@ -389,6 +470,10 @@ struct server_response_reader {
         while (true) {
             server_task_result_ptr result = ctx_server.queue_results.recv_with_timeout(id_tasks, HTTP_POLLING_SECONDS);
             if (result == nullptr) {
+                if (!ctx_server.queue_results.is_running()) {
+                    SRV_DBG("%s", "stopping response wait because the server is shutting down\n");
+                    return nullptr;
+                }
                 // timeout, check stop condition
                 if (should_stop()) {
                     SRV_DBG("%s", "stopping wait for next result due to should_stop condition\n");
@@ -438,22 +523,31 @@ struct server_response_reader {
         return batch_res;
     }
 
-    void stop() {
+    void stop() noexcept {
         ctx_server.queue_results.remove_waiting_task_ids(id_tasks);
         if (has_next() && !cancelled) {
             // if tasks is not finished yet, cancel them
             cancelled = true;
-            std::vector<server_task> cancel_tasks;
-            cancel_tasks.reserve(id_tasks.size());
-            for (const auto& id_task : id_tasks) {
-                SRV_WRN("cancel task, id_task = %d\n", id_task);
-                server_task task(SERVER_TASK_TYPE_CANCEL);
-                task.id_target = id_task;
-                ctx_server.queue_results.remove_waiting_task_id(id_task);
-                cancel_tasks.push_back(std::move(task));
+            try {
+                std::vector<server_task> cancel_tasks;
+                cancel_tasks.reserve(id_tasks.size());
+                for (const auto& id_task : id_tasks) {
+                    SRV_WRN("cancel task, id_task = %d\n", id_task);
+                    server_task task(SERVER_TASK_TYPE_CANCEL);
+                    task.id_target = id_task;
+                    ctx_server.queue_results.remove_waiting_task_id(id_task);
+                    cancel_tasks.push_back(std::move(task));
+                }
+                // Push to the beginning of the queue, so it has highest priority.
+                // Closed admission during shutdown is expected: after the HTTP
+                // worker joins, owner-thread shutdown drains the original tasks
+                // and any exact transient leases they carry.
+                ctx_server.queue_tasks.post(std::move(cancel_tasks), true);
+            } catch (const std::exception & exception) {
+                SRV_DBG("failed to enqueue response cancellation: %s\n", exception.what());
+            } catch (...) {
+                SRV_DBG("%s", "failed to enqueue response cancellation\n");
             }
-            // push to beginning of the queue, so it has highest priority
-            ctx_server.queue_tasks.post(std::move(cancel_tasks), true);
         }
         else {
             SRV_DBG("%s", "all tasks already finished, no need to cancel\n");
@@ -516,6 +610,16 @@ static bool server_parse_resource_plan(
         plan.expert_ram_bytes = value.at("expert_ram_bytes").get<uint64_t>();
         plan.aux_ram_bytes = value.at("aux_ram_bytes").get<uint64_t>();
         plan.io_staging_bytes = value.at("io_staging_bytes").get<uint64_t>();
+        plan.transient_device = value.at("transient_device").get<int>();
+        if (!common_parse_transient_policy(
+                value.at("transient_policy").get<std::string>(),
+                plan.transient_policy)) {
+            error = "resolved resource plan contains an unknown transient policy";
+            return false;
+        }
+        plan.transient_mtp_bytes = value.at("transient_mtp_bytes").get<uint64_t>();
+        plan.transient_multimodal_bytes =
+            value.at("transient_multimodal_bytes").get<uint64_t>();
         plan.transient_capacity_bytes = value.at("transient_capacity_bytes").get<uint64_t>();
         plan.expert_prefill_staging_enabled = value.at("expert_prefill_staging_enabled").get<bool>();
         plan.transient_swap = value.at("transient_swap").get<bool>();
@@ -960,6 +1064,7 @@ int main(int argc, char ** argv) {
             const bool dry_run = body["dry_run"].get<bool>();
             static const std::set<std::string> allowed = {
                 "dry_run", "context", "expert_cache_bytes_per_device",
+                "transient_policy",
             };
             for (const auto & item : body.items()) {
                 if (allowed.count(item.key()) == 0) {
@@ -992,6 +1097,18 @@ int main(int argc, char ** argv) {
                 request.set_expert_cache_bytes_per_device = true;
                 request.expert_cache_bytes_per_device =
                     body["expert_cache_bytes_per_device"].get<uint64_t>();
+            }
+            if (body.contains("transient_policy")) {
+                if (!body["transient_policy"].is_string() ||
+                        !common_parse_transient_policy(
+                            body["transient_policy"].get<std::string>(),
+                            request.transient_policy)) {
+                    res_err(res, format_error_response(
+                        "transient_policy must be one of shared, mtp-only, multimodal-only, or off",
+                        ERROR_TYPE_INVALID_REQUEST));
+                    return;
+                }
+                request.set_transient_policy = true;
             }
 
             const json current_json = json::parse(current_plan_text);
@@ -1096,11 +1213,64 @@ int main(int argc, char ** argv) {
                 }
             }
 
+            if (current.transient_device >= 0 && resources.contains("transient")) {
+                auto live_device = std::find_if(
+                    preparation_current.devices.begin(), preparation_current.devices.end(),
+                    [&current](const common_resource_device_plan & item) {
+                        return item.id == current.transient_device;
+                    });
+                if (live_device == preparation_current.devices.end()) {
+                    res_err(res, format_error_response(
+                        "resource plan omitted its configured transient device",
+                        ERROR_TYPE_SERVER));
+                    return;
+                }
+                if (live_device->transient_bytes != current.transient_capacity_bytes) {
+                    res_err(res, format_error_response(
+                        "serialized transient capacity disagrees with its device plan",
+                        ERROR_TYPE_SERVER));
+                    return;
+                }
+                // Shared-mode requests can swap the resident owner after this
+                // HTTP snapshot but before the owner-thread task runs. Keep the
+                // stable configured capacity (max module bound) on both sides
+                // instead of narrowing admission to the point-in-time owner.
+            } else if (request.set_transient_policy &&
+                    (target.transient_capacity_bytes != 0 ||
+                     current.transient_mtp_bytes != 0 ||
+                     current.transient_multimodal_bytes != 0)) {
+                res_err(res, format_error_response(
+                    "transient policy requires a configured runtime module manager",
+                    ERROR_TYPE_NOT_SUPPORTED));
+                return;
+            }
+
+            const bool transient_policy_change = current.transient_policy !=
+                    target.transient_policy ||
+                current.transient_capacity_bytes != target.transient_capacity_bytes;
+            bool transient_manager_mismatch = false;
+            if (request.set_transient_policy && resources.contains("transient")) {
+                common_transient_policy live_policy = COMMON_TRANSIENT_POLICY_OFF;
+                if (!common_parse_transient_policy(
+                        resources.at("transient").at("policy").get<std::string>(),
+                        live_policy)) {
+                    res_err(res, format_error_response(
+                        "live transient manager reported an unknown policy",
+                        ERROR_TYPE_SERVER));
+                    return;
+                }
+                transient_manager_mismatch = live_policy != target.transient_policy;
+            }
+            const bool transient_operation = request.set_transient_policy &&
+                resources.contains("transient") &&
+                (transient_policy_change || transient_manager_mismatch);
+
             common_resource_preparation_peak preparation_peak;
             if (!common_resource_rebalance_preparation_peak(
                         preparation_current, preparation_target,
                         preparation_peak, error,
-                        request.set_expert_cache_bytes_per_device)) {
+                        request.set_expert_cache_bytes_per_device,
+                        transient_operation)) {
                 res_err(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
@@ -1133,7 +1303,7 @@ int main(int argc, char ** argv) {
             // trusting only the serialized policy.
             const bool expert_cache_operation = expert_cache_change ||
                     request.set_expert_cache_bytes_per_device;
-            if (!context_change && !expert_cache_operation) {
+            if (!context_change && !expert_cache_operation && !transient_operation) {
                 res_ok(res, {
                     {"status", "committed"},
                     {"dry_run", false},
@@ -1145,20 +1315,29 @@ int main(int argc, char ** argv) {
                 return;
             }
 
-            const bool combined_operation = context_change && expert_cache_operation;
-            const std::string scope = combined_operation
-                ? "kv-and-expert"
-                : (expert_cache_operation ? "expert-cache-only" : "kv-only");
-            if (!context_change && !expert_cache_change) {
+            const unsigned operation_count = unsigned(context_change) +
+                unsigned(expert_cache_operation) + unsigned(transient_operation);
+            std::string scope;
+            if (operation_count == 3) scope = "kv-expert-and-transient";
+            else if (context_change && expert_cache_operation) scope = "kv-and-expert";
+            else if (context_change && transient_operation) scope = "kv-and-transient";
+            else if (expert_cache_operation && transient_operation) scope = "expert-and-transient";
+            else if (context_change) scope = "kv-only";
+            else if (expert_cache_operation) scope = "expert-cache-only";
+            else scope = "transient-only";
+
+            if (!context_change && !expert_cache_change && !transient_policy_change) {
                 // Same-target reconciliation repairs realized state without
                 // manufacturing a logical-plan mutation.
                 target.reason = current.reason;
             } else {
-                target.reason = combined_operation
-                    ? "idle-only atomic KV and expert-cache replacement target"
-                    : (expert_cache_operation
-                        ? "idle-only prepared expert-cache replacement target"
-                        : "idle-only runtime KV rebalance target");
+                target.reason = operation_count > 1
+                    ? "idle-only atomic multi-pool resource replacement target"
+                    : (transient_operation
+                        ? "idle-only prepared transient-policy replacement target"
+                        : (expert_cache_operation
+                            ? "idle-only prepared expert-cache replacement target"
+                            : "idle-only runtime KV rebalance target"));
             }
             target_json = json::parse(common_resource_plan_json(target));
             server_task task;
@@ -1171,7 +1350,13 @@ int main(int argc, char ** argv) {
                 {"target_expert_cache_bytes_per_device",
                     request.set_expert_cache_bytes_per_device
                         ? request.expert_cache_bytes_per_device : uint64_t(0)},
+                {"target_transient_policy",
+                    common_transient_policy_name(target.transient_policy)},
+                {"replace_kv", context_change},
+                {"replace_expert", expert_cache_operation},
+                {"replace_transient", transient_operation},
                 {"scope", scope},
+                {"expected_previous_plan", current_plan_text},
                 {"previous_plan", current_json},
                 {"target_plan", target_json},
             };
@@ -1451,6 +1636,8 @@ int main(int argc, char ** argv) {
                 "within-calibrated-bounds" : "not-active";
 
         const auto published_resources = ctx_server.published_resource_state();
+        const bool allow_multimodal = server_resource_plan_allows_multimodal(
+            ctx_server.transient_enabled(), published_resources.second);
         json data = {
             { "system_prompt",               ctx_server.system_prompt.c_str() },
             { "model_alias",                 ctx_server.params_base.model_alias },
@@ -1464,8 +1651,8 @@ int main(int argc, char ** argv) {
             { "eos_token",                   common_token_to_piece(ctx_server.ctx, llama_token_eos(ctx_server.model), /* special= */ true)},
             { "model_path",                  ctx_server.params_base.model },
             { "modalities",                  json {
-                {"vision", ctx_server.chat_params.allow_image},
-                {"audio",  ctx_server.chat_params.allow_audio},
+                {"vision", ctx_server.chat_params.allow_image && allow_multimodal},
+                {"audio",  ctx_server.chat_params.allow_audio && allow_multimodal},
             } },
             { "n_ctx",                       published_resources.first },
             { "n_ctx_max",                   ctx_server.n_ctx_max },
@@ -1505,14 +1692,17 @@ int main(int argc, char ** argv) {
                 slot_id = slot.id;
             }
         }
+        const auto published_resources = ctx_server.published_resource_state();
+        const bool allow_multimodal = server_resource_plan_allows_multimodal(
+            ctx_server.transient_enabled(), published_resources.second);
         json data = {
             { "model_name",                  get_model_name(ctx_server.params_base.model)},
             { "model_path",                  ctx_server.params_base.model },
             { "modalities",                  json {
-                {"vision", ctx_server.chat_params.allow_image},
-                {"audio",  ctx_server.chat_params.allow_audio},
+                {"vision", ctx_server.chat_params.allow_image && allow_multimodal},
+                {"audio",  ctx_server.chat_params.allow_audio && allow_multimodal},
             } },
-             { "n_ctx",                       ctx_server.n_ctx_published.load(std::memory_order_acquire) },
+             { "n_ctx",                       published_resources.first },
              { "n_ctx_max",                   ctx_server.n_ctx_max }
         };
         res.set_content(data.dump(), "application/json; charset=utf-8");
@@ -1554,6 +1744,7 @@ int main(int argc, char ** argv) {
                     inputs = tokenize_input_prompts(llama_get_vocab(ctx_server.ctx), ctx_server.mctx, prompt, true, true);
                 }
                 tasks.reserve(inputs.size());
+                transient_prompt.prepare_tasks(inputs.size());
                 const std::string requested_model_name = json_value(data, "model", std::string());
                 const std::string fallback_model_name = get_model_name(ctx_server.params_base.model);
                 const std::string oaicompat_model_name = requested_model_name.empty()
@@ -1578,9 +1769,11 @@ int main(int argc, char ** argv) {
                     task.params.oaicompat_cmpl_id = completion_id;
                     task.params.oaicompat_model = oaicompat_model_name;
                     tasks.push_back(std::move(task));
+                    transient_prompt.attach_task(tasks.back());
                 }
 
                 rd->post_tasks(std::move(tasks));
+                transient_prompt.handoff();
             }
             catch (const std::exception& e) {
                 res_err(res, format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
@@ -1969,6 +2162,8 @@ int main(int argc, char ** argv) {
         server_response_reader rd(ctx_server);
         {
             std::vector<server_task> tasks;
+            tasks.reserve(tokenized_prompts.size());
+            transient_prompt.prepare_tasks(tokenized_prompts.size());
             for (size_t i = 0; i < tokenized_prompts.size(); i++) {
                 server_task task = server_task(SERVER_TASK_TYPE_EMBEDDING);
 
@@ -1981,8 +2176,10 @@ int main(int argc, char ** argv) {
                 task.params.embd_normalize = embd_normalize;
                 task.embedding = true; // probably not needed
                 tasks.push_back(std::move(task));
+                transient_prompt.attach_task(tasks.back());
             }
             rd.post_tasks(std::move(tasks));
+            transient_prompt.handoff();
         }
 
         // wait for the results
@@ -2693,8 +2890,10 @@ int main(int argc, char ** argv) {
     ctx_server.queue_tasks.start_loop();
 
     svr->stop();
+    ctx_server.queue_results.terminate();
     t.join();
 
+    ctx_server.shutdown_transient_residency();
     llama_backend_free();
 
     return 0;

@@ -16,7 +16,8 @@ struct server_task_multi {
 
 struct server_queue {
     int id = 0;
-    bool running;
+    bool running = true;
+    bool accepting = true;
 
     // queues
     std::deque<server_task> queue_tasks;
@@ -38,7 +39,10 @@ struct server_queue {
 
     int post(std::vector<server_task>&& tasks, bool front = false);
 
-    void cleanup_pending_task(int id_target);
+    // Owner-thread cancellation extracts queued/deferred work so callers can
+    // release resources carried by each task before destruction.
+    std::vector<server_task> take_pending_tasks(int id_target);
+    std::vector<server_task> take_all_pending_tasks();
 
     // Add a new task, but defer until one slot is available
     void defer(server_task&& task);
@@ -65,6 +69,7 @@ struct server_queue {
     // end the start_loop routine
     void terminate() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
+        accepting = false;
         running = false;
         condition_tasks.notify_all();
     }
@@ -122,6 +127,8 @@ struct server_response {
 // if timeout is reached, nullptr is returned
     server_task_result_ptr recv_with_timeout(const std::unordered_set<int>& id_tasks, int timeout);
 
+    bool is_running();
+
     // Register the function to update multitask
     void on_multitask_update(callback_multitask_t callback) {
         callback_update_multitask = std::move(callback);
@@ -134,6 +141,7 @@ struct server_response {
 
     // terminate the waiting loop
     void terminate() {
+        std::unique_lock<std::mutex> lock(mutex_results);
         running = false;
         condition_results.notify_all();
     };

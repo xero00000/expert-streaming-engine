@@ -1,5 +1,7 @@
 #pragma once
 
+#include "transient-policy.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -114,6 +116,13 @@ struct common_resource_plan {
     uint64_t expert_ram_bytes = 0;
     uint64_t aux_ram_bytes = 0;
     uint64_t io_staging_bytes = 0;
+    // The transient device and module bounds remain serialized even when the
+    // policy is off, so a later live enable never has to infer topology from a
+    // zero-byte allocation.
+    int transient_device = -1;
+    common_transient_policy transient_policy = COMMON_TRANSIENT_POLICY_OFF;
+    uint64_t transient_mtp_bytes = 0;
+    uint64_t transient_multimodal_bytes = 0;
     uint64_t transient_capacity_bytes = 0;
     bool expert_prefill_staging_enabled = false;
     bool transient_swap = false;
@@ -136,11 +145,16 @@ struct common_resource_rebalance_request {
     uint32_t context = 0;
     bool set_expert_cache_bytes_per_device = false;
     uint64_t expert_cache_bytes_per_device = 0;
+    bool set_transient_policy = false;
+    common_transient_policy transient_policy = COMMON_TRANSIENT_POLICY_OFF;
 };
 
 // Peak device accounting while a runtime rebalance is still failure-atomic.
 // The current live allocation cannot be released until every replacement pool
-// has been prepared, so prepared bytes are additional to current_live_bytes.
+// has been prepared. KV/expert prepared bytes are complete off-side pools.
+// Transient owners are mutually exclusive, so prepared_transient_bytes is the
+// policy-coupled additional peak allowance above current_live_bytes (not
+// necessarily the target owner's standalone size).
 struct common_resource_device_preparation_peak {
     int id = 0;
     uint64_t capacity_bytes = 0;
@@ -149,6 +163,7 @@ struct common_resource_device_preparation_peak {
     uint64_t target_live_bytes = 0;
     uint64_t prepared_kv_bytes = 0;
     uint64_t prepared_expert_cache_bytes = 0;
+    uint64_t prepared_transient_bytes = 0;
     uint64_t peak_bytes = 0;
     uint64_t peak_headroom_bytes = 0;
 };
@@ -156,6 +171,7 @@ struct common_resource_device_preparation_peak {
 struct common_resource_preparation_peak {
     bool prepares_kv = false;
     bool prepares_expert_cache = false;
+    bool prepares_transient = false;
     std::vector<common_resource_device_preparation_peak> devices;
 };
 
@@ -229,7 +245,8 @@ bool common_resource_rebalance_preparation_peak(
     const common_resource_plan & target,
     common_resource_preparation_peak & report,
     std::string & error,
-    bool force_expert_cache_preparation = false);
+    bool force_expert_cache_preparation = false,
+    bool force_transient_preparation = false);
 
 bool common_expert_split_solve(
     const common_expert_split_input & input,
@@ -265,6 +282,7 @@ std::string common_resource_preparation_peak_json(const common_resource_preparat
 std::string common_memory_policy_name(common_memory_policy policy);
 std::string common_kv_quality_name(common_kv_quality quality);
 std::string common_resource_backend_name(common_resource_backend backend);
+std::string common_transient_policy_name(common_transient_policy policy);
 
 bool common_parse_byte_size(const std::string & text, uint64_t & bytes, std::string & error);
 bool common_parse_token_count(const std::string & text, uint32_t & count, std::string & error);
@@ -272,6 +290,7 @@ bool common_parse_memory_policy(const std::string & text, common_memory_policy &
 bool common_parse_resource_preference(const std::string & text, common_resource_preference & preference);
 bool common_parse_kv_quality(const std::string & text, common_kv_quality & quality);
 bool common_parse_resource_backend(const std::string & text, common_resource_backend & backend);
+bool common_parse_transient_policy(const std::string & text, common_transient_policy & policy);
 
 // Normalize launcher/native-controller overrides before solving the plan.
 // Zero is an explicit disabled cache, not a request for an automatic maximum.

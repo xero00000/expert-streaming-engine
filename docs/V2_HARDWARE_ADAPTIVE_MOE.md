@@ -358,9 +358,28 @@ unfused reduction reproduced the uncached output exactly. Both bounded byte
 capacity and legacy `LLAMA_EXPERT_GPU_CACHE_SLOTS=4` launches are covered by
 the parity gate; the fusion must remain off until an equivalent full-model
 proof passes.
-The remaining Phase D step is transient-pool policy. KV and expert cache now
-meet the shared failure-atomic endpoint gate; transient resources must reach
-the same standard before Phase D is complete.
+The private Phase D branch now gives the transient pool an equivalent prepared
+policy transaction. `off`, `shared`, `mtp-only`, and `multimodal-only` derive
+enabled modules and stable per-device capacity from measured MTP and projector
+bounds. Prepare constructs exact off-side MTP/mmproj owners without mutating live
+state; publish performs owner swaps; rollback restores the prior policy, budget,
+and owners; finalization retires the old owners. Overlapping request leases form
+one residency epoch so a successful image request cannot be undone by a failed
+concurrent request and paired with stale target/MTP cache state.
+
+The server now accepts every non-empty combination of KV, expert cache, and
+transient policy in one owner-thread transaction. It proves the combined
+preparation peak, publishes each reversible pool, acquires the logical-plan lock,
+finalizes the physical owners, and publishes context, capabilities, and plan as
+one reader-visible state. A queued mutation carries the exact source plan and is
+rejected before preparation if another commit made that snapshot stale. Media
+cache shrink boundaries are also resolved before preparation, preventing an
+irreversible KV shrink from cutting through or retaining stale image chunks.
+
+Phase D remains marked in progress until the full model-backed transient matrix
+and mixed-GPU evidence from `validate-phase-d-rebalance.py` are recorded on this
+private branch; the CPU, failure-injection, sanitizer, and exact MTP-owner gates
+are necessary but not substitutes for that final hardware run.
 
 ### Combined KV/expert publication contract
 

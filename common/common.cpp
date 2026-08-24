@@ -4405,10 +4405,21 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
     uint64_t max_device_margin = params.reserve_vram_bytes;
     for (const auto & device : plan.devices) {
         uint64_t device_margin = device.reserve_bytes;
+        uint64_t transient_fit_bytes = device.transient_bytes;
+        if (device.id == plan.transient_device &&
+                plan.transient_policy == COMMON_TRANSIENT_POLICY_SHARED) {
+            const uint64_t preparation_extra = std::min(
+                plan.transient_mtp_bytes, plan.transient_multimodal_bytes);
+            if (preparation_extra > UINT64_MAX - transient_fit_bytes) {
+                transient_fit_bytes = UINT64_MAX;
+            } else {
+                transient_fit_bytes += preparation_extra;
+            }
+        }
         for (const uint64_t allocation : {
                 device.expert_cache_bytes,
                 device.expert_prefill_staging_bytes,
-                device.transient_bytes }) {
+                transient_fit_bytes }) {
             if (allocation > UINT64_MAX - device_margin) {
                 device_margin = UINT64_MAX;
                 break;

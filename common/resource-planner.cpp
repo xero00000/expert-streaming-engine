@@ -145,14 +145,21 @@ bool allocate_context(
     usable.reserve(input.devices.size());
     const int transient_device = input.transient_device < 0
         ? input.devices.front().id : input.transient_device;
-    const uint64_t transient_need = std::max(input.mtp_bytes, input.multimodal_bytes);
+    // Request-time owner swaps prepare the incoming module while the outgoing
+    // module remains rollback-capable. Reserve their sum as a preparation peak
+    // even though steady-state capacity is only the larger owner.
+    uint64_t transient_preparation_peak = input.mtp_bytes;
+    if (!add_checked(transient_preparation_peak, input.multimodal_bytes)) {
+        return false;
+    }
     for (const auto & device : input.devices) {
         const uint64_t prefill_staging = plan.expert_prefill_staging_enabled && device.id >= 0
             ? input.requested_expert_prefill_staging_bytes_per_device : 0;
         uint64_t fixed = device.reserve_bytes;
         if (!add_checked(fixed, device.dense_bytes) || !add_checked(fixed, device.graph_bytes) ||
                 !add_checked(fixed, prefill_staging) ||
-                (device.id == transient_device && !add_checked(fixed, transient_need)) ||
+                (device.id == transient_device &&
+                    !add_checked(fixed, transient_preparation_peak)) ||
                 fixed > device.free_bytes) {
             return false;
         }
@@ -331,6 +338,15 @@ bool common_parse_resource_backend(const std::string & text, common_resource_bac
     return true;
 }
 
+bool common_parse_transient_policy(const std::string & text, common_transient_policy & policy) {
+    if (text == "off") policy = COMMON_TRANSIENT_POLICY_OFF;
+    else if (text == "shared") policy = COMMON_TRANSIENT_POLICY_SHARED;
+    else if (text == "mtp-only") policy = COMMON_TRANSIENT_POLICY_MTP_ONLY;
+    else if (text == "multimodal-only") policy = COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY;
+    else return false;
+    return true;
+}
+
 std::string common_memory_policy_name(common_memory_policy policy) {
     switch (policy) {
         case COMMON_MEMORY_POLICY_AUTO: return "auto";
@@ -359,6 +375,16 @@ std::string common_resource_backend_name(common_resource_backend backend) {
         case COMMON_RESOURCE_BACKEND_MMAP: return "mmap";
         case COMMON_RESOURCE_BACKEND_PREAD: return "pread";
         case COMMON_RESOURCE_BACKEND_IO_URING: return "io_uring";
+    }
+    return "unknown";
+}
+
+std::string common_transient_policy_name(common_transient_policy policy) {
+    switch (policy) {
+        case COMMON_TRANSIENT_POLICY_OFF: return "off";
+        case COMMON_TRANSIENT_POLICY_SHARED: return "shared";
+        case COMMON_TRANSIENT_POLICY_MTP_ONLY: return "mtp-only";
+        case COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY: return "multimodal-only";
     }
     return "unknown";
 }
@@ -495,11 +521,36 @@ bool common_resource_plan_solve(
         error = "transient device is not present in the resource plan";
         return false;
     }
-    candidate.transient_capacity_bytes = transient_need == 0 ? 0
-        : std::min(transient_need, transient_it->headroom_bytes);
-    candidate.transient_swap = input.mtp_bytes != 0 && input.multimodal_bytes != 0 &&
-        candidate.transient_capacity_bytes >= transient_need;
-    candidate.draft_resident = input.mtp_bytes != 0 && candidate.transient_capacity_bytes >= input.mtp_bytes;
+    candidate.transient_device = transient_device;
+    candidate.transient_mtp_bytes = input.mtp_bytes;
+    candidate.transient_multimodal_bytes = input.multimodal_bytes;
+    candidate.transient_capacity_bytes = 0;
+    candidate.transient_policy = COMMON_TRANSIENT_POLICY_OFF;
+    if (input.mtp_bytes != 0 && input.multimodal_bytes != 0) {
+        if (transient_it->headroom_bytes < transient_need) {
+            error = "configured shared transient modules do not fit while preserving the device reserve";
+            return false;
+        }
+        candidate.transient_policy = COMMON_TRANSIENT_POLICY_SHARED;
+        candidate.transient_capacity_bytes = transient_need;
+    } else if (input.mtp_bytes != 0) {
+        if (transient_it->headroom_bytes < input.mtp_bytes) {
+            error = "configured MTP transient module does not fit while preserving the device reserve";
+            return false;
+        }
+        candidate.transient_policy = COMMON_TRANSIENT_POLICY_MTP_ONLY;
+        candidate.transient_capacity_bytes = input.mtp_bytes;
+    } else if (input.multimodal_bytes != 0) {
+        if (transient_it->headroom_bytes < input.multimodal_bytes) {
+            error = "configured multimodal transient module does not fit while preserving the device reserve";
+            return false;
+        }
+        candidate.transient_policy = COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY;
+        candidate.transient_capacity_bytes = input.multimodal_bytes;
+    }
+    candidate.transient_swap = candidate.transient_policy == COMMON_TRANSIENT_POLICY_SHARED;
+    candidate.draft_resident = candidate.transient_policy == COMMON_TRANSIENT_POLICY_SHARED ||
+        candidate.transient_policy == COMMON_TRANSIENT_POLICY_MTP_ONLY;
     if (input.require_draft && !candidate.draft_resident) {
         error = "required draft allocation does not fit while preserving device reserves";
         return false;
@@ -507,9 +558,18 @@ bool common_resource_plan_solve(
 
     for (auto & device : candidate.devices) {
         device.transient_bytes = device.id == transient_device ? candidate.transient_capacity_bytes : 0;
+        uint64_t transient_preparation_reserve = device.transient_bytes;
+        if (device.id == transient_device &&
+                candidate.transient_policy == COMMON_TRANSIENT_POLICY_SHARED &&
+                !add_checked(transient_preparation_reserve,
+                    std::min(input.mtp_bytes, input.multimodal_bytes))) {
+            error = "shared transient preparation reserve overflows 64-bit bytes";
+            return false;
+        }
         const uint64_t expert = candidate.policy == COMMON_MEMORY_POLICY_RESIDENT
             ? 0 : std::min(input.requested_expert_vram_bytes_per_device,
-                device.headroom_bytes - std::min(device.headroom_bytes, device.transient_bytes));
+                device.headroom_bytes -
+                    std::min(device.headroom_bytes, transient_preparation_reserve));
         device.expert_cache_bytes = expert;
         device.planned_bytes += device.transient_bytes + expert;
         device.headroom_bytes = device.capacity_bytes - device.reserve_bytes - device.planned_bytes;
@@ -871,7 +931,47 @@ bool common_resource_rebalance_target(
 
     target = current;
     target.context = context;
+    if (request.set_transient_policy) {
+        uint64_t transient_capacity = 0;
+        switch (request.transient_policy) {
+            case COMMON_TRANSIENT_POLICY_OFF:
+                break;
+            case COMMON_TRANSIENT_POLICY_SHARED:
+                if (current.transient_mtp_bytes == 0 ||
+                        current.transient_multimodal_bytes == 0) {
+                    error = "shared transient policy requires configured MTP and multimodal modules";
+                    return false;
+                }
+                transient_capacity = std::max(
+                    current.transient_mtp_bytes,
+                    current.transient_multimodal_bytes);
+                break;
+            case COMMON_TRANSIENT_POLICY_MTP_ONLY:
+                if (current.transient_mtp_bytes == 0) {
+                    error = "mtp-only transient policy requires a configured MTP module";
+                    return false;
+                }
+                transient_capacity = current.transient_mtp_bytes;
+                break;
+            case COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY:
+                if (current.transient_multimodal_bytes == 0) {
+                    error = "multimodal-only transient policy requires a configured multimodal module";
+                    return false;
+                }
+                transient_capacity = current.transient_multimodal_bytes;
+                break;
+            default:
+                error = "unknown transient policy";
+                return false;
+        }
+        target.transient_policy = request.transient_policy;
+        target.transient_capacity_bytes = transient_capacity;
+        target.transient_swap = request.transient_policy == COMMON_TRANSIENT_POLICY_SHARED;
+        target.draft_resident = request.transient_policy == COMMON_TRANSIENT_POLICY_SHARED ||
+            request.transient_policy == COMMON_TRANSIENT_POLICY_MTP_ONLY;
+    }
     bool has_accelerator = false;
+    bool has_transient_device = false;
     for (auto & device : target.devices) {
         if (device.capacity_bytes < device.reserve_bytes) {
             error = "device capacity is below its immutable reserve";
@@ -891,6 +991,14 @@ bool common_resource_rebalance_target(
         } else if (request.set_expert_cache_bytes_per_device) {
             device.expert_cache_bytes = 0;
         }
+        if (device.id == target.transient_device) {
+            has_transient_device = true;
+            if (request.set_transient_policy) {
+                device.transient_bytes = target.transient_capacity_bytes;
+            }
+        } else if (request.set_transient_policy) {
+            device.transient_bytes = 0;
+        }
 
         uint64_t planned = 0;
         if (!add_checked(planned, device.dense_bytes) ||
@@ -904,18 +1012,31 @@ bool common_resource_rebalance_target(
         }
         const uint64_t usable = device.capacity_bytes - device.reserve_bytes;
         if (planned > usable) {
-            error = "target KV/expert allocation crosses a device reserve";
+            error = "target KV/expert/transient allocation crosses a device reserve";
             return false;
         }
         device.planned_bytes = planned;
         device.headroom_bytes = usable - planned;
+        if (target.transient_policy == COMMON_TRANSIENT_POLICY_SHARED &&
+                device.id == target.transient_device &&
+                device.headroom_bytes < std::min(
+                    target.transient_mtp_bytes,
+                    target.transient_multimodal_bytes)) {
+            error = "target allocation consumes the rollback reserve required for shared transient owner swaps";
+            return false;
+        }
     }
     if (request.set_expert_cache_bytes_per_device &&
             request.expert_cache_bytes_per_device > 0 && !has_accelerator) {
         error = "target expert cache requires an accelerator";
         return false;
     }
-    target.reason = "validated runtime KV/expert rebalance target; no resources mutated";
+    if (request.set_transient_policy && target.transient_capacity_bytes != 0 &&
+            !has_transient_device) {
+        error = "serialized transient device is not present in the resource plan";
+        return false;
+    }
+    target.reason = "validated runtime KV/expert/transient rebalance target; no resources mutated";
     return true;
 }
 
@@ -924,7 +1045,8 @@ bool common_resource_rebalance_preparation_peak(
         const common_resource_plan & target,
         common_resource_preparation_peak & report,
         std::string & error,
-        bool force_expert_cache_preparation) {
+        bool force_expert_cache_preparation,
+        bool force_transient_preparation) {
     error.clear();
     if (current.devices.empty() || current.devices.size() != target.devices.size()) {
         error = "current and target resource plans have different device topologies";
@@ -934,6 +1056,15 @@ bool common_resource_rebalance_preparation_peak(
     common_resource_preparation_peak candidate;
     candidate.prepares_kv = current.context != target.context;
     candidate.prepares_expert_cache = force_expert_cache_preparation;
+    candidate.prepares_transient = force_transient_preparation ||
+        current.transient_policy != target.transient_policy ||
+        current.transient_capacity_bytes != target.transient_capacity_bytes;
+    if (current.transient_device != target.transient_device ||
+            current.transient_mtp_bytes != target.transient_mtp_bytes ||
+            current.transient_multimodal_bytes != target.transient_multimodal_bytes) {
+        error = "runtime rebalance cannot change transient topology or module bounds";
+        return false;
+    }
     for (size_t index = 0; index < current.devices.size(); ++index) {
         const auto & live = current.devices[index];
         const auto & next = target.devices[index];
@@ -943,14 +1074,97 @@ bool common_resource_rebalance_preparation_peak(
             return false;
         }
         if (live.dense_bytes != next.dense_bytes || live.graph_bytes != next.graph_bytes ||
-                live.expert_prefill_staging_bytes != next.expert_prefill_staging_bytes ||
-                live.transient_bytes != next.transient_bytes) {
+                live.expert_prefill_staging_bytes != next.expert_prefill_staging_bytes) {
             error = "runtime KV/expert rebalance cannot change immutable device allocations";
             return false;
         }
         candidate.prepares_kv = candidate.prepares_kv || live.kv_bytes != next.kv_bytes;
         candidate.prepares_expert_cache = candidate.prepares_expert_cache ||
             live.expert_cache_bytes != next.expert_cache_bytes;
+        candidate.prepares_transient = candidate.prepares_transient ||
+            live.transient_bytes != next.transient_bytes;
+    }
+
+    uint64_t transient_additional_peak = 0;
+    if (candidate.prepares_transient && current.transient_device >= 0) {
+        enum transient_owner {
+            TRANSIENT_OWNER_NONE,
+            TRANSIENT_OWNER_MTP,
+            TRANSIENT_OWNER_MULTIMODAL,
+        };
+        transient_owner possible[3] = {};
+        size_t possible_count = 0;
+        if (force_transient_preparation) {
+            possible[possible_count++] = TRANSIENT_OWNER_NONE;
+            possible[possible_count++] = TRANSIENT_OWNER_MTP;
+            possible[possible_count++] = TRANSIENT_OWNER_MULTIMODAL;
+        } else {
+            switch (current.transient_policy) {
+                case COMMON_TRANSIENT_POLICY_OFF:
+                    possible[possible_count++] = TRANSIENT_OWNER_NONE;
+                    break;
+                case COMMON_TRANSIENT_POLICY_MTP_ONLY:
+                    possible[possible_count++] = TRANSIENT_OWNER_MTP;
+                    break;
+                case COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY:
+                    possible[possible_count++] = TRANSIENT_OWNER_MULTIMODAL;
+                    break;
+                case COMMON_TRANSIENT_POLICY_SHARED:
+                    possible[possible_count++] = TRANSIENT_OWNER_MTP;
+                    possible[possible_count++] = TRANSIENT_OWNER_MULTIMODAL;
+                    break;
+                default:
+                    error = "current resource plan has an invalid transient policy";
+                    return false;
+            }
+        }
+        const auto owner_bytes = [&](transient_owner owner) {
+            return owner == TRANSIENT_OWNER_MTP ? current.transient_mtp_bytes :
+                owner == TRANSIENT_OWNER_MULTIMODAL
+                    ? current.transient_multimodal_bytes : uint64_t(0);
+        };
+        uint64_t combined_owner_peak = 0;
+        for (size_t i = 0; i < possible_count; ++i) {
+            const transient_owner live_owner = possible[i];
+            transient_owner target_owner = TRANSIENT_OWNER_NONE;
+            switch (target.transient_policy) {
+                case COMMON_TRANSIENT_POLICY_OFF:
+                    break;
+                case COMMON_TRANSIENT_POLICY_MTP_ONLY:
+                    target_owner = TRANSIENT_OWNER_MTP;
+                    break;
+                case COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY:
+                    target_owner = TRANSIENT_OWNER_MULTIMODAL;
+                    break;
+                case COMMON_TRANSIENT_POLICY_SHARED:
+                    target_owner = live_owner == TRANSIENT_OWNER_NONE
+                        ? TRANSIENT_OWNER_MTP : live_owner;
+                    break;
+                default:
+                    error = "target resource plan has an invalid transient policy";
+                    return false;
+            }
+            uint64_t owner_peak = owner_bytes(live_owner);
+            if (target_owner != TRANSIENT_OWNER_NONE &&
+                    (force_transient_preparation || target_owner != live_owner) &&
+                    !add_checked(owner_peak, owner_bytes(target_owner))) {
+                error = "transient owner preparation peak overflows 64-bit accounting";
+                return false;
+            }
+            combined_owner_peak = std::max(combined_owner_peak, owner_peak);
+        }
+
+        const auto live_device = std::find_if(
+            current.devices.begin(), current.devices.end(),
+            [&](const common_resource_device_plan & device) {
+                return device.id == current.transient_device;
+            });
+        if (live_device == current.devices.end()) {
+            error = "current resource plan omitted its transient device";
+            return false;
+        }
+        transient_additional_peak = combined_owner_peak > live_device->transient_bytes
+            ? combined_owner_peak - live_device->transient_bytes : 0;
     }
 
     candidate.devices.reserve(current.devices.size());
@@ -1002,9 +1216,13 @@ bool common_resource_rebalance_preparation_peak(
         device.prepared_kv_bytes = candidate.prepares_kv ? next.kv_bytes : 0;
         device.prepared_expert_cache_bytes = candidate.prepares_expert_cache
             ? next.expert_cache_bytes : 0;
+        device.prepared_transient_bytes = candidate.prepares_transient &&
+                live.id == current.transient_device
+            ? transient_additional_peak : 0;
         device.peak_bytes = current_live;
         if (!add_checked(device.peak_bytes, device.prepared_kv_bytes) ||
-                !add_checked(device.peak_bytes, device.prepared_expert_cache_bytes)) {
+                !add_checked(device.peak_bytes, device.prepared_expert_cache_bytes) ||
+                !add_checked(device.peak_bytes, device.prepared_transient_bytes)) {
             error = "resource preparation peak overflows 64-bit accounting on device " +
                 std::to_string(device.id);
             return false;
@@ -1037,6 +1255,10 @@ std::string common_resource_plan_json(const common_resource_plan & plan) {
     out << ",\"expert_ram_bytes\":" << plan.expert_ram_bytes;
     out << ",\"aux_ram_bytes\":" << plan.aux_ram_bytes;
     out << ",\"io_staging_bytes\":" << plan.io_staging_bytes;
+    out << ",\"transient_device\":" << plan.transient_device;
+    out << ",\"transient_policy\":"; json_string(out, common_transient_policy_name(plan.transient_policy));
+    out << ",\"transient_mtp_bytes\":" << plan.transient_mtp_bytes;
+    out << ",\"transient_multimodal_bytes\":" << plan.transient_multimodal_bytes;
     out << ",\"transient_capacity_bytes\":" << plan.transient_capacity_bytes;
     out << ",\"expert_prefill_staging_enabled\":"
         << (plan.expert_prefill_staging_enabled ? "true" : "false");
@@ -1068,6 +1290,7 @@ std::string common_resource_preparation_peak_json(const common_resource_preparat
     out << '{';
     out << "\"prepares_kv\":" << (report.prepares_kv ? "true" : "false");
     out << ",\"prepares_expert_cache\":" << (report.prepares_expert_cache ? "true" : "false");
+    out << ",\"prepares_transient\":" << (report.prepares_transient ? "true" : "false");
     out << ",\"devices\":[";
     for (size_t i = 0; i < report.devices.size(); ++i) {
         if (i != 0) out << ',';
@@ -1079,6 +1302,7 @@ std::string common_resource_preparation_peak_json(const common_resource_preparat
             << ",\"target_live_bytes\":" << device.target_live_bytes
             << ",\"prepared_kv_bytes\":" << device.prepared_kv_bytes
             << ",\"prepared_expert_cache_bytes\":" << device.prepared_expert_cache_bytes
+            << ",\"prepared_transient_bytes\":" << device.prepared_transient_bytes
             << ",\"peak_bytes\":" << device.peak_bytes
             << ",\"peak_headroom_bytes\":" << device.peak_headroom_bytes << '}';
     }

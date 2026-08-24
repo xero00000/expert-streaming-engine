@@ -81,6 +81,26 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_link_libraries(${TARGET} PRIVATE common mtmd cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-server-tokens
+        ../../tests/test-server-tokens.cpp
+        server-common.cpp
+    )
+    target_include_directories(test-server-tokens PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ../mtmd
+    )
+    target_link_libraries(test-server-tokens PRIVATE
+        common
+        mtmd
+        cpp-httplib
+        ${CMAKE_THREAD_LIBS_INIT}
+    )
+    add_test(NAME test-server-tokens COMMAND test-server-tokens)
+    set_property(TEST test-server-tokens PROPERTY LABELS main)
+endif()
+
 if (LLAMA_SERVER_SSL)
     find_package(OpenSSL REQUIRED)
     target_link_libraries(${TARGET} PRIVATE OpenSSL::SSL OpenSSL::Crypto)

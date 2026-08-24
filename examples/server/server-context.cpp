@@ -5,6 +5,7 @@
 #include "server-queue.h"
 
 #include "common.h"
+#include "resource-planner.h"
 #include "llama.h"
 #include "llama-spec-features.h"
 #include "log.h"
@@ -18,6 +19,7 @@
 #include <regex>
 #include <exception>
 #include <cstdlib>
+#include <set>
 #include <string_view>
 
 static bool server_resource_rebalance_fail_at(std::string_view boundary) noexcept {
@@ -33,6 +35,42 @@ static bool server_resource_rebalance_fail_at(std::string_view boundary) noexcep
     bool expected = false;
     return consumed.compare_exchange_strong(
             expected, true, std::memory_order_relaxed);
+}
+
+struct server_mmproj_residency_transaction {
+    mtmd_context * offside = nullptr;
+    bool published = false;
+    bool finalized = false;
+};
+
+struct server_mtp_residency_transaction {
+    std::vector<common_speculative_mtp_transaction_t> slots;
+    bool published = false;
+    bool finalized = false;
+
+    ~server_mtp_residency_transaction() noexcept {
+        for (auto it = slots.rbegin(); it != slots.rend(); ++it) {
+            common_speculative_mtp_transaction_free(*it);
+        }
+    }
+};
+
+static void server_complete_transient_lease_group(
+        common_transient_module_manager * manager,
+        const std::shared_ptr<server_transient_lease_group> & group,
+        bool commit) noexcept;
+
+static void server_send_transient_rpc_error(
+        server_response & responses,
+        const server_task & task,
+        const std::string & message) {
+    server_task_result result;
+    result.id = task.id;
+    result.id_multi = task.id_multi;
+    result.stop = true;
+    result.error = true;
+    result.data = {{"message", message}};
+    responses.send(std::move(result));
 }
 
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min, llama_pos pos_max, int32_t offset) {
@@ -190,6 +228,12 @@ static common_speculative_stage_params server_parse_speculative_stage_json(const
 }
 
 server_context::~server_context() {
+    // Exact transient transactions hold MTP/mmproj owners that reference slot
+    // speculative state and the live projector pointer. Destroy those handles
+    // while every referenced server owner is still valid.
+    shutdown_transient_residency();
+    transient_manager.reset();
+
     // Speculative state may reference the live target context during teardown.
     for (server_slot& slot : slots) {
         if (slot.ctx_sampling != nullptr) {
@@ -460,7 +504,15 @@ void server_context::init() {
         mtp_desc.bytes = (size_t) mtp_mib * mib;
         mtp_desc.initially_resident = false;
         mtp_desc.streams = {"server-decode"};
-        mtp_desc.quiesce = [this]() { llama_synchronize(ctx); return true; };
+        mtp_desc.quiesce = [this]() {
+            llama_synchronize(ctx);
+            for (auto & slot : slots) {
+                if (auto * companion = common_speculative_get_companion_ctx(slot.spec)) {
+                    llama_synchronize(companion);
+                }
+            }
+            return true;
+        };
         mtp_desc.deactivate = [this]() {
             std::vector<server_slot *> suspended;
             for (auto & slot : slots) {
@@ -486,6 +538,99 @@ void server_context::init() {
                 resumed.push_back(&slot);
             }
             return true;
+        };
+        mtp_desc.prepare_residency = [this](bool target_resident, std::string * error) -> void * {
+            try {
+                auto transaction = std::make_unique<server_mtp_residency_transaction>();
+                transaction->slots.reserve(slots.size());
+                for (auto & slot : slots) {
+                    auto * prepared = common_speculative_mtp_prepare_residency(
+                        slot.spec, target_resident);
+                    if (prepared == nullptr) {
+                        if (error != nullptr) {
+                            *error = "failed to prepare an MTP slot owner";
+                        }
+                        return nullptr;
+                    }
+                    transaction->slots.push_back(prepared);
+                }
+                return transaction.release();
+            } catch (const std::exception & exception) {
+                if (error != nullptr) {
+                    *error = std::string("failed to prepare aggregate MTP ownership: ") +
+                        exception.what();
+                }
+                return nullptr;
+            } catch (...) {
+                if (error != nullptr) {
+                    *error = "unexpected failure while preparing aggregate MTP ownership";
+                }
+                return nullptr;
+            }
+        };
+        mtp_desc.publish_residency = [](void * opaque, std::string * error) {
+            auto * transaction = static_cast<server_mtp_residency_transaction *>(opaque);
+            if (transaction == nullptr || transaction->published || transaction->finalized) {
+                if (error != nullptr) *error = "invalid prepared aggregate MTP owner";
+                return false;
+            }
+            size_t published = 0;
+            for (; published < transaction->slots.size(); ++published) {
+                if (!common_speculative_mtp_transaction_publish(transaction->slots[published])) {
+                    bool restored = true;
+                    while (published > 0) {
+                        --published;
+                        restored &= common_speculative_mtp_transaction_rollback(
+                            transaction->slots[published]);
+                    }
+                    if (!restored) {
+                        GGML_ABORT(
+                            "partial aggregate MTP publication could not restore prior owners\n");
+                    }
+                    if (error != nullptr) {
+                        *error = "failed to publish an MTP slot owner";
+                    }
+                    return false;
+                }
+            }
+            transaction->published = true;
+            return true;
+        };
+        mtp_desc.rollback_residency = [](void * opaque, std::string * error) {
+            auto * transaction = static_cast<server_mtp_residency_transaction *>(opaque);
+            if (transaction == nullptr || !transaction->published || transaction->finalized) {
+                if (error != nullptr) *error = "invalid published aggregate MTP owner";
+                return false;
+            }
+            bool restored = true;
+            for (auto it = transaction->slots.rbegin(); it != transaction->slots.rend(); ++it) {
+                restored &= common_speculative_mtp_transaction_rollback(*it);
+            }
+            if (!restored) {
+                if (error != nullptr) *error = "failed to restore an MTP slot owner";
+                return false;
+            }
+            transaction->published = false;
+            return true;
+        };
+        mtp_desc.finalize_residency = [](void * opaque, std::string * error) {
+            auto * transaction = static_cast<server_mtp_residency_transaction *>(opaque);
+            if (transaction == nullptr || !transaction->published || transaction->finalized) {
+                if (error != nullptr) *error = "invalid aggregate MTP owner finalization";
+                return false;
+            }
+            for (auto * slot_transaction : transaction->slots) {
+                if (!common_speculative_mtp_transaction_finalize(slot_transaction)) {
+                    if (error != nullptr) *error = "failed to finalize an MTP slot owner";
+                    return false;
+                }
+            }
+            transaction->published = false;
+            transaction->finalized = true;
+            return true;
+        };
+        mtp_desc.free_residency = [](void * opaque) {
+            delete static_cast<server_mtp_residency_transaction *>(opaque);
         };
 
         common_transient_module_desc mmproj_desc;
@@ -516,6 +661,80 @@ void server_context::init() {
                 slot.mctx = mctx;
             }
             return true;
+        };
+        mmproj_desc.prepare_residency = [this](bool target_resident, std::string * error) -> void * {
+            try {
+                auto transaction = std::make_unique<server_mmproj_residency_transaction>();
+                if (target_resident) {
+                    transaction->offside = mtmd_init_from_file(
+                        params_base.mmproj.path.c_str(), model, mctx_params);
+                    if (transaction->offside == nullptr) {
+                        if (error != nullptr) {
+                            *error = "failed to prepare the multimodal projector owner";
+                        }
+                        return nullptr;
+                    }
+                }
+                return transaction.release();
+            } catch (const std::exception & exception) {
+                if (error != nullptr) {
+                    *error = std::string("failed to prepare multimodal ownership: ") +
+                        exception.what();
+                }
+                return nullptr;
+            } catch (...) {
+                if (error != nullptr) {
+                    *error = "unexpected failure while preparing multimodal ownership";
+                }
+                return nullptr;
+            }
+        };
+        mmproj_desc.publish_residency = [this](void * opaque, std::string * error) {
+            auto * transaction = static_cast<server_mmproj_residency_transaction *>(opaque);
+            if (transaction == nullptr || transaction->published || transaction->finalized) {
+                if (error != nullptr) *error = "invalid prepared multimodal owner";
+                return false;
+            }
+            std::swap(mctx, transaction->offside);
+            for (auto & slot : slots) slot.mctx = mctx;
+            transaction->published = true;
+            return true;
+        };
+        mmproj_desc.rollback_residency = [this](void * opaque, std::string * error) {
+            auto * transaction = static_cast<server_mmproj_residency_transaction *>(opaque);
+            if (transaction == nullptr || !transaction->published || transaction->finalized) {
+                if (error != nullptr) *error = "invalid published multimodal owner";
+                return false;
+            }
+            std::swap(mctx, transaction->offside);
+            for (auto & slot : slots) slot.mctx = mctx;
+            transaction->published = false;
+            return true;
+        };
+        mmproj_desc.finalize_residency = [](void * opaque, std::string * error) {
+            auto * transaction = static_cast<server_mmproj_residency_transaction *>(opaque);
+            if (transaction == nullptr || !transaction->published || transaction->finalized) {
+                if (error != nullptr) *error = "invalid multimodal owner finalization";
+                return false;
+            }
+            if (transaction->offside != nullptr) {
+                mtmd_free(transaction->offside);
+                transaction->offside = nullptr;
+            }
+            transaction->published = false;
+            transaction->finalized = true;
+            return true;
+        };
+        mmproj_desc.free_residency = [this](void * opaque) {
+            auto * transaction = static_cast<server_mmproj_residency_transaction *>(opaque);
+            if (transaction == nullptr) return;
+            if (transaction->published && !transaction->finalized) {
+                std::swap(mctx, transaction->offside);
+                for (auto & slot : slots) slot.mctx = mctx;
+                transaction->published = false;
+            }
+            if (transaction->offside != nullptr) mtmd_free(transaction->offside);
+            delete transaction;
         };
 
         std::string error;
@@ -605,11 +824,20 @@ bool server_context::transient_enabled() const {
     return transient_manager != nullptr;
 }
 
-uint64_t server_context::acquire_transient(bool multimodal, std::string & error) {
+bool server_context::transient_supports(bool multimodal) const {
+    return transient_manager == nullptr || transient_manager->module_enabled(
+        multimodal ? "multimodal" : "mtp");
+}
+
+uint64_t server_context::acquire_transient(
+        bool multimodal,
+        std::string & error,
+        bool restore_prior) {
     if (!transient_manager) {
         return 0;
     }
-    return transient_manager->acquire({multimodal ? "multimodal" : "mtp"}, false, &error);
+    return transient_manager->acquire(
+        {multimodal ? "multimodal" : "mtp"}, restore_prior, &error);
 }
 
 void server_context::release_transient(uint64_t lease, bool success) {
@@ -618,7 +846,115 @@ void server_context::release_transient(uint64_t lease, bool success) {
     }
     std::string error;
     if (!transient_manager->release(lease, success, &error)) {
-        SRV_ERR("failed to release transient residency lease: %s\n", error.c_str());
+        GGML_ABORT("failed to retire hidden transient residency lease: %s\n",
+            error.c_str());
+    }
+    queue_tasks.notify_slot_changed();
+}
+
+uint64_t server_context::acquire_transient_on_owner(
+        bool multimodal,
+        bool restore_prior,
+        std::string & error) {
+    if (!transient_manager) {
+        error = "transient modules are not configured";
+        return 0;
+    }
+
+    server_task task;
+    task.id = queue_tasks.get_new_id();
+    task.id_multi = -1;
+    task.type = SERVER_TASK_TYPE_TRANSIENT_ACQUIRE;
+    task.data = {
+        {"multimodal", multimodal},
+        {"restore_prior", restore_prior},
+    };
+
+    queue_results.add_waiting_task_id(task.id);
+    struct waiting_guard {
+        server_response & responses;
+        int id;
+        ~waiting_guard() { responses.remove_waiting_task_id(id); }
+    } waiting{queue_results, task.id};
+
+    queue_tasks.post(std::move(task));
+    server_task_result result = queue_results.recv(waiting.id);
+    if (result.error) {
+        error = result.data.value("message", "transient owner-thread acquisition failed");
+        return 0;
+    }
+    return result.data.value("lease", uint64_t(0));
+}
+
+bool server_context::release_transient_on_owner(
+        uint64_t lease,
+        bool success,
+        std::string & error) {
+    if (lease == 0) {
+        return true;
+    }
+    if (!transient_manager) {
+        error = "transient modules are not configured";
+        return false;
+    }
+
+    server_task task;
+    task.id = queue_tasks.get_new_id();
+    task.id_multi = -1;
+    task.type = SERVER_TASK_TYPE_TRANSIENT_RELEASE;
+    task.data = {{"lease", lease}, {"success", success}};
+
+    queue_results.add_waiting_task_id(task.id);
+    struct waiting_guard {
+        server_response & responses;
+        int id;
+        ~waiting_guard() { responses.remove_waiting_task_id(id); }
+    } waiting{queue_results, task.id};
+
+    queue_tasks.post(std::move(task));
+    server_task_result result = queue_results.recv(waiting.id);
+    if (result.error) {
+        error = result.data.value("message", "transient owner-thread release failed");
+        return false;
+    }
+    return true;
+}
+
+void server_context::shutdown_transient_residency() {
+    if (!transient_manager) return;
+
+    // The task loop can stop with deferred requests still queued. Resolve every
+    // pre-acquired lease on the owner thread before speculative/projector
+    // owners or backend state are torn down.
+    auto pending = queue_tasks.take_all_pending_tasks();
+    for (auto & task : pending) {
+        if (task.transient_lease_group != nullptr) {
+            server_complete_transient_lease_group(
+                transient_manager.get(), task.transient_lease_group, false);
+            task.transient_lease_group.reset();
+        } else if (task.transient_lease != 0) {
+            release_transient(task.transient_lease, false);
+            task.transient_lease = 0;
+        }
+    }
+    for (auto & slot : slots) {
+        if (slot.state == SLOT_STATE_PROCESSING) {
+            slot.release();
+        }
+    }
+
+    std::string shutdown_error;
+    if (!transient_manager->resolve_all_leases_for_shutdown(&shutdown_error)) {
+        GGML_ABORT("failed to resolve transient leases at server shutdown: %s\n",
+            shutdown_error.c_str());
+    }
+
+    const auto telemetry = transient_manager->snapshot();
+    uint64_t pins = 0;
+    for (const auto & module : telemetry.modules) pins += module.pins;
+    if (telemetry.active_leases != 0 || telemetry.pending_restores != 0 ||
+            telemetry.reconfiguration_open || pins != 0) {
+        GGML_ABORT("transient residency remained live at server shutdown\n");
     }
 }
 
@@ -795,15 +1131,45 @@ int server_slot::get_n_draft_max() const {
     return n_draft_max;
 }
 
+static void server_complete_transient_lease_group(
+        common_transient_module_manager * manager,
+        const std::shared_ptr<server_transient_lease_group> & group,
+        bool commit) noexcept {
+    if (manager == nullptr || !group) return;
+    if (group->remaining == 0 || group->remaining > group->leases.size()) {
+        GGML_ABORT("invalid transient request lease-group accounting\n");
+    }
+
+    group->commit = group->commit || commit;
+    group->remaining--;
+    if (group->remaining != 0) return;
+
+    std::string error;
+    for (size_t i = group->leases.size(); i > 1; --i) {
+        if (!manager->release(group->leases[i - 1], group->commit, &error)) {
+            GGML_ABORT("failed to release transient request pin: %s\n", error.c_str());
+        }
+    }
+    if (!group->leases.empty() &&
+            !manager->release(group->leases.front(), group->commit, &error)) {
+        GGML_ABORT("failed to resolve transient request owner: %s\n", error.c_str());
+    }
+    group->leases.clear();
+}
+
 void server_slot::release() {
     if (state == SLOT_STATE_PROCESSING) {
         t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
         command = SLOT_COMMAND_RELEASE;
         state = SLOT_STATE_IDLE;
-        if (task != nullptr && task->transient_lease != 0 && transient_manager != nullptr) {
+        if (task != nullptr && task->transient_lease_group != nullptr) {
+            server_complete_transient_lease_group(
+                transient_manager, task->transient_lease_group, true);
+        } else if (task != nullptr && task->transient_lease != 0 && transient_manager != nullptr) {
             std::string error;
             if (!transient_manager->release(task->transient_lease, true, &error)) {
-                SLT_ERR(*this, "failed to release transient residency lease: %s\n", error.c_str());
+                GGML_ABORT("slot could not retire hidden transient residency lease: %s\n",
+                    error.c_str());
             }
         }
         task.reset();
@@ -2998,6 +3364,10 @@ void server_context::process_single_task(server_task&& task) {
         if (task.data.contains("system_prompt")) {
             std::string sys_prompt = json_value(task.data, "system_prompt", std::string());
             if (!system_prompt_set(sys_prompt)) {
+                server_complete_transient_lease_group(
+                    transient_manager.get(), task.transient_lease_group, false);
+                task.transient_lease_group.reset();
+                queue_tasks.notify_slot_changed();
                 send_error(task, "server system prompts are unsupported for openPangu and DeepSeek4", ERROR_TYPE_INVALID_REQUEST);
                 break;
             }
@@ -3006,17 +3376,41 @@ void server_context::process_single_task(server_task&& task) {
                 slot.n_past = 0;
                 slot.n_past_se = 0;
             }
+            if (task.transient_lease_group != nullptr) {
+                // system_prompt_set() has already cleared/changed target KV
+                // and prompt caches. The prior exact MTP owner is now stale
+                // even if later request parsing fails before slot launch.
+                task.transient_lease_group->commit = true;
+            }
         }
 
         if (transient_manager != nullptr) {
-            std::string error;
-            task.transient_lease = acquire_transient(task.tokens.has_mtmd_data(), error);
-            if (task.transient_lease == 0) {
-                LOG_VERBOSE("transient module is currently unavailable; deferring task", {
-                    {"id_task", task.id}, {"error", error},
-                });
-                queue_tasks.defer(std::move(task));
+            const bool multimodal = task.tokens.has_mtmd_data();
+            const bool module_enabled = transient_supports(multimodal);
+            if (multimodal && !module_enabled) {
+                server_complete_transient_lease_group(
+                    transient_manager.get(), task.transient_lease_group, false);
+                task.transient_lease_group.reset();
+                queue_tasks.notify_slot_changed();
+                send_error(
+                    task,
+                    "multimodal requests are disabled by the active transient policy",
+                    ERROR_TYPE_NOT_SUPPORTED);
                 break;
+            }
+            // A disabled MTP policy intentionally falls back to target-only
+            // text generation; multimodal input has no equivalent fallback.
+            if (module_enabled && task.transient_lease == 0 &&
+                    task.transient_lease_group == nullptr) {
+                std::string error;
+                task.transient_lease = acquire_transient(multimodal, error);
+                if (task.transient_lease == 0) {
+                    LOG_VERBOSE("transient module is currently unavailable; deferring task", {
+                        {"id_task", task.id}, {"error", error},
+                    });
+                    queue_tasks.defer(std::move(task));
+                    break;
+                }
             }
         }
 
@@ -3027,15 +3421,63 @@ void server_context::process_single_task(server_task&& task) {
         slot->infill = task.infill;
         slot->embedding = task.embedding;
 
-        if (!launch_slot_with_task(*slot, task)) {
-            release_transient(task.transient_lease, false);
-            task.transient_lease = 0;
+        const auto resolve_task_transient = [&](bool success) noexcept {
+            if (task.transient_lease_group != nullptr) {
+                server_complete_transient_lease_group(
+                    transient_manager.get(), task.transient_lease_group, success);
+                task.transient_lease_group.reset();
+            } else {
+                release_transient(task.transient_lease, success);
+                task.transient_lease = 0;
+            }
+            queue_tasks.notify_slot_changed();
+        };
+
+        bool launched = false;
+        try {
+            launched = launch_slot_with_task(*slot, task);
+        } catch (const std::exception & exception) {
+            // Retire exact transient ownership before formatting or publishing
+            // the request error. launch_slot_with_task moves the task into the
+            // slot only after all parsing/allocation work has completed.
+            resolve_task_transient(false);
+            send_error(task, exception.what(), ERROR_TYPE_INVALID_REQUEST);
+            LOG_ERROR("exception while launching slot", {
+                {"id_task", task.id}, {"error", exception.what()},
+            });
+            break;
+        } catch (...) {
+            resolve_task_transient(false);
+            send_error(task, "unknown exception while launching slot", ERROR_TYPE_SERVER);
+            LOG_ERROR("unknown exception while launching slot", {
+                {"id_task", task.id},
+            });
+            break;
+        }
+
+        if (!launched) {
+            resolve_task_transient(false);
             LOG_ERROR("error while launching slot", task.data);
             break;
         }
     } break;
     case SERVER_TASK_TYPE_CANCEL:
     {
+        // Pending multimodal tasks can already own a pre-tokenization handoff
+        // lease. Extract and release them on this owner thread before their
+        // task objects are destroyed.
+        auto pending = queue_tasks.take_pending_tasks(task.id_target);
+        for (auto & pending_task : pending) {
+            if (pending_task.transient_lease_group != nullptr) {
+                server_complete_transient_lease_group(
+                    transient_manager.get(), pending_task.transient_lease_group, false);
+                pending_task.transient_lease_group.reset();
+            } else if (pending_task.transient_lease != 0) {
+                release_transient(pending_task.transient_lease, true);
+                pending_task.transient_lease = 0;
+            }
+        }
+        queue_tasks.notify_slot_changed();
         // release slot linked with the task id
         for (auto& slot : slots) {
             if (slot.id_task == task.id_target) {
@@ -3047,6 +3489,70 @@ void server_context::process_single_task(server_task&& task) {
     case SERVER_TASK_TYPE_NEXT_RESPONSE:
     {
         // do nothing
+    } break;
+    case SERVER_TASK_TYPE_TRANSIENT_ACQUIRE:
+    {
+        const bool multimodal = task.data.value("multimodal", false);
+        const bool restore_prior = task.data.value("restore_prior", false);
+        if (transient_manager == nullptr) {
+            server_send_transient_rpc_error(
+                queue_results, task, "transient modules are not configured");
+            break;
+        }
+        if (!transient_supports(multimodal)) {
+            server_send_transient_rpc_error(
+                queue_results, task,
+                multimodal
+                    ? "multimodal requests are disabled by the active transient policy"
+                    : "MTP requests are disabled by the active transient policy");
+            break;
+        }
+        std::string error;
+        const uint64_t lease = acquire_transient(multimodal, error, restore_prior);
+        if (lease == 0) {
+            const bool retryable =
+                error.find("insufficient evictable transient capacity") != std::string::npos ||
+                error.find("active residency epoch") != std::string::npos ||
+                error.find("blocked by policy reconfiguration") != std::string::npos;
+            if (retryable) {
+                queue_tasks.defer(std::move(task));
+                break;
+            }
+            server_send_transient_rpc_error(
+                queue_results, task,
+                error.empty() ? "transient module is currently unavailable" : error);
+            break;
+        }
+        server_task_result result;
+        result.id = task.id;
+        result.id_multi = task.id_multi;
+        result.stop = true;
+        result.error = false;
+        result.data = {{"lease", lease}};
+        queue_results.send(std::move(result));
+    } break;
+    case SERVER_TASK_TYPE_TRANSIENT_RELEASE:
+    {
+        if (transient_manager == nullptr) {
+            server_send_transient_rpc_error(
+                queue_results, task, "transient modules are not configured");
+            break;
+        }
+        const uint64_t lease = task.data.value("lease", uint64_t(0));
+        const bool success = task.data.value("success", true);
+        std::string error;
+        if (lease != 0 && !transient_manager->release(lease, success, &error)) {
+            GGML_ABORT("owner RPC could not retire transient residency lease: %s\n",
+                error.c_str());
+        }
+        queue_tasks.notify_slot_changed();
+        server_task_result result;
+        result.id = task.id;
+        result.id_multi = task.id_multi;
+        result.stop = true;
+        result.error = false;
+        result.data = {{"released", true}};
+        queue_results.send(std::move(result));
     } break;
     case SERVER_TASK_TYPE_METRICS:
     {
@@ -3143,9 +3649,27 @@ void server_context::process_single_task(server_task&& task) {
                 }},
             });
         }
+        common_transient_module_telemetry transient;
+        const bool has_transient = transient_manager != nullptr;
+        if (has_transient) {
+            transient = transient_manager->snapshot();
+        }
+        uint64_t transient_pins = 0;
+        for (const auto & module : transient.modules) {
+            transient_pins += module.pins;
+        }
+        const bool transient_safe = !has_transient ||
+            (transient.active_leases == 0 && transient_pins == 0 &&
+             transient.pending_restores == 0 && !transient.reconfiguration_open);
+        const bool resource_safe_point = n_processing_slots == 0 &&
+            queue_tasks.queue_tasks_deferred.empty() && transient_safe;
+        json mutable_pools = {"kv", "expert-cache"};
+        if (has_transient) {
+            mutable_pools.push_back("transient");
+        }
         res.data["resources"] = {
             {"schema", 1},
-            {"safe_point", n_processing_slots == 0},
+            {"safe_point", resource_safe_point},
             {"slots", {
                 {"idle", n_idle_slots},
                 {"processing", n_processing_slots},
@@ -3166,7 +3690,7 @@ void server_context::process_single_task(server_task&& task) {
             {"runtime_rebalance", {
                 {"mutation_enabled", true},
                 {"mode", "idle-atomic-multi-pool"},
-                {"mutable_pools", {"kv", "expert-cache"}},
+                {"mutable_pools", std::move(mutable_pools)},
                 {"combined_mutation", true},
                 {"dry_run_endpoint", "/v1/ese/resources/rebalance"},
             }},
@@ -3176,8 +3700,7 @@ void server_context::process_single_task(server_task&& task) {
             res.data["resources"]["plan"] = json::parse(plan_json);
         }
 
-        if (transient_manager != nullptr) {
-            const auto transient = transient_manager->snapshot();
+        if (has_transient) {
             json modules = json::array();
             for (const auto & module : transient.modules) {
                 modules.push_back({
@@ -3185,11 +3708,29 @@ void server_context::process_single_task(server_task&& task) {
                     {"kind", (int) module.kind},
                     {"device", module.device},
                     {"bytes", module.bytes},
+                    {"enabled", module.enabled},
                     {"resident", module.resident},
                     {"pins", module.pins},
                 });
             }
-            res.data["transient"] = {
+            json transient_devices = json::array();
+            for (const auto & pair : transient.budgets) {
+                const auto resident = transient.resident_bytes.find(pair.first);
+                const uint64_t resident_bound = resident == transient.resident_bytes.end()
+                    ? 0 : resident->second;
+                const uint64_t usable = pair.second.capacity_bytes >=
+                        pair.second.safety_margin_bytes
+                    ? pair.second.capacity_bytes - pair.second.safety_margin_bytes : 0;
+                transient_devices.push_back({
+                    {"device", pair.first},
+                    {"capacity_bytes", pair.second.capacity_bytes},
+                    {"reserve_bytes", pair.second.safety_margin_bytes},
+                    {"usable_bytes", usable},
+                    {"resident_configured_bound_bytes", resident_bound},
+                });
+            }
+            res.data["resources"]["transient"] = {
+                {"policy", common_transient_policy_name(transient.policy)},
                 {"transactions", transient.transactions},
                 {"swaps", transient.swaps},
                 {"rollbacks", transient.rollbacks},
@@ -3198,7 +3739,13 @@ void server_context::process_single_task(server_task&& task) {
                 {"bytes_moved", transient.bytes_moved},
                 {"swap_latency_us", transient.swap_latency_us},
                 {"last_failure", transient.last_failure},
-                {"resident_bytes", transient.resident_bytes},
+                {"active_leases", transient.active_leases},
+                {"pins", transient_pins},
+                {"pending_restores", transient.pending_restores},
+                {"reconfiguration_open", transient.reconfiguration_open},
+                {"byte_accounting", "configured-peak-bounds-not-backend-measurement"},
+                {"placement_scope", "configured-main-gpu-only"},
+                {"devices", std::move(transient_devices)},
                 {"modules", std::move(modules)},
             };
         }
@@ -3219,6 +3766,20 @@ void server_context::process_single_task(server_task&& task) {
             result.data = format_error_response(message, type);
             queue_results.send(std::move(result));
         };
+        const std::string expected_previous_plan =
+            task.data.at("expected_previous_plan").get<std::string>();
+        bool stale_previous_plan = false;
+        {
+            std::lock_guard<std::mutex> plan_lock(resource_plan_mutex);
+            stale_previous_plan =
+                params_base.resolved_resource_plan_json != expected_previous_plan;
+        }
+        if (stale_previous_plan) {
+            fail(
+                "resource plan changed before owner-thread preparation; retry from a fresh snapshot",
+                ERROR_TYPE_UNAVAILABLE);
+            break;
+        }
         bool slots_idle = true;
         for (const server_slot & slot : slots) {
             if (!slot.available()) {
@@ -3240,9 +3801,20 @@ void server_context::process_single_task(server_task&& task) {
         }
 
         const std::string scope = task.data.at("scope").get<std::string>();
-        if (scope != "kv-only" && scope != "expert-cache-only" &&
-                scope != "kv-and-expert") {
+        static const std::set<std::string> supported_scopes = {
+            "kv-only", "expert-cache-only", "transient-only",
+            "kv-and-expert", "kv-and-transient", "expert-and-transient",
+            "kv-expert-and-transient",
+        };
+        if (supported_scopes.count(scope) == 0) {
             fail("unsupported runtime rebalance scope", ERROR_TYPE_INVALID_REQUEST);
+            break;
+        }
+        const bool replace_kv = task.data.at("replace_kv").get<bool>();
+        const bool replace_expert = task.data.at("replace_expert").get<bool>();
+        const bool replace_transient = task.data.at("replace_transient").get<bool>();
+        if (!replace_kv && !replace_expert && !replace_transient) {
+            fail("runtime rebalance task has no physical operation", ERROR_TYPE_INVALID_REQUEST);
             break;
         }
         const uint32_t target_context = task.data.at("target_context").get<uint32_t>();
@@ -3267,11 +3839,47 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
 
+        // Cache pruning happens after KV finalization, where rollback is no
+        // longer possible. Resolve every multimodal-safe prefix now, while the
+        // transaction is still untouched, and reject a cut that would move
+        // behind a live continuation.
+        std::vector<size_t> target_cache_prefixes;
+        if (replace_kv) {
+            target_cache_prefixes.reserve(slots.size());
+            bool media_cut_precedes_live_state = false;
+            for (const server_slot & slot : slots) {
+                const size_t prefix = slot.cache_tokens.media_safe_prefix_size(
+                    target_slot_context);
+                target_cache_prefixes.push_back(prefix);
+                media_cut_precedes_live_state |= size_t(slot.n_past) > prefix;
+            }
+            if (media_cut_precedes_live_state) {
+                fail(
+                    "target context would cut through cached media before a live continuation",
+                    ERROR_TYPE_INVALID_REQUEST);
+                break;
+            }
+        }
+
         const uint32_t previous_context = llama_kv_cache_size(ctx);
         const uint64_t target_expert_cache =
             task.data.at("target_expert_cache_bytes_per_device").get<uint64_t>();
+        common_transient_policy target_transient_policy = COMMON_TRANSIENT_POLICY_OFF;
+        if (!common_parse_transient_policy(
+                task.data.at("target_transient_policy").get<std::string>(),
+                target_transient_policy)) {
+            fail("runtime rebalance task has an invalid transient policy", ERROR_TYPE_INVALID_REQUEST);
+            break;
+        }
         uint64_t previous_expert_cache = 0;
         const json & previous_plan = task.data.at("previous_plan");
+        common_transient_policy previous_transient_policy = COMMON_TRANSIENT_POLICY_OFF;
+        if (!common_parse_transient_policy(
+                previous_plan.at("transient_policy").get<std::string>(),
+                previous_transient_policy)) {
+            fail("previous resource plan has an invalid transient policy", ERROR_TYPE_SERVER);
+            break;
+        }
         if (previous_plan.contains("devices") && previous_plan.at("devices").is_array()) {
             for (const auto & device : previous_plan.at("devices")) {
                 if (device.value("id", -1) >= 0) {
@@ -3281,10 +3889,9 @@ void server_context::process_single_task(server_task&& task) {
             }
         }
 
-        const bool replace_kv = scope == "kv-only" || scope == "kv-and-expert";
-        const bool replace_expert = scope == "expert-cache-only" || scope == "kv-and-expert";
         const bool mutated = (replace_kv && previous_context != target_context) ||
-                (replace_expert && previous_expert_cache != target_expert_cache);
+                (replace_expert && previous_expert_cache != target_expert_cache) ||
+                (replace_transient && previous_transient_policy != target_transient_policy);
 
         // Allocate every response and logical-plan object before publication.
         // Once the old pools are finalized, the remaining logical commit is a
@@ -3306,14 +3913,21 @@ void server_context::process_single_task(server_task&& task) {
             {"previous_expert_cache_bytes_per_device", previous_expert_cache},
             {"current_expert_cache_bytes_per_device",
                 replace_expert ? target_expert_cache : previous_expert_cache},
+            {"previous_transient_policy",
+                common_transient_policy_name(previous_transient_policy)},
+            {"current_transient_policy", common_transient_policy_name(
+                replace_transient ? target_transient_policy : previous_transient_policy)},
             {"current_plan", task.data.at("target_plan")},
         };
 
         struct transaction_scope {
             llama_kv_cache_transaction_t kv = nullptr;
             llama_expert_cache_transaction_t expert = nullptr;
+            common_transient_module_manager * transient_owner = nullptr;
+            common_transient_policy_transaction * transient = nullptr;
             bool kv_published = false;
             bool expert_published = false;
+            bool transient_published = false;
 
             ~transaction_scope() noexcept {
                 clear();
@@ -3321,6 +3935,11 @@ void server_context::process_single_task(server_task&& task) {
 
             bool roll_back() noexcept {
                 bool restored = true;
+                if (transient_published) {
+                    restored &= transient_owner != nullptr &&
+                        transient_owner->rollback_policy(transient, nullptr);
+                    transient_published = false;
+                }
                 if (expert_published) {
                     restored &= llama_expert_cache_transaction_rollback(expert);
                     expert_published = false;
@@ -3333,6 +3952,14 @@ void server_context::process_single_task(server_task&& task) {
             }
 
             void clear() noexcept {
+                if (transient != nullptr) {
+                    if (transient_owner == nullptr ||
+                            !transient_owner->free_policy(transient, nullptr)) {
+                        GGML_ABORT("transient policy transaction cleanup invariant failed\n");
+                    }
+                }
+                transient = nullptr;
+                transient_owner = nullptr;
                 llama_expert_cache_transaction_free(expert);
                 expert = nullptr;
                 llama_kv_cache_transaction_free(kv);
@@ -3378,6 +4005,27 @@ void server_context::process_single_task(server_task&& task) {
             }
         }
 
+        if (replace_transient) {
+            if (transient_manager == nullptr) {
+                abort_transaction(
+                    "transient-policy preparation requires configured runtime modules");
+                break;
+            }
+            transaction.transient_owner = transient_manager.get();
+            transaction.transient = transient_manager->prepare_policy(
+                target_transient_policy, nullptr);
+            if (transaction.transient == nullptr) {
+                abort_transaction(
+                    "transient-policy preparation failed; the original resources remain active");
+                break;
+            }
+            if (server_resource_rebalance_fail_at("after-transient-prepare")) {
+                abort_transaction(
+                    "injected failure after transient preparation; the original resources remain active");
+                break;
+            }
+        }
+
         if (replace_kv) {
             if (!llama_kv_cache_transaction_publish(transaction.kv)) {
                 abort_transaction(
@@ -3399,6 +4047,25 @@ void server_context::process_single_task(server_task&& task) {
                 break;
             }
             transaction.expert_published = true;
+            if (server_resource_rebalance_fail_at("after-expert-publish")) {
+                abort_transaction(
+                    "injected failure after expert-cache publication; the original resources were restored");
+                break;
+            }
+        }
+
+        if (replace_transient) {
+            if (!transient_manager->publish_policy(transaction.transient, nullptr)) {
+                abort_transaction(
+                    "transient-policy publication failed; the original resources were restored");
+                break;
+            }
+            transaction.transient_published = true;
+            if (server_resource_rebalance_fail_at("after-transient-publish")) {
+                abort_transaction(
+                    "injected failure after transient publication; the original resources were restored");
+                break;
+            }
         }
 
         if (server_resource_rebalance_fail_at("before-logical-publish")) {
@@ -3414,6 +4081,11 @@ void server_context::process_single_task(server_task&& task) {
         // vector shrink, or ownership move under one reader-visible snapshot.
         {
             std::lock_guard<std::mutex> logical_publish_lock(resource_plan_mutex);
+            if (replace_transient &&
+                    !transient_manager->finalize_policy(transaction.transient, nullptr)) {
+                GGML_ABORT("transient-policy transaction reached an invalid finalization state\n");
+            }
+            transaction.transient_published = false;
             if (replace_expert &&
                     !llama_expert_cache_transaction_finalize(transaction.expert)) {
                 GGML_ABORT("expert-cache transaction reached an invalid finalization state\n");
@@ -3425,18 +4097,24 @@ void server_context::process_single_task(server_task&& task) {
             transaction.kv_published = false;
 
             if (replace_kv) {
-                for (server_slot & slot : slots) {
+                for (size_t index = 0; index < slots.size(); ++index) {
+                    server_slot & slot = slots[index];
                     slot.n_ctx = int32_t(target_slot_context);
-                    if (slot.cache_tokens.size() > target_slot_context) {
-                        slot.cache_tokens.resize(target_slot_context);
+                    if (slot.cache_tokens.size() > target_cache_prefixes[index]) {
+                        slot.cache_tokens.shrink_to_media_safe_prefix(
+                            target_cache_prefixes[index]);
                     }
                 }
                 n_ctx = int32_t(target_context);
             }
             params_base.resolved_resource_plan_json = std::move(target_plan_text);
             n_ctx_published.store(n_ctx, std::memory_order_release);
+            // Closing the finalized policy handle makes its capabilities
+            // observable. Do it under the same publication lock as the plan so
+            // readers cannot pair new capabilities with the old logical state.
+            transaction.clear();
         }
-        transaction.clear();
+        queue_tasks.notify_slot_changed();
         queue_results.send(std::move(result));
     } break;
     case SERVER_TASK_TYPE_SLOT_SAVE:

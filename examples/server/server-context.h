@@ -300,10 +300,23 @@ struct server_context {
     void init();
 
     bool transient_enabled() const;
+    bool transient_supports(bool multimodal) const;
     std::string resource_plan_json() const;
     std::pair<int32_t, std::string> published_resource_state() const;
-    uint64_t acquire_transient(bool multimodal, std::string & error);
+    // Direct residency methods are owner-thread only. Prompt preprocessing on
+    // HTTP workers must use the queued wrappers so model owners are never
+    // swapped concurrently with inference.
+    uint64_t acquire_transient(
+        bool multimodal,
+        std::string & error,
+        bool restore_prior = false);
     void release_transient(uint64_t lease, bool success = true);
+    uint64_t acquire_transient_on_owner(
+        bool multimodal,
+        bool restore_prior,
+        std::string & error);
+    bool release_transient_on_owner(uint64_t lease, bool success, std::string & error);
+    void shutdown_transient_residency();
 
     std::vector<llama_token> tokenize(const json& json_prompt, bool add_special) const;
 
