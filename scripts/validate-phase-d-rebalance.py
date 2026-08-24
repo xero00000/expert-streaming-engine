@@ -44,6 +44,7 @@ TRANSIENT_POLICIES = (
     "multimodal-only",
     "off",
 )
+CANCELLATION_CLEANUP_TIMEOUT_SECONDS = 30.0
 HANDOFF_A_PROMPT = "ESE handoff sequence A establishes deterministic text residency."
 HANDOFF_SYSTEM_PROMPT = (
     "ESE transient handoff system mutation must survive post-mutation launch failure."
@@ -1900,7 +1901,7 @@ def validate_multitask_multimodal_handoff(
             and snapshot.get("transient", {}).get("pins") == 0
             and snapshot.get("transient", {}).get("pending_restores") == 0
         ),
-        args.request_timeout,
+        min(args.request_timeout, CANCELLATION_CLEANUP_TIMEOUT_SECONDS),
         "all-fail image batch rollback",
     )
     all_fail_state = require_transient_policy(
@@ -1953,7 +1954,7 @@ def validate_multitask_multimodal_handoff(
             and snapshot.get("transient", {}).get("pins") == 0
             and snapshot.get("transient", {}).get("pending_restores") == 0
         ),
-        args.request_timeout,
+        min(args.request_timeout, CANCELLATION_CLEANUP_TIMEOUT_SECONDS),
         "partial-launch image batch commit",
     )
     partial_state = require_transient_policy(
@@ -2046,7 +2047,7 @@ def validate_deferred_multimodal_cancel(
                 and snapshot.get("transient", {}).get("pins") == 0
                 and snapshot.get("transient", {}).get("pending_restores") == 0
             ),
-            args.request_timeout,
+            min(args.request_timeout, CANCELLATION_CLEANUP_TIMEOUT_SECONDS),
             "deferred multimodal cancellation cleanup",
         )
         if busy_future.done():
