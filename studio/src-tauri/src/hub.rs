@@ -232,11 +232,18 @@ fn hardware(ese_binary: &Path) -> Result<HardwareSummary, String> {
         .args(["doctor", "--json"])
         .output()
         .map_err(|error| format!("could not inspect ESE hardware: {error}"))?;
-    if !output.status.success() {
-        return Err("ESE hardware inspection failed".into());
-    }
-    let doctor: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("invalid ESE hardware report: {error}"))?;
+    let doctor: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            format!(
+                "invalid ESE hardware report ({status}): {error}",
+                status = output.status
+            )
+        } else {
+            format!("invalid ESE hardware report: {error}; {detail}")
+        }
+    })?;
     let ram_available = doctor
         .get("ram_available")
         .and_then(Value::as_u64)
@@ -245,11 +252,19 @@ fn hardware(ese_binary: &Path) -> Result<HardwareSummary, String> {
         .get("ram_total")
         .and_then(Value::as_u64)
         .unwrap_or_default();
-    let gpus = doctor
-        .get("gpus")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let gpus = if doctor
+        .get("server_cuda")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        doctor
+            .get("gpus")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let vram_total = gpus
         .iter()
         .filter_map(|gpu| gpu.get("total_bytes").and_then(Value::as_u64))

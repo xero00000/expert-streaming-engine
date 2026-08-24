@@ -87,8 +87,8 @@ jobs:
 
   windows-studio:
     name: Build Windows Studio installers
-    runs-on: windows-2025
-    timeout-minutes: 60
+    runs-on: windows-2022
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -117,14 +117,23 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Install CUDA toolkit
+        shell: pwsh
+        run: .\.github\scripts\setup-cuda-windows.ps1
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja -y
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: studio/src-tauri
 
-      - name: Build bundled ESE CPU runtime
-        shell: pwsh
+      - name: Build bundled ESE CPU + CUDA runtime
+        shell: cmd
         run: |
-          cmake -S . -B build-release-runtime -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON -A x64
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build-release-runtime -G "Ninja Multi-Config" -DGGML_CUDA=ON -DGGML_NATIVE=OFF "-DCMAKE_CUDA_ARCHITECTURES=75-real;86-real;86-virtual" "-DCMAKE_CUDA_FLAGS=--threads=2" -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON
           cmake --build build-release-runtime --config Release --target llama-server -j 2
 
       - name: Build standalone Windows ESE launcher
@@ -141,7 +150,25 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           pnpm install --frozen-lockfile
-          pnpm tauri build --bundles nsis,msi
+          pnpm tauri build --bundles msi
+          pnpm tauri build --bundles nsis
+
+      - name: Verify CUDA runtime in installer staging
+        shell: pwsh
+        run: |
+          python .\.github\scripts\verify-windows-runtime.py --runtime-root .\studio\runtime\ese --build-root .\build-release-runtime
+          if ($LASTEXITCODE -ne 0) { throw "Staged Windows runtime verification failed" }
+          .\studio\runtime\ese\ese.exe doctor --json
+          if ($LASTEXITCODE -ne 0) { throw "ESE runtime doctor failed" }
+
+          $driverDll = Join-Path $env:SystemRoot "System32\nvcuda.dll"
+          $hasNvidiaDriver = (Test-Path -LiteralPath $driverDll) -or [bool](Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue)
+          if ($hasNvidiaDriver) {
+            .\studio\runtime\ese\build\bin\llama-server.exe --version
+            if ($LASTEXITCODE -ne 0) { throw "CUDA llama-server smoke test failed" }
+          } else {
+            Write-Host "NVIDIA driver unavailable; PE dependency checks passed and executable smoke test was skipped."
+          }
 
       - name: Prepare Windows assets
         shell: pwsh

@@ -1,12 +1,12 @@
 name: Research
 description: Track new technical research area
 title: "Research: "
-labels: ["research 🔬"]
+labels: []
 body:
   - type: markdown
     attributes:
       value: |
-        Don't forget to check for any duplicate research issue tickets
+        Search open and closed ESE issues before starting a new research ticket.
 
   - type: checkboxes
     id: research-stage
@@ -14,8 +14,8 @@ body:
       label: Research Stage
       description: Track general state of this research ticket
       options:
-        - label: Background Research (Let's try to avoid reinventing the wheel)
-        - label: Hypothesis Formed (How do you think this will work and it's effect?)
+        - label: Background research (avoid reinventing the wheel)
+        - label: Hypothesis formed (expected behavior and effect)
         - label: Strategy / Implementation Forming
         - label: Analysis of results
         - label: Debrief / Documentation (So people in the future can learn from us)
@@ -24,13 +24,13 @@ body:
     id: background
     attributes:
       label: Previous existing literature and research
-      description: Whats the current state of the art and whats the motivation for this research?
+      description: What is the current state of the art, and what motivates this research?
 
   - type: textarea
     id: hypothesis
     attributes:
       label: Hypothesis
-      description: How do you think this will work and it's effect?
+      description: How do you think this will work, and what effect do you expect?
 
   - type: textarea
     id: implementation

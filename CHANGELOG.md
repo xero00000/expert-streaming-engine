@@ -2,6 +2,15 @@
 
 ## Unreleased — unified engine
 
+### Fixed
+
+- Windows Studio packages now include the CUDA-enabled native runtime and its
+  redistributable CUDA libraries while retaining CPU fallback.
+- Hardware discovery no longer fails merely because an installed user does not
+  have source-build tools, and failed sweeps surface the native server error.
+- Visible Studio failures offer a privacy-scrubbed, prefilled GitHub bug report
+  that the user can review before submitting.
+
 ### Added
 
 - `ese` front door with `doctor`, `build`, `plan`, and `serve`.
