@@ -1,0 +1,2 @@
+# Preserve the official NVIDIA license byte-for-byte, including upstream whitespace.
+studio/licenses/NVIDIA-CUDA-12.4-LICENSE.txt -whitespace

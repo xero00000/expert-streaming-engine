@@ -350,4 +350,6 @@ research branches remain isolated until their own validation is complete.
 
 ESE is MIT licensed. It derives from `ik_llama.cpp`, which derives from
 `llama.cpp`; imported work retains its original attribution and license
-notices.
+notices. Windows packages also include NVIDIA CUDA redistributable DLLs under
+NVIDIA's terms; see [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) for the
+bundled components, exact license provenance, and checksums.

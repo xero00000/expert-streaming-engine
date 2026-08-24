@@ -1,0 +1,47 @@
+THIRD-PARTY NOTICES
+===================
+
+Purpose of this file
+--------------------
+
+This file identifies licenses and notices for components distributed with
+ESE Studio. It is informational, is not legal advice or a statement of legal
+clearance, and does not modify or replace any governing license terms.
+
+Expert Streaming Engine (ESE)
+-----------------------------
+
+ESE source code and the native runtime derived from ggml, llama.cpp, and
+ik_llama.cpp are distributed under the MIT License. The complete MIT License
+and upstream copyright notices are in LICENSE at the repository root and are
+bundled with ESE Studio as licenses/ESE-MIT-LICENSE.txt.
+
+NVIDIA CUDA runtime components (Windows packages only)
+-------------------------------------------------------
+
+The ESE Studio Windows packages include unmodified NVIDIA redistributable
+binaries required by the CUDA-enabled native runtime:
+
+  * cudart64_12.dll from NVIDIA cuda_cudart 12.4.127
+  * cublas64_12.dll and cublasLt64_12.dll from NVIDIA libcublas 12.4.5.8
+
+These NVIDIA components are not licensed under ESE's MIT License. They are
+owned by NVIDIA Corporation and governed by the NVIDIA Software License
+Agreement and CUDA Supplement included with those redistributable packages.
+The unmodified official license text is bundled as
+licenses/NVIDIA-CUDA-12.4-LICENSE.txt.
+
+License provenance
+------------------
+
+Official cuda_cudart license source:
+https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/LICENSE.txt
+
+Official libcublas license source:
+https://developer.download.nvidia.com/compute/cuda/redist/libcublas/LICENSE.txt
+
+The two official license downloads were identical when vendored. SHA-256:
+e2c71babfd18a8e69542dd7e9ca018f9caa438094001a58e6bc4d8c999bf0d07
+
+CUDA 12.4.1 EULA reference:
+https://docs.nvidia.com/cuda/archive/12.4.1/pdf/EULA.pdf

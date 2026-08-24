@@ -1,13 +1,14 @@
 name: Refactor (Maintainers)
 description: Used to track refactoring opportunities
 title: "Refactor: "
-labels: ["refactor"]
+labels: []
 body:
   - type: markdown
     attributes:
       value: |
-        Don't forget to [check for existing refactor issue tickets](https://github.com/ikawrakow/ik_llama.cpp/issues?q=is%3Aopen+is%3Aissue+label%3Arefactoring) in case it's already covered.
-        Also you may want to check [Pull request refactor label as well](https://github.com/ikawrakow/ik_llama.cpp/pulls?q=is%3Aopen+is%3Apr+label%3Arefactoring) for duplicates too.
+        Check [existing ESE issues](https://github.com/xero00000/expert-streaming-engine/issues?q=is%3Aissue+refactor)
+        and [open pull requests](https://github.com/xero00000/expert-streaming-engine/pulls?q=is%3Apr+is%3Aopen+refactor)
+        before opening a duplicate refactor ticket.
 
   - type: textarea
     id: background-description

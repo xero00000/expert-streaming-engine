@@ -207,7 +207,7 @@ function App() {
         "",
         "Add anything else that may help. Do not include prompts, model paths, usernames, hostnames, or private logs.",
         "",
-        "> This draft was generated locally. Review it before submitting.",
+        "> This draft was generated locally. Review every field and remove any private or identifying information before submitting.",
       ].join("\n"),
     });
     try {
