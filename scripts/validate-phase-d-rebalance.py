@@ -3385,11 +3385,16 @@ def main() -> int:
             }
         transient = {
             "committed_path": committed_path,
-            "injected_failures": injected_failures,
             "evidence_scope": (
                 "transient-only" if args.transient_only else "combined-three-pool"
             ),
         }
+        if args.transient_only:
+            transient["injected_failures"] = injected_failures
+        else:
+            # Preserve the schema-v3 field consumed by existing combined-gate
+            # evidence and downstream report tooling.
+            transient["combined_injected_failures"] = injected_failures
     report = {
         "schema": 3,
         "status": "pass",
