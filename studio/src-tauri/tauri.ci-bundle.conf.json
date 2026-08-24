@@ -1,0 +1,8 @@
+{
+  "build": {
+    "beforeBuildCommand": "pnpm exec tsc && pnpm exec vite build"
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false
+  }
+}

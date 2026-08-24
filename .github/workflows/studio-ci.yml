@@ -166,6 +166,14 @@ jobs:
         shell: pwsh
         run: choco install ninja -y
 
+      - name: Restore incremental Windows CUDA build
+        uses: actions/cache@v4
+        with:
+          path: build-package
+          key: ese-windows-cuda-v1-${{ runner.os }}-cuda12.4-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'src/**', 'common/**', 'examples/server/**', '.github/scripts/setup-cuda-windows.ps1') }}
+          restore-keys: |
+            ese-windows-cuda-v1-${{ runner.os }}-cuda12.4-
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: studio/src-tauri
@@ -230,8 +238,82 @@ jobs:
       - name: Test Rust backend
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      - name: Preserve verified Windows runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: ese-windows-runtime-${{ github.sha }}
+          path: studio/runtime/ese
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  windows-msi:
+    name: Windows MSI installer
+    needs: windows-studio
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: studio
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri
+
+      - name: Install locked frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore verified Windows runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: ese-windows-runtime-${{ github.sha }}
+          path: studio/runtime/ese
+
+      - name: Verify restored runtime payload
+        shell: pwsh
+        working-directory: .
+        run: |
+          $required = @(
+            '.\studio\runtime\ese\ese.exe',
+            '.\studio\runtime\ese\build\bin\llama-server.exe',
+            '.\studio\runtime\ese\build\bin\ese-runtime.json'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path)) { throw "Missing runtime artifact: $path" }
+          }
+
       - name: Build MSI installer
-        run: pnpm tauri build --bundles msi --config src-tauri/tauri.unsigned.conf.json
+        id: build_msi
+        continue-on-error: true
+        env:
+          RUST_BACKTRACE: "1"
+          RUST_LOG: tauri_bundler=trace
+        run: pnpm tauri build --bundles msi --config src-tauri/tauri.ci-bundle.conf.json
+
+      - name: Upload WiX diagnostics
+        if: always() && steps.build_msi.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ese-studio-wix-diagnostics-${{ github.run_id }}
+          path: studio/src-tauri/target/release/wix
+          if-no-files-found: warn
+
+      - name: Require MSI build success
+        if: steps.build_msi.outcome == 'failure'
+        shell: pwsh
+        run: throw 'MSI packaging failed; inspect the uploaded WiX diagnostics artifact.'
 
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
@@ -240,8 +322,42 @@ jobs:
           path: studio/src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: error
 
+  windows-nsis:
+    name: Windows NSIS installer
+    needs: windows-studio
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: studio
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri
+
+      - name: Install locked frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore verified Windows runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: ese-windows-runtime-${{ github.sha }}
+          path: studio/runtime/ese
+
       - name: Build NSIS installer
-        run: pnpm tauri build --bundles nsis --config src-tauri/tauri.unsigned.conf.json
+        run: pnpm tauri build --bundles nsis --config src-tauri/tauri.ci-bundle.conf.json
 
       - name: Upload Windows NSIS installer
         uses: actions/upload-artifact@v4
