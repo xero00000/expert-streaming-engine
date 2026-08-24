@@ -157,22 +157,25 @@ jobs:
         with:
           components: clippy,rustfmt
 
-      - name: Install CUDA toolkit
-        working-directory: .
-        shell: pwsh
-        run: .\.github\scripts\setup-cuda-windows.ps1
-
-      - name: Install Ninja
-        shell: pwsh
-        run: choco install ninja -y
-
-      - name: Restore incremental Windows CUDA build
+      - name: Restore exact Windows CUDA runtime build
+        id: windows-cuda-cache
         uses: actions/cache@v4
         with:
           path: build-package
           key: ese-windows-cuda-v1-${{ runner.os }}-cuda12.4-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'src/**', 'common/**', 'examples/server/**', '.github/scripts/setup-cuda-windows.ps1') }}
           restore-keys: |
             ese-windows-cuda-v1-${{ runner.os }}-cuda12.4-
+
+      - name: Install CUDA toolkit
+        if: steps.windows-cuda-cache.outputs.cache-hit != 'true'
+        working-directory: .
+        shell: pwsh
+        run: .\.github\scripts\setup-cuda-windows.ps1
+
+      - name: Install Ninja
+        if: steps.windows-cuda-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: choco install ninja -y
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -182,6 +185,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build bundled ESE CPU + CUDA runtime
+        if: steps.windows-cuda-cache.outputs.cache-hit != 'true'
         working-directory: .
         shell: cmd
         run: |
