@@ -157,6 +157,10 @@ function App() {
   const [sweepConfirmation, setSweepConfirmation] = useState(false);
   const [profileApplied, setProfileApplied] = useState(false);
   const [maxContext, setMaxContext] = useState(131072);
+  const [concurrentSessions, setConcurrentSessions] = useState(() => {
+    const stored = Number(globalThis.localStorage?.getItem("ese-concurrent-sessions"));
+    return [1, 2, 4].includes(stored) ? stored : 1;
+  });
   const [notice, setNotice] = useState<string>();
   const [modelRoot, setModelRoot] = useState("");
   const [showAppEditor, setShowAppEditor] = useState(false);
@@ -286,6 +290,10 @@ function App() {
   }, [terminalHeight]);
 
   useEffect(() => {
+    globalThis.localStorage?.setItem("ese-concurrent-sessions", String(concurrentSessions));
+  }, [concurrentSessions]);
+
+  useEffect(() => {
     globalThis.localStorage?.setItem("ese-chat-history", JSON.stringify(chatMessages.filter((message) => message.content).slice(-100)));
     chatEnd.current?.scrollIntoView({ behavior: chatRunning ? "auto" : "smooth", block: "end" });
   }, [chatMessages, chatRunning]);
@@ -329,7 +337,7 @@ function App() {
         apiKey: "sk-local-placeholder",
         modelId: selected.path,
         modelPath: selected.path,
-        context: selected.context ?? maxContext,
+        context: Math.max(1, Math.floor((selected.context ?? maxContext) / concurrentSessions)),
         architecture: selected.architecture,
         quantization: selected.quantization,
         kvType: selected.kvType,
@@ -454,7 +462,7 @@ function App() {
 
   const launchEse = (mode: "plan" | "serve") => {
     if (!selected) return;
-    const args = [mode, selected.path];
+    const args = [mode, selected.path, "--slots", String(concurrentSessions)];
     if (mode === "serve" && selected.source === "sweep") {
       if (selected.context) args.push("-c", String(selected.context));
       if (selected.kvType) args.push("--kv", selected.kvType);
@@ -592,7 +600,7 @@ function App() {
               })}</div> : <EmptyState title="No models found" detail="Add a model folder in Settings to begin discovery." />}
               {!!unavailable.length && <div className="unavailable"><button onClick={() => setShowUnavailable(!showUnavailable)}>{showUnavailable ? <ChevronDown size={15} /> : <ChevronRight size={15} />}Unavailable profiles <span>{unavailable.length}</span></button>{showUnavailable && <div className="model-list">{unavailable.map((model) => <ModelRow key={model.id} model={model} selected={model.id === selectedId} onSelect={() => setSelectedId(model.id)} />)}</div>}</div>}
             </div>
-            {selected && <div className="selection-bar"><div><span className="availability ready"><i />Selected</span><strong>{selected.name}</strong><small>{selected.context ? `${selected.context.toLocaleString()} max context` : "Context will be planned by ESE"}</small></div><button onClick={() => launchEse("plan")}>Inspect plan</button><button className="primary" onClick={() => launchEse("serve")}><Play size={14} fill="currentColor" />Start model</button></div>}
+            {selected && <div className="selection-bar"><div><span className="availability ready"><i />Selected</span><strong>{selected.name}</strong><small>{selected.context ? `${Math.floor(selected.context / concurrentSessions).toLocaleString()} context per session · ${selected.context.toLocaleString()} total` : `Context will be planned across ${concurrentSessions} ${concurrentSessions === 1 ? "session" : "sessions"}`}</small></div><label className="session-control"><span>Concurrent sessions</span><select value={concurrentSessions} onChange={(event) => setConcurrentSessions(Number(event.target.value))} aria-label="Concurrent local AI sessions"><option value={1}>1 · Maximum context</option><option value={2}>2 · Dense resident</option><option value={4}>4 · Dense resident</option></select></label><button onClick={() => launchEse("plan")}>Inspect plan</button><button className="primary" onClick={() => launchEse("serve")}><Play size={14} fill="currentColor" />Start model</button></div>}
           </div>}
 
           {view === "apps" && <><div className="apps-grid">{snapshot.apps.map((app) => <article className="app-card" key={app.id}><span className="app-icon"><SquareTerminal size={20} /></span><div><h2>{app.name}</h2><code>{app.command} {app.args.join(" ")}</code><p>{app.endpointAware ? "Receives the active model endpoint, identity, context, and tuning details in its terminal session." : "Runs in a persistent terminal tab. The session stays alive when models change."}</p></div><button className="primary" onClick={() => void launchApp(app)}><Play size={14} fill="currentColor" />Launch</button></article>)}<button className="add-card" onClick={() => setShowAppEditor(true)}><Plus size={18} />Add a custom app<span>Command, arguments, and optional working directory</span></button></div>{showAppEditor && <section className="panel inline-editor"><div className="panel-heading"><div><h2>Custom terminal app</h2><p>The command runs directly in a native PTY. Arguments are stored in portable TOML.</p></div><button className="icon-button" onClick={() => setShowAppEditor(false)} aria-label="Close"><X size={14} /></button></div><div className="editor-grid"><label className="field"><span>Name</span><input value={appDraft.name} onChange={(event) => setAppDraft({ ...appDraft, name: event.target.value })} placeholder="My coding agent" /></label><label className="field"><span>Command</span><input value={appDraft.command} onChange={(event) => setAppDraft({ ...appDraft, command: event.target.value })} placeholder="agent-command" /></label><label className="field"><span>Arguments</span><input value={appDraft.args} onChange={(event) => setAppDraft({ ...appDraft, args: event.target.value })} placeholder="--optional flags" /></label><label className="field"><span>Working directory</span><input value={appDraft.workingDirectory} onChange={(event) => setAppDraft({ ...appDraft, workingDirectory: event.target.value })} placeholder="/home/me/project" /></label></div><button className="primary" onClick={() => void addApp()} disabled={!native || !appDraft.name.trim() || !appDraft.command.trim()}>Save app</button></section>}</>}

@@ -87,6 +87,18 @@ def moe_model(size: int = 40 * GIB) -> ModelInfo:
     )
 
 
+def dense_model(size: int = 4 * GIB) -> ModelInfo:
+    return ModelInfo(
+        requested_path=Path("/dense.gguf"),
+        shards=(Path("/dense.gguf"),),
+        total_bytes=size,
+        metadata={
+            "general.architecture": "llama",
+            "llama.block_count": 32,
+        },
+    )
+
+
 def hardware(*free_gib: int, ram_available: int = 100) -> HardwareInfo:
     return HardwareInfo(
         host=HostMemory(128 * GIB, ram_available * GIB),
@@ -651,6 +663,67 @@ class LauncherTests(unittest.TestCase):
                 binary=Path("/server"),
                 policy="stream",
                 prefetch_tail=1,
+            )
+
+    def test_parallel_slots_are_enabled_for_resident_models(self) -> None:
+        plan = build_launch_plan(
+            model=dense_model(),
+            hardware=hardware(7, 9, ram_available=47),
+            binary=Path("/server"),
+            policy="resident",
+            context=8192,
+            slots=2,
+        )
+
+        parallel = plan.arguments.index("-np")
+        self.assertEqual(plan.arguments[parallel + 1], "2")
+        self.assertNotIn("--expert-vram-cache-mib", plan.arguments)
+        self.assertNotIn("--expert-prefill-staging-mib", plan.arguments)
+        self.assertNotIn("-no-mmad", plan.arguments)
+        self.assertNotIn("-nkvo", plan.arguments)
+        self.assertEqual(plan.as_dict()["concurrency"], {
+            "slots": 2,
+            "total_context": 8192,
+            "context_per_slot": 4096,
+            "adaptive_expert_cache": False,
+            "kqv_offload": True,
+        })
+
+    def test_parallel_slots_reject_expert_offload_until_parity_is_proven(self) -> None:
+        for policy in ("hybrid", "cache", "stream"):
+            with self.subTest(policy=policy), self.assertRaisesRegex(
+                ESEError, "concurrent sessions currently require a dense resident model"
+            ):
+                build_launch_plan(
+                    model=moe_model(),
+                    hardware=hardware(7, 9),
+                    binary=Path("/server"),
+                    policy=policy,
+                    context=8192,
+                    slots=2,
+                )
+
+        with self.assertRaisesRegex(
+            ESEError, "concurrent sessions currently require a dense resident model"
+        ):
+            build_launch_plan(
+                model=moe_model(),
+                hardware=hardware(7, 9),
+                binary=Path("/server"),
+                policy="resident",
+                context=8192,
+                slots=2,
+            )
+
+    def test_parallel_slots_require_even_total_context(self) -> None:
+        with self.assertRaisesRegex(ESEError, "divide evenly"):
+            build_launch_plan(
+                model=moe_model(),
+                hardware=hardware(20),
+                binary=Path("/server"),
+                policy="cache",
+                context=4097,
+                slots=2,
             )
 
     def test_prefill_staging_is_auto_by_default_and_explicitly_controllable(self) -> None:

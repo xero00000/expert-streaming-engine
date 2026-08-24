@@ -174,6 +174,8 @@ class LaunchPlan:
     binary: Path
     environment: dict[str, str]
     arguments: tuple[str, ...]
+    context: int = 0
+    slots: int = 1
     hybrid_gpu_experts: int = 0
     hybrid_selection: str = "automatic hybrid routing was not evaluated"
 
@@ -215,6 +217,13 @@ class LaunchPlan:
             "hybrid_routing": {
                 "gpu_experts": self.hybrid_gpu_experts,
                 "selection": self.hybrid_selection,
+            },
+            "concurrency": {
+                "slots": self.slots,
+                "total_context": self.context,
+                "context_per_slot": self.context // self.slots,
+                "adaptive_expert_cache": "--expert-vram-cache-mib" in self.arguments,
+                "kqv_offload": "-nkvo" not in self.arguments,
             },
             "arguments": list(self.arguments),
             "command": list(self.command()),
@@ -1083,11 +1092,21 @@ def build_launch_plan(
     hybrid_selection: str = "automatic hybrid routing was not evaluated",
     extra_args: Sequence[str] = (),
 ) -> LaunchPlan:
+    if slots < 1:
+        raise ESEError("--slots must be positive")
+    if context < slots or context % slots:
+        raise ESEError("--context must divide evenly across --slots")
     if reserve_vram < 0:
         raise ESEError("--reserve-vram cannot be negative")
     if not 0 <= prefetch_tail <= 32:
         raise ESEError("--prefetch-tail must be between 0 and 32")
     selected_policy, reason = select_policy(model, hardware, policy)
+    if slots > 1 and (selected_policy != "resident" or model.is_moe):
+        raise ESEError(
+            "concurrent sessions currently require a dense resident model; MoE, "
+            "hybrid, cache, and stream execution are limited to one session until "
+            "their multi-sequence output parity gate passes"
+        )
     decode_default, batch_default = _default_threads(hardware.logical_cpus)
     threads = threads or decode_default
     batch_threads = batch_threads or batch_default
@@ -1270,6 +1289,8 @@ def build_launch_plan(
         binary=binary,
         environment=env,
         arguments=tuple(args),
+        context=context,
+        slots=slots,
         hybrid_gpu_experts=hybrid_gpu_experts if selected_policy in ("cache", "stream") else 0,
         hybrid_selection=(
             hybrid_selection
@@ -1836,6 +1857,10 @@ def _print_plan(plan: LaunchPlan, as_json: bool) -> None:
     print(f"Policy : {plan.policy}")
     print(f"Reason : {plan.reason}")
     print(f"Hybrid : {plan.hybrid_selection}")
+    print(
+        f"Slots  : {plan.slots} concurrent; "
+        f"{plan.context // plan.slots} context each ({plan.context} total)"
+    )
     print(
         f"Model  : {plan.model.name} | {human_bytes(plan.model.total_bytes)} | "
         f"{len(plan.model.shards)} shard(s)"
