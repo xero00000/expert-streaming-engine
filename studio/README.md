@@ -17,7 +17,8 @@ This foundation includes:
 - optional, off-by-default sharing of sanitized verified-sweep summaries through **Help improve ESE**;
 - a bundled ESE launcher/native runtime and signed in-app updates with visible progress;
 - privacy-safe prefilled GitHub bug reports from visible errors;
-- portable TOML configuration under `~/.config/ese/studio.toml`.
+- versioned TOML configuration in the operating system's application-config
+  directory, with the exact path shown in Settings.
 
 Sweep previews only describe the search matrix and never count as evidence. A verified result is shown only after Studio has launched the real ESE-planned `llama-server`, passed its health check, and measured completion throughput. Interrupted matching sweeps resume from their last per-trial checkpoint.
 
@@ -60,7 +61,8 @@ before using `sudo`; it never installs packages silently. It builds the ESE
 runtime with CUDA when detected (CPU otherwise), installs it beside Studio,
 and writes `ese-studio` plus `ese` launchers to `~/.local/bin`.
 
-To run only the non-mutating preflight, use `./install.sh --check`.
+To run only the non-mutating preflight from the repository root, use
+`./studio/install.sh --check`.
 
 For development:
 
@@ -108,6 +110,12 @@ discover `~/models` and `~/.local/share/ese/models`; Windows defaults discover
 `%USERPROFILE%\models` and `%USERPROFILE%\Documents\ESE\models`. Installed
 agent CLIs are discovered from platform-appropriate PATH, Cargo, Bun, npm, NVM,
 and Scoop locations.
+
+The configuration file is stored under the platform application-config
+directory selected by the operating system. On Linux this is normally
+`$XDG_CONFIG_HOME/ese/studio.toml`, or `~/.config/ese/studio.toml` when
+`XDG_CONFIG_HOME` is unset; on Windows it is under the user's roaming AppData
+directory. Studio Settings displays the exact resolved path.
 
 The first Studio launch presents one optional **Help improve ESE** switch. It
 can be changed later in Settings. Turning it off also removes locally queued,

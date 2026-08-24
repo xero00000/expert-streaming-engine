@@ -321,7 +321,10 @@ llama-server --jinja -fa -hf bartowski/gemma-2-2b-it-GGUF:Q8_0
 llama-server --jinja -fa -hf bartowski/c4ai-command-r-v01-GGUF:Q2_K
 ```
 
-To get the official template from original HuggingFace repos, you can use [scripts/get_chat_template.py](../scripts/get_chat_template.py) (see examples invocations in [models/templates/README.md](../models/templates/README.md))
+Use the model publisher's official Hugging Face chat template when available.
+The checked-in [template guide](../models/templates/README.md) documents the
+templates shipped with this repository; the former
+`scripts/get_chat_template.py` helper is no longer present.
 
 > [!TIP]
 > If there is no official `tool_use` Jinja template, you may want to set `--chat-template chatml` to use a default that works with many models (YMMV!), or write your own (e.g. we provide a custom [llama-cpp-deepseek-r1.jinja](../models/templates/llama-cpp-deepseek-r1.jinja) for DeepSeek R1 distills)

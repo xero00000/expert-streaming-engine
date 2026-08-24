@@ -1,10 +1,12 @@
-# ESE Studio v0.1.0 release checklist
+# ESE Studio release validation record
 
-This checklist records the Linux-first release gate. A checked item requires
-either automated CI evidence or a retained model-backed artifact; compilation
-alone is not accepted as inference evidence.
+This append-only record separates automated package/source evidence from
+physical model-backed validation. A checked item requires either CI evidence or
+a retained model-backed artifact; compilation alone is not inference evidence.
 
-## Automated gates
+## v0.1.0 Linux foundation — 2026-08-21
+
+### Automated gates
 
 - [x] Frontend TypeScript and production Vite build.
 - [x] Rust formatting and Clippy with warnings denied.
@@ -21,7 +23,7 @@ alone is not accepted as inference evidence.
 - [x] Tag-driven release definition for normalized package names and
   `SHA256SUMS`.
 
-## UI regression — 2026-08-21
+### UI regression — 2026-08-21
 
 - [x] Models, Model hub, Apps, Config sweeper, and Settings open correctly.
 - [x] Navigation icons and labels share a consistent alignment column.
@@ -37,7 +39,7 @@ alone is not accepted as inference evidence.
 - [x] The terminal drawer has pointer, double-click, and keyboard resizing plus
   explicit collapse and restore controls.
 
-## Native and model-backed evidence
+### Native and model-backed evidence
 
 - [x] Recursive discovery is active across an internal model folder and a
   removable-drive model folder.
@@ -55,7 +57,7 @@ alone is not accepted as inference evidence.
 - [x] Production telemetry health, authenticated aggregate export, and cleanup
   of the smoke row were verified; production began with zero retained rows.
 
-## Release limitations
+### Release limitations
 
 - Linux x86-64 is the supported Studio target for v0.1.0.
 - Packages are checksummed but not cryptographically signed.
@@ -81,11 +83,18 @@ alone is not accepted as inference evidence.
 
 ## v0.1.2 Windows GPU hotfix
 
-- [ ] Studio, launcher, and native server versions report `0.1.2`.
-- [ ] Windows installer staging contains the CUDA-enabled server, CUDA runtime,
+- [x] Studio, launcher, and native server manifests report `0.1.2`.
+- [x] Windows package staging contains the CUDA-enabled server, CUDA runtime,
   and cuBLAS redistributable libraries while retaining CPU fallback.
-- [ ] Installed Windows hardware discovery succeeds without CMake or a compiler.
+- [x] Packaged-runtime hardware discovery succeeds without requiring CMake or a
+  compiler; CI runs `ese.exe doctor --json` from the staged runtime.
 - [ ] A real NVIDIA Windows sweep starts the server, passes health, and records
-  throughput.
-- [ ] Failed sweeps show the native diagnostic and offer a privacy-safe GitHub
+  throughput. Hosted Windows CI has no physical NVIDIA GPU, so PE/dependency and
+  no-driver checks do not satisfy this gate.
+- [x] Failed sweeps show the native diagnostic and offer a privacy-safe GitHub
   bug report draft.
+
+Publishing remains gated by a successful tag workflow that builds both Linux
+and Windows assets, generates checksums and signed updater metadata, and creates
+the GitHub release. That workflow status is operational release evidence, not a
+substitute for the unchecked physical NVIDIA sweep above.

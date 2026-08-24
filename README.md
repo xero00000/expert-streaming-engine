@@ -303,7 +303,8 @@ to the solo maintainer. Those architecture-specific gates remain future work;
 the runtime must still fail closed rather than inventing a synthetic pass.
 
 The Android/QNN port remains a separate draft until it receives physical-device
-build, parity, memory, and thermal evidence.
+build, parity, memory, and thermal evidence. It has no supported remote branch
+or packaged runtime on `main`; see the [Android status](docs/android.md).
 
 ## Reference performance
 
@@ -337,16 +338,22 @@ hardware, repetition statistics, cold/warm behavior, and ablations.
 - [Reference benchmarks](docs/ESE_BENCHMARKS.md)
 - [Community benchmarks](COMMUNITY_BENCHMARKS.md)
 - [Port roadmap](docs/PORT_ROADMAP.md)
+- [Branch policy and historical lineage](docs/BRANCH_POLICY.md)
+- [Installation](docs/install.md)
 - [Native build guide](docs/build.md)
+- [Containers](docker/README.md)
+- [Android status](docs/android.md)
 - [Native parameter reference](docs/parameters.md)
+- [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
 
 ## Scope and lineage
 
 ESE prioritizes bounded memory, reproducibility, and correctness over a single
 best benchmark. Experimental formats remain internal until their quality and
-lifecycle gates pass. General desktop work targets `main`; platform and
-research branches remain isolated until their own validation is complete.
+lifecycle gates pass. `main` is the only supported remote branch. Platform and
+research work uses focused pull-request branches and is documented as available
+only while the corresponding remote branch or immutable revision exists.
 
 ESE is MIT licensed. It derives from `ik_llama.cpp`, which derives from
 `llama.cpp`; imported work retains its original attribution and license

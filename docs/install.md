@@ -1,39 +1,80 @@
-# Install pre-built version of llama.cpp
+# Install Expert Streaming Engine
 
-## Homebrew
+ESE Studio installers contain the matching `ese` launcher and native
+`llama-server` runtime. Do not install a generic `llama.cpp` package when you
+need ESE's planner, resource controller, or bounded expert hierarchy.
 
-On Mac and Linux, the homebrew package manager can be used via
+## Published packages
 
-```sh
-brew install llama.cpp
-```
-The formula is automatically updated with new `llama.cpp` releases. More info: https://github.com/ggerganov/llama.cpp/discussions/7668
+Download the package and checksum file from the
+[latest GitHub release](https://github.com/xero00000/expert-streaming-engine/releases/latest).
+Package filenames include the release version; the examples below use `0.1.2`.
 
-## Nix
+### Linux
 
-On Mac and Linux, the Nix package manager can be used via
+The AppImage supports signed in-app updates:
 
-```sh
-nix profile install nixpkgs#llama-cpp
-```
-For flake enabled installs.
-
-Or
-
-```sh
-nix-env --file '<nixpkgs>' --install --attr llama-cpp
+```bash
+sha256sum --check --ignore-missing SHA256SUMS
+chmod +x ese-studio_0.1.2_amd64.AppImage
+./ese-studio_0.1.2_amd64.AppImage
 ```
 
-For non-flake enabled installs.
+Distribution packages integrate with APT or DNF:
 
-This expression is automatically updated within the [nixpkgs repo](https://github.com/NixOS/nixpkgs/blob/nixos-24.05/pkgs/by-name/ll/llama-cpp/package.nix#L164).
-
-## Flox
-
-On Mac and Linux, Flox can be used to install llama.cpp within a Flox environment via
-
-```sh
-flox install llama-cpp
+```bash
+sudo apt install ./ese-studio_0.1.2_amd64.deb
+sudo dnf install ./ese-studio-0.1.2-1.x86_64.rpm
 ```
 
-Flox follows the nixpkgs build of llama.cpp.
+Published Linux packages use a portable CPU runtime. Build from source when you
+want CUDA acceleration on Linux.
+
+### Windows
+
+Download `ese-studio_0.1.2_x64-setup.exe` (recommended) or the MSI, compare its
+SHA-256 value with `SHA256SUMS-windows.txt`, and run it. The package includes a
+CUDA-enabled runtime for supported NVIDIA GPUs and retains CPU fallback. Python,
+CMake, Visual Studio, and the CUDA toolkit are not required to run the installed
+application.
+
+The NSIS installation supports signed update checks from **Settings → Updates**.
+
+## Install from source
+
+On Linux:
+
+```bash
+git clone https://github.com/xero00000/expert-streaming-engine.git
+cd expert-streaming-engine
+./studio/scripts/install-local.sh
+ese doctor
+```
+
+On Windows, clone the repository and run from PowerShell:
+
+```powershell
+cd expert-streaming-engine\studio
+.\install.ps1 -Check
+.\install.ps1
+```
+
+Both installers show missing dependencies and ask before installing anything.
+For a command-line-only build or manual CMake controls, see the
+[source-build guide](build.md).
+
+## Verify an installation
+
+```bash
+ese --version
+ese doctor
+ese plan /models/model.gguf
+```
+
+On Windows, use a Windows model path, for example:
+
+```powershell
+ese.exe plan C:\Models\model.gguf
+```
+
+The server listens on `http://127.0.0.1:8080` by default after `ese serve`.
