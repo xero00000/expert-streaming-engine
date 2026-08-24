@@ -157,6 +157,7 @@ jobs:
         shell: pwsh
         run: |
           python .\.github\scripts\verify-windows-runtime.py --runtime-root .\studio\runtime\ese --build-root .\build-release-runtime
+          if ($LASTEXITCODE -ne 0) { throw "Staged Windows runtime verification failed" }
           .\studio\runtime\ese\ese.exe doctor --json
           if ($LASTEXITCODE -ne 0) { throw "ESE runtime doctor failed" }
 

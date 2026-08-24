@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 const studioRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(studioRoot, "..");
 const tauriConfig = JSON.parse(readFileSync(join(studioRoot, "src-tauri", "tauri.conf.json"), "utf8"));
+const studioWorkflow = readFileSync(join(repoRoot, ".github", "workflows", "studio-ci.yml"), "utf8");
+const releaseWorkflow = readFileSync(join(repoRoot, ".github", "workflows", "release.yml"), "utf8");
 
 test("package metadata bundles ESE and NVIDIA license notices", () => {
   assert.equal(tauriConfig.bundle.license, "MIT");
@@ -60,6 +62,25 @@ test("WiX splits the CUDA runtime across bounded embedded cabinets", () => {
   assert.match(template, /MaximumUncompressedMediaSize="768"/);
   assert.match(template, /MaximumCabinetSizeForLargeFileSplitting="768"/);
   assert.doesNotMatch(template, /<Media\s+Id="1"\s+Cabinet="app\.cab"/);
+});
+
+test("cached Windows builds still stage and enforce CUDA redistributables", () => {
+  const cudaInstall = studioWorkflow.match(
+    /- name: Install CUDA toolkit\n(?<body>(?: {8,}.*\n){1,5})/,
+  );
+  assert.ok(cudaInstall);
+  assert.doesNotMatch(cudaInstall.groups.body, /cache-hit/);
+  assert.match(
+    studioWorkflow,
+    /verify-windows-runtime\.py[^\n]*\n\s+if \(\$LASTEXITCODE -ne 0\) \{ throw "Staged Windows runtime verification failed" \}/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /verify-windows-runtime\.py[^\n]*\n\s+if \(\$LASTEXITCODE -ne 0\) \{ throw "Staged Windows runtime verification failed" \}/,
+  );
+  for (const pattern of ["cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll"]) {
+    assert.ok(studioWorkflow.split(pattern).length >= 3, `${pattern} is not gated in both installer jobs`);
+  }
 });
 
 test("repository forms use ESE links, branding, and available labels", () => {

@@ -167,7 +167,6 @@ jobs:
             ese-windows-cuda-v1-${{ runner.os }}-cuda12.4-
 
       - name: Install CUDA toolkit
-        if: steps.windows-cuda-cache.outputs.cache-hit != 'true'
         working-directory: .
         shell: pwsh
         run: .\.github\scripts\setup-cuda-windows.ps1
@@ -221,6 +220,7 @@ jobs:
         shell: pwsh
         run: |
           python .\.github\scripts\verify-windows-runtime.py --runtime-root .\studio\runtime\ese --build-root .\build-package
+          if ($LASTEXITCODE -ne 0) { throw "Staged Windows runtime verification failed" }
           .\studio\runtime\ese\ese.exe doctor --json
           if ($LASTEXITCODE -ne 0) { throw "ESE runtime doctor failed" }
 
@@ -297,6 +297,12 @@ jobs:
           foreach ($path in $required) {
             if (-not (Test-Path -LiteralPath $path)) { throw "Missing runtime artifact: $path" }
           }
+          $runtimeBin = './studio/runtime/ese/build/bin'
+          foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            if (-not (Get-ChildItem -Path (Join-Path $runtimeBin $pattern) -ErrorAction SilentlyContinue)) {
+              throw "Missing CUDA runtime artifact matching: $pattern"
+            }
+          }
 
       - name: Build MSI installer
         id: build_msi
@@ -359,6 +365,25 @@ jobs:
         with:
           name: ese-windows-runtime-${{ github.sha }}
           path: studio/runtime/ese
+
+      - name: Verify restored runtime payload
+        shell: pwsh
+        working-directory: .
+        run: |
+          $required = @(
+            './studio/runtime/ese/ese.exe',
+            './studio/runtime/ese/build/bin/llama-server.exe',
+            './studio/runtime/ese/build/bin/ese-runtime.json'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path)) { throw "Missing runtime artifact: $path" }
+          }
+          $runtimeBin = './studio/runtime/ese/build/bin'
+          foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            if (-not (Get-ChildItem -Path (Join-Path $runtimeBin $pattern) -ErrorAction SilentlyContinue)) {
+              throw "Missing CUDA runtime artifact matching: $pattern"
+            }
+          }
 
       - name: Build NSIS installer
         run: pnpm tauri build --bundles nsis --config src-tauri/tauri.ci-bundle.conf.json
