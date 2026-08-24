@@ -1662,6 +1662,12 @@ llm_expert_gating_func_type   gating_op,
         build_expert_branch(gpu_ids, false),
         build_expert_branch(cpu_ids, false),
     };
+    // Keep each heterogeneous branch attributable after the scheduler has
+    // split the graph.  The live hybrid guard times CPU branch completion by
+    // layer; unnamed branch outputs otherwise make that measurement vanish
+    // even though hybrid execution is active.
+    cb(branches[0], "ffn_moe_hybrid_gpu", il);
+    cb(branches[1], "ffn_moe_hybrid_cpu", il);
     ggml_ese_tensor_set_role(branches[0], GGML_ESE_ROUTE_GPU);
     ggml_ese_tensor_set_role(branches[1], GGML_ESE_ROUTE_CPU);
     ggml_tensor * result = ggml_ese_reduce_to(ctx, branches, 2, GGML_OP_ADD, 0);

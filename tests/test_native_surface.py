@@ -54,6 +54,12 @@ class NativeSurfaceTests(unittest.TestCase):
     def test_hybrid_guard_parameters_cross_the_common_context_boundary(self) -> None:
         root = Path(__file__).resolve().parents[1]
         common = (root / "common" / "common.cpp").read_text(encoding="utf-8")
+        build_context = (root / "src" / "llama-build-context.cpp").read_text(
+            encoding="utf-8"
+        )
+        backend = (root / "ggml" / "src" / "ggml-backend.cpp").read_text(
+            encoding="utf-8"
+        )
         for field in (
             "expert_hybrid_cpu_ns_per_expert",
             "expert_hybrid_upload_ns_per_expert",
@@ -62,6 +68,14 @@ class NativeSurfaceTests(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 self.assertIn(f"cparams.{field} = params.{field};", common)
+        # Branch names carry the layer suffix consumed by the scheduler's
+        # completion profiler. Without them hybrid execution remains active,
+        # but cpu_compute_ns/calls silently stay at zero and the live guard
+        # cannot revoke a slow CPU path.
+        self.assertIn('cb(branches[0], "ffn_moe_hybrid_gpu", il);', build_context)
+        self.assertIn('cb(branches[1], "ffn_moe_hybrid_cpu", il);', build_context)
+        self.assertIn("ggml_ese_callback_layer_from_name", backend)
+        self.assertIn("active_expert_cache_cpu_compute_ns += compute_ns", backend)
 
     def test_prefill_staging_crosses_the_native_context_boundary(self) -> None:
         root = Path(__file__).resolve().parents[1]
