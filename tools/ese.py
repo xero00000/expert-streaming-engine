@@ -567,6 +567,35 @@ def detect_hardware() -> HardwareInfo:
     )
 
 
+def _server_supports_cuda(binary: Path) -> bool:
+    override = os.environ.get("ESE_SERVER_BACKEND", "").strip().lower()
+    if override in {"cuda", "cpu"}:
+        return override == "cuda"
+
+    marker = binary.parent / "ese-runtime.json"
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+        if isinstance(value.get("cuda"), bool):
+            return value["cuda"]
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    cache = binary.parent.parent / "CMakeCache.txt"
+    try:
+        return bool(
+            re.search(r"^GGML_CUDA:BOOL=ON\s*$", cache.read_text(encoding="utf-8"), re.MULTILINE)
+        )
+    except OSError:
+        return False
+
+
+def _hardware_for_server(binary: Path) -> HardwareInfo:
+    hardware = detect_hardware()
+    if hardware.gpus and not _server_supports_cuda(binary):
+        return dataclasses.replace(hardware, gpus=())
+    return hardware
+
+
 _SPLIT_RE = re.compile(
     r"^(?P<prefix>.+)-(?P<part>\d{5})-of-(?P<count>\d{5})\.gguf$",
     re.IGNORECASE,
@@ -1903,6 +1932,8 @@ def _doctor(as_json: bool) -> int:
         "compiler": compiler,
         "server": str(server),
         "server_exists": server.is_file(),
+        "server_cuda": _server_supports_cuda(server),
+        "build_ready": bool(cmake and compiler),
         "ram_total": hardware.host.total_bytes,
         "ram_available": hardware.host.available_bytes,
         "gpus": [dataclasses.asdict(gpu) for gpu in hardware.gpus],
@@ -1929,7 +1960,11 @@ def _doctor(as_json: bool) -> int:
                 )
         else:
             print("  NVIDIA GPU: not detected")
-    return 0 if cmake and compiler else 2
+    # ``doctor`` is also the stable machine-readable hardware probe used by
+    # Studio.  A packaged runtime does not need CMake or a compiler, so their
+    # absence must not turn a valid hardware report into a failed probe.
+    # Callers that care about source-build readiness can inspect build_ready.
+    return 0
 
 
 def _build(args: argparse.Namespace) -> int:
@@ -2215,7 +2250,7 @@ def _make_parser() -> argparse.ArgumentParser:
         prog="ese",
         description="One front door for resident, hybrid, cached, and disk-streamed ESE inference.",
     )
-    parser.add_argument("--version", action="version", version="ese 0.1.1")
+    parser.add_argument("--version", action="version", version="ese 0.1.2")
     commands = parser.add_subparsers(dest="command", required=True)
 
     doctor = commands.add_parser("doctor", help="inspect build tools, RAM, and GPUs")
@@ -2284,7 +2319,11 @@ def _plan_from_args(
     if not 1 <= args.port <= 65535:
         raise ESEError("--port must be between 1 and 65535")
     model = inspect_model(args.model)
-    hardware = detect_hardware()
+    binary = _resolve_binary(args.binary)
+    # A CPU-only packaged server must not inherit driver-visible GPUs from the
+    # host.  Runtime-aware detection also lets the Windows CUDA marker select
+    # GPU planning without requiring build tools in the installed package.
+    hardware = _hardware_for_server(binary)
     hybrid_gpu_experts = 0
     current_identity: dict[str, Any] | None = None
     selected_policy, _ = select_policy(model, hardware, args.policy)
@@ -2331,7 +2370,7 @@ def _plan_from_args(
     plan_arguments = dict(
         model=model,
         hardware=hardware,
-        binary=_resolve_binary(args.binary),
+        binary=binary,
         policy=args.policy,
         context=args.context,
         slots=args.slots,

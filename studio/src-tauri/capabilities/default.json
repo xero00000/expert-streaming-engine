@@ -3,5 +3,17 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "windows": ["main"],
-  "permissions": ["core:default", "process:allow-restart", "updater:default"]
+  "permissions": [
+    "core:default",
+    "process:allow-restart",
+    "updater:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://github.com/xero00000/expert-streaming-engine/issues/new*"
+        }
+      ]
+    }
+  ]
 }

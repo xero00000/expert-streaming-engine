@@ -1,12 +1,13 @@
 name: Enhancement
-description: Used to request enhancements for llama.cpp
+description: Propose an enhancement to ESE or ESE Studio
 title: "Feature Request: "
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        Please post your idea first in Discussion if there is not yet a consensus for this enhancement request. This will help to keep this issue tracker focused on enhancements that the community has agreed needs to be implemented.
+        Thanks for helping improve ESE. Search open and closed issues before filing
+        a proposal, and explain the user problem as well as the requested behavior.
 
   - type: checkboxes
     id: prerequisites
@@ -16,18 +17,18 @@ body:
       options:
         - label: I am running the latest code. Mention the version if possible as well.
           required: true
-        - label: I carefully followed the [README.md](https://github.com/ikawrakow/ik_llama.cpp/blob/master/README.md).
+        - label: I carefully followed the [ESE README](https://github.com/xero00000/expert-streaming-engine/blob/main/README.md).
           required: true
         - label: I searched using keywords relevant to my issue to make sure that I am creating a new issue that is not already open (or closed).
           required: true
-        - label: I reviewed the [Discussions](https://github.com/ikawrakow/ik_llama.cpp/discussions), and have a new and useful enhancement to share.
+        - label: I searched open and closed ESE issues for the same request.
           required: true
 
   - type: textarea
     id: feature-description
     attributes:
       label: Feature Description
-      description: Please provide a detailed written description of what you were trying to do, and what you expected `llama.cpp` to do as an enhancement.
+      description: Describe what you were trying to do and what you want ESE to do differently.
       placeholder: Detailed description of the enhancement
     validations:
       required: true
@@ -36,7 +37,7 @@ body:
     id: motivation
     attributes:
       label: Motivation
-      description: Please provide a detailed written description of reasons why this feature is necessary and how it is useful to `llama.cpp` users.
+      description: Explain why this feature is necessary and how it would help ESE users.
       placeholder: Explanation of why this feature is needed and its benefits
     validations:
       required: true

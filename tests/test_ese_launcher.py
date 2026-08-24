@@ -7,6 +7,8 @@ import struct
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -31,6 +33,9 @@ from tools.ese import (
     _baseline_hybrid_plan,
     _parse_expert_cache_telemetry,
     _plan_from_args,
+    _doctor,
+    _hardware_for_server,
+    _server_supports_cuda,
     _repo_root,
     _save_hybrid_verification,
     _solve_calibrated_hybrid,
@@ -477,6 +482,34 @@ class LauncherTests(unittest.TestCase):
         )
         self.assertNotIn("--expert-hybrid-gpu-experts", mmap_plan.arguments)
         self.assertIn("pread bounded-lease", mmap_plan.hybrid_selection)
+    def test_cpu_runtime_ignores_driver_visible_gpus(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            binary = Path(temp) / "build" / "bin" / "llama-server.exe"
+            binary.parent.mkdir(parents=True)
+            binary.touch()
+            with mock.patch("tools.ese.detect_hardware", return_value=hardware(12, 20)):
+                detected = _hardware_for_server(binary)
+            self.assertEqual(detected.gpus, ())
+
+    def test_runtime_marker_enables_cuda_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            binary = Path(temp) / "llama-server.exe"
+            binary.touch()
+            binary.with_name("ese-runtime.json").write_text('{"cuda": true}')
+            self.assertTrue(_server_supports_cuda(binary))
+
+    def test_json_doctor_is_a_runtime_probe_without_build_tools(self) -> None:
+        output = StringIO()
+        with (
+            mock.patch("tools.ese.detect_hardware", return_value=hardware(12)),
+            mock.patch("tools.ese.shutil.which", return_value=None),
+            mock.patch("tools.ese._windows_msvc_installation", return_value=None),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_doctor(True), 0)
+        report = __import__("json").loads(output.getvalue())
+        self.assertFalse(report["build_ready"])
+        self.assertEqual(report["gpus"][0]["free_bytes"], 12 * GIB)
 
     def test_frozen_launcher_uses_executable_directory_as_runtime_root(self) -> None:
         with (

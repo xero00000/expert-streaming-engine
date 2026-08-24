@@ -78,3 +78,14 @@ alone is not accepted as inference evidence.
 - [x] User-local Nobara installation reports `ese 0.1.1`, finds the installed
   server, resolves bundled ESE libraries, and starts Studio successfully.
 - [x] Ubuntu and Windows packaging jobs pass on the consolidated pull request.
+
+## v0.1.2 Windows GPU hotfix
+
+- [ ] Studio, launcher, and native server versions report `0.1.2`.
+- [ ] Windows installer staging contains the CUDA-enabled server, CUDA runtime,
+  and cuBLAS redistributable libraries while retaining CPU fallback.
+- [ ] Installed Windows hardware discovery succeeds without CMake or a compiler.
+- [ ] A real NVIDIA Windows sweep starts the server, passes health, and records
+  throughput.
+- [ ] Failed sweeps show the native diagnostic and offer a privacy-safe GitHub
+  bug report draft.

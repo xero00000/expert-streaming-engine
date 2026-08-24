@@ -228,9 +228,22 @@ impl SweepManager {
         }
 
         let Some(verified_max) = verified_max else {
+            let detail = self
+                .current()
+                .ok()
+                .flatten()
+                .and_then(|status| {
+                    status
+                        .results
+                        .iter()
+                        .rev()
+                        .find_map(|result| result.error.as_deref())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "the server did not provide diagnostics".into());
             self.fail(
                 &app,
-                "no candidate context completed a stable server startup",
+                format!("no candidate context completed a stable server startup: {detail}"),
             );
             return;
         };
@@ -593,7 +606,7 @@ fn run_trial(
             .stderr(Stdio::from(error_log))
             .spawn()
             .map_err(|error| format!("failed to launch planned server: {error}"))?;
-        let server_result = wait_for_server(&mut child, port, cancel);
+        let server_result = wait_for_server(&mut child, port, cancel, &log_path);
         if let Err(error) = server_result {
             terminate(&mut child);
             return Err(error);
@@ -657,14 +670,27 @@ fn free_port() -> Result<u16, String> {
         .port())
 }
 
-fn wait_for_server(child: &mut Child, port: u16, cancel: &AtomicBool) -> Result<(), String> {
+fn wait_for_server(
+    child: &mut Child,
+    port: u16,
+    cancel: &AtomicBool,
+    log_path: &Path,
+) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(180);
     while Instant::now() < deadline {
         if cancel.load(AtomicOrdering::SeqCst) {
             return Err("cancelled".into());
         }
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            return Err(format!("server exited before becoming healthy ({status})"));
+            let diagnostic = log_tail(log_path, 12);
+            return Err(if diagnostic.is_empty() {
+                format!(
+                    "server exited before becoming healthy ({status}); see {}",
+                    log_path.display()
+                )
+            } else {
+                format!("server exited before becoming healthy ({status}): {diagnostic}")
+            });
         }
         if http_request(port, "GET", "/health", None).is_ok() {
             return Ok(());
@@ -672,6 +698,37 @@ fn wait_for_server(child: &mut Child, port: u16, cancel: &AtomicBool) -> Result<
         thread::sleep(Duration::from_millis(250));
     }
     Err("server health check timed out after 180 seconds".into())
+}
+
+fn log_tail(path: &Path, line_count: usize) -> String {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let lines = contents.lines().collect::<Vec<_>>();
+    let diagnostic = lines
+        .iter()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            [
+                "error",
+                "failed",
+                "invalid",
+                "unsupported",
+                "exception",
+                "cuda",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle))
+        })
+        .take(line_count)
+        .copied()
+        .collect::<Vec<_>>();
+    let selected = if diagnostic.is_empty() {
+        &lines[lines.len().saturating_sub(line_count)..]
+    } else {
+        diagnostic.as_slice()
+    };
+    selected.join(" | ").chars().take(2_000).collect()
 }
 
 fn completion_speed(port: u16) -> Result<f64, String> {
@@ -883,6 +940,17 @@ mod tests {
     fn runtime_kv_quality_overrides_the_requested_label() {
         let log = "noise\nresource_plan: {\"kv_quality\":\"f16\",\"context\":58368}\n";
         assert_eq!(actual_kv_quality(log).as_deref(), Some("f16"));
+    }
+
+    #[test]
+    fn server_failure_log_tail_is_bounded_and_actionable() {
+        let root = std::env::temp_dir().join(format!("ese-studio-log-tail-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create log fixture");
+        let path = root.join("trial.log");
+        fs::write(&path, "invalid parameter: --tensor-split\nhelp\nfooter\n")
+            .expect("write log fixture");
+        assert_eq!(log_tail(&path, 2), "invalid parameter: --tensor-split");
+        fs::remove_dir_all(root).expect("remove log fixture");
     }
 
     #[test]

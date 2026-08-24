@@ -1,6 +1,6 @@
 [package]
 name = "ese-studio"
-version = "0.1.1"
+version = "0.1.2"
 description = "Desktop control center for Expert Streaming Engine"
 authors = ["ESE contributors"]
 edition = "2021"
@@ -35,3 +35,4 @@ fs2 = "0.4"
 sha2 = "0.10"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
+tauri-plugin-opener = "2.5.4"

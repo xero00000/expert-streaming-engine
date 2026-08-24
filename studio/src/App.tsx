@@ -2,10 +2,12 @@ import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointer
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { Activity, AppWindow, Bot, Box, ChevronDown, ChevronRight, ChevronUp, CloudDownload, Download, Gauge, HardDrive, Heart, Library, MessageSquare, Play, Plus, RefreshCw, RotateCcw, Search, Send, Settings, ShieldCheck, SlidersHorizontal, Sparkles, SquareTerminal, StopCircle, Trash2, User, X } from "lucide-react";
+import { Activity, AppWindow, Bot, Box, Bug, ChevronDown, ChevronRight, ChevronUp, CloudDownload, Download, Gauge, HardDrive, Heart, Library, MessageSquare, Play, Plus, RefreshCw, RotateCcw, Search, Send, Settings, ShieldCheck, SlidersHorizontal, Sparkles, SquareTerminal, StopCircle, Trash2, User, X } from "lucide-react";
 import { TerminalPane } from "./components/TerminalPane";
+import { privacySafeError } from "./privacy";
 import type { AppProfile, ChatStatus, DownloadStatus, HubModel, HubModelDetails, ModelProfile, StudioSnapshot, SweepPlan, SweepStatus, TerminalTab, View } from "./types";
 import "./App.css";
 
@@ -180,12 +182,44 @@ function App() {
   const [chatDraft, setChatDraft] = useState("");
   const [chatRunning, setChatRunning] = useState(false);
   const [chatRequestId, setChatRequestId] = useState<string>();
-  const [appVersion, setAppVersion] = useState("0.1.1");
+  const [appVersion, setAppVersion] = useState("0.1.2");
   const [pendingUpdate, setPendingUpdate] = useState<Update>();
   const [updateState, setUpdateState] = useState<UpdateState>("idle");
   const [updateDetail, setUpdateDetail] = useState("Check GitHub Releases for a signed ESE Studio and runtime update.");
   const [updateProgress, setUpdateProgress] = useState(0);
   const chatEnd = useRef<HTMLDivElement>(null);
+
+  const reportError = async (area: string, error: string) => {
+    const params = new URLSearchParams({
+      title: `[Bug] Studio ${area} failure`,
+      body: [
+        "### What failed",
+        "",
+        `Area: ${area}`,
+        `Captured error: ${privacySafeError(error)}`,
+        "",
+        "### Environment",
+        "",
+        `- ESE Studio: v${appVersion}`,
+        `- Platform: ${snapshot.platform}`,
+        "",
+        "### Steps to reproduce",
+        "",
+        "1. ",
+        "",
+        "### Additional details",
+        "",
+        "Add anything else that may help. Do not include prompts, model paths, usernames, hostnames, or private logs.",
+        "",
+        "> This draft was generated locally. Review every field and remove any private or identifying information before submitting.",
+      ].join("\n"),
+    });
+    try {
+      await openUrl(`https://github.com/xero00000/expert-streaming-engine/issues/new?${params}`);
+    } catch (openError) {
+      setNotice(`Could not open the bug report: ${String(openError)}`);
+    }
+  };
 
   const refresh = async () => {
     setLoading(true);
@@ -567,7 +601,7 @@ function App() {
         </header>
 
         <section className="content">
-          {notice && <div className="notice" role="alert"><span>{notice}</span><button onClick={() => setNotice(undefined)} aria-label="Dismiss"><X size={14} /></button></div>}
+          {notice && <div className="notice" role="alert"><span>{notice}</span><div className="notice-actions">{native && !notice.startsWith("Applied verified profile") && <button className="report-error" onClick={() => void reportError(view, notice)}><Bug size={13} />Report error</button>}<button className="dismiss-notice" onClick={() => setNotice(undefined)} aria-label="Dismiss"><X size={14} /></button></div></div>}
 
           {view === "chat" && <div className="chat-layout">
             <div className="chat-statusbar"><span className={`chat-model-state ${chatStatus.active ? "ready" : "offline"}`}><i />{chatStatus.active ? "Model connected" : "No active model"}</span><code title={chatStatus.modelId}>{chatStatus.modelId ?? "Start a model from Models to begin"}</code><div><button onClick={regenerateChat} disabled={chatRunning || !chatMessages.some((message) => message.role === "user")} aria-label="Regenerate last response" title="Regenerate last response"><RotateCcw size={14} />Regenerate</button><button onClick={() => setChatMessages([])} disabled={chatRunning || chatMessages.length === 0} aria-label="Clear conversation" title="Clear conversation"><Trash2 size={14} />Clear</button></div></div>
@@ -589,7 +623,7 @@ function App() {
                 <div className="hardware-card"><HardDrive size={18} /><div><strong>{hubDetails.hardware.gpuNames.length ? hubDetails.hardware.gpuNames.join(" + ") : "CPU / system memory"}</strong><span>{formatBytes(hubDetails.hardware.vramTotalBytes)} VRAM · {formatBytes(hubDetails.hardware.ramAvailableBytes)} RAM available</span></div></div>
                 <fieldset className="quant-list"><legend>Quantizations</legend>{hubDetails.variants.map((variant) => <label key={variant.id} className={`${hubVariantId === variant.id ? "selected" : ""} ${variant.recommended ? "recommended" : ""}`}><input type="radio" name="hub-variant" checked={hubVariantId === variant.id} onChange={() => setHubVariantId(variant.id)} /><span className="quant-main"><strong>{variant.quantization}{variant.recommended && <em>Recommended</em>}</strong><small>{variant.files.length} {variant.files.length === 1 ? "file" : "shards"} · {formatBytes(variant.totalSizeBytes)}</small></span><span className={`fit fit-${variant.fit.toLowerCase().replace(/[^a-z]+/g, "-")}`}><strong>{variant.fit}</strong><small>{variant.fitReason}</small></span></label>)}</fieldset>
                 <label className="field"><span>Download to model folder</span><select value={downloadRoot} onChange={(event) => setDownloadRoot(event.target.value)}>{snapshot.modelRoots.map((root) => <option key={root} value={root}>{root}</option>)}</select></label>
-                {visibleDownloadStatus && <div className={`download-card ${visibleDownloadStatus.state}`}><div><strong>{visibleDownloadStatus.state === "downloading" ? "Downloading model" : visibleDownloadStatus.state === "complete" ? "Download complete" : visibleDownloadStatus.state === "cancelled" ? "Download paused" : "Download failed"}</strong><span>{visibleDownloadStatus.currentFile ?? visibleDownloadStatus.repoId}</span></div><div className="progress-track" role="progressbar" aria-label="Model download" aria-valuemin={0} aria-valuemax={visibleDownloadStatus.totalBytes} aria-valuenow={Math.min(visibleDownloadStatus.completedBytes, visibleDownloadStatus.totalBytes)}><span style={{ width: `${visibleDownloadStatus.totalBytes ? Math.min(100, visibleDownloadStatus.completedBytes / visibleDownloadStatus.totalBytes * 100) : 0}%` }} /></div><div className="progress-meta"><span>{formatBytes(visibleDownloadStatus.completedBytes)} of {formatBytes(visibleDownloadStatus.totalBytes)}</span><span>{visibleDownloadStatus.state === "downloading" && visibleDownloadStatus.bytesPerSecond ? `${formatSpeed(visibleDownloadStatus.bytesPerSecond)} · ${formatEta(visibleDownloadStatus.etaSeconds)}` : visibleDownloadStatus.state}</span></div>{visibleDownloadStatus.error && <small className="download-error">{visibleDownloadStatus.error}</small>}</div>}
+                {visibleDownloadStatus && <div className={`download-card ${visibleDownloadStatus.state}`}><div><strong>{visibleDownloadStatus.state === "downloading" ? "Downloading model" : visibleDownloadStatus.state === "complete" ? "Download complete" : visibleDownloadStatus.state === "cancelled" ? "Download paused" : "Download failed"}</strong><span>{visibleDownloadStatus.currentFile ?? visibleDownloadStatus.repoId}</span></div><div className="progress-track" role="progressbar" aria-label="Model download" aria-valuemin={0} aria-valuemax={visibleDownloadStatus.totalBytes} aria-valuenow={Math.min(visibleDownloadStatus.completedBytes, visibleDownloadStatus.totalBytes)}><span style={{ width: `${visibleDownloadStatus.totalBytes ? Math.min(100, visibleDownloadStatus.completedBytes / visibleDownloadStatus.totalBytes * 100) : 0}%` }} /></div><div className="progress-meta"><span>{formatBytes(visibleDownloadStatus.completedBytes)} of {formatBytes(visibleDownloadStatus.totalBytes)}</span><span>{visibleDownloadStatus.state === "downloading" && visibleDownloadStatus.bytesPerSecond ? `${formatSpeed(visibleDownloadStatus.bytesPerSecond)} · ${formatEta(visibleDownloadStatus.etaSeconds)}` : visibleDownloadStatus.state}</span></div>{visibleDownloadStatus.error && <><small className="download-error">{visibleDownloadStatus.error}</small><button className="report-error error-card-action" onClick={() => void reportError("model download", visibleDownloadStatus.error!)}><Bug size={13} />Report error</button></>}</div>}
                 <div className="hub-actions"><small>Downloads resume from partial files after cancellation.</small>{visibleDownloadStatus?.state === "downloading" ? <button onClick={() => void invoke("cancel_hf_download")}>Cancel safely</button> : <button className="primary" onClick={() => void startHubDownload()} disabled={!downloadRoot || !hubVariantId}><CloudDownload size={14} />Download selected quant</button>}</div></> : <EmptyState title="Choose a repository" detail="Hardware recommendations appear here after Studio inspects its GGUF files." />}
             </section>
           </div>}
@@ -628,7 +662,7 @@ function App() {
                 <div className="progress-meta"><span>{sweepStatus.completedTrials} / {sweepStatus.totalTrials} trials</span><span>{sweepStatus.phase}</span></div>
                 <button className="wide" onClick={() => void cancelSweep()} disabled={sweepStatus.state === "cancelling"}>Cancel safely</button>
               </> : sweepStatus && ["complete", "failed", "cancelled"].includes(sweepStatus.state) ? <>
-                <div className={`sweep-state ${sweepStatus.state}`}><strong>{sweepStatus.state === "complete" ? "Verified sweep complete" : sweepStatus.state === "failed" ? "Sweep failed" : "Sweep cancelled"}</strong><span>{sweepStatus.error ?? sweepStatus.currentLabel}</span></div>
+                <div className={`sweep-state ${sweepStatus.state}`}><strong>{sweepStatus.state === "complete" ? "Verified sweep complete" : sweepStatus.state === "failed" ? "Sweep failed" : "Sweep cancelled"}</strong><span>{sweepStatus.error ?? sweepStatus.currentLabel}</span>{sweepStatus.state === "failed" && sweepStatus.error && <button className="report-error error-card-action" onClick={() => void reportError("config sweep", sweepStatus.error!)}><Bug size={13} />Report error</button>}</div>
                 {sweepStatus.verifiedMaxContext && <div className="result-hero"><small>Promoted safe context</small><strong>{sweepStatus.promotedContext?.toLocaleString()}</strong><span>verified maximum {sweepStatus.verifiedMaxContext.toLocaleString()} tokens</span></div>}
                 <dl><div><dt>Best stable speed</dt><dd>{sweepStatus.bestTokensPerSecond ? `${sweepStatus.bestTokensPerSecond.toFixed(2)} tok/s` : "—"}</dd></div><div><dt>KV / batch</dt><dd>{sweepStatus.bestKvType ? `${sweepStatus.bestKvType} / ${sweepStatus.bestBatchSize}` : "—"}</dd></div><div><dt>Concurrent sessions</dt><dd>{sweepStatus.bestSlots ?? 1}</dd></div><div><dt>Checkpoint</dt><dd title={sweepStatus.checkpointPath}>Saved</dd></div></dl>
                 {sweepStatus.state === "complete" && <button className="primary wide" onClick={() => void applySweepProfile()} disabled={profileApplied}>{profileApplied ? "Verified profile applied" : "Apply verified profile"}</button>}
@@ -655,6 +689,7 @@ function App() {
               <section className="panel settings-updates">
                 <div className="panel-heading"><div><h2>Updates</h2><p>Signed updates replace Studio and the bundled ESE runtime together.</p></div><span className="version-badge">v{appVersion}</span></div>
                 <div className={`update-state ${updateState}`} aria-live="polite"><Sparkles size={17} /><span><strong>{updateState === "available" ? `ESE Studio ${pendingUpdate?.version}` : updateState === "downloading" ? "Installing update" : updateState === "current" ? "You’re up to date" : updateState === "error" ? "Couldn’t update" : updateState === "checking" ? "Checking for updates" : "Stable release channel"}</strong>{updateDetail}</span></div>
+                {updateState === "error" && <button className="report-error error-card-action" onClick={() => void reportError("updater", updateDetail)}><Bug size={13} />Report error</button>}
                 {updateState === "downloading" && <><div className="progress-track" role="progressbar" aria-label="Update download" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(updateProgress)}><span style={{ width: `${Math.max(3, updateProgress)}%` }} /></div><div className="progress-meta"><span>Downloading and verifying</span><span>{updateProgress ? `${Math.round(updateProgress)}%` : "Preparing…"}</span></div></>}
                 <button className={updateState === "available" ? "primary wide update-action" : "wide update-action"} onClick={() => void (updateState === "available" ? installUpdate() : checkForUpdate())} disabled={!native || updateState === "checking" || updateState === "downloading"}>{updateState === "available" ? <><Download size={14} />Download, install & restart</> : <><RefreshCw size={14} className={updateState === "checking" ? "spin" : ""} />{updateState === "checking" ? "Checking…" : "Check for updates"}</>}</button>
               </section>
