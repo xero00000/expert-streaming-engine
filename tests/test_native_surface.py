@@ -99,6 +99,26 @@ class NativeSurfaceTests(unittest.TestCase):
         self.assertIn("route_global_sync_fallbacks", backend)
         self.assertIn("ggml_backend_event_synchronize(route_event)", backend)
 
+    def test_exact_pinned_staging_is_independent_from_model_pinning(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        launcher = (root / "tools" / "ese.py").read_text(encoding="utf-8")
+        llama = (root / "src" / "llama.cpp").read_text(encoding="utf-8")
+        loader = (root / "src" / "llama-load-tensors.cpp").read_text(
+            encoding="utf-8"
+        )
+        cuda_header = (root / "ggml" / "include" / "ggml-cuda.h").read_text(
+            encoding="utf-8"
+        )
+        benchmark = (
+            root / "examples" / "hardware-bench" / "hardware-bench.cpp"
+        ).read_text(encoding="utf-8")
+        self.assertIn('env["GGML_CUDA_NO_MODEL_PINNED"] = "1"', launcher)
+        self.assertNotIn('env["GGML_CUDA_NO_PINNED"] = "1"', launcher)
+        self.assertIn('getenv("GGML_CUDA_NO_MODEL_PINNED") == nullptr', llama)
+        self.assertIn('getenv("GGML_CUDA_NO_MODEL_PINNED") == nullptr', loader)
+        self.assertIn("ggml_backend_cuda_host_buffer_alloc(size_t size)", cuda_header)
+        self.assertIn("pinned_h2d_gbps_median", benchmark)
+
     def test_server_props_exposes_live_hybrid_guard_state(self) -> None:
         root = Path(__file__).resolve().parents[1]
         server = (root / "examples" / "server" / "server.cpp").read_text(encoding="utf-8")
