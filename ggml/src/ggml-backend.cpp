@@ -1507,6 +1507,7 @@ struct ggml_backend_sched {
     uint64_t expert_prefill_lane_bytes = 0;
     std::map<int, std::array<uint64_t, GGML_ACTIVE_EXPERT_CACHE_COMPONENT_COUNT>> expert_prefill_layer_bytes;
     std::array<ggml_expert_prefill_device, GGML_SCHED_MAX_BACKENDS> expert_prefill_devices;
+    std::array<ggml_backend_event_t, GGML_SCHED_MAX_BACKENDS> active_expert_route_events = {{ nullptr }};
     std::array<ggml_backend_event_t, GGML_SCHED_MAX_BACKENDS> expert_prefill_route_events = {{ nullptr }};
     std::map<int, ggml_expert_prefill_layer_stats> expert_prefill_layer_stats;
     uint64_t expert_prefill_fallbacks = 0;
@@ -3275,7 +3276,18 @@ static bool ggml_active_expert_cache_prepare_route(
     if (ids_source->buffer && ggml_backend_buffer_is_host(ids_source->buffer)) {
         ggml_backend_tensor_get(ids_source, expert_ids.data(), 0, expert_ids.size()*sizeof(expert_ids[0]));
     } else {
-        ggml_backend_event_t route_event = ggml_backend_event_new(ids_backend);
+        int ids_backend_id = -1;
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            if (sched->backends[backend_id] == ids_backend) {
+                ids_backend_id = backend_id;
+                break;
+            }
+        }
+        if (ids_backend_id < 0 || ids_backend_id >= sched->n_backends) {
+            return false;
+        }
+        auto & route_event = sched->active_expert_route_events[ids_backend_id];
+        if (!route_event) route_event = ggml_backend_event_new(ids_backend);
         if (!route_event) {
             if (sched->expert_lease_required) {
                 GGML_ABORT("required expert route readback has no event-capable backend\n");
@@ -3285,7 +3297,6 @@ static bool ggml_active_expert_cache_prepare_route(
         ggml_backend_tensor_get_async(ids_backend, ids_source, expert_ids.data(), 0, expert_ids.size()*sizeof(expert_ids[0]));
         ggml_backend_event_record(route_event);
         ggml_backend_event_synchronize(route_event);
-        ggml_backend_event_free(route_event);
     }
     auto & layer_stats = sched->active_expert_cache_layer_stats[layer];
     layer_stats.route_readback_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -5670,6 +5681,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
         ggml_active_expert_cache_drain_leases(sched, sched->active_expert_caches[i]);
         ggml_active_expert_cache_release(sched->active_expert_caches[i]);
+        if (sched->active_expert_route_events[i]) {
+            ggml_backend_event_synchronize(sched->active_expert_route_events[i]);
+            ggml_backend_event_free(sched->active_expert_route_events[i]);
+            sched->active_expert_route_events[i] = nullptr;
+        }
     }
     if (!sched->expert_prefill_layer_stats.empty() || sched->expert_prefill_fallbacks > 0) {
         uint64_t selected = 0;
