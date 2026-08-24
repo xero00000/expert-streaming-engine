@@ -36,6 +36,7 @@ pub struct SweepPlan {
     pub candidate_contexts: Vec<u64>,
     pub kv_types: Vec<String>,
     pub batch_sizes: Vec<u32>,
+    pub slot_counts: Vec<u32>,
     pub promoted_context: u64,
     pub trial_count: usize,
     pub requires_exclusive_gpu: bool,
@@ -49,6 +50,8 @@ pub struct TrialResult {
     pub context: u64,
     pub kv_type: String,
     pub batch_size: u32,
+    #[serde(default = "default_slots")]
+    pub slots: u32,
     pub stable: bool,
     pub tokens_per_second: Option<f64>,
     pub elapsed_seconds: f64,
@@ -70,10 +73,15 @@ pub struct SweepStatus {
     pub promoted_context: Option<u64>,
     pub best_kv_type: Option<String>,
     pub best_batch_size: Option<u32>,
+    pub best_slots: Option<u32>,
     pub best_tokens_per_second: Option<f64>,
     pub results: Vec<TrialResult>,
     pub error: Option<String>,
     pub checkpoint_path: PathBuf,
+}
+
+fn default_slots() -> u32 {
+    1
 }
 
 #[derive(Clone, Default)]
@@ -127,6 +135,7 @@ impl SweepManager {
                 promoted_context: None,
                 best_kv_type: None,
                 best_batch_size: None,
+                best_slots: None,
                 best_tokens_per_second: None,
                 results: Vec::new(),
                 error: None,
@@ -195,6 +204,7 @@ impl SweepManager {
                 512,
                 false,
                 1,
+                1,
                 &self.cancel,
                 &checkpoint_directory(&self.current().ok().flatten()),
             );
@@ -238,56 +248,61 @@ impl SweepManager {
         };
         for kv_type in &plan.kv_types {
             for batch_size in &plan.batch_sizes {
-                if existing.as_ref().is_some_and(|status| {
-                    status.results.iter().any(|result| {
-                        result.phase == "tuning"
-                            && result.context == promoted
-                            && result.kv_type == *kv_type
-                            && result.batch_size == *batch_size
-                    })
-                }) {
-                    continue;
-                }
-                if self.cancelled(&app) {
-                    return;
-                }
-                if let Some(message) = crate::gpu_blocker_message() {
-                    self.fail(&app, message);
-                    return;
-                }
-                self.update(&app, |status| {
-                    status.current_label = format!(
-                        "Benchmarking {promoted} context · {kv_type} KV · batch {batch_size}"
-                    );
-                });
-                let result = run_trial(
-                    &ese_binary,
-                    &plan.model_path,
-                    promoted,
-                    kv_type,
-                    *batch_size,
-                    true,
-                    repetitions,
-                    &self.cancel,
-                    &checkpoint_directory(&self.current().ok().flatten()),
-                );
-                if let Some(message) = crate::gpu_blocker_message() {
-                    self.fail(&app, message);
-                    return;
-                }
-                if result.error.as_deref() == Some("cancelled") {
-                    self.cancelled(&app);
-                    return;
-                }
-                self.update(&app, |status| {
-                    status.completed_trials += 1;
-                    if candidate_is_better(status, &result) {
-                        status.best_tokens_per_second = result.tokens_per_second;
-                        status.best_kv_type = Some(result.kv_type.clone());
-                        status.best_batch_size = Some(result.batch_size);
+                for slots in &plan.slot_counts {
+                    if existing.as_ref().is_some_and(|status| {
+                        status.results.iter().any(|result| {
+                            result.phase == "tuning"
+                                && result.context == promoted
+                                && result.kv_type == *kv_type
+                                && result.batch_size == *batch_size
+                                && result.slots == *slots
+                        })
+                    }) {
+                        continue;
                     }
-                    status.results.push(result);
-                });
+                    if self.cancelled(&app) {
+                        return;
+                    }
+                    if let Some(message) = crate::gpu_blocker_message() {
+                        self.fail(&app, message);
+                        return;
+                    }
+                    self.update(&app, |status| {
+                        status.current_label = format!(
+                            "Benchmarking {promoted} context · {kv_type} KV · batch {batch_size} · {slots} session(s)"
+                        );
+                    });
+                    let result = run_trial(
+                        &ese_binary,
+                        &plan.model_path,
+                        promoted,
+                        kv_type,
+                        *batch_size,
+                        true,
+                        repetitions,
+                        *slots,
+                        &self.cancel,
+                        &checkpoint_directory(&self.current().ok().flatten()),
+                    );
+                    if let Some(message) = crate::gpu_blocker_message() {
+                        self.fail(&app, message);
+                        return;
+                    }
+                    if result.error.as_deref() == Some("cancelled") {
+                        self.cancelled(&app);
+                        return;
+                    }
+                    self.update(&app, |status| {
+                        status.completed_trials += 1;
+                        if candidate_is_better(status, &result) {
+                            status.best_tokens_per_second = result.tokens_per_second;
+                            status.best_kv_type = Some(result.kv_type.clone());
+                            status.best_batch_size = Some(result.batch_size);
+                            status.best_slots = Some(result.slots);
+                        }
+                        status.results.push(result);
+                    });
+                }
             }
         }
 
@@ -373,11 +388,21 @@ fn candidate_is_better(status: &SweepStatus, candidate: &TrialResult) -> bool {
         result.stable
             && status.best_kv_type.as_deref() == Some(result.kv_type.as_str())
             && status.best_batch_size == Some(result.batch_size)
+            && status.best_slots == Some(result.slots)
     });
     let Some(current) = current else {
         return true;
     };
     match status.request.objective.as_str() {
+        "max-concurrency" => {
+            (
+                candidate.slots,
+                candidate.tokens_per_second.unwrap_or(f64::NEG_INFINITY),
+            ) > (
+                current.slots,
+                current.tokens_per_second.unwrap_or(f64::NEG_INFINITY),
+            )
+        }
         "minimum-vram" => {
             (kv_memory_rank(&candidate.kv_type), candidate.batch_size)
                 < (kv_memory_rank(&current.kv_type), current.batch_size)
@@ -405,7 +430,12 @@ pub fn plan(request: &SweepRequest) -> Result<SweepPlan, String> {
     }
     if !matches!(
         request.objective.as_str(),
-        "max-safe-context" | "balanced" | "max-throughput" | "minimum-vram" | "lowest-latency"
+        "max-safe-context"
+            | "balanced"
+            | "max-throughput"
+            | "minimum-vram"
+            | "lowest-latency"
+            | "max-concurrency"
     ) {
         return Err("unsupported sweep objective".into());
     }
@@ -436,9 +466,19 @@ pub fn plan(request: &SweepRequest) -> Result<SweepPlan, String> {
     } else {
         vec![256, 512]
     };
+    let slot_counts = if request.objective == "max-concurrency" {
+        if request.preset == "quick" {
+            vec![1, 2]
+        } else {
+            vec![1, 2, 4]
+        }
+    } else {
+        vec![1]
+    };
     let promoted_context =
         floor_context((request.max_context as f64 * request.safe_margin as f64) as u64);
-    let trial_count = candidate_contexts.len() + kv_types.len() * batch_sizes.len();
+    let trial_count =
+        candidate_contexts.len() + kv_types.len() * batch_sizes.len() * slot_counts.len();
     Ok(SweepPlan {
         model_path: request.model_path.clone(),
         preset: request.preset.clone(),
@@ -446,6 +486,7 @@ pub fn plan(request: &SweepRequest) -> Result<SweepPlan, String> {
         candidate_contexts,
         kv_types,
         batch_sizes,
+        slot_counts,
         promoted_context,
         trial_count,
         requires_exclusive_gpu: true,
@@ -490,19 +531,21 @@ fn run_trial(
     batch_size: u32,
     benchmark: bool,
     repetitions: usize,
+    slots: u32,
     cancel: &AtomicBool,
     log_root: &Path,
 ) -> TrialResult {
     let started = Instant::now();
     let phase = if benchmark { "tuning" } else { "capacity" };
     let log_path = log_root.join(format!(
-        "trial-{phase}-{context}-{kv_type}-{batch_size}.log"
+        "trial-{phase}-{context}-{kv_type}-{batch_size}-slots{slots}.log"
     ));
     let mut result = TrialResult {
         phase: phase.into(),
         context,
         kv_type: kv_type.into(),
         batch_size,
+        slots,
         stable: false,
         tokens_per_second: None,
         elapsed_seconds: 0.0,
@@ -518,6 +561,7 @@ fn run_trial(
             .args(["-c", &context.to_string(), "--kv", kv_type])
             .args(["--batch-size", &batch_size.to_string()])
             .args(["--ubatch-size", &batch_size.min(512).to_string()])
+            .args(["--slots", &slots.to_string()])
             .args(["--host", "127.0.0.1", "--port", &port.to_string(), "--json"])
             .output()
             .map_err(|error| format!("failed to run ESE planner: {error}"))?;
@@ -561,7 +605,7 @@ fn run_trial(
                     terminate(&mut child);
                     return Err("cancelled".into());
                 }
-                samples.push(completion_speed(port)?);
+                samples.push(completion_throughput(port, slots)?);
             }
             samples.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
             Some(samples[samples.len() / 2])
@@ -631,17 +675,7 @@ fn wait_for_server(child: &mut Child, port: u16, cancel: &AtomicBool) -> Result<
 }
 
 fn completion_speed(port: u16) -> Result<f64, String> {
-    let prompt = "A careful local inference benchmark checks stable throughput. ".repeat(64);
-    let body = serde_json::json!({
-        "prompt": prompt,
-        "n_predict": 32,
-        "temperature": 0,
-        "cache_prompt": false,
-    })
-    .to_string();
-    let response = http_request(port, "POST", "/completion", Some(&body))?;
-    let parsed: Value = serde_json::from_str(&response)
-        .map_err(|error| format!("invalid completion JSON: {error}"))?;
+    let parsed = completion_response(port)?;
     parsed["timings"]["predicted_per_second"]
         .as_f64()
         .or_else(|| {
@@ -651,6 +685,70 @@ fn completion_speed(port: u16) -> Result<f64, String> {
                 .map(|(tokens, ms)| tokens * 1000.0 / ms)
         })
         .ok_or_else(|| "completion response omitted throughput timing".into())
+}
+
+fn completion_tokens(port: u16) -> Result<f64, String> {
+    completion_response(port)?["timings"]["predicted_n"]
+        .as_f64()
+        .ok_or_else(|| "completion response omitted generated token count".into())
+}
+
+fn completion_throughput(port: u16, slots: u32) -> Result<f64, String> {
+    if slots <= 1 {
+        return completion_speed(port);
+    }
+    let started = Instant::now();
+    let total_tokens = thread::scope(|scope| {
+        let handles = (0..slots)
+            .map(|_| scope.spawn(|| completion_tokens(port)))
+            .collect::<Vec<_>>();
+        let mut peak_processing = 0_u32;
+        while handles.iter().any(|handle| !handle.is_finished()) {
+            if let Ok(processing) = health_slots_processing(port) {
+                peak_processing = peak_processing.max(processing);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if peak_processing < slots {
+            return Err(format!(
+                "server processed only {peak_processing} of {slots} requested concurrent sessions"
+            ));
+        }
+        handles.into_iter().try_fold(0.0, |total, handle| {
+            let tokens = handle
+                .join()
+                .map_err(|_| "concurrent completion worker panicked".to_string())??;
+            Ok::<_, String>(total + tokens)
+        })
+    })?;
+    let elapsed = started.elapsed().as_secs_f64();
+    if elapsed <= 0.0 {
+        return Err("concurrent completion elapsed time was zero".into());
+    }
+    Ok(total_tokens / elapsed)
+}
+
+fn health_slots_processing(port: u16) -> Result<u32, String> {
+    let response = http_request(port, "GET", "/health", None)?;
+    let parsed: Value =
+        serde_json::from_str(&response).map_err(|error| format!("invalid health JSON: {error}"))?;
+    parsed["slots_processing"]
+        .as_u64()
+        .and_then(|value| value.try_into().ok())
+        .ok_or_else(|| "health response omitted slots_processing".into())
+}
+
+fn completion_response(port: u16) -> Result<Value, String> {
+    let prompt = "A careful local inference benchmark checks stable throughput. ".repeat(64);
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "n_predict": 32,
+        "temperature": 0,
+        "cache_prompt": false,
+    })
+    .to_string();
+    let response = http_request(port, "POST", "/completion", Some(&body))?;
+    serde_json::from_str(&response).map_err(|error| format!("invalid completion JSON: {error}"))
 }
 
 fn http_request(port: u16, method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
@@ -723,6 +821,16 @@ mod tests {
         let plan = plan(&request("quick")).expect("plan should be valid");
         assert!(plan.trial_count <= 10);
         assert_eq!(plan.kv_types, ["q8_0", "f16"]);
+        assert_eq!(plan.slot_counts, [1]);
+    }
+
+    #[test]
+    fn concurrency_objective_tests_bounded_session_counts() {
+        let mut request = request("standard");
+        request.objective = "max-concurrency".into();
+        let plan = plan(&request).expect("concurrency plan should be valid");
+        assert_eq!(plan.slot_counts, [1, 2, 4]);
+        assert_eq!(plan.trial_count, 26);
     }
 
     #[test]
@@ -743,6 +851,7 @@ mod tests {
             promoted_context: Some(58_880),
             best_kv_type: None,
             best_batch_size: None,
+            best_slots: None,
             best_tokens_per_second: None,
             results: Vec::new(),
             error: None,
@@ -784,6 +893,10 @@ mod tests {
         let Ok(ese) = std::env::var("ESE_STUDIO_E2E_BINARY") else {
             return;
         };
+        let slots = std::env::var("ESE_STUDIO_E2E_SLOTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
         let log_root = std::env::temp_dir().join(format!("ese-studio-e2e-{}", Uuid::new_v4()));
         fs::create_dir_all(&log_root).expect("create e2e log directory");
         let result = run_trial(
@@ -794,6 +907,7 @@ mod tests {
             256,
             true,
             1,
+            slots,
             &AtomicBool::new(false),
             &log_root,
         );

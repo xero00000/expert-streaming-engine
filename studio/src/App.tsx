@@ -318,7 +318,8 @@ function App() {
   const visibleDownloadStatus = downloadStatus && (downloadStatus.state === "downloading" || downloadStatus.repoId === hubDetails?.model.id) ? downloadStatus : undefined;
   useEffect(() => {
     if (selected?.context) setMaxContext(Math.max(512, selected.context));
-  }, [selectedId, selected?.context]);
+    if (selected?.slots) setConcurrentSessions(selected.slots);
+  }, [selectedId, selected?.context, selected?.slots]);
 
   useEffect(() => {
     setSweepPlan(undefined);
@@ -343,6 +344,7 @@ function App() {
         kvType: selected.kvType,
         batchSize: selected.batchSize,
         ubatchSize: selected.ubatchSize,
+        slots: concurrentSessions,
         resourcePlan: undefined,
       } : undefined;
       const sessionId = await invoke<string>("launch_terminal", { request: { command: profile.command, args: profile.args, workingDirectory: profile.workingDirectory, columns: 110, rows: 32, role, appId: profile.id, endpointAware: profile.endpointAware, modelEndpoint } });
@@ -366,7 +368,7 @@ function App() {
     if (!selected) return;
     const request = { modelPath: selected.path, preset, objective: advanced ? objective : "max-safe-context", maxContext, safeMargin: 0.9 };
     try {
-      const plan = native ? await invoke<SweepPlan>("plan_sweep", { request }) : { ...request, candidateContexts: [4096, 32768, 65536, 98304, 131072], kvTypes: ["q4_0", "q8_0", "f16"], batchSizes: [256, 512], promotedContext: 117760, trialCount: 11, requiresExclusiveGpu: true, safeMargin: 0.9 };
+      const plan = native ? await invoke<SweepPlan>("plan_sweep", { request }) : { ...request, candidateContexts: [4096, 32768, 65536, 98304, 131072], kvTypes: ["q4_0", "q8_0", "f16"], batchSizes: [256, 512], slotCounts: objective === "max-concurrency" ? [1, 2, 4] : [1], promotedContext: 117760, trialCount: 11, requiresExclusiveGpu: true, safeMargin: 0.9 };
       setSweepPlan(plan as SweepPlan);
     } catch (error) { setNotice(String(error)); }
   };
@@ -391,8 +393,9 @@ function App() {
       const profile = await invoke<ModelProfile>("promote_sweep");
       await refresh();
       setSelectedId(profile.id);
+      setConcurrentSessions(profile.slots ?? 1);
       setProfileApplied(true);
-      setNotice(`Applied verified profile for ${profile.name}. Future launches use the measured context, KV type, and batch size.`);
+      setNotice(`Applied verified profile for ${profile.name}. Future launches use the measured context, KV type, batch size, and session count.`);
     } catch (error) { setNotice(String(error)); }
   };
 
@@ -614,7 +617,7 @@ function App() {
                 <label className="field"><span>Maximum context to verify</span><input type="number" min="512" step="256" value={maxContext} onChange={(event) => setMaxContext(Math.max(512, Number(event.target.value) || 512))} /></label>
                 <label className="field"><span>Promotion margin</span><input value="90% of verified maximum" readOnly /></label>
               </div>
-              {advanced && <div className="advanced-fields"><label className="field"><span>Objective</span><select value={objective} onChange={(event) => setObjective(event.target.value)}><option value="balanced">Balanced at maximum context</option><option value="max-throughput">Maximum throughput</option><option value="minimum-vram">Minimum VRAM</option><option value="lowest-latency">Lowest latency</option></select></label><label className="field"><span>Checkpointing</span><input value="Every completed trial" readOnly /></label></div>}
+              {advanced && <div className="advanced-fields"><label className="field"><span>Objective</span><select value={objective} onChange={(event) => setObjective(event.target.value)}><option value="balanced">Balanced at maximum context</option><option value="max-throughput">Maximum throughput</option><option value="max-concurrency">Maximum concurrent sessions</option><option value="minimum-vram">Minimum VRAM</option><option value="lowest-latency">Lowest latency</option></select></label><label className="field"><span>Checkpointing</span><input value="Every completed trial" readOnly /></label></div>}
               <div className="exclusive-note"><Activity size={16} /><span><strong>Exclusive GPU access required</strong>Studio stops and later restores its active model. Unmanaged llama-server instances or CUDA apps using significant VRAM cause a safe refusal.</span></div>
               <button className="primary wide" onClick={() => void previewSweep()} disabled={!selected || sweepStatus?.state === "running"}><Gauge size={15} />Preview sweep</button>
             </section>
@@ -627,12 +630,12 @@ function App() {
               </> : sweepStatus && ["complete", "failed", "cancelled"].includes(sweepStatus.state) ? <>
                 <div className={`sweep-state ${sweepStatus.state}`}><strong>{sweepStatus.state === "complete" ? "Verified sweep complete" : sweepStatus.state === "failed" ? "Sweep failed" : "Sweep cancelled"}</strong><span>{sweepStatus.error ?? sweepStatus.currentLabel}</span></div>
                 {sweepStatus.verifiedMaxContext && <div className="result-hero"><small>Promoted safe context</small><strong>{sweepStatus.promotedContext?.toLocaleString()}</strong><span>verified maximum {sweepStatus.verifiedMaxContext.toLocaleString()} tokens</span></div>}
-                <dl><div><dt>Best stable speed</dt><dd>{sweepStatus.bestTokensPerSecond ? `${sweepStatus.bestTokensPerSecond.toFixed(2)} tok/s` : "—"}</dd></div><div><dt>KV / batch</dt><dd>{sweepStatus.bestKvType ? `${sweepStatus.bestKvType} / ${sweepStatus.bestBatchSize}` : "—"}</dd></div><div><dt>Checkpoint</dt><dd title={sweepStatus.checkpointPath}>Saved</dd></div></dl>
+                <dl><div><dt>Best stable speed</dt><dd>{sweepStatus.bestTokensPerSecond ? `${sweepStatus.bestTokensPerSecond.toFixed(2)} tok/s` : "—"}</dd></div><div><dt>KV / batch</dt><dd>{sweepStatus.bestKvType ? `${sweepStatus.bestKvType} / ${sweepStatus.bestBatchSize}` : "—"}</dd></div><div><dt>Concurrent sessions</dt><dd>{sweepStatus.bestSlots ?? 1}</dd></div><div><dt>Checkpoint</dt><dd title={sweepStatus.checkpointPath}>Saved</dd></div></dl>
                 {sweepStatus.state === "complete" && <button className="primary wide" onClick={() => void applySweepProfile()} disabled={profileApplied}>{profileApplied ? "Verified profile applied" : "Apply verified profile"}</button>}
                 <button className="wide result-secondary" onClick={() => { setSweepStatus(undefined); setSweepPlan(undefined); setProfileApplied(false); }}>New sweep</button>
               </> : sweepPlan ? <>
                 <div className="result-hero"><small>Candidate promoted context</small><strong>{sweepPlan.promotedContext.toLocaleString()}</strong><span>final value follows measured capacity</span></div>
-                <dl><div><dt>Maximum trials</dt><dd>{sweepPlan.trialCount}</dd></div><div><dt>KV types</dt><dd>{sweepPlan.kvTypes.join(", ")}</dd></div><div><dt>Batch sizes</dt><dd>{sweepPlan.batchSizes.join(", ")}</dd></div><div><dt>Checkpointing</dt><dd>Every trial</dd></div></dl>
+                <dl><div><dt>Maximum trials</dt><dd>{sweepPlan.trialCount}</dd></div><div><dt>KV types</dt><dd>{sweepPlan.kvTypes.join(", ")}</dd></div><div><dt>Batch sizes</dt><dd>{sweepPlan.batchSizes.join(", ")}</dd></div><div><dt>Sessions</dt><dd>{sweepPlan.slotCounts.join(", ")}</dd></div><div><dt>Checkpointing</dt><dd>Every trial</dd></div></dl>
                 {!sweepConfirmation ? <button className="primary wide" onClick={() => setSweepConfirmation(true)} disabled={!native}>Run verified sweep</button> : <div className="sweep-confirm"><strong>Give the sweep exclusive GPU access?</strong><span>Studio-managed serving stops now and is restored after completion, failure, or cancellation.</span><div><button onClick={() => setSweepConfirmation(false)}>Not now</button><button className="primary" onClick={() => void runSweep()}>Stop model & run</button></div></div>}
               </> : <EmptyState title="No plan yet" detail="Choose a model and preview the measured search space." />}
             </section>

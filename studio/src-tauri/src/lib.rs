@@ -44,6 +44,8 @@ struct ModelProfile {
     batch_size: Option<u32>,
     #[serde(default, alias = "ubatch_size")]
     ubatch_size: Option<u32>,
+    #[serde(default)]
+    slots: Option<u32>,
     source: String,
 }
 
@@ -140,8 +142,14 @@ struct ModelEndpoint {
     kv_type: Option<String>,
     batch_size: Option<u32>,
     ubatch_size: Option<u32>,
+    #[serde(default = "default_endpoint_slots")]
+    slots: u32,
     #[serde(default)]
     resource_plan: Option<serde_json::Value>,
+}
+
+fn default_endpoint_slots() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,6 +502,7 @@ fn discover_models(config: &StudioConfig) -> Vec<ModelProfile> {
                     kv_type: None,
                     batch_size: None,
                     ubatch_size: None,
+                    slots: None,
                     source: "discovered".into(),
                 });
             }
@@ -943,6 +952,9 @@ fn refresh_model_endpoint(endpoint: &mut ModelEndpoint) {
         endpoint.ubatch_size = argument_value(&arguments, &["-ub", "--ubatch-size"])
             .and_then(|value| value.parse().ok())
             .or(endpoint.ubatch_size);
+        endpoint.slots = argument_value(&arguments, &["-np", "--parallel"])
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(endpoint.slots);
     }
 }
 
@@ -980,6 +992,7 @@ fn apply_model_environment(command: &mut CommandBuilder, endpoint: &ModelEndpoin
     if let Some(ubatch_size) = endpoint.ubatch_size {
         command.env("ESE_UBATCH_SIZE", ubatch_size.to_string());
     }
+    command.env("ESE_CONCURRENT_SESSIONS", endpoint.slots.to_string());
     if let Some(resource_plan) = &endpoint.resource_plan {
         command.env("ESE_RESOURCE_PLAN_JSON", resource_plan.to_string());
     }
@@ -1245,6 +1258,7 @@ fn promote_sweep(state: State<'_, StudioState>) -> Result<ModelProfile, String> 
     let batch_size = status
         .best_batch_size
         .ok_or_else(|| "the completed sweep has no stable batch result".to_string())?;
+    let slots = status.best_slots.unwrap_or(1);
     let path = status.request.model_path.clone();
 
     let mut config = load_config()?;
@@ -1263,12 +1277,14 @@ fn promote_sweep(state: State<'_, StudioState>) -> Result<ModelProfile, String> 
         kv_type: None,
         batch_size: None,
         ubatch_size: None,
+        slots: None,
         source: "discovered".into(),
     });
     profile.context = Some(context);
     profile.kv_type = Some(kv_type);
     profile.batch_size = Some(batch_size);
     profile.ubatch_size = Some(batch_size.min(512));
+    profile.slots = Some(slots);
     profile.source = "sweep".into();
 
     config.models.retain(|model| model.path != path);
@@ -1639,6 +1655,7 @@ mod tests {
             kv_type: Some("q8_0".into()),
             batch_size: Some(512),
             ubatch_size: Some(256),
+            slots: 2,
             resource_plan: Some(serde_json::json!({"policy": "resident"})),
         };
         let mut command = CommandBuilder::new("agent");
@@ -1655,6 +1672,7 @@ mod tests {
             ("ESE_KV_TYPE", "q8_0"),
             ("ESE_BATCH_SIZE", "512"),
             ("ESE_UBATCH_SIZE", "256"),
+            ("ESE_CONCURRENT_SESSIONS", "2"),
             ("ESE_RESOURCE_PLAN_JSON", "{\"policy\":\"resident\"}"),
         ] {
             assert_eq!(

@@ -17,6 +17,7 @@ export interface ModelProfile {
   kvType?: string;
   batchSize?: number;
   ubatchSize?: number;
+  slots?: number;
   source: string;
 }
 
@@ -56,6 +57,7 @@ export interface SweepPlan {
   candidateContexts: number[];
   kvTypes: string[];
   batchSizes: number[];
+  slotCounts: number[];
   promotedContext: number;
   trialCount: number;
   requiresExclusiveGpu: boolean;
@@ -67,6 +69,7 @@ export interface SweepTrialResult {
   context: number;
   kvType: string;
   batchSize: number;
+  slots: number;
   stable: boolean;
   tokensPerSecond?: number;
   elapsedSeconds: number;
@@ -92,6 +95,7 @@ export interface SweepStatus {
   promotedContext?: number;
   bestKvType?: string;
   bestBatchSize?: number;
+  bestSlots?: number;
   bestTokensPerSecond?: number;
   results: SweepTrialResult[];
   error?: string;
