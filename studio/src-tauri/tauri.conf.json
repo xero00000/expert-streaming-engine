@@ -37,6 +37,9 @@
       "../licenses/NVIDIA-CUDA-12.4-LICENSE.txt": "licenses/NVIDIA-CUDA-12.4-LICENSE.txt"
     },
     "windows": {
+      "wix": {
+        "template": "wix/main.wxs"
+      },
       "nsis": {
         "template": "installer.nsi"
       }

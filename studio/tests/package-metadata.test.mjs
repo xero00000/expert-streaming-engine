@@ -51,6 +51,17 @@ test("NSIS packages the large CUDA runtime without solid compression", () => {
   assert.doesNotMatch(template, /SetCompressor\s+\/SOLID/);
 });
 
+test("WiX splits the CUDA runtime across bounded embedded cabinets", () => {
+  assert.equal(tauriConfig.bundle.windows.wix.template, "wix/main.wxs");
+  const template = readFileSync(join(studioRoot, "src-tauri", "wix", "main.wxs"), "utf8");
+  assert.match(template, /Vendored from tauri-apps\/tauri tauri-v2\.11\.4/);
+  assert.match(template, /<MediaTemplate/);
+  assert.match(template, /CabinetTemplate="ese\{0\}\.cab"/);
+  assert.match(template, /MaximumUncompressedMediaSize="768"/);
+  assert.match(template, /MaximumCabinetSizeForLargeFileSplitting="768"/);
+  assert.doesNotMatch(template, /<Media\s+Id="1"\s+Cabinet="app\.cab"/);
+});
+
 test("repository forms use ESE links, branding, and available labels", () => {
   const templateRoot = join(repoRoot, ".github", "ISSUE_TEMPLATE");
   const files = readdirSync(templateRoot)
