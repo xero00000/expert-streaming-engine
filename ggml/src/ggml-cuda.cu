@@ -1523,13 +1523,11 @@ GGML_CALL static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buf
 
 #endif // __linux__
 
-GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_alloc_impl(
+        ggml_backend_buffer_type_t buft,
+        size_t size) {
     void * ptr = ggml_cuda_host_malloc(size);
-
-    if (ptr == nullptr) {
-        // fallback to cpu buffer
-        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
-    }
+    if (ptr == nullptr) return nullptr;
 
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;
@@ -1537,6 +1535,17 @@ GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_
     buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
 
     return buffer;
+}
+
+GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft,
+        size_t size) {
+    ggml_backend_buffer_t buffer = ggml_backend_cuda_host_buffer_alloc_impl(buft, size);
+    if (buffer != nullptr) return buffer;
+    // The general-purpose host buffer retains its compatibility fallback.
+    // Staging code that requires truthful pinning uses the explicit allocator
+    // below and observes a null result instead.
+    return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
 }
 
 GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
@@ -1553,6 +1562,14 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     };
 
     return &ggml_backend_cuda_buffer_type_host;
+}
+
+GGML_CALL ggml_backend_buffer_t ggml_backend_cuda_host_buffer_alloc(size_t size) {
+    if (size == 0) return nullptr;
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_host_buffer_type();
+    ggml_backend_buffer_t buffer = ggml_backend_cuda_host_buffer_alloc_impl(buft, size);
+    GGML_ASSERT(!buffer || ggml_backend_buffer_get_size(buffer) == size);
+    return buffer;
 }
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {

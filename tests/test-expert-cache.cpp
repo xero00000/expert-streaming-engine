@@ -869,6 +869,20 @@ void test_hybrid_runtime_guard_is_one_way_and_fail_closed() {
             GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_UPLOAD_DRIFT);
 }
 
+void test_exact_cuda_pinned_staging_allocation() {
+#ifdef GGML_USE_CUDA
+    if (ggml_backend_cuda_get_device_count() == 0) return;
+    // Deliberately avoid a page/MiB boundary. The staging contract exposes the
+    // caller's exact usable byte count rather than an allocator size class.
+    constexpr size_t requested = 1000003;
+    ggml_backend_buffer_t buffer = ggml_backend_cuda_host_buffer_alloc(requested);
+    REQUIRE(buffer != nullptr);
+    REQUIRE(ggml_backend_buffer_get_size(buffer) == requested);
+    REQUIRE(std::strcmp(ggml_backend_buffer_name(buffer), "CUDA_Host") == 0);
+    ggml_backend_buffer_free(buffer);
+#endif
+}
+
 void test_expert_cache_transaction_state_machine() {
     REQUIRE(ggml_backend_sched_expert_cache_prepare(nullptr, 0, 0, 1) == nullptr);
     REQUIRE(!ggml_backend_sched_expert_cache_publish(nullptr));
@@ -1017,6 +1031,7 @@ int main() {
         test_cpu_fused_moe_merged_workspace();
         test_cuda_compact_remap_exact_parity();
         test_hybrid_runtime_guard_is_one_way_and_fail_closed();
+        test_exact_cuda_pinned_staging_allocation();
         test_expert_cache_transaction_state_machine();
         test_expert_cache_partial_publication_rollback();
         std::cout << "PASS: checked bounded expert caches and exact full/compact CUDA parity\n";
