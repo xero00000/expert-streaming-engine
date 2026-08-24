@@ -70,14 +70,24 @@ without possessing a raw-data export capability.
 
 ## Configuration and secrets
 
-The versioned user config is `~/.config/ese/studio.toml`. Model roots are auto-scanned; manual profiles override discovered metadata. Missing profiles are preserved for removable drives but hidden in a collapsed unavailable section by default.
+The versioned user config is `studio.toml` under the operating system's
+application-config directory. On Linux this normally resolves below
+`$XDG_CONFIG_HOME/ese`, or `~/.config/ese` when `XDG_CONFIG_HOME` is unset;
+Windows uses the user's roaming AppData directory. The Settings screen exposes
+the exact resolved path. Model roots are auto-scanned; manual profiles override
+discovered metadata. Missing profiles are preserved for removable drives but
+hidden in a collapsed unavailable section by default.
 
-Configuration is portable. Secrets are not: app profiles should reference environment variables or Linux Secret Service/keyring entries rather than storing plaintext tokens.
+Configuration is portable. Secrets are not: app profiles should reference
+environment variables or the operating system's credential store rather than
+storing plaintext tokens.
 
 ## Current desktop foundation
 
 - Desktop shell, recursive discovery, hidden missing profiles, native PTYs, and typed portable config.
-- Installed-agent discovery across PATH and common Linux user package locations, with non-destructive profile merging.
+- Installed-agent discovery across PATH and platform package locations,
+  including Linux user directories and Windows npm/Scoop paths, with
+  non-destructive profile merging.
 - Active-model handoff to endpoint-aware apps through OpenAI-compatible and ESE-specific environment variables; Hermes also receives persistent provider synchronization.
 - ESE plan/serve supervision and real completion-based benchmark trials.
 - Stability gates, checkpoint/resume, cancellation, active-model restoration, and verified-profile promotion.

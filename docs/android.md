@@ -1,56 +1,53 @@
+# Android status
 
-# Android
+Android is not currently a supported ESE target. `main` does not contain a
+validated QNN/NPU backend, an Android package, or physical-device evidence for
+the bounded expert hierarchy. Historical references to an `android-s25-qnn`
+branch describe an earlier draft; that branch is no longer present on the
+remote.
 
-## Build on Android using Termux
-[Termux](https://github.com/termux/termux-app#installation) is a method to execute `llama.cpp` on an Android device (no root required).
-```
-apt update && apt upgrade -y
-apt install git make cmake
-```
+## Experimental Termux CPU build
 
-It's recommended to move your model inside the `~/` directory for best performance:
-```
-cd storage/downloads
-mv model.gguf ~/
-```
+Advanced users can attempt a native CPU-only build in Termux, but it is an
+unsupported development path and does not provide ESE Studio, CUDA, QNN, or the
+Linux-only bounded expert RAM cache.
 
-[Get the code](https://github.com/ggerganov/llama.cpp#get-the-code) & [follow the Linux build instructions](https://github.com/ggerganov/llama.cpp#build) to build `llama.cpp`.
+Install the basic tools:
 
-## Building the Project using Android NDK
-Obtain the [Android NDK](https://developer.android.com/ndk) and then build with CMake.
-
-Execute the following commands on your computer to avoid downloading the NDK to your mobile. Alternatively, you can also do this in Termux:
-```
-$ mkdir build-android
-$ cd build-android
-$ export NDK=<your_ndk_directory>
-$ cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 -DCMAKE_C_FLAGS=-march=armv8.4a+dotprod ..
-$ make
+```bash
+pkg update
+pkg install git cmake ninja clang python
 ```
 
-Install [termux](https://github.com/termux/termux-app#installation) on your device and run `termux-setup-storage` to get access to your SD card (if Android 11+ then run the command twice).
+Clone this repository—not an upstream `llama.cpp` fork—and configure a portable
+CPU build:
 
-Finally, copy these built `llama` binaries and the model file to your device storage. Because the file permissions in the Android sdcard cannot be changed, you can copy the executable files to the `/data/data/com.termux/files/home/bin` path, and then execute the following commands in Termux to add executable permission:
-
-(Assumed that you have pushed the built executable files to the /sdcard/llama.cpp/bin path using `adb push`)
-```
-$cp -r /sdcard/llama.cpp/bin /data/data/com.termux/files/home/
-$cd /data/data/com.termux/files/home/bin
-$chmod +x ./*
-```
-
-Download model [llama-2-7b-chat.Q4_K_M.gguf](https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/blob/main/llama-2-7b-chat.Q4_K_M.gguf), and push it to `/sdcard/llama.cpp/`, then move it to `/data/data/com.termux/files/home/model/`
-
-```
-$mv /sdcard/llama.cpp/llama-2-7b-chat.Q4_K_M.gguf /data/data/com.termux/files/home/model/
+```bash
+git clone https://github.com/xero00000/expert-streaming-engine.git
+cd expert-streaming-engine
+cmake -S . -B build-android -G Ninja \
+  -DGGML_CUDA=OFF \
+  -DGGML_NATIVE=OFF \
+  -DLLAMA_BUILD_TESTS=OFF \
+  -DLLAMA_BUILD_SERVER=ON
+cmake --build build-android --target llama-server
 ```
 
-Now, you can start chatting:
-```
-$cd /data/data/com.termux/files/home/bin
-$./llama-cli -m ../model/llama-2-7b-chat.Q4_K_M.gguf -n 128 -cml
-```
+Termux package availability and Android linker behavior can change. Treat a
+successful compile as an experiment, not as proof of model parity, bounded
+memory, thermal stability, or supported operation.
 
-Here's a demo of an interactive session running on Pixel 5 phone:
+## Requirements before Android can be supported
 
-https://user-images.githubusercontent.com/271616/225014776-1d567049-ad71-4ef2-b050-55b0b3b9274c.mp4
+An Android backend must provide all of the following before this page can claim
+support:
+
+- reproducible on-device build and packaging;
+- exact token/output and route parity against a supported CPU reference;
+- bounded RAM/device-memory accounting and failure-atomic lifecycle behavior;
+- proof that the intended GPU/NPU kernels execute without hidden CPU fallback;
+- sustained performance and thermal measurements on physical devices; and
+- CI or retained device evidence covering the published configuration.
+
+Track new Android work through a current pull request or issue from `main`; do
+not rely on deleted branch names as installation instructions.

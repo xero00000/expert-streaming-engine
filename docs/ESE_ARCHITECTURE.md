@@ -107,9 +107,7 @@ events without a global compute-stream synchronization. Prompt-sized MoE work
 stays on the established CPU graph, where independent GPU work can overlap;
 single-token decode uses compact cache slots.
 
-Phase 4 places this controller inside a global budget shared with:
-
-Budget participants will include:
+Phase 4 places this controller inside a global budget shared by:
 
 ```text
 dense weights
@@ -149,7 +147,8 @@ Loaded or staged experts remain valid until the consuming graph or synchronized 
 
 ### Failure-atomic reconfiguration
 
-Future cache resize, KV retiering, transient-module swapping, and recurrent-state changes must either complete fully or preserve the prior usable state.
+Cache resize, KV retiering, transient-module swapping, and recurrent-state
+changes must either complete fully or preserve the prior usable state.
 
 ### Deterministic validation
 

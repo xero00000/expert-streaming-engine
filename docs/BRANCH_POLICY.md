@@ -1,57 +1,43 @@
 # Branch Policy
 
-The supported desktop engine lives on `main`. General fixes and features start
-from `main`, pass unified CI in a pull request, and return to `main` by squash
-merge. Release tags are cut only from a clean, validated `main` commit.
+The supported engine lives on `main`. General fixes and features start from
+`main`, pass CI in a pull request, and return to `main` by squash merge. Release
+tags are cut only from a clean, validated `main` commit.
 
-## Active branches
+## Supported branches
 
-### `main`
+- `main` — the public default, integration, and release branch.
 
-The public default and release branch. It contains the unified launcher, the
-native global resource controller, the bounded expert hierarchy, Turbo KV/VBR
-foundation, transient MTP/mmproj management, adaptive speculation, and the
-current DeepSeek/Maple integration line.
+No other long-lived remote branch is currently supported. Platform experiments
+and research should use a short-lived pull-request branch and must not be
+described as available until that branch actually exists on the remote.
 
-### `android-s25-qnn`
+## Historical branch lineage
 
-An active platform draft. It stays separate until the Android/QNN backend has
-physical-device build, parity, lifecycle, bounded-memory, and thermal evidence.
-Its open pull request must be moved to `main` before the former integration base
-can be retired.
+The following names occur in old discussions, commits, or planning records but
+are not current remote branches:
 
-## Retained research lines
+- `android-s25-qnn` — an unmerged Android/QNN draft. Android/QNN remains future
+  work and has no supported branch or runtime on `main`.
+- `deepseek4-expert-streaming` — the former DeepSeek/Maple integration source.
+- `fa-q4-d256-longctx` — an older long-context Flash Attention/Q4 experiment.
+- `expert-gpu-cache-experiment` — an earlier cache experiment, distinct from
+  the bounded adaptive cache now on `main`.
+- `chunked-gdn-port` — the former public default before consolidation.
 
-### `deepseek4-expert-streaming`
+Use merged pull requests, release tags, and immutable commit IDs when citing
+historical work. A historical branch name is not a reproducible reference after
+the branch has been deleted.
 
-The historical integration source for current desktop work. Do not add general
-changes here; preserve it only while unique research commits still need a
-traceable reference.
+## Working-branch rules
 
-### `fa-q4-d256-longctx`
-
-Older long-context Flash Attention/Q4 work. Re-port individual changes only
-after checking whether the current `main` kernels supersede them.
-
-### `expert-gpu-cache-experiment`
-
-A recorded GPU-cache experiment that found a miss-rate/PCIe dead end on its
-tested GPT-OSS geometry. It is not the adaptive cache now on `main`. Retain or
-archive its unique tip for provenance; do not present it as a supported line.
-
-### `chunked-gdn-port`
-
-The former public default. It remains temporarily because the Android draft
-still targets it. Retarget/rebase that pull request before archiving and
-deleting this branch.
-
-## Cleanup rules
-
-- Delete merged pull-request heads after their merge and CI evidence are
-  recorded.
+- Create a focused branch from current `main` for each independently testable
+  change.
+- Delete merged pull-request heads after their CI evidence and squash commit
+  are recorded.
 - Never infer that a squash-merged branch is unmerged from ancestry alone;
   verify its pull-request state.
-- Preserve active platform work and unique research until it is merged,
-  superseded with evidence, or tagged for archival.
+- Preserve unique research with an immutable tag or commit ID before deleting
+  its working branch.
 - Keep local model fixtures before removing disposable validation worktrees.
 - Protect `main`; never use it as an experiment scratch branch.
