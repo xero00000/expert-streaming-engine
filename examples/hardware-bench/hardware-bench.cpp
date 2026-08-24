@@ -4,6 +4,10 @@
 #include "llama.h"
 #include "llama-expert-cache.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -255,10 +259,43 @@ struct cpu_moe_result {
 struct device_transfer_result {
     std::string backend;
     double h2d_gbps = 0;
+    double pinned_h2d_gbps = 0;
     double d2h_gbps = 0;
     double contended_h2d_gbps = 0;
     std::vector<double> expert_upload_gbps;
 };
+
+struct pinned_host_source {
+    ggml_backend_buffer_t buffer = nullptr;
+
+    pinned_host_source() = default;
+    pinned_host_source(const pinned_host_source &) = delete;
+    pinned_host_source & operator=(const pinned_host_source &) = delete;
+    pinned_host_source(pinned_host_source && other) noexcept : buffer(other.buffer) {
+        other.buffer = nullptr;
+    }
+    ~pinned_host_source() {
+        if (buffer) ggml_backend_buffer_free(buffer);
+    }
+
+    void * data() const {
+        return buffer ? ggml_backend_buffer_get_base(buffer) : nullptr;
+    }
+};
+
+pinned_host_source make_pinned_host_source(const void * source, size_t bytes) {
+    pinned_host_source pinned;
+#ifdef GGML_USE_CUDA
+    pinned.buffer = ggml_backend_cuda_host_buffer_alloc(bytes);
+    if (pinned.buffer) {
+        std::memcpy(pinned.data(), source, bytes);
+    }
+#else
+    GGML_UNUSED(source);
+    GGML_UNUSED(bytes);
+#endif
+    return pinned;
+}
 
 struct device_contention_result {
     std::string backend;
@@ -693,6 +730,7 @@ int main(int argc, char ** argv) {
         const size_t allocation_bytes = std::max(opts.bytes, expert_upload_bytes);
         std::vector<uint8_t> source(allocation_bytes, 0x5a);
         std::vector<uint8_t> destination(allocation_bytes, 0);
+        pinned_host_source pinned_source = make_pinned_host_source(source.data(), allocation_bytes);
         std::vector<double> host_samples;
         for (int i = 0; i < opts.iterations; ++i) {
             const auto start = clock_type::now();
@@ -704,6 +742,7 @@ int main(int argc, char ** argv) {
         std::string backend_name;
         transfer_probe transfer = make_transfer_probe(allocation_bytes, backend_name);
         std::vector<double> h2d_samples;
+        std::vector<double> pinned_h2d_samples;
         std::vector<double> d2h_samples;
         std::vector<double> contention_h2d_samples;
         std::vector<double> expert_cache_upload_samples;
@@ -716,6 +755,13 @@ int main(int argc, char ** argv) {
                 ggml_backend_tensor_set(transfer.tensor, source.data(), 0, opts.bytes);
                 ggml_backend_synchronize(transfer.backend);
                 h2d_samples.push_back(gbps(opts.bytes, seconds_since(start)));
+
+                if (pinned_source.data()) {
+                    start = clock_type::now();
+                    ggml_backend_tensor_set(transfer.tensor, pinned_source.data(), 0, opts.bytes);
+                    ggml_backend_synchronize(transfer.backend);
+                    pinned_h2d_samples.push_back(gbps(opts.bytes, seconds_since(start)));
+                }
 
                 start = clock_type::now();
                 ggml_backend_tensor_get(transfer.tensor, destination.data(), 0, opts.bytes);
@@ -754,6 +800,7 @@ int main(int argc, char ** argv) {
             device_transfer_result primary;
             primary.backend = backend_name;
             primary.h2d_gbps = median(h2d_samples);
+            primary.pinned_h2d_gbps = pinned_h2d_samples.empty() ? 0 : median(pinned_h2d_samples);
             primary.d2h_gbps = median(d2h_samples);
             primary.contended_h2d_gbps = median(contention_h2d_samples);
             if (opts.model_experts.empty()) {
@@ -770,6 +817,7 @@ int main(int argc, char ** argv) {
                 transfer_probe extra = make_transfer_probe(allocation_bytes, extra_name, ordinal);
                 if (!extra.backend) break;
                 std::vector<double> extra_h2d;
+                std::vector<double> extra_pinned_h2d;
                 std::vector<double> extra_d2h;
                 std::vector<double> extra_contended;
                 std::vector<std::vector<double>> extra_uploads(
@@ -781,6 +829,12 @@ int main(int argc, char ** argv) {
                     ggml_backend_tensor_set(extra.tensor, source.data(), 0, opts.bytes);
                     ggml_backend_synchronize(extra.backend);
                     extra_h2d.push_back(gbps(opts.bytes, seconds_since(start)));
+                    if (pinned_source.data()) {
+                        start = clock_type::now();
+                        ggml_backend_tensor_set(extra.tensor, pinned_source.data(), 0, opts.bytes);
+                        ggml_backend_synchronize(extra.backend);
+                        extra_pinned_h2d.push_back(gbps(opts.bytes, seconds_since(start)));
+                    }
                     start = clock_type::now();
                     ggml_backend_tensor_get(extra.tensor, destination.data(), 0, opts.bytes);
                     ggml_backend_synchronize(extra.backend);
@@ -810,6 +864,7 @@ int main(int argc, char ** argv) {
                 device_transfer_result measured;
                 measured.backend = extra_name;
                 measured.h2d_gbps = median(extra_h2d);
+                measured.pinned_h2d_gbps = extra_pinned_h2d.empty() ? 0 : median(extra_pinned_h2d);
                 measured.d2h_gbps = median(extra_d2h);
                 measured.contended_h2d_gbps = median(extra_contended);
                 for (const auto & samples : extra_uploads) measured.expert_upload_gbps.push_back(median(samples));
@@ -976,6 +1031,9 @@ int main(int argc, char ** argv) {
         if (transfer.backend) {
             std::cout << "    \"gpu_transfer\": {\"status\": \"measured\", \"backend\": \""
                       << json_escape(backend_name) << "\", \"h2d_gbps_median\": " << median(h2d_samples)
+                      << ", \"pinned_h2d_available\": " << (!pinned_h2d_samples.empty() ? "true" : "false")
+                      << ", \"pinned_h2d_gbps_median\": "
+                      << (pinned_h2d_samples.empty() ? 0 : median(pinned_h2d_samples))
                       << ", \"d2h_gbps_median\": " << median(d2h_samples)
                       << ", \"contended_h2d_gbps_median\": " << median(contention_h2d_samples)
                       << ", \"devices\": [";
@@ -984,6 +1042,7 @@ int main(int argc, char ** argv) {
                 const auto & device = device_transfers[i];
                 std::cout << "{\"backend\": \"" << json_escape(device.backend)
                           << "\", \"h2d_gbps_median\": " << device.h2d_gbps
+                          << ", \"pinned_h2d_gbps_median\": " << device.pinned_h2d_gbps
                           << ", \"d2h_gbps_median\": " << device.d2h_gbps
                           << ", \"contended_h2d_gbps_median\": " << device.contended_h2d_gbps
                           << ", \"expert_upload_profiles\": [";
