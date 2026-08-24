@@ -20,10 +20,14 @@ import urllib.request
 from pathlib import Path
 
 
+# Keep enough prompt tokens to exercise every staged layer, while avoiding the
+# TinyMoE fixture's known near-tie after the old validation wording (its top two
+# first-token probabilities differ by roughly 1e-5 across CPU/GPU execution).
+# This wording retains exact 24-token parity across the established and staged
+# paths on one, two, and three participating GPUs.
 PROMPT = (
-    "ESE validates deterministic mixture of experts prefill streaming on three GPUs. "
-    "ESE validates deterministic mixture of experts prefill streaming on three GPUs. "
-    "Write one short sentence describing a reliable local inference engine."
+    "ESE is a local inference engine that runs reliably on Linux. " * 4
+    + "Describe it in one short sentence."
 )
 STATS_PREFIX = "expert_prefill_stats: "
 

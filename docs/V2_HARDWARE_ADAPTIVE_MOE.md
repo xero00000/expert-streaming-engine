@@ -262,6 +262,18 @@ default fused path also completed on the mixed SM75/SM86 three-GPU split at
 189.7 tokens/s and remained healthy through clean shutdown. These small-model
 figures are regression evidence rather than general performance claims.
 
+After compact-cache parity disabled fused `mul_multi_add`, the validator's old
+wording exposed a fixture-specific near tie: the first two token probabilities
+differed by about `1e-5`, so normal CPU/GPU floating-point differences selected
+different tokens even though forced staging fallback reproduced the staged
+distribution. The corruption gate now uses a longer stable prompt that still
+exercises every layer and requires exact 24-token hashes. On the current v2 tip,
+three paired runs passed on one, two, and three participating GPUs with zero
+fallbacks or global synchronizations. Median prompt ratios were `1.41x`,
+`2.44x`, and `2.91x` respectively; all lanes stayed at exactly 27 MiB per
+device and the three-GPU run proved 201 H2D plus 240 D2D component transfers.
+These remain development-fixture measurements rather than product benchmarks.
+
 ## Phase D: runtime resource rebalancing (in progress)
 
 `GET /v1/ese/resources` is routed through the inference task queue and reports
