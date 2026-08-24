@@ -342,6 +342,15 @@ The model-backed transaction gate is automated by:
 scripts/validate-phase-d-rebalance.py --model MODEL.gguf
 ```
 
+Models with recurrent or hybrid KV state intentionally cannot provide the
+conventional resize evidence above. For an MTP-capable model in that class,
+`--transient-only` runs the full shared/mtp-only/multimodal-only/off request
+matrix plus the after-prepare and after-publish transient fault gates, while
+skipping conventional KV, expert-only, and three-pool transactions. The report
+labels this as capability-split evidence. KV/expert and combined publication
+must still pass separately on a non-recurrent MoE model; this mode does not
+weaken or bypass the recurrent-cache fail-closed rule.
+
 On the checked TinyMoE fixture, both CPU and mixed RTX 2080 SUPER/RTX 3060
 Ti/RTX 3080 (`20,30,50`) trials shrank an occupied 1,024-token F16 cache to 512
 tokens and grew it back to 1,024 while all three seeded completions retained the

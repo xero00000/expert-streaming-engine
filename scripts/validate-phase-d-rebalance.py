@@ -2304,17 +2304,23 @@ def validate_transient_success(args: argparse.Namespace) -> dict:
             "system_prompt_handoff": system_prompt_handoff_evidence,
         }
 
-        policy_report["shared"]["concurrent_disjoint_rebalance"] = (
-            validate_serialized_disjoint_rebalances(
-                args,
-                port,
-                initial_expert,
-                mtp_bytes,
-                multimodal_bytes,
-                projector_modalities,
-                baseline_hash,
+        if getattr(args, "transient_only", False):
+            policy_report["shared"]["concurrent_disjoint_rebalance"] = {
+                "capability_split": True,
+                "reason": "conventional KV/expert transactions are gated by a separate model",
+            }
+        else:
+            policy_report["shared"]["concurrent_disjoint_rebalance"] = (
+                validate_serialized_disjoint_rebalances(
+                    args,
+                    port,
+                    initial_expert,
+                    mtp_bytes,
+                    multimodal_bytes,
+                    projector_modalities,
+                    baseline_hash,
+                )
             )
-        )
 
         mtp_dry = rebalance_transient(port, "mtp-only", True)
         require_transient_preparation_peak(
@@ -2514,6 +2520,16 @@ def validate_transient_success(args: argparse.Namespace) -> dict:
             raise RuntimeError(
                 "transient policy sweep did not restore the exact captured owner state"
             )
+
+        if getattr(args, "transient_only", False):
+            return {
+                "output_sha256": baseline_hash,
+                "image_output_sha256": image_output_hash,
+                "policies": policy_report,
+                "exact_transient_round_trip": True,
+                "capability_split": "transient-only",
+                "combined": None,
+            }
 
         before_combined_geometry = kv_geometry(normalized_snapshot)
         before_combined_transient = final_transient
@@ -2818,6 +2834,158 @@ def validate_combined_failure(
         server.stop()
 
 
+def validate_transient_failure(
+    args: argparse.Namespace,
+    failure_kind: str,
+    port_offset: int,
+) -> dict:
+    mib = 1024 * 1024
+    mtp_bytes = args.transient_mtp_mib * mib
+    multimodal_bytes = args.transient_mmproj_mib * mib
+    initial_expert = args.expert_initial_mib * mib
+    port = args.port + port_offset
+    server = Server(
+        args,
+        port,
+        failure_kind=failure_kind,
+        expert_mode=True,
+        transient_mode=True,
+    )
+    try:
+        server.wait_ready()
+        projector_modalities = get_projector_modalities(port)
+        completion(port, args.predict, args.request_timeout)
+        before = completion(port, args.predict, args.request_timeout)
+        before_hash = content_hash(before)
+        before_snapshot = resources(port)
+        require_geometry(before_snapshot, args.context, args.context)
+        require_expert_capacity(before_snapshot, initial_expert, True)
+        before_plan = require_serialized_plan(
+            before_snapshot, args.context, initial_expert
+        )
+        before_transient = require_transient_policy(
+            before_snapshot,
+            "shared",
+            mtp_bytes,
+            multimodal_bytes,
+            before_plan,
+        )
+        before_owner = transient_resident_owner(before_transient)
+        target_policy = {
+            "mtp": "multimodal-only",
+            "multimodal": "mtp-only",
+        }[before_owner]
+        before_state = exact_transaction_state(before_snapshot)
+
+        failure = rebalance_transient(
+            port, target_policy, False, expected_status=500
+        )
+        immediate_snapshot = resources(port)
+        if exact_transaction_state(immediate_snapshot) != before_state:
+            raise RuntimeError(
+                f"{failure_kind} changed exact transient state before recovery"
+            )
+        require_geometry(immediate_snapshot, args.context, args.context)
+        require_expert_capacity(immediate_snapshot, initial_expert, True)
+        require_transient_policy(
+            immediate_snapshot,
+            "shared",
+            mtp_bytes,
+            multimodal_bytes,
+            before_plan,
+        )
+        require_http_views(
+            port,
+            args.context,
+            args.context,
+            before_plan,
+            "shared",
+            mtp_bytes,
+            multimodal_bytes,
+            projector_modalities,
+        )
+        request_json(f"http://127.0.0.1:{port}/health")
+        recovery_dry_run = rebalance_transient(port, target_policy, True)
+        require_transient_preparation_peak(
+            recovery_dry_run,
+            target_policy,
+            mtp_bytes,
+            multimodal_bytes,
+            prepares=True,
+        )
+        require_rollback_message(failure, failure_kind)
+        if content_hash(completion(port, args.predict, args.request_timeout)) != before_hash:
+            raise RuntimeError(
+                f"{failure_kind} changed deterministic output after rollback"
+            )
+
+        retry = rebalance_transient(port, target_policy, False)
+        retry_plan = require_transient_commit(
+            retry, "shared", target_policy, scope="transient-only"
+        )
+        require_geometry(resources(port), args.context, args.context)
+        require_transient_policy(
+            resources(port),
+            target_policy,
+            mtp_bytes,
+            multimodal_bytes,
+            retry_plan,
+        )
+
+        restore = rebalance_transient(port, "shared", False)
+        restore_plan = require_transient_commit(
+            restore, target_policy, "shared", scope="transient-only"
+        )
+        require_transient_policy(
+            resources(port),
+            "shared",
+            mtp_bytes,
+            multimodal_bytes,
+            restore_plan,
+        )
+        final_transient, normalized_plan = restore_shared_owner(
+            port, before_owner, mtp_bytes, multimodal_bytes
+        )
+        final_snapshot = resources(port)
+        if final_transient != before_transient:
+            raise RuntimeError(
+                f"{failure_kind} retry/restore changed exact transient owner state"
+            )
+        require_geometry(final_snapshot, args.context, args.context)
+        require_expert_capacity(final_snapshot, initial_expert, True)
+        require_serialized_plan(
+            final_snapshot, args.context, initial_expert, normalized_plan
+        )
+        require_http_views(
+            port,
+            args.context,
+            args.context,
+            normalized_plan,
+            "shared",
+            mtp_bytes,
+            multimodal_bytes,
+            projector_modalities,
+        )
+        if content_hash(completion(port, args.predict, args.request_timeout)) != before_hash:
+            raise RuntimeError(
+                f"{failure_kind} retry/restore changed deterministic output"
+            )
+        return {
+            "injection": failure_kind,
+            "output_sha256": before_hash,
+            "failure_http": 500,
+            "exact_pre_completion_state_restored": True,
+            "exact_transient_owner_restored": True,
+            "serialized_plan_restored": True,
+            "http_capabilities_verified": True,
+            "same_process_retry_committed": True,
+            "same_process_restore_committed": True,
+            "scope": "transient-only",
+        }
+    finally:
+        server.stop()
+
+
 def validate_transient_combined_failure(
     args: argparse.Namespace,
     failure_kind: str,
@@ -3093,6 +3261,14 @@ def main() -> int:
     parser.add_argument("--expert-reserve-mib", type=int, default=256)
     parser.add_argument("--expert-failure-after-devices", type=int, default=-1)
     parser.add_argument(
+        "--transient-only",
+        action="store_true",
+        help=(
+            "validate MTP/mmproj ownership without conventional KV resizing; "
+            "use a separate non-recurrent model for KV/expert transaction evidence"
+        ),
+    )
+    parser.add_argument(
         "--mmproj",
         type=Path,
         help="matching multimodal projector for transient-policy validation",
@@ -3152,6 +3328,7 @@ def main() -> int:
         or args.expert_failure_after_devices < -1
         or (args.expert_failure_after_devices >= 0 and not args.expert_initial_mib)
         or (transient_requested and not transient_configured)
+        or (args.transient_only and not transient_configured)
         or (transient_requested and (
             args.gpu_layers < 1
             or not args.expert_initial_mib
@@ -3162,10 +3339,10 @@ def main() -> int:
             "invalid context, prediction, expert-cache, or transient validation geometry"
         )
 
-    success = validate_success(args)
-    failure = validate_failure(args)
+    success = None if args.transient_only else validate_success(args)
+    failure = None if args.transient_only else validate_failure(args)
     expert = None
-    if args.expert_initial_mib:
+    if args.expert_initial_mib and not args.transient_only:
         committed_path = validate_expert_success(args)
         failures = {
             "first_resident_copy": validate_expert_failure(args),
@@ -3193,14 +3370,25 @@ def main() -> int:
         }
     transient = None
     if transient_requested:
-        transient = {
-            "committed_path": validate_transient_success(args),
-            "combined_injected_failures": {
+        committed_path = validate_transient_success(args)
+        if args.transient_only:
+            injected_failures = {
+                stage: validate_transient_failure(args, stage, 40 + index)
+                for index, stage in enumerate(TRANSIENT_FAILURE_STAGES)
+            }
+        else:
+            injected_failures = {
                 stage: validate_transient_combined_failure(args, stage, 40 + index)
                 for index, stage in enumerate(
                     COMBINED_FAILURE_STAGES + TRANSIENT_FAILURE_STAGES
                 )
-            },
+            }
+        transient = {
+            "committed_path": committed_path,
+            "injected_failures": injected_failures,
+            "evidence_scope": (
+                "transient-only" if args.transient_only else "combined-three-pool"
+            ),
         }
     report = {
         "schema": 3,
@@ -3215,6 +3403,7 @@ def main() -> int:
             "expert_target_mib": args.expert_target_mib or None,
             "transient_mtp_mib": args.transient_mtp_mib or None,
             "transient_mmproj_mib": args.transient_mmproj_mib or None,
+            "transient_only": args.transient_only,
         },
         "committed_path": success,
         "injected_failure": failure,
