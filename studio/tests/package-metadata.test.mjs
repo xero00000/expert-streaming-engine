@@ -45,6 +45,17 @@ test("package metadata bundles ESE and NVIDIA license notices", () => {
   }
 });
 
+test("runtime staging includes the complete Python launcher package", () => {
+  const stageRuntime = readFileSync(join(studioRoot, "scripts", "stage-runtime.mjs"), "utf8");
+  for (const module of ["ese.py", "hardware_profile.py", "__init__.py"]) {
+    assert.match(
+      stageRuntime,
+      new RegExp(`cpSync\\(join\\(repoRoot, "tools", "${module.replace(".", "\\.")}"\\)`),
+    );
+  }
+  assert.match(studioWorkflow, /"tools\/hardware_profile\.py"/);
+});
+
 test("NSIS packages the large CUDA runtime without solid compression", () => {
   assert.equal(tauriConfig.bundle.windows.nsis.template, "installer.nsi");
   const template = readFileSync(join(studioRoot, "src-tauri", "installer.nsi"), "utf8");

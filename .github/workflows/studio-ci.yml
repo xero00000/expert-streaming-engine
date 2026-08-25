@@ -10,6 +10,7 @@ on:
       - "ese"
       - "ese.cmd"
       - "tools/ese.py"
+      - "tools/hardware_profile.py"
       - "CMakeLists.txt"
       - "ggml/**"
       - "src/**"
