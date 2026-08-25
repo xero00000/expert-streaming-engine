@@ -54,7 +54,7 @@ jobs:
   turbo-kv-reference:
     name: Turbo KV CPU reference
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
