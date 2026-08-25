@@ -5,11 +5,13 @@ ESE is a performance-oriented inference fork, but correctness and bounded memory
 ## Before opening a change
 
 1. Base general work on `main`.
-2. Keep Android/QNN work on its platform branch unless the change is backend-neutral.
+2. Create platform work, including Android/QNN experiments, as a focused branch
+   from current `main`; do not depend on deleted historical branch names.
 3. Run:
 
 ```bash
 ./ese doctor
+python scripts/check-docs.py
 python -m unittest discover -s tests -p "test_*.py" -v
 ./ese build --backend cpu
 ```
@@ -171,3 +173,9 @@ Do not merge an external fork wholesale. Port the smallest coherent layer that s
 ## Documentation
 
 User-facing changes should update one focused document under `docs/` and keep the README limited to the main path. Detailed experiments belong in benchmark records or issues, not in the landing page.
+
+Run `python scripts/check-docs.py` before submitting documentation changes. CI
+also verifies that branches listed as supported in `docs/BRANCH_POLICY.md`
+actually exist on the remote. Historical material under `github-data/` is
+archival provenance and is intentionally outside the maintained-documentation
+checks.

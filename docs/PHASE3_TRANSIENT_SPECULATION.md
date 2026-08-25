@@ -112,9 +112,9 @@ languages, or domain terms. Validation therefore reports code, prose, tool,
 multilingual, and long-context panels independently; one aggregate acceptance
 number is not sufficient.
 
-## Validation matrix
+## Validation record
 
-Before Phase 3 is mergeable, record the following separately:
+Phase 3 merged after recording the following separately:
 
 - one-slot and multi-slot transaction tests;
 - capacity rejection, activation failure, request failure, and complete restore;
@@ -130,5 +130,8 @@ Before Phase 3 is mergeable, record the following separately:
 
 CPU unit tests cover transaction atomicity, multi-device capacity, target-only MTP
 selection, profitable depth selection, mapped-id scatter, and greedy full-target
-verification. End-to-end model/hardware evidence is recorded with the consolidated
-Phase 3 pull request.
+verification. End-to-end testing used a Qwen 3.6 image request followed by
+text/MTP generation on Turing and Ampere hardware with no stale state. Five
+workload panels recorded a 12.9% aggregate decode gain and 80.8% draft
+acceptance. The consolidated status and remaining boundaries are retained in
+the [port roadmap](PORT_ROADMAP.md#phase-3--transient-modules-and-speculation).

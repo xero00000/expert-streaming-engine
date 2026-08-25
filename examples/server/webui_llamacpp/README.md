@@ -239,7 +239,8 @@ Routes → Components → Hooks → Stores → Services → Storage/API
 
 ### High-Level Architecture
 
-See: [`docs/architecture/high-level-architecture-simplified.md`](docs/architecture/high-level-architecture-simplified.md)
+The high-level architecture is summarized below. The separate diagram file from
+the upstream UI project is not included in this fork.
 
 ```mermaid
 flowchart TB
@@ -377,7 +378,7 @@ Components are organized in `app/` (application-specific) and `ui/` (shadcn-svel
 
 ### MODEL Mode (Single Model)
 
-See: [`docs/flows/data-flow-simplified-model-mode.md`](docs/flows/data-flow-simplified-model-mode.md)
+The model-mode flow is summarized below.
 
 ```mermaid
 sequenceDiagram
@@ -408,7 +409,7 @@ sequenceDiagram
 
 ### ROUTER Mode (Multi-Model)
 
-See: [`docs/flows/data-flow-simplified-router-mode.md`](docs/flows/data-flow-simplified-router-mode.md)
+The router-mode flow is summarized below.
 
 ```mermaid
 sequenceDiagram
@@ -443,14 +444,14 @@ sequenceDiagram
 
 ### Detailed Flow Diagrams
 
-| Flow          | Description                                | File                                                        |
-| ------------- | ------------------------------------------ | ----------------------------------------------------------- |
-| Chat          | Message lifecycle, streaming, regeneration | [`chat-flow.md`](docs/flows/chat-flow.md)                   |
-| Models        | Loading, unloading, modality caching       | [`models-flow.md`](docs/flows/models-flow.md)               |
-| Server        | Props fetching, role detection             | [`server-flow.md`](docs/flows/server-flow.md)               |
-| Conversations | CRUD, branching, import/export             | [`conversations-flow.md`](docs/flows/conversations-flow.md) |
-| Database      | IndexedDB schema, operations               | [`database-flow.md`](docs/flows/database-flow.md)           |
-| Settings      | Parameter sync, user overrides             | [`settings-flow.md`](docs/flows/settings-flow.md)           |
+| Flow | Description |
+| --- | --- |
+| Chat | Message lifecycle, streaming, regeneration |
+| Models | Loading, unloading, modality caching |
+| Server | Props fetching, role detection |
+| Conversations | CRUD, branching, import/export |
+| Database | IndexedDB schema, operations |
+| Settings | Parameter sync, user overrides |
 
 ---
 
@@ -683,6 +684,6 @@ tools/ui/
 
 ## Related Documentation
 
-- [llama.cpp Server README](../server/README.md) - Full server documentation
-- [Multimodal Documentation](../../docs/multimodal.md) - Image and audio support
-- [Function Calling](../../docs/function-calling.md) - Tool use capabilities
+- [Server README](../README.md) - Full server documentation
+- [Multimodal runtime](../../mtmd/README.md) - Image and audio support
+- [Function Calling](../../../docs/function-calling.md) - Tool use capabilities

@@ -1,7 +1,14 @@
-# llama.cpp for SYCL
+# Inherited SYCL backend reference
+
+> [!IMPORTANT]
+> This page is inherited backend material, not a currently validated ESE
+> platform claim. Its 2024 upstream release table is retained as historical
+> context; ESE CI does not presently build or test SYCL. Use the
+> [ESE source-build guide](../build.md) for supported build paths, and require
+> fresh physical-device evidence before describing SYCL as supported.
 
 - [Background](#background)
-- [Recommended Release](#recommended-release)
+- [Historical upstream baseline](#historical-upstream-baseline)
 - [News](#news)
 - [OS](#os)
 - [Hardware](#hardware)
@@ -28,15 +35,18 @@
 
 The llama.cpp SYCL backend is designed to support **Intel GPU** firstly. Based on the cross-platform feature of SYCL, it could support other vendor GPUs: Nvidia GPU (*AMD GPU coming*).
 
-When targeting **Intel CPU**, it is recommended to use llama.cpp for [Intel oneMKL](README.md#intel-onemkl) backend.
+When targeting **Intel CPU**, use the native Intel oneMKL backend when it is
+available in the source revision being built.
 
 It has the similar design of other llama.cpp BLAS-based paths such as *OpenBLAS, cuBLAS, etc..*. In beginning work, the oneAPI's [SYCLomatic](https://github.com/oneapi-src/SYCLomatic) open-source migration tool (Commercial release [Intel® DPC++ Compatibility Tool](https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compatibility-tool.html)) was used for this purpose.
 
-## Recommended Release
+## Historical upstream baseline
 
-The SYCL backend would be broken by some PRs due to no online CI.
+The original upstream document warned that the SYCL backend could be broken by
+changes because it had no online CI.
 
-The following release is verified with good quality:
+The following release was the upstream author's verified 2024 baseline. It is
+not an ESE recommendation:
 
 |Commit ID|Tag|Release|Verified  Platform|
 |-|-|-|-|
@@ -184,7 +194,8 @@ Platform #0: Intel(R) OpenCL HD Graphics
 
 - **Nvidia GPU**
 
-In order to target Nvidia GPUs through SYCL, please make sure the CUDA/CUBLAS native requirements *-found [here](README.md#cuda)-* are installed.
+In order to target Nvidia GPUs through SYCL, install the CUDA/cuBLAS development
+requirements for the toolkit version being used.
 
 2. **Install Intel® oneAPI Base toolkit**
 
@@ -292,7 +303,9 @@ cmake --build build --config Release -j -v
 
 #### Retrieve and prepare model
 
-You can refer to the general [*Prepare and Quantize*](README.md#prepare-and-quantize) guide for model prepration, or simply download [llama-2-7b.Q4_0.gguf](https://huggingface.co/TheBloke/Llama-2-7B-GGUF/blob/main/llama-2-7b.Q4_0.gguf) model as example.
+Prepare a compatible GGUF model, or download
+[llama-2-7b.Q4_0.gguf](https://huggingface.co/TheBloke/Llama-2-7B-GGUF/blob/main/llama-2-7b.Q4_0.gguf)
+as an example.
 
 ##### Check device
 
@@ -493,7 +506,9 @@ You can use Visual Studio to open llama.cpp folder as a CMake project. Choose th
 
 #### Retrieve and prepare model
 
-You can refer to the general [*Prepare and Quantize*](README.md#prepare-and-quantize) guide for model prepration, or simply download [llama-2-7b.Q4_0.gguf](https://huggingface.co/TheBloke/Llama-2-7B-GGUF/blob/main/llama-2-7b.Q4_0.gguf) model as example.
+Prepare a compatible GGUF model, or download
+[llama-2-7b.Q4_0.gguf](https://huggingface.co/TheBloke/Llama-2-7B-GGUF/blob/main/llama-2-7b.Q4_0.gguf)
+as an example.
 
 ##### Check device
 
