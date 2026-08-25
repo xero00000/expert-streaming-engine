@@ -1257,6 +1257,12 @@ struct ggml_active_expert_cache_component_state {
 };
 
 struct ggml_active_expert_cache_device {
+    ggml_active_expert_cache_device() = default;
+    ggml_active_expert_cache_device(const ggml_active_expert_cache_device &) = delete;
+    ggml_active_expert_cache_device & operator=(const ggml_active_expert_cache_device &) = delete;
+    ggml_active_expert_cache_device(ggml_active_expert_cache_device &&) noexcept = default;
+    ggml_active_expert_cache_device & operator=(ggml_active_expert_cache_device &&) noexcept = default;
+
     bool attempted = false;
     bool ready = false;
     int backend_id = -1;
