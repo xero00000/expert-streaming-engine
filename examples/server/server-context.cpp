@@ -3347,6 +3347,22 @@ void server_context::process_single_task(server_task&& task) {
 
         if (id_slot != -1) {
             slot = get_slot_by_id(id_slot);
+            if (slot == nullptr) {
+                if (task.transient_lease_group != nullptr) {
+                    server_complete_transient_lease_group(
+                        transient_manager.get(), task.transient_lease_group, false);
+                    task.transient_lease_group.reset();
+                } else {
+                    release_transient(task.transient_lease, false);
+                    task.transient_lease = 0;
+                }
+                queue_tasks.notify_slot_changed();
+                send_error(
+                    task,
+                    "requested slot does not exist",
+                    ERROR_TYPE_INVALID_REQUEST);
+                break;
+            }
         }
         else {
             slot = get_available_slot(task);

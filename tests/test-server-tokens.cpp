@@ -1,11 +1,15 @@
 #include "server-common.h"
+#include "server-queue.h"
 #include "server-task.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 bool server_log_json = false;
+bool server_verbose = false;
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -55,6 +59,31 @@ static void test_protocol_stop_reasons() {
     const json anthropic = result.to_json_anthropic_final();
     CHECK(anthropic["stop_reason"] == "end_turn");
     CHECK(anthropic["stop_sequence"] == "DONE");
+}
+
+static void test_response_timeout_is_not_starved_by_unrelated_results() {
+    server_response responses;
+    responses.add_waiting_task_id(1);
+    responses.add_waiting_task_id(2);
+
+    std::thread noise([&responses]() {
+        const auto stop = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+        while (std::chrono::steady_clock::now() < stop) {
+            auto result = std::make_unique<server_task_result>();
+            result->id = 2;
+            responses.send(std::move(result));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+
+    const auto started = std::chrono::steady_clock::now();
+    auto result = responses.recv_with_timeout({1}, 1);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    noise.join();
+
+    CHECK(result == nullptr);
+    CHECK(elapsed >= std::chrono::milliseconds(900));
+    CHECK(elapsed < std::chrono::milliseconds(1400));
 }
 
 int main() {
@@ -108,6 +137,7 @@ int main() {
     CHECK(!tokens.has_mtmd_data());
 
     test_protocol_stop_reasons();
+    test_response_timeout_is_not_starved_by_unrelated_results();
 
     std::cout << "server token and protocol stop-reason tests: PASS\n";
     return 0;

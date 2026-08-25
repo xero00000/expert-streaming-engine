@@ -424,6 +424,14 @@ def close_cancellable_request(connection: socket.socket) -> None:
         )
     except OSError:
         pass
+    try:
+        # Explicitly close both directions before releasing the descriptor.
+        # cpp-httplib's connection probe uses a zero-timeout readable peek;
+        # SHUT_RDWR guarantees a readable EOF on Linux even on stacks where an
+        # unread abortive RST is not surfaced until the server writes.
+        connection.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
     connection.close()
 
 
@@ -1128,13 +1136,21 @@ def require_transient_preparation_peak(
     ):
         raise RuntimeError("transient dry run returned inconsistent device topology")
     for device_id, item in peak_devices.items():
+        current_device = current_devices[device_id]
         target_device = target_devices[device_id]
         prepared = target_device.get("transient_bytes") if prepares else 0
         current_live = item.get("current_live_bytes")
+        expected_target_live = (
+            current_live
+            - current_device.get("transient_bytes", 0)
+            + target_device.get("transient_bytes", 0)
+            if prepares
+            else current_live
+        )
         usable = item.get("capacity_bytes", 0) - item.get("reserve_bytes", 0)
         if (
             not isinstance(current_live, int)
-            or item.get("target_live_bytes") != target_device.get("planned_bytes")
+            or item.get("target_live_bytes") != expected_target_live
             or item.get("prepared_kv_bytes") != 0
             or item.get("prepared_expert_cache_bytes") != 0
             or item.get("prepared_transient_bytes") != prepared
@@ -1861,36 +1877,24 @@ def validate_multitask_multimodal_handoff(
             for module in snapshot.get("transient", {}).get("modules", [])
         )
 
-    # Both tasks are valid and fully tokenized, but an impossible requested
-    # slot keeps them deferred. Cancelling the client proves all-fail group
-    # resolution rolls the shared owner back from multimodal to exact prior MTP.
-    all_fail_connection: socket.socket | None = None
-    try:
-        all_fail_connection = open_cancellable_json_request(
-            port,
-            "/completion",
-            legacy_multimodal_batch_payload(
-                args.image,
-                max(args.busy_predict, 1024),
-                id_slot=2_147_483_647,
-            ),
-            args.request_timeout,
+    # Both tasks are valid and fully tokenized, but the explicitly requested
+    # slot does not exist. The owner thread must reject every member, resolve
+    # the shared lease group, and restore the exact prior MTP owner. Invalid
+    # slot IDs must never create permanently deferred work.
+    all_fail_error = request_json(
+        f"http://127.0.0.1:{port}/completion",
+        legacy_multimodal_batch_payload(
+            args.image,
+            max(args.busy_predict, 1024),
+            id_slot=2_147_483_647,
+        ),
+        timeout=args.request_timeout,
+        expected_status=400,
+    )
+    if "requested slot does not exist" not in str(all_fail_error):
+        raise RuntimeError(
+            "invalid-slot multimodal batch did not report the slot error"
         )
-        all_fail_live = wait_for_resource_snapshot(
-            port,
-            lambda snapshot: (
-                snapshot.get("slots", {}).get("processing") == 0
-                and snapshot.get("slots", {}).get("deferred", 0) >= 2
-                and snapshot.get("transient", {}).get("active_leases", 0) >= 2
-                and snapshot.get("transient", {}).get("pins", 0) >= 2
-                and multimodal_is_resident(snapshot)
-            ),
-            args.request_timeout,
-            "both image batch members to defer before launch",
-        )
-    finally:
-        if all_fail_connection is not None:
-            close_cancellable_request(all_fail_connection)
 
     all_fail_snapshot = wait_for_resource_snapshot(
         port,
@@ -1902,7 +1906,7 @@ def validate_multitask_multimodal_handoff(
             and snapshot.get("transient", {}).get("pending_restores") == 0
         ),
         min(args.request_timeout, CANCELLATION_CLEANUP_TIMEOUT_SECONDS),
-        "all-fail image batch rollback",
+        "invalid-slot image batch rollback",
     )
     all_fail_state = require_transient_policy(
         all_fail_snapshot,
@@ -1974,7 +1978,8 @@ def validate_multitask_multimodal_handoff(
     return {
         "members": 2,
         "all_fail": {
-            "deferred": all_fail_live["slots"]["deferred"],
+            "rejected_before_launch": True,
+            "invalid_slot_not_deferred": True,
             "exact_prior_mtp_restored": True,
             "zero_active_leases_and_pins": True,
         },
@@ -2089,6 +2094,7 @@ def validate_transient_success(args: argparse.Namespace) -> dict:
     target_expert = args.expert_target_mib * mib
     port = args.port + 30
     server = Server(args, port, expert_mode=True, transient_mode=True)
+    stopped = False
     try:
         server.wait_ready()
         projector_modalities = get_projector_modalities(port)
@@ -2664,8 +2670,30 @@ def validate_transient_success(args: argparse.Namespace) -> dict:
                 },
             },
         }
+    except BaseException:
+        log = server.stop()
+        stopped = True
+        diagnostic_terms = (
+            "cancel task",
+            "cancelled",
+            "defer",
+            "disconnect",
+            "active_leases",
+            "pending_restores",
+            "prompt residency",
+            "remove task",
+            "transient module transaction",
+        )
+        diagnostic_lines = [
+            line for line in log.splitlines()
+            if any(term in line.lower() for term in diagnostic_terms)
+        ]
+        print("transient success server diagnostics (last 200 matching lines):", file=sys.stderr)
+        print("\n".join(diagnostic_lines[-200:]), file=sys.stderr)
+        raise
     finally:
-        server.stop()
+        if not stopped:
+            server.stop()
 
 
 def validate_expert_failure(

@@ -268,6 +268,7 @@ server_task_result server_response::recv(int id_task) {
 // same as recv(), but have timeout in seconds
 // if timeout is reached, nullptr is returned
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int>& id_tasks, int timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -279,7 +280,7 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
             }
         }
 
-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
+        std::cv_status cr_res = condition_results.wait_until(lock, deadline);
         if (!running) {
             SRV_DBG("%s : queue result stop\n", __func__);
             return nullptr;

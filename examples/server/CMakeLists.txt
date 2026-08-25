@@ -87,6 +87,7 @@ if (LLAMA_BUILD_TESTS)
         server-common.cpp
         server-chat.cpp
         server-task.cpp
+        server-queue.cpp
     )
     target_include_directories(test-server-tokens PRIVATE
         ${CMAKE_SOURCE_DIR}
