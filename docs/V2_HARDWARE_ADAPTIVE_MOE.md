@@ -363,6 +363,17 @@ through both failure retries. The response wait now uses an absolute deadline:
 results from other concurrent sessions can no longer restart disconnect polling
 and starve cancellation of a deferred request.
 
+A separate 2026-08-24 dense-resident concurrency gate launched the local
+`stories15M-q4_0.gguf` fixture with a 4,096-token context and four server slots,
+then submitted four simultaneous 256-token completions. Polling `/health` every
+5 ms observed all four slots in `processing` state at once. Every request
+completed all 256 requested tokens in 1.25-1.33 seconds. This is
+development-fixture evidence for true concurrent local-AI
+sessions, not an MoE concurrency claim: automatic multi-slot launch remains
+restricted to dense, fully resident models. Hybrid, expert-offloaded, streaming,
+and expert-cache configurations stay at one slot until equivalent multi-sequence
+parity and residency evidence exists.
+
 The matching 2026-08-24 non-recurrent TinyMoE lane passed the 512 -> 256 -> 512
 KV transaction, 64 -> 32 -> 64 MiB expert-cache transaction, disable/re-enable,
 combined KV+expert preparation peak, and every publication fault boundary on
