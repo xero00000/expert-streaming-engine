@@ -89,6 +89,13 @@ test("cached Windows builds still stage and enforce CUDA redistributables", () =
     releaseWorkflow,
     /verify-windows-runtime\.py[^\n]*\n\s+if \(\$LASTEXITCODE -ne 0\) \{ throw "Staged Windows runtime verification failed" \}/,
   );
+  for (const workflow of [studioWorkflow, releaseWorkflow]) {
+    assert.match(workflow, /prepare-restored-build\.py --build-root \.\\build-package/);
+    assert.match(workflow, /prepare-restored-build\.py --build-root build-package --record/);
+    assert.match(workflow, /hashFiles\([^\n]*'include\/\*\*'[^\n]*'vendor\/\*\*'[^\n]*prepare-restored-build\.py/);
+  }
+  const cacheKey = /key: (ese-windows-cuda-v2-[^\n]+)/;
+  assert.equal(studioWorkflow.match(cacheKey)?.[1], releaseWorkflow.match(cacheKey)?.[1]);
   for (const pattern of ["cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll"]) {
     assert.ok(studioWorkflow.split(pattern).length >= 3, `${pattern} is not gated in both installer jobs`);
   }

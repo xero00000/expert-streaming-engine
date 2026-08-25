@@ -163,8 +163,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build-package
-          key: ese-windows-cuda-v1-${{ runner.os }}-cuda12.4-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'src/**', 'common/**', 'examples/server/**', '.github/scripts/setup-cuda-windows.ps1') }}
+          key: ese-windows-cuda-v2-${{ runner.os }}-cuda12.4-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'include/**', 'src/**', 'common/**', 'examples/CMakeLists.txt', 'examples/server/**', 'vendor/**', '.github/scripts/setup-cuda-windows.ps1', '.github/scripts/prepare-restored-build.py') }}
           restore-keys: |
+            ese-windows-cuda-v2-${{ runner.os }}-cuda12.4-
             ese-windows-cuda-v1-${{ runner.os }}-cuda12.4-
 
       - name: Install CUDA toolkit
@@ -176,6 +177,14 @@ jobs:
         if: steps.windows-cuda-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: choco install ninja -y
+
+      - name: Prepare restored Windows CUDA build
+        if: steps.windows-cuda-cache.outputs.cache-hit != 'true'
+        working-directory: .
+        shell: pwsh
+        env:
+          PREVIOUS_HEAD: ${{ github.event.before }}
+        run: python .\.github\scripts\prepare-restored-build.py --build-root .\build-package --fallback-base "$env:PREVIOUS_HEAD"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -192,6 +201,7 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build-package -G "Ninja Multi-Config" -DGGML_CUDA=ON -DGGML_NATIVE=OFF "-DCMAKE_CUDA_ARCHITECTURES=75-real;86-real;86-virtual" "-DCMAKE_CUDA_FLAGS=--threads=2" -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON
           cmake --build build-package --config Release --target llama-server -j 2
+          python .github\scripts\prepare-restored-build.py --build-root build-package --record
 
       - name: Build standalone Windows ESE launcher
         working-directory: .
