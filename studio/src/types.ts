@@ -17,6 +17,7 @@ export interface ModelProfile {
   kvType?: string;
   batchSize?: number;
   ubatchSize?: number;
+  tensorSplit?: string;
   slots?: number;
   source: string;
 }

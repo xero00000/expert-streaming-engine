@@ -44,6 +44,8 @@ struct ModelProfile {
     batch_size: Option<u32>,
     #[serde(default, alias = "ubatch_size")]
     ubatch_size: Option<u32>,
+    #[serde(default, alias = "tensor_split")]
+    tensor_split: Option<String>,
     #[serde(default)]
     slots: Option<u32>,
     source: String,
@@ -502,6 +504,7 @@ fn discover_models(config: &StudioConfig) -> Vec<ModelProfile> {
                     kv_type: None,
                     batch_size: None,
                     ubatch_size: None,
+                    tensor_split: None,
                     slots: None,
                     source: "discovered".into(),
                 });
@@ -1277,6 +1280,7 @@ fn promote_sweep(state: State<'_, StudioState>) -> Result<ModelProfile, String> 
         kv_type: None,
         batch_size: None,
         ubatch_size: None,
+        tensor_split: None,
         slots: None,
         source: "discovered".into(),
     });

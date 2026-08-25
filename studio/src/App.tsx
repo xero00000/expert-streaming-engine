@@ -505,6 +505,7 @@ function App() {
       if (selected.kvType) args.push("--kv", selected.kvType);
       if (selected.batchSize) args.push("--batch-size", String(selected.batchSize));
       if (selected.ubatchSize) args.push("--ubatch-size", String(selected.ubatchSize));
+      if (selected.tensorSplit) args.push("--tensor-split", selected.tensorSplit);
     }
     void launchApp({ id: `ese-${mode}`, name: mode === "serve" ? `Serving · ${selected.name}` : `Plan · ${selected.name}`, command: snapshot.eseBinary ?? "ese", args, endpointAware: false }, mode === "serve" ? "model" : "tool");
   };
