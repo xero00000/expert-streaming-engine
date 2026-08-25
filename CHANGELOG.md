@@ -42,6 +42,9 @@ authoritative historical record for each tag.
   resumes.
 - Concurrent request cancellation, deferred transient-residency work, and
   protocol stop reasons no longer interfere across local sessions.
+- Graceful shutdown no longer schedules a decode continuation after task-queue
+  admission closes; active and deferred transient leases are drained without
+  an uncaught queue exception.
 - Byte-sized expert caches are no longer silently limited to 64 physical
   `(layer, expert)` slots, and free-VRAM-clamped caches retain allocation
   headroom for backend quantization padding instead of aborting during decode.

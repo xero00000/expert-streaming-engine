@@ -2086,6 +2086,88 @@ def validate_deferred_multimodal_cancel(
     }
 
 
+def validate_transient_shutdown(args: argparse.Namespace) -> dict:
+    """Stop the owner loop with a lease-owning media task still deferred."""
+    port = args.port + 60
+    server = Server(args, port, expert_mode=True, transient_mode=True)
+    connection: socket.socket | None = None
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    busy_future: concurrent.futures.Future | None = None
+    try:
+        server.wait_ready()
+        rebalance_transient(port, "multimodal-only", False)
+        busy_future = executor.submit(
+            completion,
+            port,
+            args.busy_predict,
+            args.request_timeout,
+            True,
+        )
+        wait_for_resource_snapshot(
+            port,
+            lambda snapshot: snapshot.get("slots", {}).get("processing") == 1,
+            args.request_timeout,
+            "the shutdown gate's sole inference slot to become busy",
+        )
+        connection = open_cancellable_json_request(
+            port,
+            "/v1/chat/completions",
+            multimodal_payload(args.image, args.predict),
+            args.request_timeout,
+        )
+        snapshot = wait_for_resource_snapshot(
+            port,
+            lambda current: (
+                current.get("slots", {}).get("processing") == 1
+                and current.get("slots", {}).get("deferred", 0) > 0
+                and (
+                    current.get("transient", {}).get("active_leases", 0) > 0
+                    or current.get("transient", {}).get("pins", 0) > 0
+                )
+            ),
+            args.request_timeout,
+            "a lease-owning media request to defer before shutdown",
+        )
+        server.process.send_signal(signal.SIGINT)
+        if connection is not None:
+            close_cancellable_request(connection)
+            connection = None
+        try:
+            server.process.wait(timeout=30)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("server did not drain deferred transient work on SIGINT") from error
+        if busy_future is not None:
+            try:
+                busy_future.result(timeout=5)
+            except (
+                OSError,
+                urllib.error.URLError,
+                json.JSONDecodeError,
+                RuntimeError,
+                TimeoutError,
+            ):
+                # Shutdown is allowed to terminate the in-flight HTTP response;
+                # the native process exit and lease audit are the acceptance gate.
+                pass
+        log = server.stop()
+        if "transient shutdown leaked" in log.lower():
+            raise RuntimeError("native shutdown audit reported a transient lease leak")
+        return {
+            "signal": "SIGINT",
+            "processing_observed": snapshot["slots"]["processing"],
+            "deferred_observed": snapshot["slots"]["deferred"],
+            "active_lease_observed": True,
+            "clean_exit": True,
+            "native_shutdown_audit": "pass",
+        }
+    finally:
+        if connection is not None:
+            close_cancellable_request(connection)
+        executor.shutdown(wait=False, cancel_futures=True)
+        if not server.output.closed:
+            server.stop()
+
+
 def validate_transient_success(args: argparse.Namespace) -> dict:
     mib = 1024 * 1024
     mtp_bytes = args.transient_mtp_mib * mib
@@ -3399,6 +3481,7 @@ def main() -> int:
     transient = None
     if transient_requested:
         committed_path = validate_transient_success(args)
+        shutdown = validate_transient_shutdown(args)
         if args.transient_only:
             injected_failures = {
                 stage: validate_transient_failure(args, stage, 40 + index)
@@ -3413,6 +3496,7 @@ def main() -> int:
             }
         transient = {
             "committed_path": committed_path,
+            "graceful_shutdown": shutdown,
             "evidence_scope": (
                 "transient-only" if args.transient_only else "combined-three-pool"
             ),

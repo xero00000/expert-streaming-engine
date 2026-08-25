@@ -37,6 +37,10 @@ struct server_queue {
     // Add a new task to the end of the queue
     int post(server_task task);
 
+    // Owner-loop continuations are optional once shutdown has closed task
+    // admission. Return false instead of throwing when the queue is stopping.
+    bool try_post(server_task task);
+
     int post(std::vector<server_task>&& tasks, bool front = false);
 
     // Owner-thread cancellation extracts queued/deferred work so callers can

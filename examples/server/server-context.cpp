@@ -6066,7 +6066,12 @@ void server_context::update_slots() {
         task.type = SERVER_TASK_TYPE_NEXT_RESPONSE;
         task.id_target = -1;
 
-        queue_tasks.post(std::move(task));
+        if (!queue_tasks.try_post(std::move(task))) {
+            // SIGINT/SIGTERM closes admission before the owner loop returns.
+            // Do not schedule another decode iteration; shutdown cleanup will
+            // release the active slot and every queued/deferred exact owner.
+            return;
+        }
     }
 
     // apply context-shift if needed

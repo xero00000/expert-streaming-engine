@@ -275,6 +275,9 @@ class NativeSurfaceTests(unittest.TestCase):
         context = (root / "examples" / "server" / "server-context.cpp").read_text(
             encoding="utf-8"
         )
+        queue = (root / "examples" / "server" / "server-queue.cpp").read_text(
+            encoding="utf-8"
+        )
         context_header = (root / "examples" / "server" / "server-context.h").read_text(
             encoding="utf-8"
         )
@@ -464,6 +467,8 @@ class NativeSurfaceTests(unittest.TestCase):
             "exact_prior_mtp_restored",
             "multimodal_committed",
             "validate_deferred_multimodal_cancel",
+            "validate_transient_shutdown",
+            '"native_shutdown_audit": "pass"',
             "--transient-only",
             "validate_transient_failure",
             '"evidence_scope"',
@@ -489,6 +494,8 @@ class NativeSurfaceTests(unittest.TestCase):
         ):
             with self.subTest(evidence=evidence):
                 self.assertIn(evidence, validator)
+        self.assertIn("bool server_queue::try_post", queue)
+        self.assertIn("if (!queue_tasks.try_post", context)
 
         # Preparation and publication follow KV -> expert -> transient, while
         # rollback is the exact reverse order before any logical-plan update.

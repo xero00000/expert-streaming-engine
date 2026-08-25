@@ -31,6 +31,19 @@ int server_queue::post(server_task task) {
     return task.id;
 }
 
+bool server_queue::try_post(server_task task) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (!accepting) {
+        return false;
+    }
+    if (task.id == -1) {
+        task.id = id++;
+    }
+    queue_tasks.push_back(std::move(task));
+    condition_tasks.notify_one();
+    return true;
+}
+
 std::vector<server_task> server_queue::take_pending_tasks(int id_target) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     size_t count = 0;
