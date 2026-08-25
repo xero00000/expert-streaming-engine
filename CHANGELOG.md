@@ -6,14 +6,39 @@ authoritative historical record for each tag.
 
 ## [Unreleased]
 
+### Added
+
+- Topology-bound, model-backed hardware calibration and deterministic workload
+  verification for adaptive CPU/GPU MoE routing.
+- A one-way native runtime guard that revokes mixed expert routing when live
+  CPU, upload, or fallback telemetry contradicts the verified profile.
+- Idle-safe runtime KV, expert-cache, and transient MTP/projector rebalancing
+  with dry-run admission, coherent resource reporting, and reversible
+  multi-pool publication.
+- Configurable 1/2/4-session local serving and concurrency-focused sweeps for
+  dense resident models in ESE Studio.
+
 ### Changed
 
+- MoE prefill and decode can use calibrated heterogeneous CPU/GPU work,
+  bounded double-buffered expert streaming, and per-device adaptive caches
+  without requiring the complete expert set in RAM or VRAM.
+- Multi-session launch remains fail-closed for MoE, hybrid, cache, and stream
+  plans until those modes have equivalent multi-sequence parity evidence.
 - Documentation now distinguishes the supported `main` branch from deleted
   historical research lines.
 - Build, installation, container, Android, and Studio configuration guidance
   now describes ESE rather than inherited upstream projects.
 - Documentation CI checks local links, release-version consistency, supported
   branch references, and accidental upstream installation instructions.
+
+### Fixed
+
+- KV, expert-cache, and transient-owner replacement failures now restore the
+  exact prior physical owners and logical resource plan before inference
+  resumes.
+- Concurrent request cancellation, deferred transient-residency work, and
+  protocol stop reasons no longer interfere across local sessions.
 
 ## [0.1.2] - 2026-08-24
 
