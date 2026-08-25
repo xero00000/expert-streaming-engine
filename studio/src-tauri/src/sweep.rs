@@ -50,6 +50,8 @@ pub struct TrialResult {
     pub context: u64,
     pub kv_type: String,
     pub batch_size: u32,
+    #[serde(default)]
+    pub tensor_split: Option<String>,
     #[serde(default = "default_slots")]
     pub slots: u32,
     pub stable: bool,
@@ -243,7 +245,7 @@ impl SweepManager {
                 .unwrap_or_else(|| "the server did not provide diagnostics".into());
             self.fail(
                 &app,
-                format!("no candidate context completed a stable server startup: {detail}"),
+                format!("no candidate context completed stable allocation and inference: {detail}"),
             );
             return;
         };
@@ -558,6 +560,7 @@ fn run_trial(
         context,
         kv_type: kv_type.into(),
         batch_size,
+        tensor_split: None,
         slots,
         stable: false,
         tokens_per_second: None,
@@ -598,6 +601,7 @@ fn run_trial(
         let (program, arguments) = command
             .split_first()
             .ok_or_else(|| "empty ESE command".to_string())?;
+        result.tensor_split = command_argument(arguments, &["--tensor-split", "-ts"]);
         let log = File::create(&log_path).map_err(|error| error.to_string())?;
         let error_log = log.try_clone().map_err(|error| error.to_string())?;
         let mut child = Command::new(program)
@@ -611,22 +615,24 @@ fn run_trial(
             terminate(&mut child);
             return Err(error);
         }
-        let speed = if benchmark {
-            let mut samples = Vec::with_capacity(repetitions);
-            for _ in 0..repetitions {
-                if cancel.load(AtomicOrdering::SeqCst) {
-                    terminate(&mut child);
-                    return Err("cancelled".into());
+        let workload = (|| -> Result<Option<f64>, String> {
+            if benchmark {
+                let mut samples = Vec::with_capacity(repetitions);
+                for _ in 0..repetitions {
+                    if cancel.load(AtomicOrdering::SeqCst) {
+                        return Err("cancelled".into());
+                    }
+                    samples.push(completion_throughput(port, slots)?);
                 }
-                samples.push(completion_throughput(port, slots)?);
+                samples.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+                Ok(Some(samples[samples.len() / 2]))
+            } else {
+                completion_tokens(port)?;
+                Ok(None)
             }
-            samples.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
-            Some(samples[samples.len() / 2])
-        } else {
-            None
-        };
+        })();
         terminate(&mut child);
-        Ok(speed)
+        workload
     })();
 
     if let Ok(log) = fs::read_to_string(&log_path) {
@@ -649,6 +655,12 @@ fn run_trial(
     }
     result.elapsed_seconds = started.elapsed().as_secs_f64();
     result
+}
+
+fn command_argument(arguments: &[String], names: &[&str]) -> Option<String> {
+    arguments
+        .windows(2)
+        .find_map(|pair| names.contains(&pair[0].as_str()).then(|| pair[1].clone()))
 }
 
 fn actual_kv_quality(log: &str) -> Option<String> {
@@ -940,6 +952,22 @@ mod tests {
     fn runtime_kv_quality_overrides_the_requested_label() {
         let log = "noise\nresource_plan: {\"kv_quality\":\"f16\",\"context\":58368}\n";
         assert_eq!(actual_kv_quality(log).as_deref(), Some("f16"));
+    }
+
+    #[test]
+    fn winning_trial_records_the_exact_planned_tensor_split() {
+        let arguments = vec![
+            "-m".into(),
+            "model.gguf".into(),
+            "--tensor-split".into(),
+            "32,32,36".into(),
+            "-c".into(),
+            "65536".into(),
+        ];
+        assert_eq!(
+            command_argument(&arguments, &["--tensor-split", "-ts"]).as_deref(),
+            Some("32,32,36")
+        );
     }
 
     #[test]

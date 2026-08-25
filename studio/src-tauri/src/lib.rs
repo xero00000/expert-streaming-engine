@@ -1262,6 +1262,17 @@ fn promote_sweep(state: State<'_, StudioState>) -> Result<ModelProfile, String> 
         .best_batch_size
         .ok_or_else(|| "the completed sweep has no stable batch result".to_string())?;
     let slots = status.best_slots.unwrap_or(1);
+    let tensor_split = status
+        .results
+        .iter()
+        .find(|result| {
+            result.stable
+                && result.context == context
+                && result.kv_type == kv_type
+                && result.batch_size == batch_size
+                && result.slots == slots
+        })
+        .and_then(|result| result.tensor_split.clone());
     let path = status.request.model_path.clone();
 
     let mut config = load_config()?;
@@ -1288,6 +1299,7 @@ fn promote_sweep(state: State<'_, StudioState>) -> Result<ModelProfile, String> 
     profile.kv_type = Some(kv_type);
     profile.batch_size = Some(batch_size);
     profile.ubatch_size = Some(batch_size.min(512));
+    profile.tensor_split = tensor_split;
     profile.slots = Some(slots);
     profile.source = "sweep".into();
 
