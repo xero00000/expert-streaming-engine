@@ -47,6 +47,7 @@ __global__ void delta_net_recurrent_f32(
     const int repeat_type,
     const int64_t n_tokens,
     const int64_t n_seqs,
+    const bool kda,
     size_t vnb1, size_t vnb2, size_t vnb3) {
     constexpr int warps_per_head = HEAD_DIM/WARP_SIZE;
     const int batch_idx = blockIdx.x / (warps_per_head*n_heads);
@@ -65,12 +66,12 @@ __global__ void delta_net_recurrent_f32(
 
     // G/Beta: [n_tokens, 1, n_heads, n_seqs] / [1, n_tokens, n_heads, n_seqs]
     //const int64_t g_stride_head = n_tokens;
-    const int64_t g_stride_batch = n_tokens * n_heads;
+    const int64_t g_stride_batch = (kda ? HEAD_DIM : 1) * n_tokens * n_heads;
 
     // State: [HEAD_DIM, HEAD_DIM*n_heads, 1, n_seqs]
     // For head h: columns h*HEAD_DIM to (h+1)*HEAD_DIM
-    // state[row, col] for head h = state[row, h*HEAD_DIM + col]
-    // Linear index: row + (h*HEAD_DIM + col) * HEAD_DIM = row + h*HEAD_DIM^2 + col*HEAD_DIM
+    // DeltaNet state is [key, value].  Each thread owns one value row and
+    // iterates keys, so its elements are key + value*HEAD_DIM.
     const int64_t state_head_offset = head_idx * HEAD_DIM * HEAD_DIM;
     const int64_t state_batch_stride = HEAD_DIM * HEAD_DIM * n_heads;
 
@@ -81,8 +82,9 @@ __global__ void delta_net_recurrent_f32(
     const float * q_ptr = q + batch_idx * qkv_stride_batch_kq + head_idx_kq * qkv_stride_head;
     const float * k_ptr = k + batch_idx * qkv_stride_batch_kq + head_idx_kq * qkv_stride_head;
     const float * v_ptr = v + batch_idx * vnb3 + head_idx * vnb2;
-    const float * g_ptr = g + batch_idx * g_stride_batch + head_idx;
-    const float * beta_ptr = beta_in + batch_idx * g_stride_batch + head_idx;
+    const float * g_ptr = g + batch_idx * g_stride_batch + head_idx * (kda ? HEAD_DIM * n_tokens : 1);
+    const float * beta_ptr = beta_in + batch_idx * (n_tokens * n_heads) +
+        (kda ? head_idx * n_tokens : head_idx);
     const float * state_src = state_in + batch_idx * state_batch_stride + state_head_offset;
 
     // Output layout: [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]
@@ -109,7 +111,7 @@ __global__ void delta_net_recurrent_f32(
     float state_local[HEAD_DIM/num_warps];
     for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
         int col = num_warps*i + col_idx_0;
-        state_local[i] = state_src[col*HEAD_DIM + row_out];
+        state_local[i] = state_src[row_out*HEAD_DIM + col];
     }
 
     constexpr int WARP_SIZE_S = WARP_SIZE + 1;
@@ -128,8 +130,16 @@ __global__ void delta_net_recurrent_f32(
 
         float attn_score = reduce_sum<block_size>(sum_kq, sum_helper);
 
-        float beta_val = sigmoid_f(beta_ptr[t*n_heads]);
-        float decay    = expf(fminf(g_ptr[t*n_heads], 50.0f));
+        float beta_val = sigmoid_f(beta_ptr[kda ? t : t*n_heads]);
+        float decay    = kda ? 1.0f : expf(fminf(g_ptr[t*n_heads], 50.0f));
+
+        if (kda) {
+#pragma unroll
+            for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
+                const int col = num_warps*i + col_idx_0;
+                state_local[i] *= expf(fminf(g_ptr[t*HEAD_DIM + col], 50.0f));
+            }
+        }
 
         float sum1 = 0, sum2 = 0;
 #pragma unroll
@@ -168,7 +178,7 @@ __global__ void delta_net_recurrent_f32(
             float * state_step_dst = saved_states + batch_idx * state_batch_stride + state_head_offset + t * state_step_stride;
             for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
                 int col = num_warps*i + col_idx_0;
-                state_step_dst[col*HEAD_DIM + row_out] = state_local[i];
+                state_step_dst[row_out*HEAD_DIM + col] = state_local[i];
             }
         }
 
@@ -182,7 +192,7 @@ __global__ void delta_net_recurrent_f32(
     // Copy the final state to its destination
     for (int i = 0; i < HEAD_DIM/num_warps; ++i) {
         int col = num_warps*i + col_idx_0;
-        state_dst[col*HEAD_DIM + row_out] = state_local[i];
+        state_dst[row_out*HEAD_DIM + col] = state_local[i];
     }
 }
 
@@ -201,6 +211,7 @@ static void delta_net_f32_cuda(
     const int64_t n_heads,
     const int64_t gqa_ratio,
     const int     repeat_type,
+    const bool    kda,
     const int64_t n_seqs,
     size_t vnb1, size_t vnb2, size_t vnb3,
     const int device_id,
@@ -221,19 +232,19 @@ static void delta_net_f32_cuda(
         constexpr int threads_per_block = 256;
         if (head_dim == 64) {
             delta_net_recurrent_f32<64, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3);
+                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, kda, vnb1, vnb2, vnb3);
         } else {
             delta_net_recurrent_f32<128, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3);
+                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, kda, vnb1, vnb2, vnb3);
         }
     } else {
         constexpr int threads_per_block = 128;
         if (head_dim == 64) {
             delta_net_recurrent_f32<64, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3);
+                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, kda, vnb1, vnb2, vnb3);
         } else {
             delta_net_recurrent_f32<128, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
-                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3);
+                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, kda, vnb1, vnb2, vnb3);
         }
     }
 
@@ -307,7 +318,9 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // and index via [t * n_heads] — that math is unaffected by which dim is 1.
     GGML_ASSERT(((src3->ne[0] == n_tokens && src3->ne[1] == 1) ||
                  (src3->ne[0] == 1 && src3->ne[1] == n_tokens)) &&
-                src3->ne[2] == n_heads && src3->ne[3] == n_seqs);
+                src3->ne[2] == n_heads && src3->ne[3] == n_seqs ||
+                (src3->ne[0] == head_dim && src3->ne[1] == n_tokens &&
+                 src3->ne[2] == n_heads && src3->ne[3] == n_seqs));
     // Beta: [1, n_tokens, n_heads, n_seqs]
     GGML_ASSERT(src4->ne[0] == 1 && src4->ne[1] == n_tokens && src4->ne[2] == n_heads && src4->ne[3] == n_seqs);
     // State: [head_dim, head_dim*n_heads, 1, n_seqs]
@@ -547,7 +560,7 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         (float *)dst->data,
         src7 ? (float *)src7->data : (float *)dst->data + output_size,
         src6 ? (float *)src6->data : nullptr,
-        head_dim, n_tokens, n_heads, gqa_ratio, repeat_type, n_seqs,
+        head_dim, n_tokens, n_heads, gqa_ratio, repeat_type, kda, n_seqs,
         src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float),
         device_id, cc,
         ctx.stream());

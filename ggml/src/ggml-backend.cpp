@@ -1238,8 +1238,30 @@ struct ggml_active_expert_cache_layout {
 
 static constexpr size_t GGML_ACTIVE_EXPERT_CACHE_BASE_ROUTE_COUNT = 64;
 static constexpr size_t GGML_ACTIVE_EXPERT_CACHE_ID_STRIDE = 256;
-static constexpr size_t GGML_ACTIVE_EXPERT_CACHE_BASE_ID_BYTES =
-        GGML_ACTIVE_EXPERT_CACHE_BASE_ROUTE_COUNT*GGML_ACTIVE_EXPERT_CACHE_ID_STRIDE;
+
+static int ggml_active_expert_cache_capacity_slot_limit(
+        const ggml_tensor * source,
+        size_t route_capacity) {
+    if (!source || source->ne[2] <= 1) return 0;
+    route_capacity = std::max(route_capacity, GGML_ACTIVE_EXPERT_CACHE_BASE_ROUTE_COUNT);
+    const uint64_t logical_experts = uint64_t(source->ne[2]);
+    const uint64_t routes = uint64_t(route_capacity);
+    const uint64_t combinations = logical_experts > uint64_t(INT_MAX)/routes
+            ? uint64_t(INT_MAX) : logical_experts*routes;
+    return int(combinations);
+}
+
+static uint64_t ggml_active_expert_cache_capacity_slots(
+        uint64_t capacity_bytes,
+        uint64_t ids_bytes,
+        uint64_t expert_set_bytes) {
+    if (expert_set_bytes == 0 || capacity_bytes <= ids_bytes) return 0;
+    const uint64_t slots = (capacity_bytes - ids_bytes)/expert_set_bytes;
+    // Quantized backend buffers can pad their final row beyond nb[2]. Keep one
+    // complete expert set as bounded allocation headroom so a free-VRAM-clamped
+    // capacity cannot create a compact graph that later fails component staging.
+    return slots > 1 ? slots - 1 : slots;
+}
 
 struct ggml_active_expert_cache_entry {
     int layer = -1;
@@ -2069,16 +2091,22 @@ static int ggml_active_expert_cache_slots_for_policy(
         const ggml_tensor * source,
         uint64_t capacity_bytes,
         int legacy_slots,
-        uint64_t expert_set_bytes) {
+        uint64_t expert_set_bytes,
+        size_t route_capacity) {
     if (capacity_bytes == 0) return legacy_slots;
     if (!source || source->nb[2] == 0 || source->ne[2] <= 1 || expert_set_bytes == 0) return 0;
-    const uint64_t payload_bytes = capacity_bytes > GGML_ACTIVE_EXPERT_CACHE_BASE_ID_BYTES
-            ? capacity_bytes - GGML_ACTIVE_EXPERT_CACHE_BASE_ID_BYTES : 0;
-    const uint64_t slots = payload_bytes/expert_set_bytes;
+    route_capacity = std::max(route_capacity, GGML_ACTIVE_EXPERT_CACHE_BASE_ROUTE_COUNT);
+    if (route_capacity > UINT64_MAX/GGML_ACTIVE_EXPERT_CACHE_ID_STRIDE) return 0;
+    const uint64_t slots = ggml_active_expert_cache_capacity_slots(
+            capacity_bytes,
+            uint64_t(route_capacity)*GGML_ACTIVE_EXPERT_CACHE_ID_STRIDE,
+            expert_set_bytes);
     // Physical cache slots are shared by (layer, expert) entries.  Limiting
     // them to the number of logical experts makes a capacity-sized cache hold
     // only one layer and forces deterministic cross-layer thrashing.
-    return int(std::min<uint64_t>(slots, 64));
+    return int(std::min<uint64_t>(
+            slots,
+            uint64_t(ggml_active_expert_cache_capacity_slot_limit(source, route_capacity))));
 }
 
 static int ggml_active_expert_cache_slots_for(
@@ -2088,7 +2116,8 @@ static int ggml_active_expert_cache_slots_for(
             source,
             sched->active_expert_cache_capacity_bytes,
             sched->active_expert_cache_slots,
-            sched->active_expert_set_bytes);
+            sched->active_expert_set_bytes,
+            sched->active_expert_cache_route_capacity);
 }
 
 static ggml_tensor * ggml_active_expert_cache_compact_copy(
@@ -2209,12 +2238,15 @@ static bool ggml_active_expert_cache_init_for_policy(
         cache.slots = policy.slots;
     } else {
         if (expert_set_bytes == 0) return false;
-        const uint64_t payload_bytes = cache.capacity_bytes > cache.ids_bytes
-                ? cache.capacity_bytes - cache.ids_bytes : 0;
-        cache.slots = int(std::min<uint64_t>(64, payload_bytes/expert_set_bytes));
+        cache.slots = int(std::min<uint64_t>(
+                ggml_active_expert_cache_capacity_slots(
+                    cache.capacity_bytes, cache.ids_bytes, expert_set_bytes),
+                uint64_t(ggml_active_expert_cache_capacity_slot_limit(source, route_capacity))));
     }
 
-    if (cache.slots < 1 || cache.slots > 64 || ggml_backend_is_cpu(sched->backends[backend_id]) ||
+    const int slot_limit = policy.capacity_bytes == 0
+            ? 64 : ggml_active_expert_cache_capacity_slot_limit(source, route_capacity);
+    if (cache.slots < 1 || cache.slots > slot_limit || ggml_backend_is_cpu(sched->backends[backend_id]) ||
             (policy.capacity_bytes == 0 && source->ne[2] < cache.slots) || source->nb[2] == 0) {
         return false;
     }
@@ -2351,7 +2383,15 @@ static bool ggml_active_expert_cache_init_component_for_policy(
     // the largest layout seen in this graph, then alias each layout over the
     // same bounded component allocation.
     if (max_expert_bytes == 0 || max_expert_bytes > SIZE_MAX/size_t(cache.slots)) return false;
-    const size_t buffer_size = size_t(max_expert_bytes)*size_t(cache.slots);
+    const auto cache_buft = sched->bufts[cache.backend_id];
+    // Backend allocations may require a padded final quantized row even when
+    // ggml_nbytes()/nb[2] describe the exact logical payload (CUDA pads to
+    // MATRIX_ROW_PADDING).  Account for that before allocating the shared
+    // component buffer; otherwise MXFP4 layouts can fit logically but fail
+    // ggml_backend_tensor_alloc()'s physical bounds assertion.
+    const size_t layout_alloc_size = ggml_backend_buft_get_alloc_size(cache_buft, layout);
+    const size_t logical_buffer_size = size_t(max_expert_bytes)*size_t(cache.slots);
+    const size_t buffer_size = std::max(logical_buffer_size, layout_alloc_size);
 #ifdef GGML_USE_CUDA
     if (!component.buffer && ggml_backend_is_cuda(sched->backends[cache.backend_id])) {
         size_t free_bytes = 0;
@@ -2370,13 +2410,16 @@ static bool ggml_active_expert_cache_init_component_for_policy(
         return false;
     }
     if (!component.buffer) {
-        component.buffer = ggml_backend_buft_alloc_buffer(sched->bufts[cache.backend_id], buffer_size);
+        component.buffer = ggml_backend_buft_alloc_buffer(cache_buft, buffer_size);
         if (!component.buffer) return false;
         component.buffer_bytes = ggml_backend_buffer_get_size(component.buffer);
         ggml_backend_buffer_clear(component.buffer, 0);
         cache.allocated_bytes += component.buffer_bytes;
     }
-    if (ggml_nbytes(layout) > component.buffer_bytes) return false;
+    // A later layer can reuse this component index with a different
+    // quantization/layout.  Fail back to the full host tensor instead of
+    // invoking tensor_alloc with a backend-padded size that does not fit.
+    if (layout_alloc_size > component.buffer_bytes) return false;
     if (!layout->buffer) {
         ggml_backend_tensor_alloc(component.buffer, layout, ggml_backend_buffer_get_base(component.buffer));
     }

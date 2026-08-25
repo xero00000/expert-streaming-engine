@@ -17,6 +17,9 @@ authoritative historical record for each tag.
   multi-pool publication.
 - Configurable 1/2/4-session local serving and concurrency-focused sweeps for
   dense resident models in ESE Studio.
+- Native `kimi-linear` GGUF execution for Kimi Linear 48B-A3B, including its
+  hybrid KDA/MLA graph, 256-expert top-8 routing, and bounded sidecar-backed
+  expert caching on CPU, Turing, and Ampere CUDA paths.
 
 ### Changed
 
@@ -39,6 +42,9 @@ authoritative historical record for each tag.
   resumes.
 - Concurrent request cancellation, deferred transient-residency work, and
   protocol stop reasons no longer interfere across local sessions.
+- Byte-sized expert caches are no longer silently limited to 64 physical
+  `(layer, expert)` slots, and free-VRAM-clamped caches retain allocation
+  headroom for backend quantization padding instead of aborting during decode.
 
 ## [0.1.2] - 2026-08-24
 

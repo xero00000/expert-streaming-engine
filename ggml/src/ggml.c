@@ -10390,9 +10390,11 @@ struct ggml_tensor * ggml_delta_net(
     // 2026-05-26: relaxed g check to accept either legacy [n_tokens, 1, H_v, n_seqs]
     // OR aligned-with-beta [1, n_tokens, H_v, n_seqs] layout. Memory layout is
     // identical in both cases — only the ggml shape interpretation differs.
-    GGML_ASSERT(((g->ne[0] == n_tokens && g->ne[1] == 1) ||
+    GGML_ASSERT((((g->ne[0] == n_tokens && g->ne[1] == 1) ||
                  (g->ne[0] == 1 && g->ne[1] == n_tokens)) &&
-                g->ne[2] == H_v && g->ne[3] == n_seqs);
+                 g->ne[2] == H_v && g->ne[3] == n_seqs) ||
+                (g->ne[0] == S_k && g->ne[1] == n_tokens &&
+                 g->ne[2] == H_v && g->ne[3] == n_seqs));
     GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == n_tokens && beta->ne[2] == H_v && beta->ne[3] == n_seqs);
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v * H_v && state->ne[2] == 1 && state->ne[3] == n_seqs);
     //GGML_ASSERT(H_k == H_v);
@@ -24199,6 +24201,7 @@ static void ggml_compute_forward_delta_net_f32(
     const int64_t n_tokens = src0->ne[1];
     const int64_t n_heads  = src2->ne[2];
     const int64_t n_seqs   = src0->ne[3];
+    const bool kda = src3->ne[0] == head_dim;
     GGML_ASSERT(src2->ne[2] % src0->ne[2] == 0);
     GGML_ASSERT(src2->ne[0] == head_dim);
     const int gqa_ratio    = src2->ne[2]/src0->ne[2];
@@ -24237,7 +24240,7 @@ static void ggml_compute_forward_delta_net_f32(
         GGML_ASSERT(src6->ne[0] >= (n_tokens - 1)*state_step_stride);
     }
 
-    if (iqk_fused_delta_net(head_dim, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs,
+    if (!kda && iqk_fused_delta_net(head_dim, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs,
                 src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float),
                 q_data, k_data, v_data, g_data, beta_data, state_in,
                 out_data, state_working, saved_steps, (int) state_step_stride, ith, nth)) {
@@ -24263,7 +24266,10 @@ static void ggml_compute_forward_delta_net_f32(
         const int64_t qkv_head_offset  = batch_idx * (head_dim * n_tokens * n_heads) + head_idx * (head_dim * n_tokens);
         const int64_t qkv_head_offset_kq = batch_idx * (head_dim * n_tokens * n_heads/gqa_ratio) + head_idx_kq * (head_dim * n_tokens);
         const int64_t qkv_token_stride = head_dim;
-        const int64_t g_head_offset    = batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
+        const int64_t g_head_offset    = kda
+            ? batch_idx * (head_dim * n_tokens * n_heads) + head_idx * (head_dim * n_tokens)
+            : batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
+        const int64_t beta_head_offset = batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
         const int64_t state_head_offset = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
         const int64_t out_head_offset  = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
         const int64_t out_token_stride = head_dim * n_heads;
@@ -24280,8 +24286,8 @@ static void ggml_compute_forward_delta_net_f32(
             const float * k_t = k_data + qkv_head_offset_kq + t * qkv_token_stride;
             const float * v_t = v_data + qkv_head_offset + t * qkv_token_stride;
 
-            const float g_val    = g_data[g_head_offset + t];
-            const float beta_raw = beta_data[g_head_offset + t];
+            const float g_val    = kda ? 0.0f : g_data[g_head_offset + t];
+            const float beta_raw = beta_data[beta_head_offset + t];
 
             float q_norm_sq = 0.0f;
             float k_norm_sq = 0.0f;
@@ -24294,6 +24300,17 @@ static void ggml_compute_forward_delta_net_f32(
 
             const float beta_val = 1.0f / (1.0f + expf(-beta_raw));
             const float decay    = expf(fminf(g_val, 50.0f));
+
+            if (kda) {
+                for (int64_t col = 0; col < head_dim; ++col) {
+                    const float decay_col = expf(fminf(g_data[g_head_offset + t * head_dim + col], 50.0f));
+                    for (int64_t row = 0; row < head_dim; ++row) {
+                        // DeltaNet stores S as [key, value].  GGML's first
+                        // dimension is contiguous, so key is the inner index.
+                        state[col + row * head_dim] *= decay_col;
+                    }
+                }
+            }
 
             float attn_score = 0.0f;
             for (int64_t i = 0; i < head_dim; ++i) {
@@ -24309,23 +24326,23 @@ static void ggml_compute_forward_delta_net_f32(
                 for (int64_t col = 0; col < head_dim; ++col) {
                     const float k_col = k_t[col];
                     const float q_col = q_t[col];
-                    const float s = state[row + col * head_dim];
+                    const float s = state[col + row * head_dim];
 
                     v_prime += s * k_col;
                     out_val += s * q_col;
                 }
 
-                const float v_new = v_t[row] * beta_val - v_prime * beta_val * decay * k_norm_inv;
+                const float v_new = v_t[row] * beta_val - v_prime * beta_val * (kda ? 1.0f : decay) * k_norm_inv;
                 v_new_buf[row] = v_new;
-                out_t[row] = out_val * decay * q_norm_inv * scale + v_new * attn_score;
+                out_t[row] = out_val * (kda ? 1.0f : decay) * q_norm_inv * scale + v_new * attn_score;
             }
 
             for (int64_t col = 0; col < head_dim; ++col) {
                 const float k_col = k_t[col] * k_norm_inv;
                 for (int64_t row = 0; row < head_dim; ++row) {
-                    float s = state[row + col * head_dim];
-                    s = decay * s + v_new_buf[row] * k_col;
-                    state[row + col * head_dim] = fminf(fmaxf(s, -1e6f), 1e6f);
+                    float s = state[col + row * head_dim];
+                    s = (kda ? s : decay * s) + v_new_buf[row] * k_col;
+                    state[col + row * head_dim] = fminf(fmaxf(s, -1e6f), 1e6f);
                 }
             }
 

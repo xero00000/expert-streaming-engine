@@ -114,6 +114,7 @@ enum e_model {
     MODEL_30B_A3B,
     MODEL_33B_A3B,
     MODEL_35B_A3B,
+    MODEL_48B_A3B, // Kimi Linear
     MODEL_80B_A3B, // Qwen3-Next
     MODEL_80B_A13B,
     MODEL_100B_A6B,
@@ -355,9 +356,17 @@ struct llama_layer {
     struct ggml_tensor * ssm_beta_alpha = nullptr;
     struct ggml_tensor * ssm_alpha = nullptr;
     struct ggml_tensor * ssm_beta = nullptr;
+    struct ggml_tensor * ssm_f_a = nullptr;
+    struct ggml_tensor * ssm_f_b = nullptr;
+    struct ggml_tensor * ssm_g_a = nullptr;
+    struct ggml_tensor * ssm_g_b = nullptr;
+    struct ggml_tensor * ssm_o_norm = nullptr;
 
     // mamba
     struct ggml_tensor * ssm_conv1d = nullptr;
+    struct ggml_tensor * ssm_q_conv = nullptr;
+    struct ggml_tensor * ssm_k_conv = nullptr;
+    struct ggml_tensor * ssm_v_conv = nullptr;
     struct ggml_tensor * ssm_a = nullptr;
     struct ggml_tensor * ssm_d = nullptr;
 
@@ -572,7 +581,7 @@ struct llama_model {
     size_t max_nodes(int n_tokens) const {
         auto n_tensors = tensors_by_name.size();
         if (split_mode == LLAMA_SPLIT_MODE_GRAPH && !devices.empty()) n_tensors *= devices.size();
-        if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN35) {
+        if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_KIMI_LINEAR) {
             return std::max<size_t>(n_tokens * 40, 32u * n_tensors);
         }
         //return std::max<size_t>(1024, 8*n_tensors);
@@ -584,7 +593,7 @@ struct llama_model {
     }
 
     bool is_mla_model() const {
-        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4;
+        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_KIMI_LINEAR;
     }
 
     static inline int hadamard_size(int head_size) {

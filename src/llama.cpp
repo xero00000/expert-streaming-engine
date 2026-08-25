@@ -1970,7 +1970,7 @@ static bool llama_kv_cache_init(
     }
 
     int n_mla = 0;
-    int n_kv_active_layers = 0;
+    int n_mla_eligible_layers = 0;
     const int n_mtp_first_layer = hparams.n_layer - hparams.nextn_predict_layers;
     for (int i = 0; i < (int) n_layer; i++) {
         // For MTP-only context, skip KV allocation for non-MTP layers
@@ -1982,8 +1982,10 @@ static bool llama_kv_cache_init(
             }
             continue;
         }
-        n_kv_active_layers++;
         const bool qnext_recurrent = llama_is_recurrent_layer(hparams, i);
+        if (!qnext_recurrent) {
+            n_mla_eligible_layers++;
+        }
         const uint32_t n_embd_v_row = llama_kv_v_row_embd(model, hparams, i);
         const uint32_t n_head_kv    = hparams.n_head_kv(i);
         const uint32_t n_embd_head_k= hparams.n_embd_head_k(i);
@@ -1997,7 +1999,10 @@ static bool llama_kv_cache_init(
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
         ggml_tensor * s = nullptr;
-        if (is_mla_attn && cparams.mla_attn) {
+        // Hybrid KDA/MLA architectures classify the model as MLA globally, but
+        // recurrent KDA layers need qnext state storage rather than an MLA KV
+        // cache.  Select the cache representation per layer.
+        if (!qnext_recurrent && is_mla_attn && cparams.mla_attn) {
             // DeepSeek MLA
             const uint32_t n_embd_head_qk_rope = hparams.n_rot;
             const uint32_t kv_lora_rank = hparams.n_lora_kv;
@@ -2219,8 +2224,8 @@ static bool llama_kv_cache_init(
             }
         }
     }
-    if (is_mla_attn && cparams.mla_attn && n_mla < n_kv_active_layers && n_mla > 0) {
-        LLAMA_LOG_ERROR("%s: unexpected situation with %d out of %d active KV layers having MLA enabled\n", __func__, n_mla, n_kv_active_layers);
+    if (is_mla_attn && cparams.mla_attn && n_mla < n_mla_eligible_layers && n_mla > 0) {
+        LLAMA_LOG_ERROR("%s: unexpected situation with %d out of %d eligible KV layers having MLA enabled\n", __func__, n_mla, n_mla_eligible_layers);
         LLAMA_LOG_ERROR("%s: bailing out\n", __func__);
         GGML_ABORT("fatal error");
     }
@@ -9571,6 +9576,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_JAIS:
+        case LLM_ARCH_KIMI_LINEAR:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values

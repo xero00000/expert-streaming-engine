@@ -325,6 +325,7 @@ validation.
 | CUDA hardware | RTX 2080 SUPER (`sm_75`), RTX 3060 Ti (`sm_86`), and RTX 3080 (`sm_86`) |
 | Global controller | CPU plus real Turing+Ampere three-GPU model load with explicit 1 GiB reserves |
 | Hardware-adaptive MoE | Schema-v3 DeepSeek-V4-Flash gate measured 7.54x; model-backed one-way live revocation and `/props` status reporting |
+| Kimi Linear | Kimi Linear 48B-A3B MXFP4_MOE loads all 610 tensors; CPU/CUDA KDA parity, deterministic generation, 64K allocation, and bounded top-8 sidecar caching verified |
 | Runtime rebalancing | Occupied KV shrink/grow parity, busy-server rejection, injected migration rollback, and post-failure continuation |
 | Transient/speculation | CPU, Turing, Ampere, and model-backed image→text module swapping |
 | Turbo KV foundation | CPU/CUDA codecs, direct attention paths, lifecycle tests, and quality sweeps |
@@ -356,6 +357,13 @@ class and NVMe storage. These are machine- and configuration-specific
 engineering records, not universal performance promises. See
 [reference benchmarks](docs/ESE_BENCHMARKS.md) for exact commands, model hash,
 hardware, repetition statistics, cold/warm behavior, and ablations.
+
+Kimi Linear 48B-A3B MXFP4_MOE now runs through ESE's hybrid KDA/MLA and
+sidecar-cache path. On the reference RTX 3060 Ti + RTX 3080 pair, a 65,536-token
+context allocation and deterministic 32-token decode reached 9.29 tok/s with a
+`4,22` layer split and 2 GiB expert cache per device. This was a short-prompt
+decode test, not evidence of a fully populated 64K prompt; exact results and
+the tested command are in the benchmark document.
 
 ## Documentation
 

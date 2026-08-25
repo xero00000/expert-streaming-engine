@@ -16,15 +16,17 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
     auto & hparams = model.hparams;
 
     GGML_ASSERT(batch.n_tokens > 0);
-    GGML_ASSERT(hparams.ssm_n_group > 0);
-    GGML_ASSERT(hparams.ssm_dt_rank > 0);
     GGML_ASSERT(hparams.ssm_d_conv > 0);
-    GGML_ASSERT(hparams.ssm_d_inner % hparams.ssm_dt_rank == 0);
 
-    const int64_t head_k_dim     = hparams.ssm_d_state;
-    const int64_t num_k_heads    = hparams.ssm_n_group;
-    const int64_t num_v_heads    = hparams.ssm_dt_rank;
-    const int64_t head_v_dim     = hparams.ssm_d_inner / num_v_heads;
+    const bool kda = hparams.n_embd_head_kda > 0;
+    GGML_ASSERT(kda || hparams.ssm_n_group > 0);
+    GGML_ASSERT(kda || hparams.ssm_dt_rank > 0);
+    GGML_ASSERT(kda || hparams.ssm_d_inner % hparams.ssm_dt_rank == 0);
+
+    const int64_t head_k_dim     = kda ? hparams.n_embd_head_kda : hparams.ssm_d_state;
+    const int64_t num_k_heads    = kda ? hparams.n_head() : hparams.ssm_n_group;
+    const int64_t num_v_heads    = kda ? hparams.n_head() : hparams.ssm_dt_rank;
+    const int64_t head_v_dim     = kda ? hparams.n_embd_head_kda : hparams.ssm_d_inner / num_v_heads;
     const int64_t key_dim        = head_k_dim * num_k_heads;
     const int64_t value_dim      = head_v_dim * num_v_heads;
     const int64_t ssm_state_dim  = head_v_dim * head_v_dim * num_v_heads;
@@ -95,7 +97,9 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     GGML_ASSERT(q->ne[0] == S_k && q->ne[2] == H_k && q->ne[1] == n_tokens && q->ne[3] == n_seqs);
     GGML_ASSERT(k->ne[0] == S_k && k->ne[2] == H_k && k->ne[1] == n_tokens && k->ne[3] == n_seqs);
     GGML_ASSERT(v->ne[2] == n_tokens);
-    GGML_ASSERT(g->ne[0] == H_v && g->ne[1] == n_tokens && g->ne[2] == n_seqs);
+    const bool kda = g->ne[0] == S_k;
+    GGML_ASSERT((kda && g->ne[0] == S_k && g->ne[1] == n_tokens && g->ne[2] == H_v && g->ne[3] == n_seqs) ||
+                (!kda && g->ne[0] == H_v && g->ne[1] == n_tokens && g->ne[2] == n_seqs));
     GGML_ASSERT(beta->ne[0] == H_v && beta->ne[2] == n_tokens && beta->ne[3] == n_seqs);
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H_v && state->ne[3] == n_seqs);
     //GGML_ASSERT(H_k == H_v);
@@ -109,12 +113,26 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     cb(state,"state_in", il);
 
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    if (kda && !ggml_is_contiguous(v)) {
+        // The legacy CPU fused operator reads V as contiguous
+        // [value, token, head, sequence].  KDA starts with
+        // [value, head, token, sequence], so materialize the permutation.
+        v = ggml_cont(ctx0, v);
+    }
     // 2026-05-26 PATH C: kept legacy g permute (2,0,3,1). The sequential
     // kernel works as before. The chunked path is enabled by metadata
     // override at the CUDA dispatch (in delta-net.cu) — same data, beta's
     // strides applied to g just before delta_net_chunk(), restored after.
-    g = ggml_permute(ctx0, g, 2, 0, 3, 1);
+    if (!kda) {
+        g = ggml_permute(ctx0, g, 2, 0, 3, 1);
+    }
     beta = ggml_permute(ctx0, beta, 2, 0, 1, 3);
+    if (kda) {
+        // KDA beta originates as [head, 1, token, sequence].  The permuted
+        // [1, token, head, sequence] view is not physically contiguous, while
+        // both fused backends consume one contiguous beta row per head.
+        beta = ggml_cont(ctx0, beta);
+    }
 
     ggml_tensor * state_flat = ggml_reshape_4d(ctx0, state, S_v, S_v * H_v, 1, n_seqs);
     if (!ggml_is_contiguous(state_flat)) {
@@ -659,3 +677,91 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
 
 }
 
+ggml_tensor * delta_net::build_layer_kda_core(ggml_context * ctx0, ggml_cgraph * gf,
+        ggml_tensor * input, ggml_tensor * inp_s_seq_qnext, ggml_tensor * inp_out_ids,
+        uint32_t state_seq_id, bool reset_state, int il, const llm_build_cb & cb) const {
+    const auto & hparams = lctx.model.hparams;
+    const auto & layer   = lctx.model.layers[il];
+    auto & kv_self       = lctx.kv_self;
+
+    const int64_t head_dim = hparams.n_embd_head_kda;
+    const int64_t n_heads  = hparams.n_head(il);
+    const int64_t n_tok    = input->ne[1];
+    const int64_t inner    = head_dim * n_heads;
+
+    auto cur = llm_build_context::llm_build_norm(ctx0, input, hparams,
+            layer.attn_norm, nullptr, LLM_NORM_RMS, cb, il);
+
+    auto q = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.wq, cur);
+    auto k = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.wk, cur);
+    auto v = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.wv, cur);
+    auto qkv = ggml_concat(ctx0, ggml_concat(ctx0, q, k, 0), v, 0);
+    qkv = ggml_reshape_3d(ctx0, qkv, 3 * inner, n_tok, 1);
+
+    auto wq_conv = ggml_reshape_2d(ctx0, layer.ssm_q_conv, hparams.ssm_d_conv, inner);
+    auto wk_conv = ggml_reshape_2d(ctx0, layer.ssm_k_conv, hparams.ssm_d_conv, inner);
+    auto wv_conv = ggml_reshape_2d(ctx0, layer.ssm_v_conv, hparams.ssm_d_conv, inner);
+    auto conv_w = ggml_concat(ctx0, ggml_concat(ctx0, wq_conv, wk_conv, 1), wv_conv, 1);
+
+    auto f = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_f_a, cur);
+    f = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_f_b, f);
+    f = ggml_softplus(ctx0, ggml_add(ctx0, f, layer.ssm_dt_b));
+    f = ggml_reshape_3d(ctx0, f, head_dim, n_heads, n_tok);
+    auto a = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_heads, 1);
+    auto gate = ggml_mul(ctx0, f, a);
+    gate = ggml_permute(ctx0, gate, 0, 2, 1, 3); // [head_dim, token, head, seq]
+    gate = ggml_cont_4d(ctx0, gate, head_dim, n_tok, n_heads, 1);
+
+    auto beta = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_beta, cur);
+    beta = ggml_reshape_4d(ctx0, beta, n_heads, 1, n_tok, 1);
+
+    const uint32_t state_slots = llm_build_context::llama_kv_qnext_state_slots(kv_self);
+    auto output = build_qkv(ctx0, kv_self.s_l[il], conv_w, qkv, inp_s_seq_qnext, beta, gate,
+            head_dim, n_heads, head_dim, n_heads, hparams.ssm_d_conv,
+            state_seq_id, state_slots, reset_state, hparams.f_norm_rms_eps,
+            1, il, cb, gf);
+
+    auto g2 = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_g_a, cur);
+    g2 = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_g_b, g2);
+    g2 = ggml_reshape_2d(ctx0, g2, head_dim, n_heads * n_tok);
+
+    auto out2 = ggml_reshape_2d(ctx0, output, head_dim, n_heads * n_tok);
+    out2 = llm_build_context::llm_build_norm(ctx0, out2, hparams,
+            layer.ssm_o_norm, nullptr, LLM_NORM_RMS, cb, il);
+    out2 = ggml_mul(ctx0, out2, ggml_sigmoid(ctx0, g2));
+    out2 = ggml_reshape_2d(ctx0, out2, inner, n_tok);
+    auto projected = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.wo, out2);
+
+    if (inp_out_ids) {
+        projected = ggml_get_rows(ctx0, projected, inp_out_ids);
+        input = ggml_get_rows(ctx0, input, inp_out_ids);
+    }
+    auto result = ggml_add(ctx0, projected, input);
+    cb(result, "kda_output", il);
+    return result;
+}
+
+ggml_tensor * delta_net::build_layer_kda(ggml_context * ctx0, ggml_cgraph * gf,
+        ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb) const {
+    GGML_ASSERT(lctx.inp_s_seq_qnext != nullptr);
+    GGML_ASSERT(lctx.model.hparams.n_embd_head_kda > 0);
+
+    if (all_same_seq) {
+        const bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
+        return build_layer_kda_core(ctx0, gf, cur, lctx.inp_s_seq_qnext, inp_out_ids,
+                token_seq_ids.front(), reset_state, il, cb);
+    }
+
+    GGML_ASSERT(has_unique_seq_ids && "KDA mixed-sequence batches require unique sequence IDs per token");
+    ggml_tensor * out = nullptr;
+    for (int64_t i = 0; i < batch.n_tokens; ++i) {
+        auto cur_i = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (size_t) i * cur->nb[1]);
+        auto seq_i = ggml_view_2d(ctx0, lctx.inp_s_seq_qnext, 1, 1,
+                lctx.inp_s_seq_qnext->nb[1], (size_t) i * lctx.inp_s_seq_qnext->nb[1]);
+        const bool reset_state = batch.pos != nullptr && batch.pos[i] == 0;
+        auto out_i = build_layer_kda_core(ctx0, gf, cur_i, seq_i, inp_out_ids,
+                token_seq_ids[i], reset_state, il, cb);
+        out = out == nullptr ? out_i : ggml_concat(ctx0, out, out_i, 1);
+    }
+    return out;
+}

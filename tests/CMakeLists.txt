@@ -234,6 +234,9 @@ llama_test(test-speculative-mtp-transaction)
 llama_build(test-resource-planner.cpp)
 llama_test(test-resource-planner)
 
+llama_build(test-kda-delta-net.cpp)
+llama_test(test-kda-delta-net)
+
 llama_build(test-mapped-draft.cpp)
 llama_test(test-mapped-draft)
 

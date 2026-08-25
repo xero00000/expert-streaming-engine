@@ -2813,6 +2813,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_qwen35();
             } break;
+        case LLM_ARCH_KIMI_LINEAR:
+            {
+                result = llm.build_kimi_linear();
+            } break;
         case LLM_ARCH_QWEN3VL:
             {
                 result = llm.build_qwen3vl();
