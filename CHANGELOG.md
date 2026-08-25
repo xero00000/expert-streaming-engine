@@ -6,6 +6,8 @@ authoritative historical record for each tag.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-25
+
 ### Added
 
 - Topology-bound, model-backed hardware calibration and deterministic workload
@@ -48,6 +50,10 @@ authoritative historical record for each tag.
 - Byte-sized expert caches are no longer silently limited to 64 physical
   `(layer, expert)` slots, and free-VRAM-clamped caches retain allocation
   headroom for backend quantization padding instead of aborting during decode.
+- Configuration sweeps now perform inference during capacity checks and apply
+  the exact tested multi-GPU tensor split instead of retaining a stale profile.
+
+See [the v0.2.0 release notes](docs/releases/v0.2.0.md).
 
 ## [0.1.2] - 2026-08-24
 
@@ -106,7 +112,8 @@ See [the v0.1.1 release notes](docs/releases/v0.1.1.md).
 
 See [the v0.1.0 release notes](docs/releases/v0.1.0.md).
 
-[Unreleased]: https://github.com/xero00000/expert-streaming-engine/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/xero00000/expert-streaming-engine/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/xero00000/expert-streaming-engine/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/xero00000/expert-streaming-engine/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/xero00000/expert-streaming-engine/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/xero00000/expert-streaming-engine/releases/tag/v0.1.0

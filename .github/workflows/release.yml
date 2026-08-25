@@ -21,12 +21,7 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           expected="${RELEASE_TAG#v}"
-          package_version="$(node -p "require('./studio/package.json').version")"
-          tauri_version="$(node -p "require('./studio/src-tauri/tauri.conf.json').version")"
-          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' studio/src-tauri/Cargo.toml | head -n1)"
-          test "$package_version" = "$expected"
-          test "$tauri_version" = "$expected"
-          test "$cargo_version" = "$expected"
+          python3 .github/scripts/verify-release-version.py --expected "$expected"
 
       - name: Install Linux desktop build dependencies
         run: >-
@@ -98,10 +93,8 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           $expected = $env:RELEASE_TAG.Substring(1)
-          $packageVersion = node -p "require('./studio/package.json').version"
-          $tauriVersion = node -p "require('./studio/src-tauri/tauri.conf.json').version"
-          $cargoVersion = (Select-String -Path studio/src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
-          if ($packageVersion -ne $expected -or $tauriVersion -ne $expected -or $cargoVersion -ne $expected) { throw "Release versions do not match $env:RELEASE_TAG" }
+          python .\.github\scripts\verify-release-version.py --expected $expected
+          if ($LASTEXITCODE -ne 0) { throw "Release versions do not match $env:RELEASE_TAG" }
 
       - uses: actions/setup-node@v4
         with:

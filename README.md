@@ -15,7 +15,7 @@ observable decisions, and no hidden backend or precision fallback.
 
 ## Install ESE Studio + ESE
 
-The v0.1.2 desktop installers are unified: one installation provides ESE
+The v0.2.0 desktop installers are unified: one installation provides ESE
 Studio, the `ese` launcher, and a matching native `llama-server` runtime. The
 Windows package includes CUDA acceleration for NVIDIA GPUs and retains CPU
 fallback. Linux packages carry a portable CPU baseline. A source install
@@ -32,16 +32,16 @@ The AppImage is recommended when you want signed in-app updates:
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
-chmod +x ese-studio_0.1.2_amd64.AppImage
-./ese-studio_0.1.2_amd64.AppImage
+chmod +x ese-studio_0.2.0_amd64.AppImage
+./ese-studio_0.2.0_amd64.AppImage
 ```
 
 Native packages integrate with the system package manager and are updated by
 installing the next package release:
 
 ```bash
-sudo apt install ./ese-studio_0.1.2_amd64.deb       # Debian / Ubuntu
-sudo dnf install ./ese-studio-0.1.2-1.x86_64.rpm   # Fedora / Nobara
+sudo apt install ./ese-studio_0.2.0_amd64.deb       # Debian / Ubuntu
+sudo dnf install ./ese-studio-0.2.0-1.x86_64.rpm   # Fedora / Nobara
 ```
 
 For a user-local accelerated build from source:
@@ -59,7 +59,7 @@ them. It installs Studio under `~/.local/share/ese-studio`, and installs both
 
 ### Windows
 
-Download the NSIS `ese-studio_0.1.2_x64-setup.exe` (recommended) or MSI,
+Download the NSIS `ese-studio_0.2.0_x64-setup.exe` (recommended) or MSI,
 compare its SHA-256 value with `SHA256SUMS-windows.txt`, and run it. Studio, a
 standalone `ese.exe`, and the native server are installed together; Python is
 not required at runtime. The NSIS build supports signed in-app updates from

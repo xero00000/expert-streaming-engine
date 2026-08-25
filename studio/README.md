@@ -53,7 +53,7 @@ are recognized rather than overwritten. Use `HF_TOKEN` or
 
 ## Linux install
 
-The v0.1.2 AppImage, DEB, and RPM packages contain both Studio and ESE. Use the
+The v0.2.0 AppImage, DEB, and RPM packages contain both Studio and ESE. Use the
 AppImage for signed in-app updating, or use the distribution package and apply
 future package updates through APT/DNF.
 

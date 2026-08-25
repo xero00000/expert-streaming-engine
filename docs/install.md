@@ -8,7 +8,7 @@ need ESE's planner, resource controller, or bounded expert hierarchy.
 
 Download the package and checksum file from the
 [latest GitHub release](https://github.com/xero00000/expert-streaming-engine/releases/latest).
-Package filenames include the release version; the examples below use `0.1.2`.
+Package filenames include the release version; the examples below use `0.2.0`.
 
 ### Linux
 
@@ -16,15 +16,15 @@ The AppImage supports signed in-app updates:
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
-chmod +x ese-studio_0.1.2_amd64.AppImage
-./ese-studio_0.1.2_amd64.AppImage
+chmod +x ese-studio_0.2.0_amd64.AppImage
+./ese-studio_0.2.0_amd64.AppImage
 ```
 
 Distribution packages integrate with APT or DNF:
 
 ```bash
-sudo apt install ./ese-studio_0.1.2_amd64.deb
-sudo dnf install ./ese-studio-0.1.2-1.x86_64.rpm
+sudo apt install ./ese-studio_0.2.0_amd64.deb
+sudo dnf install ./ese-studio-0.2.0-1.x86_64.rpm
 ```
 
 Published Linux packages use a portable CPU runtime. Build from source when you
@@ -32,7 +32,7 @@ want CUDA acceleration on Linux.
 
 ### Windows
 
-Download `ese-studio_0.1.2_x64-setup.exe` (recommended) or the MSI, compare its
+Download `ese-studio_0.2.0_x64-setup.exe` (recommended) or the MSI, compare its
 SHA-256 value with `SHA256SUMS-windows.txt`, and run it. The package includes a
 CUDA-enabled runtime for supported NVIDIA GPUs and retains CPU fallback. Python,
 CMake, Visual Studio, and the CUDA toolkit are not required to run the installed

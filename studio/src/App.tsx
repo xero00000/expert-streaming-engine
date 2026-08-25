@@ -182,7 +182,7 @@ function App() {
   const [chatDraft, setChatDraft] = useState("");
   const [chatRunning, setChatRunning] = useState(false);
   const [chatRequestId, setChatRequestId] = useState<string>();
-  const [appVersion, setAppVersion] = useState("0.1.2");
+  const [appVersion, setAppVersion] = useState("0.2.0");
   const [pendingUpdate, setPendingUpdate] = useState<Update>();
   const [updateState, setUpdateState] = useState<UpdateState>("idle");
   const [updateDetail, setUpdateDetail] = useState("Check GitHub Releases for a signed ESE Studio and runtime update.");
