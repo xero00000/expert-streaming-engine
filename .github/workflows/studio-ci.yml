@@ -135,7 +135,9 @@ jobs:
   windows-studio:
     name: Studio frontend, Rust, and Windows installers
     runs-on: windows-2022
-    timeout-minutes: 120
+    # A cold CUDA 12.4 build takes just under two hours on the hosted runner.
+    # Leave enough time to verify and preserve it for later PR updates.
+    timeout-minutes: 180
     defaults:
       run:
         working-directory: studio
@@ -243,6 +245,13 @@ jobs:
           } else {
             Write-Host "NVIDIA driver unavailable; PE dependency checks passed and executable smoke test was skipped."
           }
+
+      - name: Save verified Windows CUDA runtime build
+        if: steps.windows-cuda-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build-package
+          key: ese-windows-cuda-v2-${{ runner.os }}-cuda12.4-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'include/**', 'src/**', 'common/**', 'examples/CMakeLists.txt', 'examples/server/**', 'vendor/**', '.github/scripts/setup-cuda-windows.ps1', '.github/scripts/prepare-restored-build.py') }}
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
