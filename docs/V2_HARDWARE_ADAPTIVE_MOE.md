@@ -351,6 +351,26 @@ labels this as capability-split evidence. KV/expert and combined publication
 must still pass separately on a non-recurrent MoE model; this mode does not
 weaken or bypass the recurrent-cache fail-closed rule.
 
+The 2026-08-24 capability-split gate passed on the local recurrent
+`Qwen3.6-35B-A3B-vram13-q2ex-imat-MTP.gguf` plus its matching projector across
+RTX 3060 Ti, RTX 2080 SUPER, and RTX 3080 with a `20,30,50` split. All four
+transient policies, real text/image/text owner handoffs, invalid-slot batch
+rollback, busy-slot deferred cancellation, system-prompt launch failure, and
+the after-prepare/after-publish one-shot faults completed with zero retained
+leases, pins, or pending restores. The seeded text continuation remained
+`c7ba672c59ef81f1e30329f3d7a9bb0687526e3f4498f85a788ab1e44084a72d`
+through both failure retries. The response wait now uses an absolute deadline:
+results from other concurrent sessions can no longer restart disconnect polling
+and starve cancellation of a deferred request.
+
+The matching 2026-08-24 non-recurrent TinyMoE lane passed the 512 -> 256 -> 512
+KV transaction, 64 -> 32 -> 64 MiB expert-cache transaction, disable/re-enable,
+combined KV+expert preparation peak, and every publication fault boundary on
+the same three GPUs. The partial-device gate failed after one prepared/published
+GPU, restored exact per-device accounting, then committed and restored in the
+same server process. All paths retained output hash
+`c79892a711899f1d470a6e7be6315a19452562bc1570faae8030217dae1b1364`.
+
 On the checked TinyMoE fixture, both CPU and mixed RTX 2080 SUPER/RTX 3060
 Ti/RTX 3080 (`20,30,50`) trials shrank an occupied 1,024-token F16 cache to 512
 tokens and grew it back to 1,024 while all three seeded completions retained the
