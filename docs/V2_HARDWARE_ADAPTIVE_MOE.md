@@ -274,7 +274,7 @@ fallbacks or global synchronizations. Median prompt ratios were `1.41x`,
 device and the three-GPU run proved 201 H2D plus 240 D2D component transfers.
 These remain development-fixture measurements rather than product benchmarks.
 
-## Phase D: runtime resource rebalancing (in progress)
+## Phase D: runtime resource rebalancing (complete)
 
 `GET /v1/ese/resources` is routed through the inference task queue and reports
 a coherent owner-thread snapshot without synchronizing a device. It includes
@@ -417,10 +417,15 @@ rejected before preparation if another commit made that snapshot stale. Media
 cache shrink boundaries are also resolved before preparation, preventing an
 irreversible KV shrink from cutting through or retaining stale image chunks.
 
-Phase D remains marked in progress until the full model-backed transient matrix
-and mixed-GPU evidence from `validate-phase-d-rebalance.py` are recorded on this
-private branch; the CPU, failure-injection, sanitizer, and exact MTP-owner gates
-are necessary but not substitutes for that final hardware run.
+Phase D completed its private hardware gate on 2026-08-24. The recurrent Qwen
+lane supplies the full model-backed transient-policy and real multimodal owner
+matrix, while the non-recurrent TinyMoE lane supplies combined KV/expert
+publication, failure-atomic retry, and mixed three-GPU evidence. The two lanes
+are intentionally capability-split: recurrent models cannot provide the
+conventional KV-resize proof, and a tiny non-recurrent MoE fixture cannot prove
+exact MTP/projector owner handoff. Together with the CPU, sanitizer, and native
+transaction gates, they satisfy the Phase D acceptance contract without
+weakening either model class's fail-closed behavior.
 
 ### Combined KV/expert publication contract
 
@@ -461,8 +466,7 @@ snapshots in the single-Ampere run and 60 in the mixed run.
 
 ## Later phases
 
-1. Complete Phase D live transient-resource rebalancing.
-2. Phase E: optional aligned FastStore sidecar bound to GGUF identity.
-3. Phase F: semantic cache anchors and newer hardware kernels.
+1. Phase E: optional aligned FastStore sidecar bound to GGUF identity.
+2. Phase F: semantic cache anchors and newer hardware kernels.
 
 Each phase needs correctness tests, local benchmark evidence, documented hardware coverage and limitations, and a clean private review checkpoint before it is proposed for public `main`.
