@@ -765,6 +765,7 @@ enum llm_chat_template {
     LLM_CHAT_TEMPLATE_MISTRAL_V3_TEKKEN,
     LLM_CHAT_TEMPLATE_MISTRAL_V7,
     LLM_CHAT_TEMPLATE_PHI_3,
+    LLM_CHAT_TEMPLATE_PHI_4,
     LLM_CHAT_TEMPLATE_FALCON_3,
     LLM_CHAT_TEMPLATE_FALCON_E,
     LLM_CHAT_TEMPLATE_ZEPHYR,
@@ -788,6 +789,7 @@ enum llm_chat_template {
     LLM_CHAT_TEMPLATE_GRANITE,
     LLM_CHAT_TEMPLATE_GIGACHAT,
     LLM_CHAT_TEMPLATE_MEGREZ,
+    LLM_CHAT_TEMPLATE_YANDEX,
     LLM_CHAT_TEMPLATE_LLAMA4,
     LLM_CHAT_TEMPLATE_BITNET,
     LLM_CHAT_TEMPLATE_DOTS1,
@@ -813,6 +815,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "mistral-v3-tekken", LLM_CHAT_TEMPLATE_MISTRAL_V3_TEKKEN },
     { "mistral-v7",        LLM_CHAT_TEMPLATE_MISTRAL_V7        },
     { "phi3",              LLM_CHAT_TEMPLATE_PHI_3             },
+    { "phi4",              LLM_CHAT_TEMPLATE_PHI_4             },
     { "falcon3",           LLM_CHAT_TEMPLATE_FALCON_3          },
     { "falcon_e",          LLM_CHAT_TEMPLATE_FALCON_E          },
     { "zephyr",            LLM_CHAT_TEMPLATE_ZEPHYR            },
@@ -837,6 +840,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "granite",           LLM_CHAT_TEMPLATE_GRANITE           },
     { "gigachat",          LLM_CHAT_TEMPLATE_GIGACHAT          },
     { "megrez",            LLM_CHAT_TEMPLATE_MEGREZ            },
+    { "yandex",            LLM_CHAT_TEMPLATE_YANDEX            },
     { "llama4",            LLM_CHAT_TEMPLATE_LLAMA4            },
     { "hunyuan-moe",       LLM_CHAT_TEMPLATE_HUNYUAN_MOE       },
     { "kimi-k2",           LLM_CHAT_TEMPLATE_KIMI_K2           },
@@ -13472,7 +13476,9 @@ static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
         return tmpl.find(haystack) != std::string::npos;
     };
     if (tmpl_contains("<|im_start|>")) {
-        return LLM_CHAT_TEMPLATE_CHATML;
+        return tmpl_contains("<|im_sep|>")
+            ? LLM_CHAT_TEMPLATE_PHI_4
+            : LLM_CHAT_TEMPLATE_CHATML;
     } else if (tmpl.find("mistral") == 0 || tmpl_contains("[INST]")) {
         if (tmpl_contains("[SYSTEM_PROMPT]")) {
             return LLM_CHAT_TEMPLATE_MISTRAL_V7;
@@ -13565,6 +13571,8 @@ static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
         return LLM_CHAT_TEMPLATE_GIGACHAT;
     } else if (tmpl_contains("<|role_start|>")) {
         return LLM_CHAT_TEMPLATE_MEGREZ;
+    } else if (tmpl_contains(" Ассистент:")) {
+        return LLM_CHAT_TEMPLATE_YANDEX;
     } else if (tmpl_contains("<role>ASSISTANT</role>") && tmpl_contains("'HUMAN'")) {
         return LLM_CHAT_TEMPLATE_BAILING;
     } else if (tmpl_contains("<role>ASSISTANT</role>") && tmpl_contains("\"HUMAN\"") && tmpl_contains("<think>")) {
@@ -13688,6 +13696,13 @@ static int32_t llama_chat_apply_template_internal(
         }
         if (add_ass) {
             ss << "<|assistant|>\n";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_PHI_4) {
+        for (auto message : chat) {
+            ss << "<|im_start|>" << message->role << "<|im_sep|>" << message->content << "<|im_end|>";
+        }
+        if (add_ass) {
+            ss << "<|im_start|>assistant<|im_sep|>";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_FALCON_3) {
         // Falcon 3
@@ -13945,7 +13960,7 @@ static int32_t llama_chat_apply_template_internal(
             ss << message->content << "<|end_of_text|>\n";
         }
         if (add_ass) {
-            ss << "<|start_of_role|>assistant<|end_of_role|>\n";
+            ss << "<|start_of_role|>assistant<|end_of_role|>";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_GIGACHAT) {
         // GigaChat template
@@ -13982,6 +13997,18 @@ static int32_t llama_chat_apply_template_internal(
 
         if (add_ass) {
             ss << "<|role_start|>assistant<|role_end|>";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_YANDEX) {
+        for (size_t i = 0; i < chat.size(); i++) {
+            std::string role(chat[i]->role);
+            if (role == "user") {
+                ss << LU8(" Пользователь: ") << chat[i]->content << "\n\n";
+            } else if (role == "assistant") {
+                ss << LU8(" Ассистент: ") << chat[i]->content << "\n\n";
+            }
+        }
+        if (add_ass) {
+            ss << LU8(" Ассистент:[SEP]");
         }
     }  else if (tmpl == LLM_CHAT_TEMPLATE_BAILING || tmpl == LLM_CHAT_TEMPLATE_BAILING_THINK) {
         // Bailing (Ling/Ring) template
