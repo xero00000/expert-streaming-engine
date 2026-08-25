@@ -61,6 +61,11 @@ class PhaseDValidatorDispatchTests(unittest.TestCase):
                 ) as transient_success,
                 mock.patch.object(
                     validator,
+                    "validate_transient_shutdown",
+                    return_value={"clean_exit": True},
+                ) as transient_shutdown,
+                mock.patch.object(
+                    validator,
                     "validate_transient_failure",
                     side_effect=lambda _args, stage, _offset: {"stage": stage},
                 ) as transient_failure,
@@ -87,6 +92,8 @@ class PhaseDValidatorDispatchTests(unittest.TestCase):
                 set(validator.TRANSIENT_FAILURE_STAGES),
             )
             transient_success.assert_called_once()
+            transient_shutdown.assert_called_once()
+            self.assertTrue(report["transient"]["graceful_shutdown"]["clean_exit"])
             self.assertEqual(transient_failure.call_count, 2)
             kv_success.assert_not_called()
             kv_failure.assert_not_called()
@@ -143,6 +150,11 @@ class PhaseDValidatorDispatchTests(unittest.TestCase):
                     validator,
                     "validate_transient_success",
                     return_value={"transient": True},
+                ),
+                mock.patch.object(
+                    validator,
+                    "validate_transient_shutdown",
+                    return_value={"clean_exit": True},
                 ),
                 mock.patch.object(
                     validator,
