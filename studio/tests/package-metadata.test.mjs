@@ -128,3 +128,19 @@ test("generated bug reports require review before submission", () => {
   const app = readFileSync(join(studioRoot, "src", "App.tsx"), "utf8");
   assert.match(app, /Review every field and remove any private or identifying information before submitting\./);
 });
+
+test("Studio presents reasoning and runtime actions from measured state", () => {
+  const app = readFileSync(join(studioRoot, "src", "App.tsx"), "utf8");
+  const types = readFileSync(join(studioRoot, "src", "types.ts"), "utf8");
+
+  assert.match(app, /<details className="chat-reasoning">/);
+  assert.match(app, /payload\.reasoning/);
+  assert.match(app, /chatStatus\.ready \? "Model connected" : chatStatus\.active \? "Model starting"/);
+  assert.match(app, /chatStatus\.active \? "Stop model & run" : "Run sweep"/);
+  assert.match(app, /chatStatus\.modelPath === selected\.path \? "Restart model" : "Switch model"/);
+  assert.match(app, /selected\.available \? "Selected" : "Missing"/);
+  assert.match(app, />Included<\/span>/);
+  assert.match(types, /ready: boolean;/);
+  assert.match(types, /modelPath\?: string;/);
+  assert.doesNotMatch(app, />Scanning<\/span>/);
+});

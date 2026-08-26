@@ -2,7 +2,9 @@ export type View = "models" | "chat" | "hub" | "apps" | "sweeper" | "settings";
 
 export interface ChatStatus {
   active: boolean;
+  ready: boolean;
   modelId?: string;
+  modelPath?: string;
 }
 
 export interface ModelProfile {

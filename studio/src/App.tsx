@@ -41,6 +41,7 @@ interface ChatEntry {
   id: string;
   role: "user" | "assistant";
   content: string;
+  reasoning?: string;
 }
 
 type UpdateState = "idle" | "checking" | "available" | "downloading" | "current" | "error";
@@ -48,10 +49,35 @@ type UpdateState = "idle" | "checking" | "available" | "downloading" | "current"
 function storedChat(): ChatEntry[] {
   try {
     const parsed = JSON.parse(globalThis.localStorage?.getItem("ese-chat-history") ?? "[]");
-    return Array.isArray(parsed) ? parsed.filter((item) => item && ["user", "assistant"].includes(item.role) && typeof item.content === "string").slice(-100) : [];
+    return Array.isArray(parsed) ? parsed.filter((item) => item && ["user", "assistant"].includes(item.role) && typeof item.content === "string" && (item.reasoning === undefined || typeof item.reasoning === "string")).slice(-100) : [];
   } catch {
     return [];
   }
+}
+
+function splitEmbeddedThinking(content: string, streamedReasoning = "") {
+  let answer = content;
+  const reasoning: string[] = streamedReasoning ? [streamedReasoning] : [];
+  answer = answer.replace(/<think>([\s\S]*?)<\/think>/gi, (_match, thought: string) => {
+    if (thought.trim()) reasoning.push(thought);
+    return "";
+  });
+  const open = answer.search(/<think>/i);
+  if (open >= 0) {
+    const thought = answer.slice(open).replace(/<think>/i, "");
+    if (thought.trim()) reasoning.push(thought);
+    answer = answer.slice(0, open);
+  }
+  return { answer: answer.trimStart(), reasoning: reasoning.join("\n").trim() };
+}
+
+function ChatMessageBody({ message }: { message: ChatEntry }) {
+  const parsed = message.role === "assistant" ? splitEmbeddedThinking(message.content, message.reasoning) : { answer: message.content, reasoning: "" };
+  if (!parsed.answer && !parsed.reasoning) return <span className="typing-indicator"><i /><i /><i /><span className="sr-only">Generating response</span></span>;
+  return <>
+    {parsed.reasoning && <details className="chat-reasoning"><summary><ChevronRight size={13} /><span>Thinking</span></summary><p>{parsed.reasoning}</p></details>}
+    {parsed.answer && <p>{parsed.answer}</p>}
+  </>;
 }
 
 function formatBytes(bytes?: number) {
@@ -177,7 +203,7 @@ function App() {
   const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>();
   const [onboardingChoice, setOnboardingChoice] = useState(false);
   const [savingConsent, setSavingConsent] = useState(false);
-  const [chatStatus, setChatStatus] = useState<ChatStatus>({ active: false });
+  const [chatStatus, setChatStatus] = useState<ChatStatus>({ active: false, ready: false });
   const [chatMessages, setChatMessages] = useState<ChatEntry[]>(storedChat);
   const [chatDraft, setChatDraft] = useState("");
   const [chatRunning, setChatRunning] = useState(false);
@@ -261,11 +287,15 @@ function App() {
       setDownloadStatus(payload);
       if (payload.state === "complete") void refresh();
     }));
-    register(listen<{ requestId: string; content: string }>("chat-token", ({ payload }) => {
-      setChatMessages((messages) => messages.map((message) => message.id === payload.requestId ? { ...message, content: message.content + payload.content } : message));
+    register(listen<{ requestId: string; content: string; reasoning: boolean }>("chat-token", ({ payload }) => {
+      setChatMessages((messages) => messages.map((message) => message.id === payload.requestId
+        ? payload.reasoning
+          ? { ...message, reasoning: (message.reasoning ?? "") + payload.content }
+          : { ...message, content: message.content + payload.content }
+        : message));
     }));
     register(listen<{ requestId: string; stopped: boolean; error?: string }>("chat-finished", ({ payload }) => {
-      setChatMessages((messages) => messages.filter((message) => message.id !== payload.requestId || message.content.length > 0));
+      setChatMessages((messages) => messages.filter((message) => message.id !== payload.requestId || message.content.length > 0 || Boolean(message.reasoning)));
       setChatRunning(false);
       setChatRequestId(undefined);
       if (payload.error) setNotice(payload.error);
@@ -328,13 +358,13 @@ function App() {
   }, [concurrentSessions]);
 
   useEffect(() => {
-    globalThis.localStorage?.setItem("ese-chat-history", JSON.stringify(chatMessages.filter((message) => message.content).slice(-100)));
+    globalThis.localStorage?.setItem("ese-chat-history", JSON.stringify(chatMessages.filter((message) => message.content || message.reasoning).slice(-100)));
     chatEnd.current?.scrollIntoView({ behavior: chatRunning ? "auto" : "smooth", block: "end" });
   }, [chatMessages, chatRunning]);
 
   useEffect(() => {
     if (!native) return;
-    const update = () => void invoke<ChatStatus>("get_chat_status").then(setChatStatus).catch(() => setChatStatus({ active: false }));
+    const update = () => void invoke<ChatStatus>("get_chat_status").then(setChatStatus).catch(() => setChatStatus({ active: false, ready: false }));
     update();
     const interval = window.setInterval(update, 2000);
     return () => window.clearInterval(interval);
@@ -512,7 +542,7 @@ function App() {
 
   const sendChat = async (text: string, history = chatMessages) => {
     const content = text.trim();
-    if (!content || !native || !chatStatus.active || chatRunning) return;
+    if (!content || !native || !chatStatus.ready || chatRunning) return;
     const requestId = crypto.randomUUID();
     const userMessage: ChatEntry = { id: crypto.randomUUID(), role: "user", content };
     const assistantMessage: ChatEntry = { id: requestId, role: "assistant", content: "" };
@@ -591,7 +621,7 @@ function App() {
           {nav.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? "active" : ""} onClick={() => setView(id)}><Icon size={16} />{label}</button>)}
         </nav>
         <div className="sidebar-spacer" />
-        <div className="runtime-card"><span><i /> Runtime ready</span><small>{snapshot.eseBinary ?? "ESE not found"}</small></div>
+        <div className={`runtime-card ${snapshot.eseBinary ? "ready" : "unavailable"}`}><span><i />{snapshot.eseBinary ? "Runtime ready" : "Runtime unavailable"}</span><small>{snapshot.eseBinary ?? "ESE launcher not found"}</small></div>
         <nav aria-label="Secondary"><button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}><Settings size={16} />Settings</button></nav>
       </aside>
 
@@ -605,12 +635,12 @@ function App() {
           {notice && <div className="notice" role="alert"><span>{notice}</span><div className="notice-actions">{native && !notice.startsWith("Applied verified profile") && <button className="report-error" onClick={() => void reportError(view, notice)}><Bug size={13} />Report error</button>}<button className="dismiss-notice" onClick={() => setNotice(undefined)} aria-label="Dismiss"><X size={14} /></button></div></div>}
 
           {view === "chat" && <div className="chat-layout">
-            <div className="chat-statusbar"><span className={`chat-model-state ${chatStatus.active ? "ready" : "offline"}`}><i />{chatStatus.active ? "Model connected" : "No active model"}</span><code title={chatStatus.modelId}>{chatStatus.modelId ?? "Start a model from Models to begin"}</code><div><button onClick={regenerateChat} disabled={chatRunning || !chatMessages.some((message) => message.role === "user")} aria-label="Regenerate last response" title="Regenerate last response"><RotateCcw size={14} />Regenerate</button><button onClick={() => setChatMessages([])} disabled={chatRunning || chatMessages.length === 0} aria-label="Clear conversation" title="Clear conversation"><Trash2 size={14} />Clear</button></div></div>
+            <div className="chat-statusbar"><span className={`chat-model-state ${chatStatus.ready ? "ready" : chatStatus.active ? "starting" : "offline"}`}><i />{chatStatus.ready ? "Model connected" : chatStatus.active ? "Model starting" : "No active model"}</span><code title={chatStatus.modelId}>{chatStatus.modelId ?? "Start a model from Models to begin"}</code><div><button onClick={regenerateChat} disabled={chatRunning || !chatStatus.ready || !chatMessages.some((message) => message.role === "user")} aria-label="Regenerate last response" title="Regenerate last response"><RotateCcw size={14} />Regenerate</button><button onClick={() => setChatMessages([])} disabled={chatRunning || chatMessages.length === 0} aria-label="Clear conversation" title="Clear conversation"><Trash2 size={14} />Clear</button></div></div>
             <div className="chat-transcript" role="log" aria-live="polite" aria-label="Conversation">
-              {chatMessages.length ? chatMessages.map((message) => <article className={`chat-message ${message.role}`} key={message.id}><span className="chat-avatar" aria-hidden="true">{message.role === "user" ? <User size={16} /> : <Bot size={16} />}</span><div><strong>{message.role === "user" ? "You" : "ESE"}</strong><p>{message.content || <span className="typing-indicator"><i /><i /><i /><span className="sr-only">Generating response</span></span>}</p></div></article>) : <div className="chat-empty"><span><MessageSquare size={22} /></span><h2>Chat with your local model</h2><p>{chatStatus.active ? "Messages stay on this computer and are sent only to the active ESE server." : "Start a model from the Models screen. Chat will connect automatically when it is ready."}</p>{!chatStatus.active && <button className="primary" onClick={() => setView("models")}><Play size={14} />Choose a model</button>}</div>}
+              {chatMessages.length ? chatMessages.map((message) => <article className={`chat-message ${message.role}`} key={message.id}><span className="chat-avatar" aria-hidden="true">{message.role === "user" ? <User size={16} /> : <Bot size={16} />}</span><div><strong>{message.role === "user" ? "You" : "ESE"}</strong><ChatMessageBody message={message} /></div></article>) : <div className="chat-empty"><span><MessageSquare size={22} /></span><h2>Chat with your local model</h2><p>{chatStatus.ready ? "Messages stay on this computer and are sent only to the active ESE server." : chatStatus.active ? "The model is starting. Chat will enable when its health check passes." : "Start a model from the Models screen. Chat will connect automatically when it is ready."}</p>{!chatStatus.active && <button className="primary" onClick={() => setView("models")}><Play size={14} />Choose a model</button>}</div>}
               <div ref={chatEnd} />
             </div>
-            <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); void sendChat(chatDraft); }}><textarea value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void sendChat(chatDraft); } }} placeholder={chatStatus.active ? "Message your local model" : "Start a model to enable chat"} aria-label="Chat message" rows={2} disabled={!chatStatus.active || chatRunning} /><div><small>Enter to send · Shift+Enter for a new line</small>{chatRunning ? <button type="button" className="chat-stop" onClick={() => void stopChat()}><StopCircle size={15} />Stop</button> : <button type="submit" className="primary" disabled={!chatStatus.active || !chatDraft.trim()}><Send size={15} />Send</button>}</div></form>
+            <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); void sendChat(chatDraft); }}><textarea value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void sendChat(chatDraft); } }} placeholder={chatStatus.ready ? "Message your local model" : chatStatus.active ? "Waiting for the model to become ready" : "Start a model to enable chat"} aria-label="Chat message" rows={2} disabled={!chatStatus.ready || chatRunning} /><div><small>Enter to send · Shift+Enter for a new line</small>{chatRunning ? <button type="button" className="chat-stop" onClick={() => void stopChat()}><StopCircle size={15} />Stop</button> : <button type="submit" className="primary" disabled={!chatStatus.ready || !chatDraft.trim()}><Send size={15} />Send</button>}</div></form>
           </div>}
 
           {view === "hub" && <div className="hub-layout">
@@ -638,10 +668,10 @@ function App() {
               })}</div> : <EmptyState title="No models found" detail="Add a model folder in Settings to begin discovery." />}
               {!!unavailable.length && <div className="unavailable"><button onClick={() => setShowUnavailable(!showUnavailable)}>{showUnavailable ? <ChevronDown size={15} /> : <ChevronRight size={15} />}Unavailable profiles <span>{unavailable.length}</span></button>{showUnavailable && <div className="model-list">{unavailable.map((model) => <ModelRow key={model.id} model={model} selected={model.id === selectedId} onSelect={() => setSelectedId(model.id)} />)}</div>}</div>}
             </div>
-            {selected && <div className="selection-bar"><div><span className="availability ready"><i />Selected</span><strong>{selected.name}</strong><small>{selected.context ? `${Math.floor(selected.context / concurrentSessions).toLocaleString()} context per session · ${selected.context.toLocaleString()} total` : `Context will be planned across ${concurrentSessions} ${concurrentSessions === 1 ? "session" : "sessions"}`}</small></div><label className="session-control"><span>Concurrent sessions</span><select value={concurrentSessions} onChange={(event) => setConcurrentSessions(Number(event.target.value))} aria-label="Concurrent local AI sessions"><option value={1}>1 · Maximum context</option><option value={2}>2 · Dense resident</option><option value={4}>4 · Dense resident</option></select></label><button onClick={() => launchEse("plan")}>Inspect plan</button><button className="primary" onClick={() => launchEse("serve")}><Play size={14} fill="currentColor" />Start model</button></div>}
+            {selected && <div className="selection-bar"><div><span className={`availability ${selected.available ? "ready" : "missing"}`}><i />{selected.available ? "Selected" : "Missing"}</span><strong>{selected.name}</strong><small>{selected.available ? selected.context ? `${Math.floor(selected.context / concurrentSessions).toLocaleString()} context per session · ${selected.context.toLocaleString()} total` : `Context will be planned across ${concurrentSessions} ${concurrentSessions === 1 ? "session" : "sessions"}` : "The configured GGUF file could not be found."}</small></div><label className="session-control"><span>Concurrent sessions</span><select value={concurrentSessions} onChange={(event) => setConcurrentSessions(Number(event.target.value))} aria-label="Concurrent local AI sessions" disabled={!selected.available}><option value={1}>1 · Maximum context</option><option value={2}>2 · Dense resident</option><option value={4}>4 · Dense resident</option></select></label><button onClick={() => launchEse("plan")} disabled={!selected.available}>Inspect plan</button><button className="primary" onClick={() => launchEse("serve")} disabled={!selected.available}><Play size={14} fill="currentColor" />{selected.available ? chatStatus.active ? chatStatus.modelPath === selected.path ? "Restart model" : "Switch model" : "Start model" : "Model file missing"}</button></div>}
           </div>}
 
-          {view === "apps" && <><div className="apps-grid">{snapshot.apps.map((app) => <article className="app-card" key={app.id}><span className="app-icon"><SquareTerminal size={20} /></span><div><h2>{app.name}</h2><code>{app.command} {app.args.join(" ")}</code><p>{app.endpointAware ? "Receives the active model endpoint, identity, context, and tuning details in its terminal session." : "Runs in a persistent terminal tab. The session stays alive when models change."}</p></div><button className="primary" onClick={() => void launchApp(app)}><Play size={14} fill="currentColor" />Launch</button></article>)}<button className="add-card" onClick={() => setShowAppEditor(true)}><Plus size={18} />Add a custom app<span>Command, arguments, and optional working directory</span></button></div>{showAppEditor && <section className="panel inline-editor"><div className="panel-heading"><div><h2>Custom terminal app</h2><p>The command runs directly in a native PTY. Arguments are stored in portable TOML.</p></div><button className="icon-button" onClick={() => setShowAppEditor(false)} aria-label="Close"><X size={14} /></button></div><div className="editor-grid"><label className="field"><span>Name</span><input value={appDraft.name} onChange={(event) => setAppDraft({ ...appDraft, name: event.target.value })} placeholder="My coding agent" /></label><label className="field"><span>Command</span><input value={appDraft.command} onChange={(event) => setAppDraft({ ...appDraft, command: event.target.value })} placeholder="agent-command" /></label><label className="field"><span>Arguments</span><input value={appDraft.args} onChange={(event) => setAppDraft({ ...appDraft, args: event.target.value })} placeholder="--optional flags" /></label><label className="field"><span>Working directory</span><input value={appDraft.workingDirectory} onChange={(event) => setAppDraft({ ...appDraft, workingDirectory: event.target.value })} placeholder="/home/me/project" /></label></div><button className="primary" onClick={() => void addApp()} disabled={!native || !appDraft.name.trim() || !appDraft.command.trim()}>Save app</button></section>}</>}
+          {view === "apps" && <><div className="apps-grid">{snapshot.apps.map((app) => <article className="app-card" key={app.id}><span className="app-icon"><SquareTerminal size={20} /></span><div><h2>{app.name}</h2><code>{app.command} {app.args.join(" ")}</code><p>{app.endpointAware ? chatStatus.ready ? "Receives the active model endpoint, identity, context, and tuning details in its terminal session." : "Requires a ready local model so Studio can pass its endpoint and tuning details." : "Runs in a persistent terminal tab. The session stays alive when models change."}</p></div><button className="primary" onClick={() => void launchApp(app)} disabled={app.endpointAware && !chatStatus.ready}><Play size={14} fill="currentColor" />{app.endpointAware && !chatStatus.ready ? "Start a model first" : "Launch"}</button></article>)}<button className="add-card" onClick={() => setShowAppEditor(true)}><Plus size={18} />Add a custom app<span>Command, arguments, and optional working directory</span></button></div>{showAppEditor && <section className="panel inline-editor"><div className="panel-heading"><div><h2>Custom terminal app</h2><p>The command runs directly in a native PTY. Arguments are stored in portable TOML.</p></div><button className="icon-button" onClick={() => setShowAppEditor(false)} aria-label="Close"><X size={14} /></button></div><div className="editor-grid"><label className="field"><span>Name</span><input value={appDraft.name} onChange={(event) => setAppDraft({ ...appDraft, name: event.target.value })} placeholder="My coding agent" /></label><label className="field"><span>Command</span><input value={appDraft.command} onChange={(event) => setAppDraft({ ...appDraft, command: event.target.value })} placeholder="agent-command" /></label><label className="field"><span>Arguments</span><input value={appDraft.args} onChange={(event) => setAppDraft({ ...appDraft, args: event.target.value })} placeholder="--optional flags" /></label><label className="field"><span>Working directory</span><input value={appDraft.workingDirectory} onChange={(event) => setAppDraft({ ...appDraft, workingDirectory: event.target.value })} placeholder="/home/me/project" /></label></div><button className="primary" onClick={() => void addApp()} disabled={!native || !appDraft.name.trim() || !appDraft.command.trim()}>Save app</button></section>}</>}
 
           {view === "sweeper" && <div className="sweep-layout">
             <section className="panel">
@@ -653,7 +683,7 @@ function App() {
                 <label className="field"><span>Promotion margin</span><input value="90% of verified maximum" readOnly /></label>
               </div>
               {advanced && <div className="advanced-fields"><label className="field"><span>Objective</span><select value={objective} onChange={(event) => setObjective(event.target.value)}><option value="balanced">Balanced at maximum context</option><option value="max-throughput">Maximum throughput</option><option value="max-concurrency">Maximum concurrent sessions</option><option value="minimum-vram">Minimum VRAM</option><option value="lowest-latency">Lowest latency</option></select></label><label className="field"><span>Checkpointing</span><input value="Every completed trial" readOnly /></label></div>}
-              <div className="exclusive-note"><Activity size={16} /><span><strong>Exclusive GPU access required</strong>Studio stops and later restores its active model. Unmanaged llama-server instances or CUDA apps using significant VRAM cause a safe refusal.</span></div>
+              <div className="exclusive-note"><Activity size={16} /><span><strong>Exclusive GPU access required</strong>If a Studio-managed model is active, Studio stops and later restores it. Unmanaged llama-server instances or CUDA apps using significant VRAM cause a safe refusal.</span></div>
               <button className="primary wide" onClick={() => void previewSweep()} disabled={!selected || sweepStatus?.state === "running"}><Gauge size={15} />Preview sweep</button>
             </section>
             <section className="panel results">
@@ -671,7 +701,7 @@ function App() {
               </> : sweepPlan ? <>
                 <div className="result-hero"><small>Candidate promoted context</small><strong>{sweepPlan.promotedContext.toLocaleString()}</strong><span>final value follows measured capacity</span></div>
                 <dl><div><dt>Maximum trials</dt><dd>{sweepPlan.trialCount}</dd></div><div><dt>KV types</dt><dd>{sweepPlan.kvTypes.join(", ")}</dd></div><div><dt>Batch sizes</dt><dd>{sweepPlan.batchSizes.join(", ")}</dd></div><div><dt>Sessions</dt><dd>{sweepPlan.slotCounts.join(", ")}</dd></div><div><dt>Checkpointing</dt><dd>Every trial</dd></div></dl>
-                {!sweepConfirmation ? <button className="primary wide" onClick={() => setSweepConfirmation(true)} disabled={!native}>Run verified sweep</button> : <div className="sweep-confirm"><strong>Give the sweep exclusive GPU access?</strong><span>Studio-managed serving stops now and is restored after completion, failure, or cancellation.</span><div><button onClick={() => setSweepConfirmation(false)}>Not now</button><button className="primary" onClick={() => void runSweep()}>Stop model & run</button></div></div>}
+                {!sweepConfirmation ? <button className="primary wide" onClick={() => setSweepConfirmation(true)} disabled={!native}>Run verified sweep</button> : <div className="sweep-confirm"><strong>Give the sweep exclusive GPU access?</strong><span>{chatStatus.active ? "The Studio-managed model stops now and is restored after completion, failure, or cancellation." : "No Studio-managed model is running. The sweep will still check for other GPU workloads before it starts."}</span><div><button onClick={() => setSweepConfirmation(false)}>Not now</button><button className="primary" onClick={() => void runSweep()}>{chatStatus.active ? "Stop model & run" : "Run sweep"}</button></div></div>}
               </> : <EmptyState title="No plan yet" detail="Choose a model and preview the measured search space." />}
             </section>
           </div>}
@@ -680,7 +710,7 @@ function App() {
             <section className="panel settings-models">
               <div className="panel-heading"><div><h2>Model discovery</h2><p>Folders are scanned recursively for GGUF files.</p></div></div>
               <div className="path-entry"><input value={modelRoot} onChange={(event) => setModelRoot(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void addModelRoot(); }} placeholder={snapshot.platform === "windows" ? "C:\\Models" : "/path/to/models"} aria-label="Model folder path" /><button className="primary" onClick={() => void addModelRoot()} disabled={!native || !modelRoot.trim()}><Plus size={14} />Add folder</button></div>
-              {snapshot.modelRoots.length ? <div className="settings-paths">{snapshot.modelRoots.map((root) => <div className="setting-row" key={root}><Library size={16} /><code title={root}>{root}</code><span className="availability ready"><i />Scanning</span></div>)}</div> : <EmptyState title="No model folders" detail="Add a folder to make local models discoverable." />}
+              {snapshot.modelRoots.length ? <div className="settings-paths">{snapshot.modelRoots.map((root) => <div className="setting-row" key={root}><Library size={16} /><code title={root}>{root}</code><span className="availability ready"><i />Included</span></div>)}</div> : <EmptyState title="No model folders" detail="Add a folder to make local models discoverable." />}
             </section>
             <div className="settings-side">
               <section className="panel community-setting">

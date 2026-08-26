@@ -106,7 +106,9 @@ struct ChatMessage {
 #[serde(rename_all = "camelCase")]
 struct ChatStatus {
     active: bool,
+    ready: bool,
     model_id: Option<String>,
+    model_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +116,7 @@ struct ChatStatus {
 struct ChatChunk {
     request_id: String,
     content: String,
+    reasoning: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -628,13 +631,28 @@ fn set_help_improve_ese(enabled: bool, app: AppHandle) -> Result<StudioSnapshot,
 
 #[tauri::command]
 fn get_chat_status(state: State<'_, StudioState>) -> Result<ChatStatus, String> {
-    let active = state
-        .active_model
-        .lock()
-        .map_err(|_| "model state is poisoned")?;
+    let (active, ready, model_id, model_path) = {
+        let mut active = state
+            .active_model
+            .lock()
+            .map_err(|_| "model state is poisoned")?;
+        let ready = active
+            .as_mut()
+            .is_some_and(|model| refresh_model_endpoint(&mut model.endpoint));
+        (
+            active.is_some(),
+            ready,
+            active.as_ref().map(|model| model.endpoint.model_id.clone()),
+            active
+                .as_ref()
+                .map(|model| model.endpoint.model_path.clone()),
+        )
+    };
     Ok(ChatStatus {
-        active: active.is_some(),
-        model_id: active.as_ref().map(|model| model.endpoint.model_id.clone()),
+        active,
+        ready,
+        model_id,
+        model_path,
     })
 }
 
@@ -740,12 +758,13 @@ fn stream_chat(
         if data == "[DONE]" {
             return Ok(());
         }
-        if let Some(content) = chat_delta_content(data) {
+        for (content, reasoning) in chat_delta_chunks(data) {
             let _ = app.emit(
                 "chat-token",
                 ChatChunk {
                     request_id: request_id.to_owned(),
                     content,
+                    reasoning,
                 },
             );
         }
@@ -753,13 +772,32 @@ fn stream_chat(
     Ok(())
 }
 
-fn chat_delta_content(data: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(data)
-        .ok()?
-        .pointer("/choices/0/delta/content")?
-        .as_str()
+fn chat_delta_chunks(data: &str) -> Vec<(String, bool)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return Vec::new();
+    };
+    let Some(delta) = value.pointer("/choices/0/delta") else {
+        return Vec::new();
+    };
+    let mut chunks = Vec::with_capacity(2);
+    for key in ["reasoning_content", "reasoning"] {
+        if let Some(reasoning) = delta
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|content| !content.is_empty())
+        {
+            chunks.push((reasoning.to_owned(), true));
+            break;
+        }
+    }
+    if let Some(content) = delta
+        .get("content")
+        .and_then(serde_json::Value::as_str)
         .filter(|content| !content.is_empty())
-        .map(str::to_owned)
+    {
+        chunks.push((content.to_owned(), false));
+    }
+    chunks
 }
 
 #[tauri::command]
@@ -901,8 +939,9 @@ fn argument_value(arguments: &[String], flags: &[&str]) -> Option<String> {
         .find_map(|pair| flags.contains(&pair[0].as_str()).then(|| pair[1].clone()))
 }
 
-fn refresh_model_endpoint(endpoint: &mut ModelEndpoint) {
-    if let Some(props) = server_props(&endpoint.base_url) {
+fn refresh_model_endpoint(endpoint: &mut ModelEndpoint) -> bool {
+    let props = server_props(&endpoint.base_url);
+    if let Some(props) = &props {
         endpoint.context = props
             .get("n_ctx")
             .or_else(|| props.pointer("/default_generation_settings/n_ctx"))
@@ -934,7 +973,7 @@ fn refresh_model_endpoint(endpoint: &mut ModelEndpoint) {
                 .then_some(arguments)
         });
         let Some(arguments) = matching_arguments else {
-            return;
+            return props.is_some();
         };
         if let Some(context) =
             argument_value(&arguments, &["-c", "--ctx-size"]).and_then(|value| value.parse().ok())
@@ -959,6 +998,7 @@ fn refresh_model_endpoint(endpoint: &mut ModelEndpoint) {
             .and_then(|value| value.parse().ok())
             .unwrap_or(endpoint.slots);
     }
+    props.is_some()
 }
 
 fn apply_model_environment(command: &mut CommandBuilder, endpoint: &ModelEndpoint) {
@@ -1581,16 +1621,23 @@ mod tests {
     }
 
     #[test]
-    fn chat_stream_parser_extracts_only_text_deltas() {
+    fn chat_stream_parser_separates_reasoning_and_answer_deltas() {
         assert_eq!(
-            chat_delta_content(r#"{"choices":[{"delta":{"content":"hello"}}]}"#).as_deref(),
-            Some("hello")
+            chat_delta_chunks(r#"{"choices":[{"delta":{"content":"hello"}}]}"#),
+            vec![("hello".into(), false)]
         );
         assert_eq!(
-            chat_delta_content(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#),
-            None
+            chat_delta_chunks(
+                r#"{"choices":[{"delta":{"reasoning_content":"checking","content":"answer"}}]}"#
+            ),
+            vec![("checking".into(), true), ("answer".into(), false)]
         );
-        assert_eq!(chat_delta_content("not json"), None);
+        assert_eq!(
+            chat_delta_chunks(r#"{"choices":[{"delta":{"reasoning":"legacy"}}]}"#),
+            vec![("legacy".into(), true)]
+        );
+        assert!(chat_delta_chunks(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#).is_empty());
+        assert!(chat_delta_chunks("not json").is_empty());
     }
 
     #[test]
