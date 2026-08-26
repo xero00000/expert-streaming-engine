@@ -44,6 +44,10 @@ struct ModelProfile {
     batch_size: Option<u32>,
     #[serde(default, alias = "ubatch_size")]
     ubatch_size: Option<u32>,
+    #[serde(default, alias = "tensor_split")]
+    tensor_split: Option<String>,
+    #[serde(default)]
+    slots: Option<u32>,
     source: String,
 }
 
@@ -102,7 +106,9 @@ struct ChatMessage {
 #[serde(rename_all = "camelCase")]
 struct ChatStatus {
     active: bool,
+    ready: bool,
     model_id: Option<String>,
+    model_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +116,7 @@ struct ChatStatus {
 struct ChatChunk {
     request_id: String,
     content: String,
+    reasoning: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,8 +147,14 @@ struct ModelEndpoint {
     kv_type: Option<String>,
     batch_size: Option<u32>,
     ubatch_size: Option<u32>,
+    #[serde(default = "default_endpoint_slots")]
+    slots: u32,
     #[serde(default)]
     resource_plan: Option<serde_json::Value>,
+}
+
+fn default_endpoint_slots() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,6 +507,8 @@ fn discover_models(config: &StudioConfig) -> Vec<ModelProfile> {
                     kv_type: None,
                     batch_size: None,
                     ubatch_size: None,
+                    tensor_split: None,
+                    slots: None,
                     source: "discovered".into(),
                 });
             }
@@ -616,13 +631,28 @@ fn set_help_improve_ese(enabled: bool, app: AppHandle) -> Result<StudioSnapshot,
 
 #[tauri::command]
 fn get_chat_status(state: State<'_, StudioState>) -> Result<ChatStatus, String> {
-    let active = state
-        .active_model
-        .lock()
-        .map_err(|_| "model state is poisoned")?;
+    let (active, ready, model_id, model_path) = {
+        let mut active = state
+            .active_model
+            .lock()
+            .map_err(|_| "model state is poisoned")?;
+        let ready = active
+            .as_mut()
+            .is_some_and(|model| refresh_model_endpoint(&mut model.endpoint));
+        (
+            active.is_some(),
+            ready,
+            active.as_ref().map(|model| model.endpoint.model_id.clone()),
+            active
+                .as_ref()
+                .map(|model| model.endpoint.model_path.clone()),
+        )
+    };
     Ok(ChatStatus {
-        active: active.is_some(),
-        model_id: active.as_ref().map(|model| model.endpoint.model_id.clone()),
+        active,
+        ready,
+        model_id,
+        model_path,
     })
 }
 
@@ -728,12 +758,13 @@ fn stream_chat(
         if data == "[DONE]" {
             return Ok(());
         }
-        if let Some(content) = chat_delta_content(data) {
+        for (content, reasoning) in chat_delta_chunks(data) {
             let _ = app.emit(
                 "chat-token",
                 ChatChunk {
                     request_id: request_id.to_owned(),
                     content,
+                    reasoning,
                 },
             );
         }
@@ -741,13 +772,32 @@ fn stream_chat(
     Ok(())
 }
 
-fn chat_delta_content(data: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(data)
-        .ok()?
-        .pointer("/choices/0/delta/content")?
-        .as_str()
+fn chat_delta_chunks(data: &str) -> Vec<(String, bool)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return Vec::new();
+    };
+    let Some(delta) = value.pointer("/choices/0/delta") else {
+        return Vec::new();
+    };
+    let mut chunks = Vec::with_capacity(2);
+    for key in ["reasoning_content", "reasoning"] {
+        if let Some(reasoning) = delta
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|content| !content.is_empty())
+        {
+            chunks.push((reasoning.to_owned(), true));
+            break;
+        }
+    }
+    if let Some(content) = delta
+        .get("content")
+        .and_then(serde_json::Value::as_str)
         .filter(|content| !content.is_empty())
-        .map(str::to_owned)
+    {
+        chunks.push((content.to_owned(), false));
+    }
+    chunks
 }
 
 #[tauri::command]
@@ -889,8 +939,9 @@ fn argument_value(arguments: &[String], flags: &[&str]) -> Option<String> {
         .find_map(|pair| flags.contains(&pair[0].as_str()).then(|| pair[1].clone()))
 }
 
-fn refresh_model_endpoint(endpoint: &mut ModelEndpoint) {
-    if let Some(props) = server_props(&endpoint.base_url) {
+fn refresh_model_endpoint(endpoint: &mut ModelEndpoint) -> bool {
+    let props = server_props(&endpoint.base_url);
+    if let Some(props) = &props {
         endpoint.context = props
             .get("n_ctx")
             .or_else(|| props.pointer("/default_generation_settings/n_ctx"))
@@ -922,7 +973,7 @@ fn refresh_model_endpoint(endpoint: &mut ModelEndpoint) {
                 .then_some(arguments)
         });
         let Some(arguments) = matching_arguments else {
-            return;
+            return props.is_some();
         };
         if let Some(context) =
             argument_value(&arguments, &["-c", "--ctx-size"]).and_then(|value| value.parse().ok())
@@ -943,7 +994,11 @@ fn refresh_model_endpoint(endpoint: &mut ModelEndpoint) {
         endpoint.ubatch_size = argument_value(&arguments, &["-ub", "--ubatch-size"])
             .and_then(|value| value.parse().ok())
             .or(endpoint.ubatch_size);
+        endpoint.slots = argument_value(&arguments, &["-np", "--parallel"])
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(endpoint.slots);
     }
+    props.is_some()
 }
 
 fn apply_model_environment(command: &mut CommandBuilder, endpoint: &ModelEndpoint) {
@@ -980,6 +1035,7 @@ fn apply_model_environment(command: &mut CommandBuilder, endpoint: &ModelEndpoin
     if let Some(ubatch_size) = endpoint.ubatch_size {
         command.env("ESE_UBATCH_SIZE", ubatch_size.to_string());
     }
+    command.env("ESE_CONCURRENT_SESSIONS", endpoint.slots.to_string());
     if let Some(resource_plan) = &endpoint.resource_plan {
         command.env("ESE_RESOURCE_PLAN_JSON", resource_plan.to_string());
     }
@@ -1245,6 +1301,18 @@ fn promote_sweep(state: State<'_, StudioState>) -> Result<ModelProfile, String> 
     let batch_size = status
         .best_batch_size
         .ok_or_else(|| "the completed sweep has no stable batch result".to_string())?;
+    let slots = status.best_slots.unwrap_or(1);
+    let tensor_split = status
+        .results
+        .iter()
+        .find(|result| {
+            result.stable
+                && result.context == context
+                && result.kv_type == kv_type
+                && result.batch_size == batch_size
+                && result.slots == slots
+        })
+        .and_then(|result| result.tensor_split.clone());
     let path = status.request.model_path.clone();
 
     let mut config = load_config()?;
@@ -1263,12 +1331,16 @@ fn promote_sweep(state: State<'_, StudioState>) -> Result<ModelProfile, String> 
         kv_type: None,
         batch_size: None,
         ubatch_size: None,
+        tensor_split: None,
+        slots: None,
         source: "discovered".into(),
     });
     profile.context = Some(context);
     profile.kv_type = Some(kv_type);
     profile.batch_size = Some(batch_size);
     profile.ubatch_size = Some(batch_size.min(512));
+    profile.tensor_split = tensor_split;
+    profile.slots = Some(slots);
     profile.source = "sweep".into();
 
     config.models.retain(|model| model.path != path);
@@ -1549,16 +1621,23 @@ mod tests {
     }
 
     #[test]
-    fn chat_stream_parser_extracts_only_text_deltas() {
+    fn chat_stream_parser_separates_reasoning_and_answer_deltas() {
         assert_eq!(
-            chat_delta_content(r#"{"choices":[{"delta":{"content":"hello"}}]}"#).as_deref(),
-            Some("hello")
+            chat_delta_chunks(r#"{"choices":[{"delta":{"content":"hello"}}]}"#),
+            vec![("hello".into(), false)]
         );
         assert_eq!(
-            chat_delta_content(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#),
-            None
+            chat_delta_chunks(
+                r#"{"choices":[{"delta":{"reasoning_content":"checking","content":"answer"}}]}"#
+            ),
+            vec![("checking".into(), true), ("answer".into(), false)]
         );
-        assert_eq!(chat_delta_content("not json"), None);
+        assert_eq!(
+            chat_delta_chunks(r#"{"choices":[{"delta":{"reasoning":"legacy"}}]}"#),
+            vec![("legacy".into(), true)]
+        );
+        assert!(chat_delta_chunks(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#).is_empty());
+        assert!(chat_delta_chunks("not json").is_empty());
     }
 
     #[test]
@@ -1640,6 +1719,7 @@ mod tests {
             kv_type: Some("q8_0".into()),
             batch_size: Some(512),
             ubatch_size: Some(256),
+            slots: 2,
             resource_plan: Some(serde_json::json!({"policy": "resident"})),
         };
         let mut command = CommandBuilder::new("agent");
@@ -1656,6 +1736,7 @@ mod tests {
             ("ESE_KV_TYPE", "q8_0"),
             ("ESE_BATCH_SIZE", "512"),
             ("ESE_UBATCH_SIZE", "256"),
+            ("ESE_CONCURRENT_SESSIONS", "2"),
             ("ESE_RESOURCE_PLAN_JSON", "{\"policy\":\"resident\"}"),
         ] {
             assert_eq!(

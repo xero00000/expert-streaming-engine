@@ -57,6 +57,14 @@ void llama_set_mtp_n_heads(struct llama_context * ctx, int32_t mtp_n_heads);
 
 namespace {
 
+bool legacy_expert_cache_requested() {
+    const char * cache_slots = std::getenv("LLAMA_EXPERT_GPU_CACHE_SLOTS");
+    if (!cache_slots) return false;
+    char * end = nullptr;
+    const long parsed = std::strtol(cache_slots, &end, 10);
+    return end != cache_slots && *end == '\0' && parsed >= 4 && parsed <= 64;
+}
+
 bool expert_prefetch_is_topk(const ggml_tensor * tensor) {
     static constexpr char prefix[] = "ffn_moe_topk-";
     return std::strncmp(ggml_get_name(tensor), prefix, sizeof(prefix) - 1) == 0;
@@ -674,6 +682,9 @@ expert_prefetch_mode expert_prefetch_requested() {
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
+static void llama_expert_cache_transaction_release_for_context_teardown(
+        struct llama_context * ctx) noexcept;
+
 //
 // helpers
 //
@@ -754,6 +765,7 @@ enum llm_chat_template {
     LLM_CHAT_TEMPLATE_MISTRAL_V3_TEKKEN,
     LLM_CHAT_TEMPLATE_MISTRAL_V7,
     LLM_CHAT_TEMPLATE_PHI_3,
+    LLM_CHAT_TEMPLATE_PHI_4,
     LLM_CHAT_TEMPLATE_FALCON_3,
     LLM_CHAT_TEMPLATE_FALCON_E,
     LLM_CHAT_TEMPLATE_ZEPHYR,
@@ -770,12 +782,14 @@ enum llm_chat_template {
     LLM_CHAT_TEMPLATE_LLAMA_3,
     LLM_CHAT_TEMPLATE_CHATGLM_3,
     LLM_CHAT_TEMPLATE_CHATGLM_4,
+    LLM_CHAT_TEMPLATE_GLMEDGE,
     LLM_CHAT_TEMPLATE_MINICPM,
     LLM_CHAT_TEMPLATE_EXAONE_3,
     LLM_CHAT_TEMPLATE_RWKV_WORLD,
     LLM_CHAT_TEMPLATE_GRANITE,
     LLM_CHAT_TEMPLATE_GIGACHAT,
     LLM_CHAT_TEMPLATE_MEGREZ,
+    LLM_CHAT_TEMPLATE_YANDEX,
     LLM_CHAT_TEMPLATE_LLAMA4,
     LLM_CHAT_TEMPLATE_BITNET,
     LLM_CHAT_TEMPLATE_DOTS1,
@@ -801,6 +815,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "mistral-v3-tekken", LLM_CHAT_TEMPLATE_MISTRAL_V3_TEKKEN },
     { "mistral-v7",        LLM_CHAT_TEMPLATE_MISTRAL_V7        },
     { "phi3",              LLM_CHAT_TEMPLATE_PHI_3             },
+    { "phi4",              LLM_CHAT_TEMPLATE_PHI_4             },
     { "falcon3",           LLM_CHAT_TEMPLATE_FALCON_3          },
     { "falcon_e",          LLM_CHAT_TEMPLATE_FALCON_E          },
     { "zephyr",            LLM_CHAT_TEMPLATE_ZEPHYR            },
@@ -818,12 +833,14 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "llama3",            LLM_CHAT_TEMPLATE_LLAMA_3           },
     { "chatglm3",          LLM_CHAT_TEMPLATE_CHATGLM_3         },
     { "chatglm4",          LLM_CHAT_TEMPLATE_CHATGLM_4         },
+    { "glmedge",           LLM_CHAT_TEMPLATE_GLMEDGE           },
     { "minicpm",           LLM_CHAT_TEMPLATE_MINICPM           },
     { "exaone3",           LLM_CHAT_TEMPLATE_EXAONE_3          },
     { "rwkv-world",        LLM_CHAT_TEMPLATE_RWKV_WORLD        },
     { "granite",           LLM_CHAT_TEMPLATE_GRANITE           },
     { "gigachat",          LLM_CHAT_TEMPLATE_GIGACHAT          },
     { "megrez",            LLM_CHAT_TEMPLATE_MEGREZ            },
+    { "yandex",            LLM_CHAT_TEMPLATE_YANDEX            },
     { "llama4",            LLM_CHAT_TEMPLATE_LLAMA4            },
     { "hunyuan-moe",       LLM_CHAT_TEMPLATE_HUNYUAN_MOE       },
     { "kimi-k2",           LLM_CHAT_TEMPLATE_KIMI_K2           },
@@ -904,7 +921,7 @@ ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer) {
 
 #if defined(GGML_USE_CUDA)
     // host buffers should only be used when data is expected to be copied to/from the GPU
-    if (host_buffer) {
+    if (host_buffer && getenv("GGML_CUDA_NO_MODEL_PINNED") == nullptr) {
         buft = ggml_backend_cuda_host_buffer_type();
     }
 #elif defined(GGML_USE_SYCL)
@@ -1174,6 +1191,7 @@ struct llama_context::Prev {
     llama_mtp_op_type mtp_op_type;
     int32_t mtp_step_idx;
     int32_t mtp_n_heads;
+    enum ggml_backend_expert_hybrid_guard_status expert_hybrid_guard_status;
     ggml_cgraph * graph;
 };
 
@@ -1198,6 +1216,11 @@ static void why_not_reuse_previous(const llama_batch & u_batch, const llama_cont
     if (ctx.cparams.mtp_op_type != the_prev->mtp_op_type) { printf("    mtp_op_type is not the same\n"); return; }
     if (ctx.mtp_step_idx != the_prev->mtp_step_idx) { printf("    mtp_step_idx is not the same\n"); return; }
     if (ctx.mtp_n_heads != the_prev->mtp_n_heads) { printf("    mtp_n_heads is not the same\n"); return; }
+    if (ggml_backend_sched_get_expert_hybrid_guard_status(ctx.sched) !=
+            the_prev->expert_hybrid_guard_status) {
+        printf("    expert hybrid guard status changed\n");
+        return;
+    }
     printf("    update_cache_copies() must have failed\n");
 }
 
@@ -1219,6 +1242,8 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
            cparams.mtp_op_type == the_prev->mtp_op_type &&
            mtp_step_idx == the_prev->mtp_step_idx &&
            mtp_n_heads == the_prev->mtp_n_heads &&
+           ggml_backend_sched_get_expert_hybrid_guard_status(sched) ==
+                   the_prev->expert_hybrid_guard_status &&
            update_cache_copies();
     if (false && !result) {
         printf("%s(%d):", __func__, cparams.mtp_op_type);
@@ -1380,6 +1405,14 @@ void llama_context::set_mtp_n_heads(int32_t value) {
 }
 
 llama_context::~llama_context() {
+    // Resolve an abandoned public KV transaction while its scheduler and
+    // cache are still alive. A published transaction rolls back here; a
+    // prepared transaction simply drops its off-side candidate.
+    if (kv_cache_transaction != nullptr) {
+        LLAMA_LOG_WARN("%s: freeing an unresolved KV-cache transaction\n", __func__);
+        llama_kv_cache_transaction_free(kv_cache_transaction);
+    }
+
     // Join the background prefetch worker before reporting its counters or
     // releasing the model mappings it is allowed to touch.
     if (expert_prefetch_worker) {
@@ -1387,6 +1420,13 @@ llama_context::~llama_context() {
         expert_prefetch_failures += expert_prefetch_worker->failure_count();
     }
     expert_prefetch_worker.reset();
+
+    // A published transaction still owns the previous cache and policy needed
+    // for rollback. The prefetch worker is joined first so no background work
+    // can race the scheduler reset; the transaction is then released before
+    // either scheduler or any backend is destroyed.
+    llama_expert_cache_transaction_release_for_context_teardown(this);
+
     if (expert_prefetch_enabled) {
         LLAMA_LOG_INFO("%s: mode=%s, route callbacks=%" PRIu64 ", successful slices=%" PRIu64 ", advised=%.2f MiB, failures=%" PRIu64 "\n",
                 __func__,
@@ -1930,7 +1970,7 @@ static bool llama_kv_cache_init(
     }
 
     int n_mla = 0;
-    int n_kv_active_layers = 0;
+    int n_mla_eligible_layers = 0;
     const int n_mtp_first_layer = hparams.n_layer - hparams.nextn_predict_layers;
     for (int i = 0; i < (int) n_layer; i++) {
         // For MTP-only context, skip KV allocation for non-MTP layers
@@ -1942,8 +1982,10 @@ static bool llama_kv_cache_init(
             }
             continue;
         }
-        n_kv_active_layers++;
         const bool qnext_recurrent = llama_is_recurrent_layer(hparams, i);
+        if (!qnext_recurrent) {
+            n_mla_eligible_layers++;
+        }
         const uint32_t n_embd_v_row = llama_kv_v_row_embd(model, hparams, i);
         const uint32_t n_head_kv    = hparams.n_head_kv(i);
         const uint32_t n_embd_head_k= hparams.n_embd_head_k(i);
@@ -1957,7 +1999,10 @@ static bool llama_kv_cache_init(
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
         ggml_tensor * s = nullptr;
-        if (is_mla_attn && cparams.mla_attn) {
+        // Hybrid KDA/MLA architectures classify the model as MLA globally, but
+        // recurrent KDA layers need qnext state storage rather than an MLA KV
+        // cache.  Select the cache representation per layer.
+        if (!qnext_recurrent && is_mla_attn && cparams.mla_attn) {
             // DeepSeek MLA
             const uint32_t n_embd_head_qk_rope = hparams.n_rot;
             const uint32_t kv_lora_rank = hparams.n_lora_kv;
@@ -2179,8 +2224,8 @@ static bool llama_kv_cache_init(
             }
         }
     }
-    if (is_mla_attn && cparams.mla_attn && n_mla < n_kv_active_layers && n_mla > 0) {
-        LLAMA_LOG_ERROR("%s: unexpected situation with %d out of %d active KV layers having MLA enabled\n", __func__, n_mla, n_kv_active_layers);
+    if (is_mla_attn && cparams.mla_attn && n_mla < n_mla_eligible_layers && n_mla > 0) {
+        LLAMA_LOG_ERROR("%s: unexpected situation with %d out of %d eligible KV layers having MLA enabled\n", __func__, n_mla, n_mla_eligible_layers);
         LLAMA_LOG_ERROR("%s: bailing out\n", __func__);
         GGML_ABORT("fatal error");
     }
@@ -7084,7 +7129,8 @@ static int llama_decode_internal(
                         (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)kv_self_used.n,
                         (int)u_batch.n_tokens,
                         kv_self_used.save_per_step_ssm, kv_self_used.ckpt.per_step_max_allocated,
-                        cparams.mtp_op_type, lctx.mtp_step_idx, lctx.mtp_n_heads, gf});
+                        cparams.mtp_op_type, lctx.mtp_step_idx, lctx.mtp_n_heads,
+                        ggml_backend_sched_get_expert_hybrid_guard_status(lctx.sched), gf});
             }
         } else {
             //printf("Reusing graph with type = %d, n_kv = %d, n_tokens = %d\n", cparams.mtp_op_type, (int)prev->n_kv, (int)prev->n_tokens);
@@ -8260,7 +8306,13 @@ struct llama_context_params llama_context_default_params() {
         /*.cuda_params                 =*/ nullptr,
         /*.expert_vram_cache_bytes     =*/ 0,
         /*.expert_vram_reserve_bytes   =*/ 0,
+        /*.expert_prefill_staging_bytes =*/ 0,
         /*.expert_cache_min_observations =*/ 2,
+        /*.expert_hybrid_gpu_experts   =*/ 0,
+        /*.expert_hybrid_cpu_ns_per_expert =*/ 0,
+        /*.expert_hybrid_upload_ns_per_expert =*/ 0,
+        /*.expert_hybrid_maximum_drift_ppm =*/ 4000000,
+        /*.expert_hybrid_minimum_cpu_calls =*/ 64,
     };
 
     return result;
@@ -8769,7 +8821,21 @@ struct llama_context * llama_init_from_model(
     cparams.worst_graph_tokens = params.worst_case_tokens;
     cparams.expert_vram_cache_bytes = params.expert_vram_cache_bytes;
     cparams.expert_vram_reserve_bytes = params.expert_vram_reserve_bytes;
+    cparams.expert_prefill_staging_bytes = params.expert_prefill_staging_bytes;
     cparams.expert_cache_min_observations = params.expert_cache_min_observations;
+    cparams.expert_hybrid_gpu_experts = params.expert_hybrid_gpu_experts;
+    cparams.expert_hybrid_cpu_ns_per_expert = params.expert_hybrid_cpu_ns_per_expert;
+    cparams.expert_hybrid_upload_ns_per_expert = params.expert_hybrid_upload_ns_per_expert;
+    cparams.expert_hybrid_maximum_drift_ppm = params.expert_hybrid_maximum_drift_ppm;
+    cparams.expert_hybrid_minimum_cpu_calls = params.expert_hybrid_minimum_cpu_calls;
+    if (cparams.fused_mmad &&
+            (cparams.expert_vram_cache_bytes > 0 || legacy_expert_cache_requested())) {
+        // Compact expert remapping does not yet preserve full-graph numerical
+        // parity through fused mul_multi_add. Keep the exact unfused reduction
+        // until that combination has its own model-level parity proof.
+        LLAMA_LOG_WARN("%s: adaptive expert cache disables experimental fused_mmad for output parity\n", __func__);
+        cparams.fused_mmad = false;
+    }
 
     cparams.reduce_type      = params.type_reduce;
     cparams.graph_attn_precision = params.type_graph_attn;
@@ -8786,6 +8852,7 @@ struct llama_context * llama_init_from_model(
 
     // this is necessary due to kv_self.n being padded later during inference
     cparams.n_ctx            = GGML_PAD(cparams.n_ctx, llama_kv_cache_get_padding(cparams));
+    ctx->n_ctx_max           = cparams.n_ctx;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch          = hparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -9252,6 +9319,20 @@ struct llama_context * llama_init_from_model(
                         cparams.expert_vram_cache_bytes,
                         cparams.expert_vram_reserve_bytes,
                         cparams.expert_cache_min_observations);
+                ggml_backend_sched_set_expert_prefill_staging(
+                        ctx->sched,
+                        cparams.expert_prefill_staging_bytes,
+                        cparams.expert_vram_reserve_bytes);
+                const uint32_t cpu_positions = model->hparams.n_expert_used >
+                        cparams.expert_hybrid_gpu_experts ?
+                        model->hparams.n_expert_used - cparams.expert_hybrid_gpu_experts : 0;
+                ggml_backend_sched_set_expert_hybrid_guard(
+                        ctx->sched,
+                        cparams.expert_hybrid_cpu_ns_per_expert,
+                        cpu_positions,
+                        cparams.expert_hybrid_upload_ns_per_expert,
+                        cparams.expert_hybrid_maximum_drift_ppm,
+                        cparams.expert_hybrid_minimum_cpu_calls);
                 if (model->expert_ram_cache) {
                     ggml_backend_sched_set_expert_lease_callbacks(
                             ctx->sched,
@@ -9268,6 +9349,28 @@ struct llama_context * llama_init_from_model(
             }
 
             llama_repack_up_gate_exps(*ctx);
+
+            auto reserve_hybrid_decode_graph = [&]() {
+                if (cparams.expert_hybrid_gpu_experts == 0 || cparams.expert_vram_cache_bytes == 0) {
+                    return true;
+                }
+                int hybrid_past = cparams.n_ctx > 0 ? (int)cparams.n_ctx - 1 : 0;
+                llama_token hybrid_token = llama_token_bos(&ctx->model);
+                llama_batch hybrid_batch = llama_batch_get_one(&hybrid_token, 1, hybrid_past, 0);
+                if (ctx->model.arch == LLM_ARCH_DEEPSEEK4 &&
+                        !llama_prepare_dsv4_graph_inputs(*ctx, hybrid_batch, false, true)) {
+                    return false;
+                }
+                ggml_cgraph * hybrid_graph = llm_build_context::llama_build_graph(
+                        *ctx, hybrid_batch, true, 1);
+                return ggml_backend_sched_reserve(ctx->sched, hybrid_graph);
+            };
+
+            if (!reserve_hybrid_decode_graph()) {
+                LLAMA_LOG_ERROR("%s: failed to reserve hybrid decode compute buffers\n", __func__);
+                llama_free(ctx);
+                return nullptr;
+            }
 
             // build worst-case graph
             int n_past = cparams.n_ctx - n_tokens;
@@ -9288,7 +9391,17 @@ struct llama_context * llama_init_from_model(
                     ggml_backend_sched_free(ctx->sched);
                     ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
                     configure_expert_hierarchy();
-                    gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
+                    gf_success = reserve_hybrid_decode_graph();
+                    if (gf_success) {
+                        if (ctx->model.arch == LLM_ARCH_DEEPSEEK4 &&
+                                !llama_prepare_dsv4_graph_inputs(*ctx, reserve_batch, false, true)) {
+                            gf_success = false;
+                        } else {
+                            gf = llm_build_context::llama_build_graph(
+                                    *ctx, reserve_batch, true, cparams.worst_graph_tokens);
+                            gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
+                        }
+                    }
                 }
                 if (!gf_success) {
                     LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
@@ -9402,6 +9515,26 @@ const struct llama_model * llama_get_model(const struct llama_context * ctx) {
     return &ctx->model;
 }
 
+enum llama_expert_hybrid_guard_status
+llama_get_expert_hybrid_guard_status(const struct llama_context * ctx) {
+    if (!ctx || !ctx->sched) {
+        return LLAMA_EXPERT_HYBRID_GUARD_DISABLED;
+    }
+    switch (ggml_backend_sched_get_expert_hybrid_guard_status(ctx->sched)) {
+        case GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING:
+            return LLAMA_EXPERT_HYBRID_GUARD_MONITORING;
+        case GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_FALLBACK:
+            return LLAMA_EXPERT_HYBRID_GUARD_REVOKED_FALLBACK;
+        case GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_CPU_DRIFT:
+            return LLAMA_EXPERT_HYBRID_GUARD_REVOKED_CPU_DRIFT;
+        case GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_UPLOAD_DRIFT:
+            return LLAMA_EXPERT_HYBRID_GUARD_REVOKED_UPLOAD_DRIFT;
+        case GGML_BACKEND_EXPERT_HYBRID_GUARD_DISABLED:
+        default:
+            return LLAMA_EXPERT_HYBRID_GUARD_DISABLED;
+    }
+}
+
 const struct llama_vocab * llama_get_vocab(const struct llama_context * ctx) {
     return &ctx->model.vocab;
 }
@@ -9443,6 +9576,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_JAIS:
+        case LLM_ARCH_KIMI_LINEAR:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
@@ -9668,6 +9802,20 @@ uint64_t llama_model_largest_expert_component(const struct llama_model * model) 
     for (const auto & item : model->expert_index.descriptors) {
         largest = std::max(largest, item.second->bytes());
     }
+    return largest;
+}
+
+uint64_t llama_model_largest_expert_layer(const struct llama_model * model) {
+    if (!model) return 0;
+    std::map<uint32_t, uint64_t> layer_bytes;
+    for (const auto & item : model->expert_index.descriptors) {
+        const auto & descriptor = item.second;
+        auto & total = layer_bytes[descriptor->key().layer];
+        if (descriptor->bytes() > UINT64_MAX - total) return UINT64_MAX;
+        total += descriptor->bytes();
+    }
+    uint64_t largest = 0;
+    for (const auto & item : layer_bytes) largest = std::max(largest, item.second);
     return largest;
 }
 
@@ -10399,163 +10547,402 @@ bool llama_kv_cache_get_layer_types(
     return true;
 }
 
-static bool llama_kv_cache_replace(
+enum class llama_kv_cache_transaction_state {
+    prepared,
+    published,
+    rolled_back,
+    finalized,
+};
+
+static void llama_kv_cache_reset_graph_bindings(struct llama_context & ctx) noexcept {
+    ctx.reset_scheduler();
+    for (auto & copy : ctx.cache_copies) copy = {};
+    for (auto & copy : ctx.dsa_cache_copies) copy = {};
+    for (auto & copy : ctx.openpangu_cache_copies) copy = {};
+    for (auto & copy : ctx.openpangu_cache_copies_mtp) copy = {};
+}
+
+// Owns exactly one off-to-the-side cache. Before publication it is the new
+// candidate; after publication it is the old live storage. The live cache's
+// checkpoint deliberately does not participate in the storage swap, so a
+// publication can be rolled back without rebuilding or copying that checkpoint.
+struct llama_kv_cache_transaction {
+    explicit llama_kv_cache_transaction(
+            struct llama_context * context,
+            uint32_t target_context_size,
+            bool changes_storage) noexcept
+        : ctx(context),
+          previous_context_size(context->cparams.n_ctx),
+          target_context_size(target_context_size),
+          changes_storage(changes_storage) {
+    }
+
+    llama_kv_cache_transaction(const llama_kv_cache_transaction &) = delete;
+    llama_kv_cache_transaction & operator=(const llama_kv_cache_transaction &) = delete;
+
+    ~llama_kv_cache_transaction() noexcept {
+        // A caller that publishes but does not finalize has not committed. Keep
+        // the old cache/checkpoint contract even on an exception or early return.
+        if (state == llama_kv_cache_transaction_state::published) {
+            rollback();
+        }
+        detach_owner();
+    }
+
+    bool publish() noexcept {
+        if (state != llama_kv_cache_transaction_state::prepared || ctx == nullptr ||
+                ctx->kv_cache_transaction != this) {
+            return false;
+        }
+        if (changes_storage) {
+            // All allocation and migration work is already complete. These
+            // vector/storage swaps and scalar writes do not allocate.
+            llama_kv_cache_swap_storage(ctx->kv_self, alternate);
+            ctx->cparams.n_ctx = target_context_size;
+        }
+        state = llama_kv_cache_transaction_state::published;
+        if (changes_storage) {
+            llama_kv_cache_reset_graph_bindings(*ctx);
+        }
+        return true;
+    }
+
+    bool rollback() noexcept {
+        if (state != llama_kv_cache_transaction_state::published || ctx == nullptr ||
+                ctx->kv_cache_transaction != this) {
+            return false;
+        }
+        if (changes_storage) {
+            llama_kv_cache_swap_storage(ctx->kv_self, alternate);
+            ctx->cparams.n_ctx = previous_context_size;
+            llama_kv_cache_reset_graph_bindings(*ctx);
+        }
+        state = llama_kv_cache_transaction_state::rolled_back;
+        detach_owner();
+        return true;
+    }
+
+    bool finalize() noexcept {
+        if (state != llama_kv_cache_transaction_state::published || ctx == nullptr ||
+                ctx->kv_cache_transaction != this) {
+            return false;
+        }
+        if (changes_storage) {
+            // The old checkpoint stayed attached to the live context so that a
+            // rollback remained possible. Only an irrevocable commit may drop
+            // it and retire the old buffers now held by alternate.
+            ctx->kv_self.ckpt.release();
+            alternate.ckpt.release();
+            llama_kv_cache retired;
+            llama_kv_cache_swap_storage(alternate, retired);
+        }
+        state = llama_kv_cache_transaction_state::finalized;
+        detach_owner();
+        return true;
+    }
+
+    void detach_owner() noexcept {
+        if (ctx != nullptr && ctx->kv_cache_transaction == this) {
+            ctx->kv_cache_transaction = nullptr;
+        }
+        ctx = nullptr;
+    }
+
+    struct llama_context * ctx;
+    llama_kv_cache alternate;
+    uint32_t previous_context_size;
+    uint32_t target_context_size;
+    bool changes_storage;
+    llama_kv_cache_transaction_state state = llama_kv_cache_transaction_state::prepared;
+    int64_t migrated_rows = 0;
+    size_t peak_staging = 0;
+};
+
+static bool llama_kv_cache_transaction_fail_after_publish() noexcept {
+    const char * value = getenv("ESE_KV_TRANSACTION_FAIL_AFTER_PUBLISH");
+    return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static std::unique_ptr<llama_kv_cache_transaction> llama_kv_cache_prepare_impl(
         struct llama_context * ctx,
         const enum ggml_type * type_k_layers,
         const enum ggml_type * type_v_layers,
         uint32_t n_layers,
-        uint32_t target_size) {
-    if (ctx == nullptr || n_layers == 0 || n_layers != ctx->kv_self.k_l.size() ||
-            (type_k_layers == nullptr && type_v_layers == nullptr) || target_size == 0) {
-        LLAMA_LOG_ERROR("%s: invalid layer map\n", __func__);
-        return false;
-    }
-
-    auto & current = ctx->kv_self;
-    const auto & model = ctx->model;
-    if (current.recurrent || current.hybrid || current.v_trans || model.is_mla_model() ||
-            model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_OPENPANGU ||
-            !current.split_k_l.empty() || !current.split_v_l.empty() ||
-            !current.split_s_l.empty() || !current.replicated_k_l.empty()) {
-        LLAMA_LOG_ERROR("%s: live retiering is not supported for recurrent, transposed, MLA, or split KV layouts\n", __func__);
-        return false;
-    }
-
-    std::vector<ggml_type> target_k(n_layers, current.type_k);
-    std::vector<ggml_type> target_v(n_layers, current.type_v);
-    bool changed = target_size != current.size;
-    for (uint32_t layer = 0; layer < n_layers; ++layer) {
-        if (current.k_l[layer] != nullptr) {
-            target_k[layer] = type_k_layers == nullptr ? current.k_l[layer]->type : type_k_layers[layer];
-            changed |= target_k[layer] != current.k_l[layer]->type;
+        uint32_t target_size) noexcept {
+    try {
+        if (ctx == nullptr || ctx->kv_cache_transaction != nullptr ||
+                n_layers == 0 || n_layers != ctx->kv_self.k_l.size() ||
+                (type_k_layers == nullptr && type_v_layers == nullptr) || target_size == 0) {
+            LLAMA_LOG_ERROR("%s: invalid layer map or another transaction is already open\n", __func__);
+            return nullptr;
         }
-        if (layer < current.v_l.size() && current.v_l[layer] != nullptr) {
-            target_v[layer] = type_v_layers == nullptr ? current.v_l[layer]->type : type_v_layers[layer];
-            changed |= target_v[layer] != current.v_l[layer]->type;
-        }
-    }
-    if (!changed) {
-        return true;
-    }
 
-    if (target_size > ctx->cparams.n_ctx ||
-            target_size % llama_kv_cache_get_padding(ctx->cparams) != 0) {
-        LLAMA_LOG_ERROR("%s: target size %u exceeds the context limit or backend padding contract\n",
-                __func__, target_size);
-        return false;
-    }
-    if (target_size < current.size) {
-        for (uint32_t cell = target_size; cell < current.size; ++cell) {
-            if (current.cells[cell].pos >= 0) {
-                LLAMA_LOG_ERROR("%s: target size %u would discard occupied cell %u\n",
-                        __func__, target_size, cell);
-                return false;
+        auto & current = ctx->kv_self;
+        const auto & model = ctx->model;
+        if (current.recurrent || current.hybrid || current.v_trans || model.is_mla_model() ||
+                model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_OPENPANGU ||
+                !current.split_k_l.empty() || !current.split_v_l.empty() ||
+                !current.split_s_l.empty() || !current.replicated_k_l.empty()) {
+            LLAMA_LOG_ERROR("%s: live retiering is not supported for recurrent, transposed, MLA, or split KV layouts\n", __func__);
+            return nullptr;
+        }
+
+        std::vector<ggml_type> target_k(n_layers, current.type_k);
+        std::vector<ggml_type> target_v(n_layers, current.type_v);
+        bool changed = target_size != current.size;
+        for (uint32_t layer = 0; layer < n_layers; ++layer) {
+            if (current.k_l[layer] != nullptr) {
+                target_k[layer] = type_k_layers == nullptr ? current.k_l[layer]->type : type_k_layers[layer];
+                changed |= target_k[layer] != current.k_l[layer]->type;
+            }
+            if (layer < current.v_l.size() && current.v_l[layer] != nullptr) {
+                target_v[layer] = type_v_layers == nullptr ? current.v_l[layer]->type : type_v_layers[layer];
+                changed |= target_v[layer] != current.v_l[layer]->type;
             }
         }
-    }
 
-    llama_synchronize(ctx);
-    if (llama_kv_cache_update_internal(*ctx) != 0) {
-        LLAMA_LOG_ERROR("%s: failed to settle pending KV updates\n", __func__);
-        return false;
-    }
-    llama_synchronize(ctx);
-    ctx->reset_scheduler();
+        auto transaction = std::make_unique<llama_kv_cache_transaction>(ctx, target_size, changed);
+        if (!changed) {
+            return transaction;
+        }
 
-    llama_kv_cache prepared;
-    if (!llama_kv_cache_init(prepared, ctx, current.type_k, current.type_v,
-                ctx->cparams.idx_type_k, target_size, ctx->cparams.offload_kqv,
-                current.type_k, current.type_k, current.type_v, current.type_v,
-                -1, -1, -1, -1,
-                target_k.data(), target_v.data(), n_layers, n_layers)) {
-        LLAMA_LOG_ERROR("%s: target cache allocation failed; original cache retained\n", __func__);
-        return false;
-    }
-
-    const auto & hparams = model.hparams;
-    const int64_t fail_after = llama_kv_retier_failure_row();
-    int64_t migrated_rows = 0;
-    size_t peak_staging = 0;
-    std::vector<uint8_t> source_bytes;
-    std::vector<uint8_t> destination_bytes;
-    std::vector<float> source_float;
-    std::vector<float> destination_float;
-
-    const auto migrate = [&](const ggml_tensor * source, ggml_tensor * destination,
-            uint32_t logical_head, uint32_t head_count, uint32_t cell) -> bool {
-        const uint32_t source_head = uint32_t(source->ne[0] / (source->ne[1] == 1 ? current.size * head_count : 1));
-        const uint32_t destination_head = uint32_t(destination->ne[0] /
-                (destination->ne[1] == 1 ? prepared.size * head_count : 1));
-        const size_t source_head_bytes = ggml_row_size(source->type, source_head);
-        const size_t destination_head_bytes = ggml_row_size(destination->type, destination_head);
-        for (uint32_t head = 0; head < head_count; ++head) {
-            if (migrated_rows == fail_after) {
-                LLAMA_LOG_WARN("%s: injected failure after %lld rows; original cache retained\n",
-                        __func__, (long long) migrated_rows);
-                return false;
+        if (target_size > ctx->n_ctx_max ||
+                target_size % llama_kv_cache_get_padding(ctx->cparams) != 0) {
+            LLAMA_LOG_ERROR("%s: target size %u exceeds the context limit or backend padding contract\n",
+                    __func__, target_size);
+            return nullptr;
+        }
+        if (target_size < current.size) {
+            for (uint32_t cell = target_size; cell < current.size; ++cell) {
+                if (current.cells[cell].pos >= 0) {
+                    LLAMA_LOG_ERROR("%s: target size %u would discard occupied cell %u\n",
+                            __func__, target_size, cell);
+                    return nullptr;
+                }
             }
-            const size_t source_offset = (size_t(cell) * head_count + head) * source_head_bytes;
-            const size_t destination_offset = (size_t(cell) * head_count + head) * destination_head_bytes;
-            if (!llama_kv_cache_transcode_head_row(source, destination,
-                        source_offset, destination_offset, source_head, destination_head,
-                        logical_head, source_bytes, destination_bytes, source_float, destination_float)) {
-                return false;
-            }
-            ++migrated_rows;
-            peak_staging = std::max(peak_staging,
-                    source_bytes.capacity() + destination_bytes.capacity() +
-                    (source_float.capacity() + destination_float.capacity()) * sizeof(float));
         }
-        return true;
-    };
 
-    for (uint32_t layer = 0; layer < n_layers; ++layer) {
-        if ((current.k_l[layer] == nullptr) != (prepared.k_l[layer] == nullptr) ||
-                (layer < current.v_l.size() && current.v_l[layer] != nullptr) !=
-                (layer < prepared.v_l.size() && prepared.v_l[layer] != nullptr)) {
-            LLAMA_LOG_ERROR("%s: target cache geometry changed at layer %u\n", __func__, layer);
-            return false;
+        llama_synchronize(ctx);
+        if (llama_kv_cache_update_internal(*ctx) != 0) {
+            LLAMA_LOG_ERROR("%s: failed to settle pending KV updates\n", __func__);
+            return nullptr;
         }
-        if (current.k_l[layer] == nullptr) {
-            continue;
+        llama_synchronize(ctx);
+        ctx->reset_scheduler();
+
+        auto & prepared = transaction->alternate;
+        if (!llama_kv_cache_init(prepared, ctx, current.type_k, current.type_v,
+                    ctx->cparams.idx_type_k, target_size, ctx->cparams.offload_kqv,
+                    current.type_k, current.type_k, current.type_v, current.type_v,
+                    -1, -1, -1, -1,
+                    target_k.data(), target_v.data(), n_layers, n_layers)) {
+            LLAMA_LOG_ERROR("%s: target cache allocation failed; original cache retained\n", __func__);
+            return nullptr;
         }
-        const uint32_t head_count = hparams.n_head_kv(layer);
-        for (uint32_t cell = 0; cell < current.size; ++cell) {
-            if (current.cells[cell].pos < 0) {
+
+        const auto & hparams = model.hparams;
+        const int64_t fail_after = llama_kv_retier_failure_row();
+        std::vector<uint8_t> source_bytes;
+        std::vector<uint8_t> destination_bytes;
+        std::vector<float> source_float;
+        std::vector<float> destination_float;
+
+        const auto migrate = [&](const ggml_tensor * source, ggml_tensor * destination,
+                uint32_t logical_head, uint32_t head_count, uint32_t cell) -> bool {
+            const uint32_t source_head = uint32_t(source->ne[0] / (source->ne[1] == 1 ? current.size * head_count : 1));
+            const uint32_t destination_head = uint32_t(destination->ne[0] /
+                    (destination->ne[1] == 1 ? prepared.size * head_count : 1));
+            const size_t source_head_bytes = ggml_row_size(source->type, source_head);
+            const size_t destination_head_bytes = ggml_row_size(destination->type, destination_head);
+            for (uint32_t head = 0; head < head_count; ++head) {
+                if (transaction->migrated_rows == fail_after) {
+                    LLAMA_LOG_WARN("%s: injected failure after %lld rows; original cache retained\n",
+                            __func__, (long long) transaction->migrated_rows);
+                    return false;
+                }
+                const size_t source_offset = (size_t(cell) * head_count + head) * source_head_bytes;
+                const size_t destination_offset = (size_t(cell) * head_count + head) * destination_head_bytes;
+                if (!llama_kv_cache_transcode_head_row(source, destination,
+                            source_offset, destination_offset, source_head, destination_head,
+                            logical_head, source_bytes, destination_bytes, source_float, destination_float)) {
+                    return false;
+                }
+                ++transaction->migrated_rows;
+                transaction->peak_staging = std::max(transaction->peak_staging,
+                        source_bytes.capacity() + destination_bytes.capacity() +
+                        (source_float.capacity() + destination_float.capacity()) * sizeof(float));
+            }
+            return true;
+        };
+
+        for (uint32_t layer = 0; layer < n_layers; ++layer) {
+            if ((current.k_l[layer] == nullptr) != (prepared.k_l[layer] == nullptr) ||
+                    (layer < current.v_l.size() && current.v_l[layer] != nullptr) !=
+                    (layer < prepared.v_l.size() && prepared.v_l[layer] != nullptr)) {
+                LLAMA_LOG_ERROR("%s: target cache geometry changed at layer %u\n", __func__, layer);
+                return nullptr;
+            }
+            if (current.k_l[layer] == nullptr) {
                 continue;
             }
-            if (!migrate(current.k_l[layer], prepared.k_l[layer],
-                        hparams.n_embd_head_k(layer), head_count, cell)) {
-                return false;
-            }
-            if (layer < current.v_l.size() && current.v_l[layer] != nullptr &&
-                    !migrate(current.v_l[layer], prepared.v_l[layer],
-                        hparams.n_embd_head_v(layer), head_count, cell)) {
-                return false;
+            const uint32_t head_count = hparams.n_head_kv(layer);
+            for (uint32_t cell = 0; cell < current.size; ++cell) {
+                if (current.cells[cell].pos < 0) {
+                    continue;
+                }
+                if (!migrate(current.k_l[layer], prepared.k_l[layer],
+                            hparams.n_embd_head_k(layer), head_count, cell)) {
+                    return nullptr;
+                }
+                if (layer < current.v_l.size() && current.v_l[layer] != nullptr &&
+                        !migrate(current.v_l[layer], prepared.v_l[layer],
+                            hparams.n_embd_head_v(layer), head_count, cell)) {
+                    return nullptr;
+                }
             }
         }
+
+        const uint32_t retained_cells = std::min(current.size, prepared.size);
+        std::copy_n(current.cells.begin(), retained_cells, prepared.cells.begin());
+        prepared.head = current.head < prepared.size ? current.head : 0;
+        prepared.used = current.used;
+        prepared.n = std::min(current.n, prepared.size);
+        prepared.has_shift = current.has_shift;
+        prepared.save_per_step_ssm = current.save_per_step_ssm;
+        return transaction;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: preparation threw an exception; original cache retained: %s\n",
+                __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: preparation threw an unknown exception; original cache retained\n", __func__);
+    }
+    return nullptr;
+}
+
+llama_kv_cache_transaction_t llama_kv_cache_prepare_retier(
+        struct llama_context * ctx,
+        const enum ggml_type * type_k_layers,
+        const enum ggml_type * type_v_layers,
+        uint32_t n_layers) {
+    try {
+        if (ctx == nullptr) {
+            return nullptr;
+        }
+        auto transaction = llama_kv_cache_prepare_impl(
+                ctx, type_k_layers, type_v_layers, n_layers, ctx->kv_self.size);
+        if (!transaction) {
+            return nullptr;
+        }
+        ctx->kv_cache_transaction = transaction.get();
+        return transaction.release();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: exception while preparing retier transaction: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception while preparing retier transaction\n", __func__);
+    }
+    return nullptr;
+}
+
+llama_kv_cache_transaction_t llama_kv_cache_prepare_resize(
+        struct llama_context * ctx,
+        uint32_t size) {
+    try {
+        if (ctx == nullptr || ctx->kv_self.k_l.empty()) {
+            return nullptr;
+        }
+        const uint32_t n_layers = uint32_t(ctx->kv_self.k_l.size());
+        std::vector<ggml_type> type_k(n_layers, ctx->kv_self.type_k);
+        std::vector<ggml_type> type_v(n_layers, ctx->kv_self.type_v);
+        for (uint32_t layer = 0; layer < n_layers; ++layer) {
+            if (ctx->kv_self.k_l[layer] != nullptr) {
+                type_k[layer] = ctx->kv_self.k_l[layer]->type;
+            }
+            if (layer < ctx->kv_self.v_l.size() && ctx->kv_self.v_l[layer] != nullptr) {
+                type_v[layer] = ctx->kv_self.v_l[layer]->type;
+            }
+        }
+        auto transaction = llama_kv_cache_prepare_impl(
+                ctx, type_k.data(), type_v.data(), n_layers, size);
+        if (!transaction) {
+            return nullptr;
+        }
+        ctx->kv_cache_transaction = transaction.get();
+        return transaction.release();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: exception while preparing resize transaction: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception while preparing resize transaction\n", __func__);
+    }
+    return nullptr;
+}
+
+bool llama_kv_cache_transaction_publish(llama_kv_cache_transaction_t transaction) {
+    try {
+        return transaction != nullptr && transaction->publish();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: publication exception: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown publication exception\n", __func__);
+    }
+    return false;
+}
+
+bool llama_kv_cache_transaction_rollback(llama_kv_cache_transaction_t transaction) {
+    try {
+        return transaction != nullptr && transaction->rollback();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: rollback exception: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown rollback exception\n", __func__);
+    }
+    return false;
+}
+
+bool llama_kv_cache_transaction_finalize(llama_kv_cache_transaction_t transaction) {
+    try {
+        return transaction != nullptr && transaction->finalize();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: finalization exception: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown finalization exception\n", __func__);
+    }
+    return false;
+}
+
+void llama_kv_cache_transaction_free(llama_kv_cache_transaction_t transaction) {
+    if (transaction == nullptr) {
+        return;
+    }
+    try {
+        delete transaction;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: transaction destruction exception: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown transaction destruction exception\n", __func__);
+    }
+}
+
+static bool llama_kv_cache_replace(llama_kv_cache_transaction_t transaction) noexcept {
+    if (transaction == nullptr || !llama_kv_cache_transaction_publish(transaction)) {
+        llama_kv_cache_transaction_free(transaction);
+        return false;
+    }
+    if (transaction->changes_storage && llama_kv_cache_transaction_fail_after_publish()) {
+        LLAMA_LOG_WARN("%s: injected failure after reversible publication; rolling back\n", __func__);
+        if (!llama_kv_cache_transaction_rollback(transaction)) {
+            LLAMA_LOG_ERROR("%s: failed to roll back reversible KV publication\n", __func__);
+        }
+        llama_kv_cache_transaction_free(transaction);
+        return false;
     }
 
-    const uint32_t retained_cells = std::min(current.size, prepared.size);
-    std::copy_n(current.cells.begin(), retained_cells, prepared.cells.begin());
-    prepared.head = current.head < prepared.size ? current.head : 0;
-    prepared.used = current.used;
-    prepared.n = std::min(current.n, prepared.size);
-    prepared.has_shift = current.has_shift;
-    prepared.save_per_step_ssm = current.save_per_step_ssm;
-
-    // Publication cannot fail: all allocation and conversion work completed
-    // above. Releasing an in-memory checkpoint prevents it from retaining
-    // tensors owned by the old representation.
-    current.ckpt.release();
-    prepared.ckpt.release();
-    llama_kv_cache_swap_storage(current, prepared);
-    ctx->reset_scheduler();
-    for (auto & copy : ctx->cache_copies) copy = {};
-    for (auto & copy : ctx->dsa_cache_copies) copy = {};
-    for (auto & copy : ctx->openpangu_cache_copies) copy = {};
-    for (auto & copy : ctx->openpangu_cache_copies_mtp) copy = {};
-
+    const int64_t migrated_rows = transaction->migrated_rows;
+    const size_t peak_staging = transaction->peak_staging;
+    if (!llama_kv_cache_transaction_finalize(transaction)) {
+        llama_kv_cache_transaction_free(transaction);
+        return false;
+    }
+    llama_kv_cache_transaction_free(transaction);
     LLAMA_LOG_INFO("%s: committed %lld bounded row migrations (peak host staging %.2f KiB)\n",
             __func__, (long long) migrated_rows, peak_staging / 1024.0);
     return true;
@@ -10566,24 +10953,298 @@ bool llama_kv_cache_retier(
         const enum ggml_type * type_k_layers,
         const enum ggml_type * type_v_layers,
         uint32_t n_layers) {
-    return llama_kv_cache_replace(ctx, type_k_layers, type_v_layers, n_layers,
-            ctx == nullptr ? 0 : ctx->kv_self.size);
+    return llama_kv_cache_replace(llama_kv_cache_prepare_retier(
+            ctx, type_k_layers, type_v_layers, n_layers));
 }
 
 bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size) {
-    if (ctx == nullptr || ctx->kv_self.k_l.empty()) {
+    try {
+        return llama_kv_cache_replace(llama_kv_cache_prepare_resize(ctx, size));
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: exception while constructing target layer map: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception while constructing target layer map\n", __func__);
+    }
+    return false;
+}
+
+enum class llama_expert_cache_transaction_state : uint8_t {
+    prepared,
+    published,
+    rolled_back,
+    finalized,
+};
+
+struct llama_expert_cache_transaction {
+    llama_context * ctx = nullptr;
+    ggml_backend_sched_expert_cache_txn_t backend = nullptr;
+    llama_expert_cache_transaction_state state =
+            llama_expert_cache_transaction_state::prepared;
+    uint64_t previous_bytes_per_device = 0;
+    uint64_t target_bytes_per_device = 0;
+    bool previous_fused_mmad = false;
+};
+
+static llama_expert_cache_transaction_t llama_expert_cache_prepare_resize_impl(
+        struct llama_context * ctx,
+        uint64_t bytes_per_device) {
+    if (ctx == nullptr || ctx->active_expert_cache_transaction != nullptr) {
+        return nullptr;
+    }
+
+    llama_synchronize(ctx);
+    std::unique_ptr<llama_expert_cache_transaction> transaction(
+            new llama_expert_cache_transaction);
+    transaction->ctx = ctx;
+    transaction->previous_bytes_per_device = ctx->cparams.expert_vram_cache_bytes;
+    transaction->target_bytes_per_device = bytes_per_device;
+    transaction->previous_fused_mmad = ctx->cparams.fused_mmad;
+    transaction->backend = ggml_backend_sched_expert_cache_prepare(
+                ctx->sched,
+                bytes_per_device,
+                ctx->cparams.expert_vram_reserve_bytes,
+                ctx->cparams.expert_cache_min_observations);
+    if (!transaction->backend) return nullptr;
+    ctx->active_expert_cache_transaction = transaction.get();
+    return transaction.release();
+}
+
+static bool llama_expert_cache_transaction_publish_impl(
+        llama_expert_cache_transaction_t transaction) {
+    if (!transaction || !transaction->ctx || !transaction->backend ||
+            transaction->ctx->active_expert_cache_transaction != transaction ||
+            transaction->state != llama_expert_cache_transaction_state::prepared) {
         return false;
     }
-    const uint32_t n_layers = uint32_t(ctx->kv_self.k_l.size());
-    std::vector<ggml_type> type_k(n_layers, ctx->kv_self.type_k);
-    std::vector<ggml_type> type_v(n_layers, ctx->kv_self.type_v);
-    for (uint32_t layer = 0; layer < n_layers; ++layer) {
-        if (ctx->kv_self.k_l[layer] != nullptr) type_k[layer] = ctx->kv_self.k_l[layer]->type;
-        if (layer < ctx->kv_self.v_l.size() && ctx->kv_self.v_l[layer] != nullptr) {
-            type_v[layer] = ctx->kv_self.v_l[layer]->type;
-        }
+    if (!ggml_backend_sched_expert_cache_publish(transaction->backend)) return false;
+
+    transaction->ctx->cparams.expert_vram_cache_bytes =
+            transaction->target_bytes_per_device;
+    if (transaction->target_bytes_per_device > 0) {
+        // One-way safety guard: the CPU-expert -> CUDA fused MMAD boundary is
+        // not correct with a live adaptive cache. Disabling the cache later
+        // must not silently re-enable an unproven path.
+        transaction->ctx->cparams.fused_mmad = false;
     }
-    return llama_kv_cache_replace(ctx, type_k.data(), type_v.data(), n_layers, size);
+    transaction->ctx->reset_scheduler();
+    transaction->state = llama_expert_cache_transaction_state::published;
+    return true;
+}
+
+static bool llama_expert_cache_transaction_rollback_impl(
+        llama_expert_cache_transaction_t transaction) {
+    if (!transaction || !transaction->ctx || !transaction->backend ||
+            transaction->ctx->active_expert_cache_transaction != transaction ||
+            transaction->state != llama_expert_cache_transaction_state::published) {
+        return false;
+    }
+    if (!ggml_backend_sched_expert_cache_rollback(transaction->backend)) return false;
+
+    transaction->ctx->cparams.expert_vram_cache_bytes =
+            transaction->previous_bytes_per_device;
+    transaction->ctx->cparams.fused_mmad = transaction->previous_fused_mmad;
+    transaction->ctx->reset_scheduler();
+    transaction->state = llama_expert_cache_transaction_state::rolled_back;
+    return true;
+}
+
+static bool llama_expert_cache_transaction_finalize_impl(
+        llama_expert_cache_transaction_t transaction) {
+    if (!transaction || !transaction->ctx || !transaction->backend ||
+            transaction->ctx->active_expert_cache_transaction != transaction ||
+            transaction->state != llama_expert_cache_transaction_state::published) {
+        return false;
+    }
+    if (!ggml_backend_sched_expert_cache_finalize(transaction->backend)) return false;
+    transaction->backend = nullptr;
+    transaction->state = llama_expert_cache_transaction_state::finalized;
+    return true;
+}
+
+static bool llama_expert_cache_transaction_free_impl(
+        llama_expert_cache_transaction_t transaction) {
+    if (!transaction) return true;
+    if (!transaction->ctx ||
+            transaction->ctx->active_expert_cache_transaction != transaction) {
+        return false;
+    }
+    if (transaction->state == llama_expert_cache_transaction_state::published &&
+            !llama_expert_cache_transaction_rollback_impl(transaction)) {
+        return false;
+    }
+    if (transaction->backend &&
+            !ggml_backend_sched_expert_cache_finalize(transaction->backend)) {
+        return false;
+    }
+    transaction->backend = nullptr;
+    transaction->ctx->active_expert_cache_transaction = nullptr;
+    transaction->ctx = nullptr;
+    delete transaction;
+    return true;
+}
+
+static void llama_expert_cache_transaction_release_for_context_teardown(
+        struct llama_context * ctx) noexcept {
+    if (!ctx || !ctx->active_expert_cache_transaction) return;
+    try {
+        if (llama_expert_cache_transaction_free_impl(
+                ctx->active_expert_cache_transaction)) {
+            return;
+        }
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: transaction release exception: %s\n",
+                __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown transaction release exception\n", __func__);
+    }
+
+    // Context destruction cannot return an error to the caller. If ordinary
+    // rollback/release failed, sever the public shell deterministically and
+    // ask the lower scheduler transaction to retire its off-side owner. If
+    // that lower call also fails, the scheduler still owns the lower handle
+    // and its destructor performs the final retirement before backend teardown.
+    auto * transaction = ctx->active_expert_cache_transaction;
+    LLAMA_LOG_ERROR(
+            "%s: forcing transaction retirement during context teardown\n",
+            __func__);
+    if (transaction->backend &&
+            !ggml_backend_sched_expert_cache_finalize(transaction->backend)) {
+        LLAMA_LOG_ERROR(
+                "%s: scheduler retains lower transaction for teardown\n",
+                __func__);
+    }
+    transaction->backend = nullptr;
+    transaction->ctx = nullptr;
+    ctx->active_expert_cache_transaction = nullptr;
+    delete transaction;
+}
+
+llama_expert_cache_transaction_t llama_expert_cache_prepare_resize(
+        struct llama_context * ctx,
+        uint64_t bytes_per_device) {
+    try {
+        return llama_expert_cache_prepare_resize_impl(ctx, bytes_per_device);
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
+    }
+    return nullptr;
+}
+
+bool llama_expert_cache_transaction_publish(
+        llama_expert_cache_transaction_t transaction) {
+    try {
+        return llama_expert_cache_transaction_publish_impl(transaction);
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
+    }
+    return false;
+}
+
+bool llama_expert_cache_transaction_rollback(
+        llama_expert_cache_transaction_t transaction) {
+    try {
+        return llama_expert_cache_transaction_rollback_impl(transaction);
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
+    }
+    return false;
+}
+
+bool llama_expert_cache_transaction_finalize(
+        llama_expert_cache_transaction_t transaction) {
+    try {
+        return llama_expert_cache_transaction_finalize_impl(transaction);
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
+    }
+    return false;
+}
+
+void llama_expert_cache_transaction_free(
+        llama_expert_cache_transaction_t transaction) {
+    try {
+        if (!llama_expert_cache_transaction_free_impl(transaction)) {
+            LLAMA_LOG_ERROR("%s: unable to safely release transaction\n", __func__);
+        }
+    } catch (const std::exception & exception) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, exception.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
+    }
+}
+
+bool llama_expert_cache_resize(
+        struct llama_context * ctx,
+        uint64_t bytes_per_device) {
+    auto * transaction = llama_expert_cache_prepare_resize(ctx, bytes_per_device);
+    if (!transaction) {
+        LLAMA_LOG_ERROR("%s: target expert cache allocation failed; original cache retained\n", __func__);
+        return false;
+    }
+    if (!llama_expert_cache_transaction_publish(transaction)) {
+        llama_expert_cache_transaction_free(transaction);
+        LLAMA_LOG_ERROR("%s: target expert cache publication failed; original cache retained\n", __func__);
+        return false;
+    }
+    if (!llama_expert_cache_transaction_finalize(transaction)) {
+        llama_expert_cache_transaction_free(transaction);
+        LLAMA_LOG_ERROR("%s: target expert cache finalization failed; original cache restored\n", __func__);
+        return false;
+    }
+    llama_expert_cache_transaction_free(transaction);
+    return true;
+}
+
+uint32_t llama_resource_device_count(const struct llama_context * ctx) {
+    if (ctx == nullptr) return 0;
+    const size_t count = ggml_backend_sched_get_resource_device_count(ctx->sched);
+    return count > UINT32_MAX ? UINT32_MAX : uint32_t(count);
+}
+
+bool llama_resource_get_snapshot(
+        const struct llama_context * ctx,
+        struct llama_resource_snapshot * snapshot,
+        struct llama_resource_device_snapshot * devices,
+        uint32_t device_capacity) {
+    if (ctx == nullptr || snapshot == nullptr) return false;
+    const uint32_t count = llama_resource_device_count(ctx);
+    if (count > 0 && (devices == nullptr || device_capacity < count)) return false;
+
+    llama_expert_cache::cache_stats ram = {};
+    if (ctx->model.expert_ram_cache) ram = ctx->model.expert_ram_cache->stats();
+    *snapshot = {
+        ctx->kv_self.size,
+        ctx->kv_self.used,
+        uint64_t(ctx->kv_self.total_size()),
+        ram.capacity_bytes,
+        ram.resident_bytes,
+        ram.active_leases,
+        count,
+        ctx->n_ctx_max,
+    };
+
+    std::vector<ggml_backend_sched_resource_device_stats> native(count);
+    if (!ggml_backend_sched_get_resource_device_stats(
+            ctx->sched, native.data(), native.size())) return false;
+    for (uint32_t index = 0; index < count; ++index) {
+        devices[index] = {
+            native[index].backend_id,
+            native[index].expert_cache_capacity_bytes,
+            native[index].expert_cache_allocated_bytes,
+            native[index].expert_cache_resident_bytes,
+            native[index].expert_prefill_capacity_bytes,
+            native[index].expert_prefill_allocated_bytes,
+        };
+    }
+    return true;
 }
 
 // deprecated
@@ -12821,7 +13482,9 @@ static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
         return tmpl.find(haystack) != std::string::npos;
     };
     if (tmpl_contains("<|im_start|>")) {
-        return LLM_CHAT_TEMPLATE_CHATML;
+        return tmpl_contains("<|im_sep|>")
+            ? LLM_CHAT_TEMPLATE_PHI_4
+            : LLM_CHAT_TEMPLATE_CHATML;
     } else if (tmpl.find("mistral") == 0 || tmpl_contains("[INST]")) {
         if (tmpl_contains("[SYSTEM_PROMPT]")) {
             return LLM_CHAT_TEMPLATE_MISTRAL_V7;
@@ -12865,7 +13528,7 @@ static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
     } else if (tmpl_contains("<|assistant|>") && tmpl_contains("<|end|>")) {
         return LLM_CHAT_TEMPLATE_PHI_3;
     } else if (tmpl_contains("<|assistant|>") && tmpl_contains("<|user|>")) {
-        return LLM_CHAT_TEMPLATE_FALCON_3;
+        return tmpl_contains("</s>") ? LLM_CHAT_TEMPLATE_FALCON_3 : LLM_CHAT_TEMPLATE_GLMEDGE;
     } else if (tmpl == "falcon_e" && (tmpl_contains("assistant") && tmpl_contains("user"))) {
         return LLM_CHAT_TEMPLATE_FALCON_E;
     } else if (tmpl_contains("<|user|>") && tmpl_contains("<|endoftext|>")) {
@@ -12914,6 +13577,8 @@ static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
         return LLM_CHAT_TEMPLATE_GIGACHAT;
     } else if (tmpl_contains("<|role_start|>")) {
         return LLM_CHAT_TEMPLATE_MEGREZ;
+    } else if (tmpl_contains(" Ассистент:")) {
+        return LLM_CHAT_TEMPLATE_YANDEX;
     } else if (tmpl_contains("<role>ASSISTANT</role>") && tmpl_contains("'HUMAN'")) {
         return LLM_CHAT_TEMPLATE_BAILING;
     } else if (tmpl_contains("<role>ASSISTANT</role>") && tmpl_contains("\"HUMAN\"") && tmpl_contains("<think>")) {
@@ -13037,6 +13702,13 @@ static int32_t llama_chat_apply_template_internal(
         }
         if (add_ass) {
             ss << "<|assistant|>\n";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_PHI_4) {
+        for (auto message : chat) {
+            ss << "<|im_start|>" << message->role << "<|im_sep|>" << message->content << "<|im_end|>";
+        }
+        if (add_ass) {
+            ss << "<|im_start|>assistant<|im_sep|>";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_FALCON_3) {
         // Falcon 3
@@ -13205,6 +13877,14 @@ static int32_t llama_chat_apply_template_internal(
             ss << "<|" << role << "|>" << "\n" << message->content;
         }
         if (add_ass) {
+            ss << "<|assistant|>\n";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_GLMEDGE) {
+        for (auto message : chat) {
+            std::string role(message->role);
+            ss << "<|" << role << "|>" << "\n" << message->content;
+        }
+        if (add_ass) {
             ss << "<|assistant|>";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_MINICPM) {
@@ -13286,7 +13966,7 @@ static int32_t llama_chat_apply_template_internal(
             ss << message->content << "<|end_of_text|>\n";
         }
         if (add_ass) {
-            ss << "<|start_of_role|>assistant<|end_of_role|>\n";
+            ss << "<|start_of_role|>assistant<|end_of_role|>";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_GIGACHAT) {
         // GigaChat template
@@ -13323,6 +14003,18 @@ static int32_t llama_chat_apply_template_internal(
 
         if (add_ass) {
             ss << "<|role_start|>assistant<|role_end|>";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_YANDEX) {
+        for (size_t i = 0; i < chat.size(); i++) {
+            std::string role(chat[i]->role);
+            if (role == "user") {
+                ss << LU8(" Пользователь: ") << chat[i]->content << "\n\n";
+            } else if (role == "assistant") {
+                ss << LU8(" Ассистент: ") << chat[i]->content << "\n\n";
+            }
+        }
+        if (add_ass) {
+            ss << LU8(" Ассистент:[SEP]");
         }
     }  else if (tmpl == LLM_CHAT_TEMPLATE_BAILING || tmpl == LLM_CHAT_TEMPLATE_BAILING_THINK) {
         // Bailing (Ling/Ring) template

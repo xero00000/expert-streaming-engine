@@ -29,6 +29,8 @@ mkdirSync(join(destination, "build", "bin"), { recursive: true });
 cpSync(join(repoRoot, "ese"), join(destination, "ese"));
 cpSync(join(repoRoot, "ese.cmd"), join(destination, "ese.cmd"));
 cpSync(join(repoRoot, "tools", "ese.py"), join(destination, "tools", "ese.py"));
+cpSync(join(repoRoot, "tools", "hardware_profile.py"), join(destination, "tools", "hardware_profile.py"));
+cpSync(join(repoRoot, "tools", "__init__.py"), join(destination, "tools", "__init__.py"));
 if (process.platform === "win32") {
   const standaloneLauncher = join(repoRoot, "dist", "ese.exe");
   if (!existsSync(standaloneLauncher)) {

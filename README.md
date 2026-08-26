@@ -15,7 +15,7 @@ observable decisions, and no hidden backend or precision fallback.
 
 ## Install ESE Studio + ESE
 
-The v0.1.2 desktop installers are unified: one installation provides ESE
+The v0.2.0 desktop installers are unified: one installation provides ESE
 Studio, the `ese` launcher, and a matching native `llama-server` runtime. The
 Windows package includes CUDA acceleration for NVIDIA GPUs and retains CPU
 fallback. Linux packages carry a portable CPU baseline. A source install
@@ -32,16 +32,16 @@ The AppImage is recommended when you want signed in-app updates:
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
-chmod +x ese-studio_0.1.2_amd64.AppImage
-./ese-studio_0.1.2_amd64.AppImage
+chmod +x ese-studio_0.2.0_amd64.AppImage
+./ese-studio_0.2.0_amd64.AppImage
 ```
 
 Native packages integrate with the system package manager and are updated by
 installing the next package release:
 
 ```bash
-sudo apt install ./ese-studio_0.1.2_amd64.deb       # Debian / Ubuntu
-sudo dnf install ./ese-studio-0.1.2-1.x86_64.rpm   # Fedora / Nobara
+sudo apt install ./ese-studio_0.2.0_amd64.deb       # Debian / Ubuntu
+sudo dnf install ./ese-studio-0.2.0-1.x86_64.rpm   # Fedora / Nobara
 ```
 
 For a user-local accelerated build from source:
@@ -59,7 +59,7 @@ them. It installs Studio under `~/.local/share/ese-studio`, and installs both
 
 ### Windows
 
-Download the NSIS `ese-studio_0.1.2_x64-setup.exe` (recommended) or MSI,
+Download the NSIS `ese-studio_0.2.0_x64-setup.exe` (recommended) or MSI,
 compare its SHA-256 value with `SHA256SUMS-windows.txt`, and run it. Studio, a
 standalone `ese.exe`, and the native server are installed together; Python is
 not required at runtime. The NSIS build supports signed in-app updates from
@@ -206,6 +206,35 @@ host RAM, and current per-GPU VRAM before choosing a native policy.
 ./ese serve MODEL.gguf --policy stream --expert-storage-backend pread
 ```
 
+Hardware calibration can propose a mixed CPU/GPU expert split, but ESE will not
+activate it until the exact model, hardware, and launch configuration beats the
+established path with identical deterministic output:
+
+```bash
+./ese calibrate --model MODEL.gguf
+./ese validate-hybrid MODEL.gguf --policy stream
+./ese serve MODEL.gguf --policy stream
+```
+
+On strongly heterogeneous systems where valid per-device calibration disagrees,
+advanced users can test a specific split with
+`./ese validate-hybrid MODEL.gguf --hybrid-candidate N`. The same option on
+`plan` or `serve` remains inert until that exact candidate has passing evidence;
+it cannot bypass missing or stale calibration.
+
+The validator stores no prompts or generated text. It also requires reconciled
+per-layer cache telemetry, mixed CPU/GPU routing, zero forced fallbacks, and CPU
+compute/upload timing that remains within conservative bounds of calibration.
+Its local evidence is private to the user (`0600`) and becomes stale when the
+sampled model contents, hardware topology, or performance-relevant configuration
+changes.
+
+Passing evidence also configures a one-way native serving guard. Rolling CPU and
+upload windows are checked against the calibrated bounds after transfer events
+complete; any contradiction or forced fallback permanently returns subsequent
+graphs to the established path. `GET /props` reports the live
+`expert_hybrid_guard` state and reason for ESE Studio and operators.
+
 Use `./ese plan MODEL.gguf --json` for machine-readable launcher output. Pass
 native `llama-server` options after `--`:
 
@@ -295,6 +324,9 @@ validation.
 | Expert hierarchy | mmap/pread parity, forced eviction, sanitizer coverage, and 1/2/3-GPU execution |
 | CUDA hardware | RTX 2080 SUPER (`sm_75`), RTX 3060 Ti (`sm_86`), and RTX 3080 (`sm_86`) |
 | Global controller | CPU plus real Turing+Ampere three-GPU model load with explicit 1 GiB reserves |
+| Hardware-adaptive MoE | Schema-v3 DeepSeek-V4-Flash gate measured 7.54x; model-backed one-way live revocation and `/props` status reporting |
+| Kimi Linear | Kimi Linear 48B-A3B MXFP4_MOE loads all 610 tensors; CPU/CUDA KDA parity, deterministic generation, 64K allocation, and bounded top-8 sidecar caching verified |
+| Runtime rebalancing | Occupied KV shrink/grow parity, busy-server rejection, injected migration rollback, and post-failure continuation |
 | Transient/speculation | CPU, Turing, Ampere, and model-backed image→text module swapping |
 | Turbo KV foundation | CPU/CUDA codecs, direct attention paths, lifecycle tests, and quality sweeps |
 
@@ -325,6 +357,13 @@ class and NVMe storage. These are machine- and configuration-specific
 engineering records, not universal performance promises. See
 [reference benchmarks](docs/ESE_BENCHMARKS.md) for exact commands, model hash,
 hardware, repetition statistics, cold/warm behavior, and ablations.
+
+Kimi Linear 48B-A3B MXFP4_MOE now runs through ESE's hybrid KDA/MLA and
+sidecar-cache path. On the reference RTX 3060 Ti + RTX 3080 pair, a 65,536-token
+context allocation and deterministic 32-token decode reached 9.29 tok/s with a
+`4,22` layer split and 2 GiB expert cache per device. This was a short-prompt
+decode test, not evidence of a fully populated 64K prompt; exact results and
+the tested command are in the benchmark document.
 
 ## Documentation
 

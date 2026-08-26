@@ -17,7 +17,9 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <new>
 #include <unordered_map>
+#include <utility>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -261,6 +263,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
     int n_embd = 0;
     std::unordered_map<llama_seq_id, std::vector<float>> target_hidden_by_seq;
     std::unordered_map<llama_seq_id, mtp_last_embd> draft_cache_by_seq;
+    common_speculative_mtp_transaction_t active_transaction = nullptr;
 
     common_speculative_state_mtp(
             enum common_speculative_type type,
@@ -300,46 +303,6 @@ struct common_speculative_state_mtp : public common_speculative_state {
         if (ctx_mtp) {
             llama_free(ctx_mtp);
         }
-    }
-
-    bool suspend() {
-        target_hidden_by_seq.clear();
-        draft_cache_by_seq.clear();
-        mtp_warmed_heads = 0;
-        if (smpl) {
-            common_sampler_free(smpl);
-            smpl = nullptr;
-        }
-        if (ctx_mtp) {
-            llama_free(ctx_mtp);
-            ctx_mtp = nullptr;
-        }
-        return true;
-    }
-
-    bool resume() {
-        if (ctx_mtp) {
-            return true;
-        }
-        ctx_mtp = llama_init_from_model(model_mtp, cparams_mtp);
-        if (!ctx_mtp) {
-            return false;
-        }
-        common_params_sampling sparams;
-        sparams.samplers_sequence = { llama_sampler_type::DIST };
-        smpl = common_sampler_init(model_mtp, sparams);
-        if (!smpl) {
-            llama_free(ctx_mtp);
-            ctx_mtp = nullptr;
-            return false;
-        }
-        llama_set_mtp_target_context(ctx_mtp, ctx_tgt);
-        n_embd = llama_mtp_state_n_embd(ctx_mtp);
-        n_heads_model = std::max(1, llama_model_n_nextn_layer(model_mtp));
-        target_hidden_by_seq.clear();
-        draft_cache_by_seq.clear();
-        mtp_warmed_heads = 0;
-        return true;
     }
 
     void begin(const llama_tokens & prompt) override {
@@ -1564,6 +1527,11 @@ void common_speculative_free(common_speculative * spec) {
         return;
     }
 
+    if (auto * state = common_speculative_get_mtp_state(spec);
+            state != nullptr && state->active_transaction != nullptr) {
+        LOG_WRN("%s: freeing an unresolved MTP residency transaction\n", __func__);
+        common_speculative_mtp_transaction_free(state->active_transaction);
+    }
     spec->checkpoint.clear();
     delete spec;
 }
@@ -2867,30 +2835,239 @@ llama_context * common_speculative_get_companion_ctx(common_speculative * spec) 
     return nullptr;
 }
 
-bool common_speculative_suspend_mtp(common_speculative * spec) {
-    auto * state = common_speculative_get_mtp_state(spec);
-    if (state == nullptr) {
-        return true;
+enum class common_speculative_mtp_transaction_state : uint8_t {
+    prepared,
+    published,
+    rolled_back,
+    finalized,
+};
+
+// Exactly one of these owners is off-side during a residency transaction. It
+// starts as the prepared target owner; after publication it is the prior live
+// owner. Destruction retires every resource and all cached sequence state held
+// by that owner.
+struct common_speculative_mtp_owner {
+    llama_context * ctx_mtp = nullptr;
+    common_sampler * sampler = nullptr;
+    int32_t warmed_heads = 0;
+    std::unordered_map<llama_seq_id, std::vector<float>> target_hidden_by_seq;
+    std::unordered_map<llama_seq_id, mtp_last_embd> draft_cache_by_seq;
+
+    common_speculative_mtp_owner() = default;
+    common_speculative_mtp_owner(const common_speculative_mtp_owner &) = delete;
+    common_speculative_mtp_owner & operator=(const common_speculative_mtp_owner &) = delete;
+
+    ~common_speculative_mtp_owner() noexcept {
+        if (sampler != nullptr) {
+            common_sampler_free(sampler);
+        }
+        if (ctx_mtp != nullptr) {
+            llama_free(ctx_mtp);
+        }
     }
+};
+
+static_assert(noexcept(std::declval<decltype(common_speculative_mtp_owner::target_hidden_by_seq) &>().swap(
+        std::declval<decltype(common_speculative_mtp_owner::target_hidden_by_seq) &>())));
+static_assert(noexcept(std::declval<decltype(common_speculative_mtp_owner::draft_cache_by_seq) &>().swap(
+        std::declval<decltype(common_speculative_mtp_owner::draft_cache_by_seq) &>())));
+
+struct common_speculative_mtp_transaction {
+    common_speculative_state_mtp * mtp_state = nullptr;
+    std::unique_ptr<common_speculative_mtp_owner> alternate;
+    common_speculative_mtp_transaction_state state =
+            common_speculative_mtp_transaction_state::prepared;
+    bool changes_owner = false;
+
+    common_speculative_mtp_transaction() = default;
+    common_speculative_mtp_transaction(const common_speculative_mtp_transaction &) = delete;
+    common_speculative_mtp_transaction & operator=(const common_speculative_mtp_transaction &) = delete;
+
+    void swap_owner() noexcept {
+        GGML_ASSERT(mtp_state != nullptr);
+        GGML_ASSERT(alternate != nullptr);
+
+        std::swap(mtp_state->ctx_mtp, alternate->ctx_mtp);
+        std::swap(mtp_state->smpl, alternate->sampler);
+        std::swap(mtp_state->mtp_warmed_heads, alternate->warmed_heads);
+        mtp_state->target_hidden_by_seq.swap(alternate->target_hidden_by_seq);
+        mtp_state->draft_cache_by_seq.swap(alternate->draft_cache_by_seq);
+    }
+
+    void detach_owner() noexcept {
+        if (mtp_state != nullptr && mtp_state->active_transaction == this) {
+            mtp_state->active_transaction = nullptr;
+        }
+        mtp_state = nullptr;
+    }
+};
+
+common_speculative_mtp_transaction_t common_speculative_mtp_prepare_residency(
+        common_speculative * spec,
+        bool                 target_resident) noexcept {
+    try {
+        auto * mtp_state = common_speculative_get_mtp_state(spec);
+        if (mtp_state == nullptr || mtp_state->active_transaction != nullptr) {
+            return nullptr;
+        }
+
+        if ((mtp_state->ctx_mtp == nullptr) != (mtp_state->smpl == nullptr)) {
+            LOG_ERR("%s: inconsistent live MTP context/sampler ownership\n", __func__);
+            return nullptr;
+        }
+
+        auto transaction = std::make_unique<common_speculative_mtp_transaction>();
+        transaction->mtp_state = mtp_state;
+        transaction->alternate = std::make_unique<common_speculative_mtp_owner>();
+
+        const bool currently_resident = mtp_state->ctx_mtp != nullptr;
+        transaction->changes_owner = currently_resident != target_resident;
+
+        if (target_resident && !currently_resident) {
+            if (mtp_state->model_mtp == nullptr) {
+                return nullptr;
+            }
+
+            auto & prepared = *transaction->alternate;
+            prepared.ctx_mtp = llama_init_from_model(mtp_state->model_mtp, mtp_state->cparams_mtp);
+            if (prepared.ctx_mtp == nullptr) {
+                return nullptr;
+            }
+
+            common_params_sampling sparams;
+            sparams.samplers_sequence = { llama_sampler_type::DIST };
+            prepared.sampler = common_sampler_init(mtp_state->model_mtp, sparams);
+            if (prepared.sampler == nullptr) {
+                return nullptr;
+            }
+
+            llama_set_mtp_target_context(prepared.ctx_mtp, mtp_state->ctx_tgt);
+
+            // The immutable companion-model geometry must agree with the
+            // metadata retained while suspended. Compute it during prepare so
+            // publication remains a pure ownership swap.
+            const int prepared_n_embd = llama_mtp_state_n_embd(prepared.ctx_mtp);
+            const int prepared_n_heads = std::max(1, llama_model_n_nextn_layer(mtp_state->model_mtp));
+            if (prepared_n_embd != mtp_state->n_embd || prepared_n_heads != mtp_state->n_heads_model) {
+                LOG_ERR("%s: prepared MTP geometry changed while suspended\n", __func__);
+                return nullptr;
+            }
+        }
+
+        mtp_state->active_transaction = transaction.get();
+        return transaction.release();
+    } catch (const std::bad_alloc &) {
+        LOG_ERR("%s: allocation failed while preparing MTP residency\n", __func__);
+    } catch (const std::exception & err) {
+        LOG_ERR("%s: exception while preparing MTP residency: %s\n", __func__, err.what());
+    } catch (...) {
+        LOG_ERR("%s: unknown exception while preparing MTP residency\n", __func__);
+    }
+
+    return nullptr;
+}
+
+bool common_speculative_mtp_transaction_publish(
+        common_speculative_mtp_transaction_t transaction) noexcept {
+    if (transaction == nullptr || transaction->mtp_state == nullptr ||
+            transaction->alternate == nullptr ||
+            transaction->mtp_state->active_transaction != transaction ||
+            transaction->state != common_speculative_mtp_transaction_state::prepared) {
+        return false;
+    }
+
+    if (transaction->changes_owner) {
+        transaction->swap_owner();
+    }
+    transaction->state = common_speculative_mtp_transaction_state::published;
+    return true;
+}
+
+bool common_speculative_mtp_transaction_rollback(
+        common_speculative_mtp_transaction_t transaction) noexcept {
+    if (transaction == nullptr || transaction->mtp_state == nullptr ||
+            transaction->alternate == nullptr ||
+            transaction->mtp_state->active_transaction != transaction ||
+            transaction->state != common_speculative_mtp_transaction_state::published) {
+        return false;
+    }
+
+    if (transaction->changes_owner) {
+        transaction->swap_owner();
+    }
+    transaction->state = common_speculative_mtp_transaction_state::rolled_back;
+    transaction->detach_owner();
+    return true;
+}
+
+bool common_speculative_mtp_transaction_finalize(
+        common_speculative_mtp_transaction_t transaction) noexcept {
+    if (transaction == nullptr || transaction->mtp_state == nullptr ||
+            transaction->alternate == nullptr ||
+            transaction->mtp_state->active_transaction != transaction ||
+            transaction->state != common_speculative_mtp_transaction_state::published) {
+        return false;
+    }
+
+    // Retire the previous live owner before reopening the state for another
+    // transaction. Owner destruction is allocation-free and noexcept.
+    transaction->alternate.reset();
+    transaction->state = common_speculative_mtp_transaction_state::finalized;
+    transaction->detach_owner();
+    return true;
+}
+
+void common_speculative_mtp_transaction_free(
+        common_speculative_mtp_transaction_t transaction) noexcept {
+    if (transaction == nullptr) {
+        return;
+    }
+
+    if (transaction->state == common_speculative_mtp_transaction_state::published &&
+            !common_speculative_mtp_transaction_rollback(transaction)) {
+        LOG_ERR("%s: unable to safely roll back published MTP residency\n", __func__);
+        return;
+    }
+
+    transaction->detach_owner();
+    delete transaction;
+}
+
+static void common_speculative_reset_after_mtp_residency_change(common_speculative * spec) {
     spec->checkpoint.clear();
     spec->curr_impl = nullptr;
     spec->last_n_drafted = 0;
     spec->t_step_start_us = 0;
     spec->last_step_target_only = false;
-    return state->suspend();
+}
+
+static bool common_speculative_set_mtp_residency(common_speculative * spec, bool target_resident) {
+    if (common_speculative_get_mtp_state(spec) == nullptr) {
+        return true;
+    }
+
+    auto * transaction = common_speculative_mtp_prepare_residency(spec, target_resident);
+    if (transaction == nullptr) {
+        return false;
+    }
+
+    const bool committed =
+            common_speculative_mtp_transaction_publish(transaction) &&
+            common_speculative_mtp_transaction_finalize(transaction);
+    common_speculative_mtp_transaction_free(transaction);
+
+    if (committed) {
+        common_speculative_reset_after_mtp_residency_change(spec);
+    }
+    return committed;
+}
+
+bool common_speculative_suspend_mtp(common_speculative * spec) {
+    return common_speculative_set_mtp_residency(spec, false);
 }
 
 bool common_speculative_resume_mtp(common_speculative * spec) {
-    auto * state = common_speculative_get_mtp_state(spec);
-    if (state == nullptr) {
-        return true;
-    }
-    spec->checkpoint.clear();
-    spec->curr_impl = nullptr;
-    spec->last_n_drafted = 0;
-    spec->t_step_start_us = 0;
-    spec->last_step_target_only = false;
-    return state->resume();
+    return common_speculative_set_mtp_residency(spec, true);
 }
 
 bool common_speculative_mtp_resident(const common_speculative * spec) {

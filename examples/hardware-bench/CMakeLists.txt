@@ -1,0 +1,6 @@
+set(TARGET ese-hardware-bench)
+add_executable(${TARGET} hardware-bench.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama ggml ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

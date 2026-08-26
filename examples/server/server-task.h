@@ -5,12 +5,23 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <memory>
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
 #include <vector>
 
 using json = nlohmann::ordered_json;
+
+// A multimodal HTTP request can fan out into several server tasks. The first
+// lease owns the exact pre-request owner transaction; the remaining leases are
+// pins. The owner thread releases the group only after every task is terminal,
+// committing if any task reached a slot and rolling back if none launched.
+struct server_transient_lease_group {
+    std::vector<uint64_t> leases;
+    size_t remaining = 0;
+    bool commit = false;
+};
 
 enum stop_type {
     STOP_TYPE_NONE,
@@ -28,7 +39,10 @@ enum server_task_type {
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
+    SERVER_TASK_TYPE_TRANSIENT_ACQUIRE,
+    SERVER_TASK_TYPE_TRANSIENT_RELEASE,
     SERVER_TASK_TYPE_METRICS,
+    SERVER_TASK_TYPE_RESOURCE_REBALANCE,
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
@@ -102,6 +116,7 @@ struct server_task {
     // A transient residency lease is acquired by the scheduler immediately
     // before launch and held by the slot for the complete request lifetime.
     uint64_t transient_lease = 0;
+    std::shared_ptr<server_transient_lease_group> transient_lease_group;
 
     server_task() = default;
     server_task(server_task_type type) : type(type) {}
@@ -149,6 +164,7 @@ struct server_task_result {
     json data;
 
     bool stop;
+    enum stop_type termination = STOP_TYPE_NONE;
     bool error;
     bool final_result = false;
     result_timings timings;

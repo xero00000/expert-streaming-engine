@@ -41,6 +41,74 @@ The resolved JSON plan is printed before serving and returned by `/props`.
 `--metrics` adds plan capacity/headroom gauges. See
 [`PHASE4_GLOBAL_RESOURCE_CONTROLLER.md`](../../docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md).
 
+V2 resource-control clients can query a coherent live snapshot with `GET
+/v1/ese/resources`. The response distinguishes planned capacity, actual
+allocation, residency/occupancy, and whether the server is at an idle safe
+point. Snapshot collection runs on the inference owner thread.
+
+Target validation is available without mutation:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/ese/resources/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{"dry_run":true,"context":65536,"expert_cache_bytes_per_device":4294967296}'
+```
+
+The dry run validates budget, device reserves, slot divisibility, live KV
+occupancy, and the server's load-time KV maximum. An idle server can commit KV,
+expert cache, or both together with `"dry_run":false`. For example, a KV target
+is:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/ese/resources/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{"dry_run":false,"context":32768}'
+```
+
+The server prepares and migrates the replacement KV cache off to the side,
+publishes it only after every occupied row succeeds, and leaves the original
+cache usable after allocation or injected migration failure. The bounded
+per-device expert cache uses the same prepare/migrate/commit contract:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/ese/resources/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{"dry_run":false,"expert_cache_bytes_per_device":2147483648}'
+```
+
+The hottest resident experts and their admission history are migrated into a
+fully allocated replacement before publication. A value of zero disables the
+cache; a later nonzero request prepares it again. All slots must be idle and
+the deferred queue must be empty. A combined target uses one reversible
+publication boundary:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/ese/resources/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{"dry_run":false,"context":32768,"expert_cache_bytes_per_device":2147483648}'
+```
+
+Both replacements prepare off-side, publish by allocation-free ownership
+swaps, and remain reversible until both are live. The server then finalizes the
+old pools and publishes context plus resource-plan JSON as one coherent
+snapshot. Any preparation or reversible-publication failure restores both old
+pools before returning HTTP 500.
+
+Run the model-backed commit, busy-safe-point, and injected-failure gate with:
+
+```bash
+scripts/validate-phase-d-rebalance.py --model MODEL.gguf
+scripts/validate-phase-d-rebalance.py --model MOE.gguf --gpu-layers 99 \
+  --expert-initial-mib 8 --expert-target-mib 4
+```
+
+For a mixed multi-GPU gate, add the normal `--tensor-split` server arguments
+and `--expert-failure-after-devices 1`. This covers failure after one device
+candidate is prepared and automatically adds a combined failure after the first
+expert device is published whenever at least two accelerators are observed.
+Every failure must retain identical capacity, allocation, residency, plan, and
+deterministic output, then successfully commit and restore in the same server.
+
 ```
 usage: ./llama-server [options]
 

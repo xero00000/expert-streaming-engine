@@ -142,29 +142,128 @@ int main(int argc, char ** argv) {
     assert(llama_kv_cache_size(ctx) == 512);
     assert(!llama_kv_cache_resize(ctx, 256));
     assert(llama_kv_cache_size(ctx) == 512);
+    assert(llama_n_ctx(ctx) == 512);
     assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
 #if defined(_WIN32)
     _putenv_s("ESE_TURBO_RETIER_FAIL_AFTER_ROWS", "");
 #else
     unsetenv("ESE_TURBO_RETIER_FAIL_AFTER_ROWS");
 #endif
+
+    // Preparation succeeded and the candidate was made live, but a combined
+    // transaction may still need to roll it back if a later publication fails.
+    // This gate exercises that reversible boundary through the compatibility
+    // API and proves that geometry, representation, and sequence state survive.
+    const auto before_publish_rollback = save_sequence(ctx, 0);
+#if defined(_WIN32)
+    _putenv_s("ESE_KV_TRANSACTION_FAIL_AFTER_PUBLISH", "1");
+#else
+    setenv("ESE_KV_TRANSACTION_FAIL_AFTER_PUBLISH", "1", 1);
+#endif
+    assert(!llama_kv_cache_resize(ctx, 256));
+    assert(llama_kv_cache_size(ctx) == 512);
+    assert(llama_n_ctx(ctx) == 512);
+    require_all_types(ctx, GGML_TYPE_Q8_0);
+    assert(save_sequence(ctx, 0) == before_publish_rollback);
+    assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
+#if defined(_WIN32)
+    _putenv_s("ESE_KV_TRANSACTION_FAIL_AFTER_PUBLISH", "");
+#else
+    unsetenv("ESE_KV_TRANSACTION_FAIL_AFTER_PUBLISH");
+#endif
+
+    // Public transaction ownership/state contract. Preparation is off-side,
+    // only one handle may be open, and freeing a prepared candidate is a
+    // no-op for the live cache.
+    auto * prepared_resize = llama_kv_cache_prepare_resize(ctx, 256);
+    assert(prepared_resize != nullptr);
+    assert(llama_kv_cache_size(ctx) == 512);
+    assert(llama_n_ctx(ctx) == 512);
+    assert(llama_kv_cache_prepare_resize(ctx, 256) == nullptr);
+    assert(!llama_kv_cache_transaction_rollback(prepared_resize));
+    assert(!llama_kv_cache_transaction_finalize(prepared_resize));
+    llama_kv_cache_transaction_free(prepared_resize);
+    llama_kv_cache_transaction_free(nullptr);
+    assert(llama_kv_cache_size(ctx) == 512);
+    assert(llama_n_ctx(ctx) == 512);
+    assert(save_sequence(ctx, 0) == before_publish_rollback);
+
+    // Publication is reversible until finalize. Abandoning a published
+    // handle through free() must restore storage, cparams, and checkpoint.
+    auto * published_resize = llama_kv_cache_prepare_resize(ctx, 256);
+    assert(published_resize != nullptr);
+    assert(llama_kv_cache_transaction_publish(published_resize));
+    assert(!llama_kv_cache_transaction_publish(published_resize));
+    assert(llama_kv_cache_size(ctx) == 256);
+    assert(llama_n_ctx(ctx) == 256);
+    llama_kv_cache_transaction_free(published_resize);
+    assert(llama_kv_cache_size(ctx) == 512);
+    assert(llama_n_ctx(ctx) == 512);
+    require_all_types(ctx, GGML_TYPE_Q8_0);
+    assert(save_sequence(ctx, 0) == before_publish_rollback);
+
+    // Finalize makes publication irreversible but deliberately retains a
+    // small inert handle that callers release explicitly.
+    auto * finalized_resize = llama_kv_cache_prepare_resize(ctx, 256);
+    assert(finalized_resize != nullptr);
+    assert(llama_kv_cache_transaction_publish(finalized_resize));
+    assert(llama_kv_cache_transaction_finalize(finalized_resize));
+    assert(!llama_kv_cache_transaction_finalize(finalized_resize));
+    assert(!llama_kv_cache_transaction_rollback(finalized_resize));
+    assert(llama_kv_cache_size(ctx) == 256);
+    assert(llama_n_ctx(ctx) == 256);
+    llama_kv_cache_transaction_free(finalized_resize);
+    assert(llama_kv_cache_size(ctx) == 256);
+
+    auto * restore_resize = llama_kv_cache_prepare_resize(ctx, 512);
+    assert(restore_resize != nullptr);
+    assert(llama_kv_cache_transaction_publish(restore_resize));
+    assert(llama_kv_cache_transaction_finalize(restore_resize));
+    llama_kv_cache_transaction_free(restore_resize);
+    assert(llama_kv_cache_size(ctx) == 512);
+    assert(llama_n_ctx(ctx) == 512);
+    assert(save_sequence(ctx, 0) == before_publish_rollback);
+
+    auto * noop_retier = llama_kv_cache_prepare_retier(ctx, q8.data(), q8.data(), layers);
+    assert(noop_retier != nullptr);
+    assert(llama_kv_cache_transaction_publish(noop_retier));
+    assert(llama_kv_cache_transaction_finalize(noop_retier));
+    llama_kv_cache_transaction_free(noop_retier);
+    require_all_types(ctx, GGML_TYPE_Q8_0);
+
     assert(llama_kv_cache_resize(ctx, 256));
     assert(llama_kv_cache_size(ctx) == 256);
+    assert(llama_n_ctx(ctx) == 256);
     assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
+
+    llama_batch resized_batch = llama_batch_init(1, 0, 1);
+    resized_batch.n_tokens = 1;
+    resized_batch.token[0] = prompt.back();
+    resized_batch.pos[0] = shifted_position + 1;
+    resized_batch.n_seq_id[0] = 1;
+    resized_batch.seq_id[0][0] = 0;
+    resized_batch.logits[0] = 1;
+    assert(llama_decode(ctx, resized_batch) == 0);
+    llama_synchronize(ctx);
+    llama_batch_free(resized_batch);
+    const llama_pos resized_position = shifted_position + 1;
+    assert(llama_kv_cache_seq_pos_max(ctx, 0) == resized_position);
+
     assert(llama_kv_cache_resize(ctx, 512));
     assert(llama_kv_cache_size(ctx) == 512);
-    assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
+    assert(llama_n_ctx(ctx) == 512);
+    assert(llama_kv_cache_seq_pos_max(ctx, 0) == resized_position);
 
     const auto q8_checkpoint = save_sequence(ctx, 0);
     assert(llama_kv_cache_seq_rm(ctx, 0, -1, -1));
     assert(llama_state_seq_set_data(ctx, q8_checkpoint.data(), q8_checkpoint.size(), 0, 0) == q8_checkpoint.size());
-    assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
+    assert(llama_kv_cache_seq_pos_max(ctx, 0) == resized_position);
     assert(llama_kv_cache_seq_pos_min(ctx, 1) < 0);
 
     std::vector<ggml_type> f16(layers, GGML_TYPE_F16);
     assert(llama_kv_cache_retier(ctx, f16.data(), f16.data(), layers));
     require_all_types(ctx, GGML_TYPE_F16);
-    assert(llama_kv_cache_seq_pos_max(ctx, 0) == shifted_position);
+    assert(llama_kv_cache_seq_pos_max(ctx, 0) == resized_position);
     assert(llama_kv_cache_seq_pos_min(ctx, 1) < 0);
 
     llama_free(ctx);
