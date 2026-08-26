@@ -11,7 +11,11 @@ This foundation includes:
   revision-pinned resumable downloads with speed and ETA;
 - available models in the primary view and missing manual profiles in a collapsed **Unavailable profiles** section;
 - user-configurable CLI app profiles with persistent embedded PTY terminals;
+- configurable 1/2/4-session serving for dense resident models, with total
+  context divided visibly across independent local clients;
 - Quick, Standard, and Exhaustive measured sweeps with a safe 90% context promotion default;
+- an advanced concurrency objective that verifies simultaneous slot occupancy
+  and ranks aggregate throughput before saving a session count;
 - per-trial checkpoints, cancellation/resume, exclusive-GPU safety, and active-model restoration;
 - one-click promotion of verified context, KV, and batch settings into future model launches;
 - optional, off-by-default sharing of sanitized verified-sweep summaries through **Help improve ESE**;
@@ -21,6 +25,10 @@ This foundation includes:
   directory, with the exact path shown in Settings.
 
 Sweep previews only describe the search matrix and never count as evidence. A verified result is shown only after Studio has launched the real ESE-planned `llama-server`, passed its health check, and measured completion throughput. Interrupted matching sweeps resume from their last per-trial checkpoint.
+
+Concurrent serving currently requires a dense resident plan. ESE refuses
+parallel MoE, hybrid, cache, and stream plans until their multi-sequence output
+parity gate passes; those modes continue to use one session safely.
 
 Before a measured sweep starts, Studio stops its managed model and checks for
 unmanaged `llama-server` instances and external CUDA processes using at least
@@ -45,7 +53,7 @@ are recognized rather than overwritten. Use `HF_TOKEN` or
 
 ## Linux install
 
-The v0.1.2 AppImage, DEB, and RPM packages contain both Studio and ESE. Use the
+The v0.2.0 AppImage, DEB, and RPM packages contain both Studio and ESE. Use the
 AppImage for signed in-app updating, or use the distribution package and apply
 future package updates through APT/DNF.
 

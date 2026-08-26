@@ -1,6 +1,6 @@
 [package]
 name = "ese-studio"
-version = "0.1.2"
+version = "0.2.0"
 description = "Desktop control center for Expert Streaming Engine"
 authors = ["ESE contributors"]
 edition = "2021"

@@ -105,7 +105,10 @@ ggml_tensor * llm_build_context::build_deepseek2_tp_attention(
         ggml_tensor * kv_compressed = ggml_view_2d(ctx0, kv_rope_compressed,
                 kv_lora_rank, n_tokens, kv_rope_compressed->nb[1], 0);
 
-        if (rope_cache) {
+        if (rope_type == LLAMA_ROPE_TYPE_NONE) {
+            // Kimi Linear MLA names the final key slice "rope", but the model
+            // intentionally uses it without rotary position encoding.
+        } else if (rope_cache) {
             q_rope = ggml_rope_fast(ctx0, q_rope, rope_cache);
             k_rope = ggml_rope_fast(ctx0, k_rope, rope_cache);
         } else {
@@ -723,6 +726,7 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
     const uint32_t n_embd_head_qk_nope = hparams.n_embd_head_k(0) - hparams.n_rot;
     const uint32_t kv_lora_rank = hparams.n_lora_kv;
     const uint32_t q_lora_rank  = hparams.n_lora_q;
+    const bool latent_first = rope_type == LLAMA_ROPE_TYPE_NONE;
     ggml_tensor * cur;
 
     // norm
@@ -857,7 +861,10 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
 
         ggml_build_forward_expand(gf, q_rope);
         ggml_build_forward_expand(gf, k_rope);
-        if (rope_cache) {
+        if (rope_type == LLAMA_ROPE_TYPE_NONE) {
+            // Kimi Linear keeps the key slice layout used by MLA but does not
+            // apply rotary position encoding to it.
+        } else if (rope_cache) {
             q_rope = ggml_rope_fast(ctx0, q_rope, rope_cache);
             k_rope = ggml_rope_fast(ctx0, k_rope, rope_cache);
         } else {
@@ -895,7 +902,9 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
             }
 
             //ggml_tensor * kvr = ggml_concat(ctx0, kv_compressed, ggml_permute(ctx0, k_rope, 0, 2, 1, 3), 0);
-            ggml_tensor * kvr = ggml_concat(ctx0, ggml_permute(ctx0, k_rope, 0, 2, 1, 3), kv_compressed, 0);
+            ggml_tensor * kvr = latent_first
+                ? ggml_concat(ctx0, kv_compressed, ggml_permute(ctx0, k_rope, 0, 2, 1, 3), 0)
+                : ggml_concat(ctx0, ggml_permute(ctx0, k_rope, 0, 2, 1, 3), kv_compressed, 0);
             cb(kvr, "kvr", il);
 
             auto row_size = ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope);
@@ -911,10 +920,16 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
 
             ggml_tensor * kqv;
 
-            if (lctx.cparams.mla_attn > 1 && lctx.cparams.flash_attn && pp_opt) { // PP for mla=2,3
+            // The DeepSeek FA layouts assume a RoPE-first latent cache.  Kimi
+            // Linear is no-RoPE and stores the latent slice first; using these
+            // kernels is both numerically incorrect on Ampere and can request
+            // an unsupported SM75 shared-memory configuration.  Keep Kimi on
+            // the verified absorbed-MLA path until a dedicated FA layout is
+            // available.
+            if (lctx.cparams.mla_attn > 1 && lctx.cparams.flash_attn && pp_opt && !latent_first) { // PP for mla=2,3
 
                 auto kv_cache_nope = ggml_view_2d(ctx0, kv_self.k_l[il], kv_lora_rank, n_kv, kv_self.k_l[il]->nb[1],
-                        ggml_row_size(kv_self.k_l[il]->type, n_embd_head_qk_rope));
+                        latent_first ? 0 : ggml_row_size(kv_self.k_l[il]->type, n_embd_head_qk_rope));
 
                 auto kv_f32_size = model.layers[il].wkv_b->ne[1] * kv_cache_nope->ne[1] * sizeof(float) / (1024*1024);
                 int n_max_head = n_head;
@@ -932,7 +947,8 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
                 auto n_per_head = model.layers[il].wkv_b->ne[1] / n_head;
 
                 auto kv_cache_rope = ggml_view_3d(ctx0, kv_self.k_l[il], n_embd_head_qk_rope, n_kv, 1,
-                        kv_self.k_l[il]->nb[1], kv_self.k_l[il]->nb[2], 0); //ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank));
+                        kv_self.k_l[il]->nb[1], kv_self.k_l[il]->nb[2],
+                        latent_first ? ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank) : 0);
 
                 // There is still an issue with one or more of the ops GGML_OP_REPEAT, GGML_OP_CONCAT, GGML_OP_CPY on CUDA when
                 // the KV cache is quantized. Hence, in that case we will simply use fp16 for now.
@@ -952,7 +968,9 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
                 cb(k_rope, "k_rope", il);
 
                 //auto q = ggml_concat(ctx0, q_nope, q_rope, 0);
-                auto q = ggml_concat(ctx0, q_rope, q_nope, 0);
+                auto q = latent_first
+                    ? ggml_concat(ctx0, q_nope, q_rope, 0)
+                    : ggml_concat(ctx0, q_rope, q_nope, 0);
                 q = ggml_permute(ctx0, q, 0, 2, 1, 3);
                 cb(q, "q_concat", il);
 
@@ -987,7 +1005,9 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
                     ggml_build_forward_expand(gf, v);
 
                     //auto k = ggml_concat(ctx0, k_nope, k_rope, 0);
-                    auto k = ggml_concat(ctx0, k_rope, k_nope, 0);
+                    auto k = latent_first
+                        ? ggml_concat(ctx0, k_nope, k_rope, 0)
+                        : ggml_concat(ctx0, k_rope, k_nope, 0);
                     cb(k, "k", il);
 
                     ggml_build_forward_expand(gf, k);
@@ -1029,10 +1049,13 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
                 cb(q_nope2, "q_nope2", il);
 
                 //ggml_tensor * q = ggml_concat(ctx0, q_nope2, ggml_permute(ctx0, q_rope, 0, 2, 1, 3), 0);
-                ggml_tensor * q = ggml_concat(ctx0, ggml_permute(ctx0, q_rope, 0, 2, 1, 3), q_nope2, 0);
+                ggml_tensor * q = latent_first
+                    ? ggml_concat(ctx0, q_nope2, ggml_permute(ctx0, q_rope, 0, 2, 1, 3), 0)
+                    : ggml_concat(ctx0, ggml_permute(ctx0, q_rope, 0, 2, 1, 3), q_nope2, 0);
                 cb(q, "q", il);
 
-                if (lctx.cparams.flash_attn && (lctx.cparams.mla_attn == 1 || lctx.cparams.mla_attn == 3)) {
+                if (lctx.cparams.flash_attn && !latent_first &&
+                        (lctx.cparams.mla_attn == 1 || lctx.cparams.mla_attn == 3)) {
 
                     if (dsa_last_full_sorted && dsa_fast_path) {
                         auto row_size = ggml_row_size(kv_self.k_l[il]->type, kv_self.k_l[il]->ne[0]);
@@ -1049,7 +1072,7 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
                         ggml_tensor * kv_cache_lora = ggml_view_2d(ctx0, kv_self.k_l[il],
                                 kv_lora_rank, n_kv,
                                 ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope),
-                                ggml_row_size(kv_self.k_l[il]->type, n_embd_head_qk_rope));
+                                latent_first ? 0 : ggml_row_size(kv_self.k_l[il]->type, n_embd_head_qk_rope));
                         cb(kv_cache_lora, "kv_cache_lora", il);
 
                         kqv_compressed = ggml_flash_attn_ext(ctx0, q, kv_cache, kv_cache_lora, sparse_mask_fa, kq_scale, hparams.f_max_alibi_bias, 0.f);
@@ -1071,7 +1094,7 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
                         ggml_tensor * kv_cache_lora = ggml_view_2d(ctx0, kv_self.k_l[il],
                                 kv_lora_rank, n_kv,
                                 ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope),
-                                ggml_row_size(kv_self.k_l[il]->type, n_embd_head_qk_rope));
+                                latent_first ? 0 : ggml_row_size(kv_self.k_l[il]->type, n_embd_head_qk_rope));
                         cb(kv_cache, "kv_cache_lora", il);
 
                         kv_cache_trans = ggml_cont(ctx0, ggml_transpose(ctx0, kv_cache_lora));

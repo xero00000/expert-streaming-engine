@@ -67,6 +67,9 @@ extern "C" {
 
     struct llama_model;
     struct llama_context;
+    struct llama_kv_cache_transaction;
+
+    typedef struct llama_kv_cache_transaction * llama_kv_cache_transaction_t;
 
     typedef int32_t llama_pos;
     typedef int32_t llama_token;
@@ -535,7 +538,21 @@ extern "C" {
         void *              cuda_params;
         uint64_t expert_vram_cache_bytes;   // per-device adaptive expert cache bound
         uint64_t expert_vram_reserve_bytes; // per-device reserve that cache allocation must preserve
+        uint64_t expert_prefill_staging_bytes; // separate two-lane whole-layer prefill staging capacity per device
         uint32_t expert_cache_min_observations; // route observations before GPU admission
+        uint32_t expert_hybrid_gpu_experts; // decode top-k positions assigned to the GPU branch; 0 disables
+        uint64_t expert_hybrid_cpu_ns_per_expert; // conservative calibrated CPU cost used by runtime guard
+        uint64_t expert_hybrid_upload_ns_per_expert; // conservative calibrated upload cost used by runtime guard
+        uint32_t expert_hybrid_maximum_drift_ppm; // one-way runtime revocation threshold
+        uint32_t expert_hybrid_minimum_cpu_calls; // minimum rolling-window CPU samples
+    };
+
+    enum llama_expert_hybrid_guard_status {
+        LLAMA_EXPERT_HYBRID_GUARD_DISABLED = 0,
+        LLAMA_EXPERT_HYBRID_GUARD_MONITORING,
+        LLAMA_EXPERT_HYBRID_GUARD_REVOKED_FALLBACK,
+        LLAMA_EXPERT_HYBRID_GUARD_REVOKED_CPU_DRIFT,
+        LLAMA_EXPERT_HYBRID_GUARD_REVOKED_UPLOAD_DRIFT,
     };
 
     // model quantization parameters
@@ -642,6 +659,8 @@ extern "C" {
 
 
     LLAMA_API const struct llama_model * llama_get_model(const struct llama_context * ctx);
+    LLAMA_API enum llama_expert_hybrid_guard_status
+        llama_get_expert_hybrid_guard_status(const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
@@ -709,6 +728,7 @@ extern "C" {
             uint64_t * dense_bytes,
             uint64_t * expert_bytes);
     LLAMA_API uint64_t llama_model_largest_expert_component(const struct llama_model * model);
+    LLAMA_API uint64_t llama_model_largest_expert_layer(const struct llama_model * model);
 
     LLAMA_API uint64_t llama_model_kv_bytes(
             const struct llama_model * model,
@@ -1005,15 +1025,115 @@ extern "C" {
             struct llama_kv_cache_layer_types * types,
             uint32_t capacity);
 
+    // Prepare replacement KV storage without changing the live cache. The
+    // context must be quiescent and remain owned by the calling thread until
+    // the transaction is resolved. At most one KV transaction may be open per
+    // context. A transaction handle must not outlive its context unless it has
+    // already been rolled back or finalized.
+    //
+    // publish() installs the prepared cache with allocation-free swaps.
+    // rollback() reverses a published swap. finalize() commits a published
+    // swap, retires the old cache/checkpoint, and leaves a small finalized
+    // handle for free(). free() drops a prepared candidate and automatically
+    // rolls back a published-but-unfinalized transaction. State-changing calls
+    // return false outside their documented prepare -> publish ->
+    // rollback/finalize order; free(NULL) is a no-op.
+    LLAMA_API llama_kv_cache_transaction_t llama_kv_cache_prepare_resize(
+            struct llama_context * ctx,
+            uint32_t size);
+
+    LLAMA_API llama_kv_cache_transaction_t llama_kv_cache_prepare_retier(
+            struct llama_context * ctx,
+            const enum ggml_type * type_k_layers,
+            const enum ggml_type * type_v_layers,
+            uint32_t n_layers);
+
+    LLAMA_API bool llama_kv_cache_transaction_publish(
+            llama_kv_cache_transaction_t transaction);
+
+    LLAMA_API bool llama_kv_cache_transaction_rollback(
+            llama_kv_cache_transaction_t transaction);
+
+    LLAMA_API bool llama_kv_cache_transaction_finalize(
+            llama_kv_cache_transaction_t transaction);
+
+    LLAMA_API void llama_kv_cache_transaction_free(
+            llama_kv_cache_transaction_t transaction);
+
     LLAMA_API bool llama_kv_cache_retier(
             struct llama_context * ctx,
             const enum ggml_type * type_k_layers,
             const enum ggml_type * type_v_layers,
             uint32_t n_layers);
 
-    // Resize the storage while preserving every occupied cell. The requested
-    // size must respect backend padding and cannot exceed the context limit.
+    // Failure-atomically replace the active KV storage while preserving every
+    // occupied cell. The requested size must respect backend padding and cannot
+    // exceed the immutable load-time context limit. On success llama_n_ctx()
+    // reports the new active graph/KV geometry.
     LLAMA_API bool llama_kv_cache_resize(struct llama_context * ctx, uint32_t size);
+
+    struct llama_expert_cache_transaction;
+    typedef struct llama_expert_cache_transaction * llama_expert_cache_transaction_t;
+
+    // Prepare a complete expert-cache replacement without changing context
+    // parameters or graph policy. The opaque handle may be held beside other
+    // prepared resource transactions by the context owner.
+    //
+    // publish() installs the prepared scheduler cache, publishes the target
+    // context parameters, and resets graph reuse. rollback() restores both the
+    // previous cache and context policy. finalize() irreversibly retires the
+    // old cache but retains a finalized handle for free(). Freeing a prepared
+    // transaction discards it; freeing a published transaction rolls it back.
+    LLAMA_API llama_expert_cache_transaction_t llama_expert_cache_prepare_resize(
+            struct llama_context * ctx,
+            uint64_t bytes_per_device);
+    LLAMA_API bool llama_expert_cache_transaction_publish(
+            llama_expert_cache_transaction_t transaction);
+    LLAMA_API bool llama_expert_cache_transaction_rollback(
+            llama_expert_cache_transaction_t transaction);
+    LLAMA_API bool llama_expert_cache_transaction_finalize(
+            llama_expert_cache_transaction_t transaction);
+    LLAMA_API void llama_expert_cache_transaction_free(
+            llama_expert_cache_transaction_t transaction);
+
+    // Failure-atomically replace the bounded per-device expert cache while the
+    // context is quiescent. Resident experts are migrated into the prepared
+    // replacement before it becomes visible; false retains the prior cache.
+    // This convenience API composes prepare -> publish -> finalize.
+    LLAMA_API bool llama_expert_cache_resize(
+            struct llama_context * ctx,
+            uint64_t bytes_per_device);
+
+    // Live resource-pool accounting for control planes. This is a read-only
+    // snapshot and does not synchronize a device. Call it from the context
+    // owner thread (the server routes it through its task queue).
+    struct llama_resource_snapshot {
+        uint32_t kv_capacity_tokens;
+        uint32_t kv_used_cells;
+        uint64_t kv_allocated_bytes;
+        uint64_t expert_ram_capacity_bytes;
+        uint64_t expert_ram_resident_bytes;
+        uint64_t expert_ram_active_leases;
+        uint32_t device_count;
+        uint32_t kv_max_capacity_tokens;
+    };
+
+    struct llama_resource_device_snapshot {
+        int32_t device_id;
+        uint64_t expert_cache_capacity_bytes;
+        uint64_t expert_cache_allocated_bytes;
+        uint64_t expert_cache_resident_bytes;
+        uint64_t expert_prefill_capacity_bytes;
+        uint64_t expert_prefill_allocated_bytes;
+    };
+
+    LLAMA_API uint32_t llama_resource_device_count(const struct llama_context * ctx);
+
+    LLAMA_API bool llama_resource_get_snapshot(
+            const struct llama_context * ctx,
+            struct llama_resource_snapshot * snapshot,
+            struct llama_resource_device_snapshot * devices,
+            uint32_t device_capacity);
 
     // Apply the KV cache updates (such as K-shifts, defragmentation, etc.)
     // Positive return values does not mean a fatal error, but rather a warning.

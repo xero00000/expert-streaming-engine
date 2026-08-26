@@ -173,6 +173,54 @@ On the one-thousand-token fast slot, Q8 K/V improved the documented repeated wor
 
 This result is one reason the unified launcher defaults to `q8_0` rather than assuming lower KV precision is always faster.
 
+## v2 candidate: Kimi Linear 48B-A3B
+
+This gate used `Kimi-Linear-48B-A3B-Instruct.MXFP4_MOE.gguf` (SHA-256
+`3c3a000f566e68dfccd7925e49cf16602be830b72aecf844c15b6ae840e72a04`), a
+27-layer, 49.123B-parameter model with 20 KDA layers, seven MLA layers, 256
+experts, and top-8 routing. The file contains 610 tensors and is 25.331 GiB.
+
+The tested host had 46 GiB RAM, an RTX 3060 Ti 8 GiB (`sm_86`), RTX 2080 SUPER
+8 GiB (`sm_75`), and RTX 3080 10 GiB (`sm_86`). The promoted short-prompt
+decode profile intentionally used only the two Ampere GPUs:
+
+```bash
+GGML_CUDA_NO_PINNED=1 CUDA_VISIBLE_DEVICES=0,2 llama-cli \
+  -m Kimi-Linear-48B-A3B-Instruct.MXFP4_MOE.gguf \
+  -c 65536 -b 128 -ub 32 -ngl 99 -sm layer -ts 4,22 \
+  -cmoe --defer-experts \
+  --expert-ram-cache-mib 8192 \
+  --expert-vram-cache-mib 2048 \
+  --expert-vram-reserve-mib 768 \
+  --expert-storage-backend pread --expert-sidecar-only \
+  --expert-cache-min-observations 1 \
+  --no-warmup --temp 0 --seed 1234 -n 32 \
+  -p 'The capital of France is'
+```
+
+| Measurement | Result |
+| --- | ---: |
+| Context allocated | 65,536 tokens |
+| Five-token prompt processing | 4.69 tok/s |
+| 32-token generation | 9.29 tok/s |
+| Expert-cache slots | 570 per GPU |
+| Aggregate cache hits / misses | 3,229 / 3,219 |
+| Forced fallbacks / rejected admissions | 0 / 0 |
+
+The generated continuation was deterministic across repeated runs:
+`The capital of France is Paris. The capital of Italy is Rome. The capital of
+Germany is Berlin.` Both runs had SHA-256
+`f9af01b0e54b872d6cb619331565f86e5986288164f76dfac0f309996f6dd196`.
+CPU and CUDA KDA unit outputs agreed within `4.47035e-08` on all three GPUs,
+and ESE's first token matched the independent upstream reference output.
+
+This is a 64K allocation and short-prompt decode gate, not a fully populated
+64K prompt benchmark. KDA prefill still uses the correctness-first sequential
+kernel; improving long-prompt KDA throughput remains separate performance
+work. Increasing the cache from the former accidental 64-slot limit eliminated
+short-run evictions, while the 32-token workload exercises sustained bounded
+eviction and sidecar reload behavior.
+
 ## Benchmark acceptance template
 
 New performance claims should record:

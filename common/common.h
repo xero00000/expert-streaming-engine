@@ -454,6 +454,7 @@ struct gpt_params {
     bool expert_sidecar_only = false;
     int64_t expert_vram_cache_mib = 0; // explicit per-device capacity; 0 disables
     int64_t expert_vram_reserve_mib = 0;
+    int64_t expert_prefill_staging_mib = -1; // -1 = native-policy auto, 0 disables, otherwise two-lane total
     int64_t transient_vram_budget_mib = 0; // shared transient-module capacity; 0 disables
     int64_t transient_vram_reserve_mib = 0;
     int64_t transient_mtp_mib = 0;          // measured MTP companion allocation
@@ -468,6 +469,11 @@ struct gpt_params {
     std::string resolved_resource_plan_json;
     ggml_type resolved_resource_kv_type = GGML_TYPE_COUNT;
     int expert_cache_min_observations = 2;
+    int expert_hybrid_gpu_experts = 0;
+    uint64_t expert_hybrid_cpu_ns_per_expert = 0;
+    uint64_t expert_hybrid_upload_ns_per_expert = 0;
+    uint32_t expert_hybrid_maximum_drift_ppm = 4000000;
+    uint32_t expert_hybrid_minimum_cpu_calls = 64;
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
     bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)
     bool split_mode_graph_scheduling = false; // if true, force split mode graph scheduling

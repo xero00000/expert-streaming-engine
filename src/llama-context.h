@@ -305,8 +305,12 @@ struct llama_context {
     const struct llama_model & model;
 
     struct llama_cparams        cparams;
+    // Immutable load-time ceiling. cparams.n_ctx is the active graph/KV
+    // geometry and may change after a committed runtime KV transaction.
+    uint32_t                    n_ctx_max = 0;
     struct llama_sampling       sampling;
     struct llama_kv_cache       kv_self;
+    llama_kv_cache_transaction_t kv_cache_transaction = nullptr;
     struct llama_context      * mtp_target_ctx   = nullptr;
     struct llama_control_vector cvec;
 
@@ -672,6 +676,12 @@ struct llama_context {
     std::vector<CacheCopy> dsa_cache_copies;
     std::vector<CacheCopy> openpangu_cache_copies;
     std::vector<CacheCopy> openpangu_cache_copies_mtp;
+
+    // The context owns at most one open expert-cache transaction. Keeping this
+    // as the final data member prevents overlapping publication candidates and
+    // lets teardown roll a published candidate back while its scheduler and
+    // backends are still alive.
+    llama_expert_cache_transaction_t active_expert_cache_transaction = nullptr;
 
     bool update_cache_copies();
 

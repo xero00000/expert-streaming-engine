@@ -98,3 +98,22 @@ Publishing remains gated by a successful tag workflow that builds both Linux
 and Windows assets, generates checksums and signed updater metadata, and creates
 the GitHub release. That workflow status is operational release evidence, not a
 substitute for the unchecked physical NVIDIA sweep above.
+
+## v0.2.0 hardware-adaptive feature release
+
+- [x] Studio, launcher, frontend fallback, Cargo manifest/lock, and package
+  metadata report `0.2.0` locally.
+- [x] Hardware calibration, mixed CPU/GPU MoE, bounded prefill streaming, and
+  reversible KV/expert/transient rebalancing passed their retained CPU,
+  sanitizer, Turing, Ampere, and heterogeneous three-GPU gates.
+- [x] Dense concurrent sessions and real Qwen text/image/text transient-owner
+  handoffs pass model-backed lifecycle and shutdown validation.
+- [x] Kimi Linear 48B-A3B loads and produces deterministic output through its
+  native KDA/MLA and bounded top-8 expert-cache paths.
+- [x] A 65,536-context Qwen3.8 27B profile survived 1,306- and 4,786-token
+  workloads after the verified `32,32,36` tensor split replaced the stale
+  `30,25,45` profile.
+- [ ] The consolidated private pull request is green, reviewed, and merged to
+  public `main` without missing public-main commits.
+- [ ] The `v0.2.0` tag workflow publishes signed Linux/Windows updater assets,
+  installers, checksums, and release notes.

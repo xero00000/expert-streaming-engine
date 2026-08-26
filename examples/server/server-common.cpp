@@ -1321,6 +1321,40 @@ void server_tokens::insert(const std::vector<llama_token>& inp_tokens) {
 // for compatibility with context shift and prompt truncation
 void server_tokens::resize(size_t size) {
     //GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    if (size < tokens.size() && has_mtmd) {
+        const size_t safe_size = media_safe_prefix_size(size);
+        if (safe_size != size) {
+            throw std::runtime_error("cannot resize tokens through the middle of a media chunk");
+        }
+        shrink_to_media_safe_prefix(size);
+        return;
+    }
+    tokens.resize(size);
+}
+
+size_t server_tokens::media_safe_prefix_size(size_t requested) const noexcept {
+    size_t result = std::min(requested, tokens.size());
+    if (!has_mtmd || map_idx_to_media.empty()) {
+        return result;
+    }
+    for (const auto & entry : map_idx_to_media) {
+        const size_t start = entry.first;
+        if (start >= result) break;
+        const size_t n_media = mtmd_input_chunk_get_n_tokens(entry.second.get());
+        GGML_ASSERT(start <= tokens.size() && n_media <= tokens.size() - start);
+        if (result - start < n_media) {
+            return start;
+        }
+    }
+    return result;
+}
+
+void server_tokens::shrink_to_media_safe_prefix(size_t size) noexcept {
+    GGML_ASSERT(size <= tokens.size());
+    GGML_ASSERT(media_safe_prefix_size(size) == size);
+    map_idx_to_media.erase(map_idx_to_media.lower_bound(size), map_idx_to_media.end());
+    // llama_token is a scalar, so shrinking cannot allocate or invoke a
+    // throwing destructor. Keep this operation safe after physical finalize.
     tokens.resize(size);
 }
 
@@ -1370,6 +1404,7 @@ bool server_tokens::empty() const {
 
 void server_tokens::clear() {
     tokens.clear();
+    map_idx_to_media.clear();
 }
 
 void server_tokens::keep_first(size_t n) {

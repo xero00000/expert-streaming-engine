@@ -159,6 +159,10 @@ function App() {
   const [sweepConfirmation, setSweepConfirmation] = useState(false);
   const [profileApplied, setProfileApplied] = useState(false);
   const [maxContext, setMaxContext] = useState(131072);
+  const [concurrentSessions, setConcurrentSessions] = useState(() => {
+    const stored = Number(globalThis.localStorage?.getItem("ese-concurrent-sessions"));
+    return [1, 2, 4].includes(stored) ? stored : 1;
+  });
   const [notice, setNotice] = useState<string>();
   const [modelRoot, setModelRoot] = useState("");
   const [showAppEditor, setShowAppEditor] = useState(false);
@@ -178,7 +182,7 @@ function App() {
   const [chatDraft, setChatDraft] = useState("");
   const [chatRunning, setChatRunning] = useState(false);
   const [chatRequestId, setChatRequestId] = useState<string>();
-  const [appVersion, setAppVersion] = useState("0.1.2");
+  const [appVersion, setAppVersion] = useState("0.2.0");
   const [pendingUpdate, setPendingUpdate] = useState<Update>();
   const [updateState, setUpdateState] = useState<UpdateState>("idle");
   const [updateDetail, setUpdateDetail] = useState("Check GitHub Releases for a signed ESE Studio and runtime update.");
@@ -320,6 +324,10 @@ function App() {
   }, [terminalHeight]);
 
   useEffect(() => {
+    globalThis.localStorage?.setItem("ese-concurrent-sessions", String(concurrentSessions));
+  }, [concurrentSessions]);
+
+  useEffect(() => {
     globalThis.localStorage?.setItem("ese-chat-history", JSON.stringify(chatMessages.filter((message) => message.content).slice(-100)));
     chatEnd.current?.scrollIntoView({ behavior: chatRunning ? "auto" : "smooth", block: "end" });
   }, [chatMessages, chatRunning]);
@@ -344,7 +352,8 @@ function App() {
   const visibleDownloadStatus = downloadStatus && (downloadStatus.state === "downloading" || downloadStatus.repoId === hubDetails?.model.id) ? downloadStatus : undefined;
   useEffect(() => {
     if (selected?.context) setMaxContext(Math.max(512, selected.context));
-  }, [selectedId, selected?.context]);
+    if (selected?.slots) setConcurrentSessions(selected.slots);
+  }, [selectedId, selected?.context, selected?.slots]);
 
   useEffect(() => {
     setSweepPlan(undefined);
@@ -363,12 +372,13 @@ function App() {
         apiKey: "sk-local-placeholder",
         modelId: selected.path,
         modelPath: selected.path,
-        context: selected.context ?? maxContext,
+        context: Math.max(1, Math.floor((selected.context ?? maxContext) / concurrentSessions)),
         architecture: selected.architecture,
         quantization: selected.quantization,
         kvType: selected.kvType,
         batchSize: selected.batchSize,
         ubatchSize: selected.ubatchSize,
+        slots: concurrentSessions,
         resourcePlan: undefined,
       } : undefined;
       const sessionId = await invoke<string>("launch_terminal", { request: { command: profile.command, args: profile.args, workingDirectory: profile.workingDirectory, columns: 110, rows: 32, role, appId: profile.id, endpointAware: profile.endpointAware, modelEndpoint } });
@@ -392,7 +402,7 @@ function App() {
     if (!selected) return;
     const request = { modelPath: selected.path, preset, objective: advanced ? objective : "max-safe-context", maxContext, safeMargin: 0.9 };
     try {
-      const plan = native ? await invoke<SweepPlan>("plan_sweep", { request }) : { ...request, candidateContexts: [4096, 32768, 65536, 98304, 131072], kvTypes: ["q4_0", "q8_0", "f16"], batchSizes: [256, 512], promotedContext: 117760, trialCount: 11, requiresExclusiveGpu: true, safeMargin: 0.9 };
+      const plan = native ? await invoke<SweepPlan>("plan_sweep", { request }) : { ...request, candidateContexts: [4096, 32768, 65536, 98304, 131072], kvTypes: ["q4_0", "q8_0", "f16"], batchSizes: [256, 512], slotCounts: objective === "max-concurrency" ? [1, 2, 4] : [1], promotedContext: 117760, trialCount: 11, requiresExclusiveGpu: true, safeMargin: 0.9 };
       setSweepPlan(plan as SweepPlan);
     } catch (error) { setNotice(String(error)); }
   };
@@ -417,8 +427,9 @@ function App() {
       const profile = await invoke<ModelProfile>("promote_sweep");
       await refresh();
       setSelectedId(profile.id);
+      setConcurrentSessions(profile.slots ?? 1);
       setProfileApplied(true);
-      setNotice(`Applied verified profile for ${profile.name}. Future launches use the measured context, KV type, and batch size.`);
+      setNotice(`Applied verified profile for ${profile.name}. Future launches use the measured context, KV type, batch size, and session count.`);
     } catch (error) { setNotice(String(error)); }
   };
 
@@ -488,12 +499,13 @@ function App() {
 
   const launchEse = (mode: "plan" | "serve") => {
     if (!selected) return;
-    const args = [mode, selected.path];
+    const args = [mode, selected.path, "--slots", String(concurrentSessions)];
     if (mode === "serve" && selected.source === "sweep") {
       if (selected.context) args.push("-c", String(selected.context));
       if (selected.kvType) args.push("--kv", selected.kvType);
       if (selected.batchSize) args.push("--batch-size", String(selected.batchSize));
       if (selected.ubatchSize) args.push("--ubatch-size", String(selected.ubatchSize));
+      if (selected.tensorSplit) args.push("--tensor-split", selected.tensorSplit);
     }
     void launchApp({ id: `ese-${mode}`, name: mode === "serve" ? `Serving · ${selected.name}` : `Plan · ${selected.name}`, command: snapshot.eseBinary ?? "ese", args, endpointAware: false }, mode === "serve" ? "model" : "tool");
   };
@@ -626,7 +638,7 @@ function App() {
               })}</div> : <EmptyState title="No models found" detail="Add a model folder in Settings to begin discovery." />}
               {!!unavailable.length && <div className="unavailable"><button onClick={() => setShowUnavailable(!showUnavailable)}>{showUnavailable ? <ChevronDown size={15} /> : <ChevronRight size={15} />}Unavailable profiles <span>{unavailable.length}</span></button>{showUnavailable && <div className="model-list">{unavailable.map((model) => <ModelRow key={model.id} model={model} selected={model.id === selectedId} onSelect={() => setSelectedId(model.id)} />)}</div>}</div>}
             </div>
-            {selected && <div className="selection-bar"><div><span className="availability ready"><i />Selected</span><strong>{selected.name}</strong><small>{selected.context ? `${selected.context.toLocaleString()} max context` : "Context will be planned by ESE"}</small></div><button onClick={() => launchEse("plan")}>Inspect plan</button><button className="primary" onClick={() => launchEse("serve")}><Play size={14} fill="currentColor" />Start model</button></div>}
+            {selected && <div className="selection-bar"><div><span className="availability ready"><i />Selected</span><strong>{selected.name}</strong><small>{selected.context ? `${Math.floor(selected.context / concurrentSessions).toLocaleString()} context per session · ${selected.context.toLocaleString()} total` : `Context will be planned across ${concurrentSessions} ${concurrentSessions === 1 ? "session" : "sessions"}`}</small></div><label className="session-control"><span>Concurrent sessions</span><select value={concurrentSessions} onChange={(event) => setConcurrentSessions(Number(event.target.value))} aria-label="Concurrent local AI sessions"><option value={1}>1 · Maximum context</option><option value={2}>2 · Dense resident</option><option value={4}>4 · Dense resident</option></select></label><button onClick={() => launchEse("plan")}>Inspect plan</button><button className="primary" onClick={() => launchEse("serve")}><Play size={14} fill="currentColor" />Start model</button></div>}
           </div>}
 
           {view === "apps" && <><div className="apps-grid">{snapshot.apps.map((app) => <article className="app-card" key={app.id}><span className="app-icon"><SquareTerminal size={20} /></span><div><h2>{app.name}</h2><code>{app.command} {app.args.join(" ")}</code><p>{app.endpointAware ? "Receives the active model endpoint, identity, context, and tuning details in its terminal session." : "Runs in a persistent terminal tab. The session stays alive when models change."}</p></div><button className="primary" onClick={() => void launchApp(app)}><Play size={14} fill="currentColor" />Launch</button></article>)}<button className="add-card" onClick={() => setShowAppEditor(true)}><Plus size={18} />Add a custom app<span>Command, arguments, and optional working directory</span></button></div>{showAppEditor && <section className="panel inline-editor"><div className="panel-heading"><div><h2>Custom terminal app</h2><p>The command runs directly in a native PTY. Arguments are stored in portable TOML.</p></div><button className="icon-button" onClick={() => setShowAppEditor(false)} aria-label="Close"><X size={14} /></button></div><div className="editor-grid"><label className="field"><span>Name</span><input value={appDraft.name} onChange={(event) => setAppDraft({ ...appDraft, name: event.target.value })} placeholder="My coding agent" /></label><label className="field"><span>Command</span><input value={appDraft.command} onChange={(event) => setAppDraft({ ...appDraft, command: event.target.value })} placeholder="agent-command" /></label><label className="field"><span>Arguments</span><input value={appDraft.args} onChange={(event) => setAppDraft({ ...appDraft, args: event.target.value })} placeholder="--optional flags" /></label><label className="field"><span>Working directory</span><input value={appDraft.workingDirectory} onChange={(event) => setAppDraft({ ...appDraft, workingDirectory: event.target.value })} placeholder="/home/me/project" /></label></div><button className="primary" onClick={() => void addApp()} disabled={!native || !appDraft.name.trim() || !appDraft.command.trim()}>Save app</button></section>}</>}
@@ -640,7 +652,7 @@ function App() {
                 <label className="field"><span>Maximum context to verify</span><input type="number" min="512" step="256" value={maxContext} onChange={(event) => setMaxContext(Math.max(512, Number(event.target.value) || 512))} /></label>
                 <label className="field"><span>Promotion margin</span><input value="90% of verified maximum" readOnly /></label>
               </div>
-              {advanced && <div className="advanced-fields"><label className="field"><span>Objective</span><select value={objective} onChange={(event) => setObjective(event.target.value)}><option value="balanced">Balanced at maximum context</option><option value="max-throughput">Maximum throughput</option><option value="minimum-vram">Minimum VRAM</option><option value="lowest-latency">Lowest latency</option></select></label><label className="field"><span>Checkpointing</span><input value="Every completed trial" readOnly /></label></div>}
+              {advanced && <div className="advanced-fields"><label className="field"><span>Objective</span><select value={objective} onChange={(event) => setObjective(event.target.value)}><option value="balanced">Balanced at maximum context</option><option value="max-throughput">Maximum throughput</option><option value="max-concurrency">Maximum concurrent sessions</option><option value="minimum-vram">Minimum VRAM</option><option value="lowest-latency">Lowest latency</option></select></label><label className="field"><span>Checkpointing</span><input value="Every completed trial" readOnly /></label></div>}
               <div className="exclusive-note"><Activity size={16} /><span><strong>Exclusive GPU access required</strong>Studio stops and later restores its active model. Unmanaged llama-server instances or CUDA apps using significant VRAM cause a safe refusal.</span></div>
               <button className="primary wide" onClick={() => void previewSweep()} disabled={!selected || sweepStatus?.state === "running"}><Gauge size={15} />Preview sweep</button>
             </section>
@@ -653,12 +665,12 @@ function App() {
               </> : sweepStatus && ["complete", "failed", "cancelled"].includes(sweepStatus.state) ? <>
                 <div className={`sweep-state ${sweepStatus.state}`}><strong>{sweepStatus.state === "complete" ? "Verified sweep complete" : sweepStatus.state === "failed" ? "Sweep failed" : "Sweep cancelled"}</strong><span>{sweepStatus.error ?? sweepStatus.currentLabel}</span>{sweepStatus.state === "failed" && sweepStatus.error && <button className="report-error error-card-action" onClick={() => void reportError("config sweep", sweepStatus.error!)}><Bug size={13} />Report error</button>}</div>
                 {sweepStatus.verifiedMaxContext && <div className="result-hero"><small>Promoted safe context</small><strong>{sweepStatus.promotedContext?.toLocaleString()}</strong><span>verified maximum {sweepStatus.verifiedMaxContext.toLocaleString()} tokens</span></div>}
-                <dl><div><dt>Best stable speed</dt><dd>{sweepStatus.bestTokensPerSecond ? `${sweepStatus.bestTokensPerSecond.toFixed(2)} tok/s` : "—"}</dd></div><div><dt>KV / batch</dt><dd>{sweepStatus.bestKvType ? `${sweepStatus.bestKvType} / ${sweepStatus.bestBatchSize}` : "—"}</dd></div><div><dt>Checkpoint</dt><dd title={sweepStatus.checkpointPath}>Saved</dd></div></dl>
+                <dl><div><dt>Best stable speed</dt><dd>{sweepStatus.bestTokensPerSecond ? `${sweepStatus.bestTokensPerSecond.toFixed(2)} tok/s` : "—"}</dd></div><div><dt>KV / batch</dt><dd>{sweepStatus.bestKvType ? `${sweepStatus.bestKvType} / ${sweepStatus.bestBatchSize}` : "—"}</dd></div><div><dt>Concurrent sessions</dt><dd>{sweepStatus.bestSlots ?? 1}</dd></div><div><dt>Checkpoint</dt><dd title={sweepStatus.checkpointPath}>Saved</dd></div></dl>
                 {sweepStatus.state === "complete" && <button className="primary wide" onClick={() => void applySweepProfile()} disabled={profileApplied}>{profileApplied ? "Verified profile applied" : "Apply verified profile"}</button>}
                 <button className="wide result-secondary" onClick={() => { setSweepStatus(undefined); setSweepPlan(undefined); setProfileApplied(false); }}>New sweep</button>
               </> : sweepPlan ? <>
                 <div className="result-hero"><small>Candidate promoted context</small><strong>{sweepPlan.promotedContext.toLocaleString()}</strong><span>final value follows measured capacity</span></div>
-                <dl><div><dt>Maximum trials</dt><dd>{sweepPlan.trialCount}</dd></div><div><dt>KV types</dt><dd>{sweepPlan.kvTypes.join(", ")}</dd></div><div><dt>Batch sizes</dt><dd>{sweepPlan.batchSizes.join(", ")}</dd></div><div><dt>Checkpointing</dt><dd>Every trial</dd></div></dl>
+                <dl><div><dt>Maximum trials</dt><dd>{sweepPlan.trialCount}</dd></div><div><dt>KV types</dt><dd>{sweepPlan.kvTypes.join(", ")}</dd></div><div><dt>Batch sizes</dt><dd>{sweepPlan.batchSizes.join(", ")}</dd></div><div><dt>Sessions</dt><dd>{sweepPlan.slotCounts.join(", ")}</dd></div><div><dt>Checkpointing</dt><dd>Every trial</dd></div></dl>
                 {!sweepConfirmation ? <button className="primary wide" onClick={() => setSweepConfirmation(true)} disabled={!native}>Run verified sweep</button> : <div className="sweep-confirm"><strong>Give the sweep exclusive GPU access?</strong><span>Studio-managed serving stops now and is restored after completion, failure, or cancellation.</span><div><button onClick={() => setSweepConfirmation(false)}>Not now</button><button className="primary" onClick={() => void runSweep()}>Stop model & run</button></div></div>}
               </> : <EmptyState title="No plan yet" detail="Choose a model and preview the measured search space." />}
             </section>

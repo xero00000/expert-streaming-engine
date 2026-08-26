@@ -47,6 +47,7 @@ struct llama_hparams {
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
+    uint32_t n_embd_head_kda    = 0;
     uint32_t n_ff_exp           = 0;
     uint32_t n_ff_shexp         = 0;
     uint32_t n_expert_shared    = 0;
@@ -215,6 +216,7 @@ struct llama_hparams {
         if (this->n_layer_dense_lead != other.n_layer_dense_lead) return true;
         if (this->n_lora_q           != other.n_lora_q)           return true;
         if (this->n_lora_kv          != other.n_lora_kv)          return true;
+        if (this->n_embd_head_kda    != other.n_embd_head_kda)    return true;
         if (this->n_ff_exp           != other.n_ff_exp)           return true;
         if (this->n_ff_shexp         != other.n_ff_shexp)         return true;
         if (this->n_expert_shared    != other.n_expert_shared)    return true;
@@ -324,6 +326,12 @@ struct llama_hparams {
     }
 
     uint32_t n_embd_v_s() const { // dimension of the recurrent state embeddings
+        if (n_embd_head_kda > 0) {
+            const uint32_t d_inner = n_head() * n_embd_head_kda;
+            const uint32_t conv_state_dim = 3 * (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * d_inner;
+            const uint32_t kda_state_dim  = n_head() * n_embd_head_kda * n_embd_head_kda;
+            return conv_state_dim + kda_state_dim;
+        }
         if (ssm_n_group > 0) {
             // qwen3next recurrent state packs:
             // 1) conv state: (d_conv - 1) * (2 * key_dim + value_dim)

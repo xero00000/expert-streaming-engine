@@ -716,6 +716,13 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
         }
     }
 
+    if (params.expert_hybrid_gpu_experts > 0 &&
+            (params.expert_hybrid_cpu_ns_per_expert == 0 ||
+             params.expert_hybrid_upload_ns_per_expert == 0)) {
+        throw std::invalid_argument(
+                "error: --expert-hybrid-gpu-experts requires calibrated CPU and upload guard costs");
+    }
+
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
@@ -2280,12 +2287,60 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--expert-prefill-staging-mib") {
+        CHECK_ARG;
+        params.expert_prefill_staging_mib = std::stoll(argv[i]);
+        if (params.expert_prefill_staging_mib < 0) {
+            fprintf(stderr, "error: --expert-prefill-staging-mib must be >= 0\n");
+            invalid_param = true;
+        }
+        return true;
+    }
     if (arg == "--expert-cache-min-observations") {
         CHECK_ARG;
         params.expert_cache_min_observations = std::stoi(argv[i]);
         if (params.expert_cache_min_observations < 1) {
             fprintf(stderr, "error: --expert-cache-min-observations must be >= 1\n");
             invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--expert-hybrid-gpu-experts") {
+        CHECK_ARG;
+        params.expert_hybrid_gpu_experts = std::stoi(argv[i]);
+        if (params.expert_hybrid_gpu_experts < 0 || params.expert_hybrid_gpu_experts > 64) {
+            fprintf(stderr, "error: --expert-hybrid-gpu-experts must be between 0 and 64\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--expert-hybrid-cpu-ns-per-expert" ||
+            arg == "--expert-hybrid-upload-ns-per-expert") {
+        CHECK_ARG;
+        const uint64_t value = std::stoull(argv[i]);
+        if (value == 0) {
+            fprintf(stderr, "error: %s must be >= 1\n", arg.c_str());
+            invalid_param = true;
+        } else if (arg == "--expert-hybrid-cpu-ns-per-expert") {
+            params.expert_hybrid_cpu_ns_per_expert = value;
+        } else {
+            params.expert_hybrid_upload_ns_per_expert = value;
+        }
+        return true;
+    }
+    if (arg == "--expert-hybrid-maximum-drift-ppm" ||
+            arg == "--expert-hybrid-minimum-cpu-calls") {
+        CHECK_ARG;
+        const uint64_t value = std::stoull(argv[i]);
+        if (value > UINT32_MAX ||
+                (arg == "--expert-hybrid-maximum-drift-ppm" && value < 1000000) ||
+                (arg == "--expert-hybrid-minimum-cpu-calls" && value < 1)) {
+            fprintf(stderr, "error: invalid value for %s\n", arg.c_str());
+            invalid_param = true;
+        } else if (arg == "--expert-hybrid-maximum-drift-ppm") {
+            params.expert_hybrid_maximum_drift_ppm = (uint32_t) value;
+        } else {
+            params.expert_hybrid_minimum_cpu_calls = (uint32_t) value;
         }
         return true;
     }
@@ -3431,7 +3486,13 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --expert-sidecar-only", "reject any expert read that bypasses the checked descriptor/lease hierarchy"});
     options.push_back({ "*",           "       --expert-vram-cache-mib N", "per-device adaptive GPU expert-cache bound in MiB (default: disabled)"});
     options.push_back({ "*",           "       --expert-vram-reserve-mib N", "VRAM that the expert cache must leave unallocated per device"});
+    options.push_back({ "*",           "       --expert-prefill-staging-mib N", "separate two-lane whole-layer prefill staging total per device (default: native-policy auto; 0 disables)"});
     options.push_back({ "*",           "       --expert-cache-min-observations N", "minimum routes before GPU-cache admission (default: 2)"});
+    options.push_back({ "*",           "       --expert-hybrid-gpu-experts N", "decode top-k positions assigned to the GPU branch (default: disabled)"});
+    options.push_back({ "*",           "       --expert-hybrid-cpu-ns-per-expert N", "calibrated conservative CPU cost required by the live hybrid guard"});
+    options.push_back({ "*",           "       --expert-hybrid-upload-ns-per-expert N", "calibrated conservative upload cost required by the live hybrid guard"});
+    options.push_back({ "*",           "       --expert-hybrid-maximum-drift-ppm N", "one-way live hybrid revocation threshold (default: 4000000)"});
+    options.push_back({ "*",           "       --expert-hybrid-minimum-cpu-calls N", "rolling CPU timing window before live guard evaluation (default: 64)"});
     options.push_back({ "*",           "       --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
     options.push_back({ "*",           "       --prefetch-experts-threads N",
                                                                         "number of expert prefetch workers, tune to drive speed/type (default: auto)"});
@@ -4209,6 +4270,7 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
     probe_params.defer_experts = true;
     probe_params.expert_ram_cache_mib = 0;
     probe_params.expert_vram_cache_mib = 0;
+    probe_params.expert_prefill_staging_mib = 0;
     llama_model_params probe_mparams = common_model_params_to_llama(probe_params);
     llama_model * probe = common_load_model_for_params(probe_params, probe_mparams);
     if (!probe) {
@@ -4229,6 +4291,29 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
     input.requested_aux_ram_bytes = params.cache_ram_mib > 0
         ? uint64_t(params.cache_ram_mib)*1024ULL*1024ULL : 0;
     input.requested_expert_vram_bytes_per_device = common_resource_cache_limit_bytes(params.expert_vram_cache_mib);
+    const uint64_t largest_expert_layer = llama_model_largest_expert_layer(probe);
+    if (params.expert_prefill_staging_mib < 0) {
+        if (largest_expert_layer > UINT64_MAX/2) {
+            llama_free_model(probe);
+            error = "two-lane expert prefill staging size overflows 64-bit bytes";
+            return false;
+        }
+        constexpr uint64_t mib = 1024ULL*1024ULL;
+        const uint64_t exact_staging = 2*largest_expert_layer;
+        if (exact_staging > UINT64_MAX - (mib - 1)) {
+            llama_free_model(probe);
+            error = "MiB-aligned expert prefill staging size overflows 64-bit bytes";
+            return false;
+        }
+        // gpt_params carries this capacity in MiB. Round before solving so the
+        // planner accounts exactly the capacity later passed to the scheduler.
+        input.requested_expert_prefill_staging_bytes_per_device =
+            ((exact_staging + mib - 1)/mib)*mib;
+    } else {
+        input.requested_expert_prefill_staging_bytes_per_device =
+            common_resource_cache_limit_bytes(params.expert_prefill_staging_mib);
+    }
+    input.require_expert_prefill_staging = params.expert_prefill_staging_mib > 0;
     input.io_staging_bytes = params.expert_ram_staging_mib > 0
         ? uint64_t(params.expert_ram_staging_mib)*1024ULL*1024ULL
         : std::max<uint64_t>(input.min_expert_ram_bytes, 64ULL*1024ULL*1024ULL);
@@ -4282,6 +4367,7 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
         input.devices.push_back(host);
         input.transient_device = -1;
         input.requested_expert_vram_bytes_per_device = 0;
+        input.requested_expert_prefill_staging_bytes_per_device = 0;
     }
 
     const bool solved = common_resource_plan_solve(input, plan, error);
@@ -4291,6 +4377,9 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
     }
 
     constexpr uint64_t mib = 1024ULL*1024ULL;
+    const auto ceil_mib = [mib](uint64_t bytes) {
+        return bytes/mib + (bytes % mib != 0 ? 1 : 0);
+    };
     params.n_ctx = (int32_t) plan.context;
     params.n_batch = (int32_t) plan.batch;
     params.n_ubatch = (int32_t) plan.ubatch;
@@ -4300,6 +4389,12 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
     params.expert_ram_cache_mib = (int64_t) ((plan.expert_ram_bytes + mib - 1)/mib);
     params.cache_ram_mib = (int32_t) std::min<uint64_t>(INT32_MAX, plan.aux_ram_bytes/mib);
     params.expert_ram_staging_mib = (int64_t) ((plan.io_staging_bytes + mib - 1)/mib);
+    uint64_t min_prefill_staging = UINT64_MAX;
+    for (const auto & device : plan.devices) {
+        min_prefill_staging = std::min(min_prefill_staging, device.expert_prefill_staging_bytes);
+    }
+    params.expert_prefill_staging_mib = min_prefill_staging == UINT64_MAX ? 0
+        : (int64_t) ceil_mib(min_prefill_staging);
     params.defer_experts = plan.policy != COMMON_MEMORY_POLICY_RESIDENT && input.model_is_moe;
     // Static CPU-MoE placement already bounds the GPU-resident model tensors.
     // The loader rejects combining that explicit placement with --fit, so only
@@ -4309,10 +4404,31 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
 
     uint64_t max_device_margin = params.reserve_vram_bytes;
     for (const auto & device : plan.devices) {
-        max_device_margin = std::max(max_device_margin,
-            device.reserve_bytes + device.expert_cache_bytes + device.transient_bytes);
+        uint64_t device_margin = device.reserve_bytes;
+        uint64_t transient_fit_bytes = device.transient_bytes;
+        if (device.id == plan.transient_device &&
+                plan.transient_policy == COMMON_TRANSIENT_POLICY_SHARED) {
+            const uint64_t preparation_extra = std::min(
+                plan.transient_mtp_bytes, plan.transient_multimodal_bytes);
+            if (preparation_extra > UINT64_MAX - transient_fit_bytes) {
+                transient_fit_bytes = UINT64_MAX;
+            } else {
+                transient_fit_bytes += preparation_extra;
+            }
+        }
+        for (const uint64_t allocation : {
+                device.expert_cache_bytes,
+                device.expert_prefill_staging_bytes,
+                transient_fit_bytes }) {
+            if (allocation > UINT64_MAX - device_margin) {
+                device_margin = UINT64_MAX;
+                break;
+            }
+            device_margin += allocation;
+        }
+        max_device_margin = std::max(max_device_margin, device_margin);
     }
-    params.fit_margin = (int32_t) std::min<uint64_t>(INT32_MAX, (max_device_margin + mib - 1)/mib);
+    params.fit_margin = (int32_t) std::min<uint64_t>(INT32_MAX, ceil_mib(max_device_margin));
     uint64_t min_expert_vram = UINT64_MAX;
     for (const auto & device : plan.devices) {
         min_expert_vram = std::min(min_expert_vram, device.expert_cache_bytes);
@@ -4676,13 +4792,22 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.prefetch_experts_threads = params.prefetch_experts_threads;
     cparams.max_extra_alloc   = params.max_extra_alloc_MiB;
     constexpr uint64_t expert_mib = 1024ULL*1024ULL;
+    const uint64_t expert_prefill_staging_mib = params.expert_prefill_staging_mib > 0
+        ? uint64_t(params.expert_prefill_staging_mib) : 0;
     if (uint64_t(params.expert_vram_cache_mib) > UINT64_MAX/expert_mib ||
+            expert_prefill_staging_mib > UINT64_MAX/expert_mib ||
             uint64_t(params.expert_vram_reserve_mib) > UINT64_MAX/expert_mib) {
         throw std::runtime_error("expert VRAM capacity overflows 64-bit bytes");
     }
     cparams.expert_vram_cache_bytes = uint64_t(params.expert_vram_cache_mib)*expert_mib;
     cparams.expert_vram_reserve_bytes = uint64_t(params.expert_vram_reserve_mib)*expert_mib;
+    cparams.expert_prefill_staging_bytes = expert_prefill_staging_mib*expert_mib;
     cparams.expert_cache_min_observations = uint32_t(params.expert_cache_min_observations);
+    cparams.expert_hybrid_gpu_experts = uint32_t(params.expert_hybrid_gpu_experts);
+    cparams.expert_hybrid_cpu_ns_per_expert = params.expert_hybrid_cpu_ns_per_expert;
+    cparams.expert_hybrid_upload_ns_per_expert = params.expert_hybrid_upload_ns_per_expert;
+    cparams.expert_hybrid_maximum_drift_ppm = params.expert_hybrid_maximum_drift_ppm;
+    cparams.expert_hybrid_minimum_cpu_calls = params.expert_hybrid_minimum_cpu_calls;
     cparams.mtp               = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     cparams.mtp_op_type      = MTP_OP_NONE;
 
@@ -5689,6 +5814,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "expert_sidecar_only: %s # default: false\n", params.expert_sidecar_only ? "true" : "false");
     fprintf(stream, "expert_vram_cache_mib: %lld # default: 0 (disabled)\n", (long long) params.expert_vram_cache_mib);
     fprintf(stream, "expert_vram_reserve_mib: %lld # default: 0\n", (long long) params.expert_vram_reserve_mib);
+    fprintf(stream, "expert_prefill_staging_mib: %lld # default: -1 (native-policy auto)\n", (long long) params.expert_prefill_staging_mib);
     fprintf(stream, "memory_policy: %s # default: legacy tuning\n", params.memory_policy.c_str());
     fprintf(stream, "max_ram_bytes: %llu # default: detected/unlimited\n", (unsigned long long) params.max_ram_bytes);
     fprintf(stream, "reserve_vram_bytes: %llu # default: 0\n", (unsigned long long) params.reserve_vram_bytes);

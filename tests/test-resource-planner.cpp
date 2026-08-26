@@ -1,8 +1,11 @@
 #include "resource-planner.h"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <stdexcept>
+
+#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -21,6 +24,7 @@ common_resource_plan_input base_input() {
     input.requested_expert_ram_bytes = 16ULL*1024*MiB;
     input.requested_aux_ram_bytes = 4ULL*1024*MiB;
     input.requested_expert_vram_bytes_per_device = 512*MiB;
+    input.requested_expert_prefill_staging_bytes_per_device = 256*MiB;
     input.io_staging_bytes = 256*MiB;
     input.mtp_bytes = 1200*MiB;
     input.multimodal_bytes = 1500*MiB;
@@ -40,6 +44,30 @@ common_resource_plan_input base_input() {
     return input;
 }
 
+common_resource_plan runtime_plan(
+        uint64_t capacity,
+        uint64_t reserve,
+        uint64_t fixed,
+        uint64_t kv,
+        uint64_t expert,
+        uint32_t context = 4096) {
+    common_resource_plan plan;
+    plan.policy = COMMON_MEMORY_POLICY_CACHE;
+    plan.context = context;
+    plan.slots = 1;
+    common_resource_device_plan device;
+    device.id = 0;
+    device.capacity_bytes = capacity;
+    device.reserve_bytes = reserve;
+    device.dense_bytes = fixed;
+    device.kv_bytes = kv;
+    device.expert_cache_bytes = expert;
+    device.planned_bytes = fixed + kv + expert;
+    device.headroom_bytes = capacity - reserve - device.planned_bytes;
+    plan.devices.push_back(device);
+    return plan;
+}
+
 void test_deterministic_budget_and_json() {
     auto input = base_input();
     common_resource_plan first;
@@ -54,15 +82,55 @@ void test_deterministic_budget_and_json() {
     REQUIRE(first.context == input.requested_context);
     REQUIRE(first.kv_quality == COMMON_KV_QUALITY_TURBO8);
     REQUIRE(first.transient_swap);
+    REQUIRE(first.transient_device == input.transient_device);
+    REQUIRE(first.transient_policy == COMMON_TRANSIENT_POLICY_SHARED);
+    REQUIRE(first.transient_mtp_bytes == input.mtp_bytes);
+    REQUIRE(first.transient_multimodal_bytes == input.multimodal_bytes);
     REQUIRE(first.devices[0].transient_bytes == 0);
     REQUIRE(first.devices[1].transient_bytes == input.multimodal_bytes);
+    REQUIRE(first.devices[1].headroom_bytes >=
+        std::min(input.mtp_bytes, input.multimodal_bytes));
     for (const auto & device : first.devices) {
         REQUIRE(device.expert_cache_bytes <= input.requested_expert_vram_bytes_per_device);
+        REQUIRE(device.expert_prefill_staging_bytes ==
+                input.requested_expert_prefill_staging_bytes_per_device);
         REQUIRE(device.planned_bytes + device.reserve_bytes <= device.capacity_bytes);
     }
     const std::string json = common_resource_plan_json(first);
     REQUIRE(json.find("\"policy\":\"cache\"") != std::string::npos);
     REQUIRE(json.find("\"kv_quality\":\"turbo8\"") != std::string::npos);
+    REQUIRE(json.find("\"expert_prefill_staging_enabled\":true") != std::string::npos);
+    REQUIRE(json.find("\"transient_policy\":\"shared\"") != std::string::npos);
+}
+
+void test_optional_prefill_staging_falls_back_without_violating_context_floor() {
+    auto input = base_input();
+    input.devices = {{ 0, 3ULL*1024*MiB, 512*MiB, 512*MiB, 256*MiB }};
+    input.transient_device = 0;
+    input.mtp_bytes = 0;
+    input.multimodal_bytes = 0;
+    input.requested_context = 4096;
+    input.max_context = 4096;
+    input.min_context = 4096;
+    input.kv_bytes_per_token[COMMON_KV_QUALITY_TURBO4] = 128*1024;
+    input.requested_expert_prefill_staging_bytes_per_device = 2ULL*1024*MiB;
+
+    common_resource_plan plan;
+    std::string error;
+    REQUIRE(common_resource_plan_solve(input, plan, error));
+    REQUIRE(!plan.expert_prefill_staging_enabled);
+    REQUIRE(plan.devices.front().expert_prefill_staging_bytes == 0);
+    REQUIRE(plan.reason.find("optional expert prefill staging disabled") != std::string::npos);
+
+    input.require_expert_prefill_staging = true;
+    REQUIRE(!common_resource_plan_solve(input, plan, error));
+    REQUIRE(error.find("required expert prefill staging") != std::string::npos);
+
+    auto resident = base_input();
+    resident.requested_policy = COMMON_MEMORY_POLICY_RESIDENT;
+    resident.require_expert_prefill_staging = true;
+    REQUIRE(!common_resource_plan_solve(resident, plan, error));
+    REQUIRE(error.find("non-resident MoE memory policy") != std::string::npos);
 }
 
 void test_preference_tradeoff() {
@@ -136,6 +204,298 @@ void test_atomic_rollback() {
     REQUIRE(error.find("injected commit failure") != std::string::npos);
 }
 
+void test_runtime_rebalance_target_is_pure_and_reserve_bounded() {
+    auto input = base_input();
+    common_resource_plan current;
+    std::string error;
+    REQUIRE(common_resource_plan_solve(input, current, error));
+    const std::string original = common_resource_plan_json(current);
+
+    common_resource_rebalance_request request;
+    request.context = current.context/2;
+    request.set_expert_cache_bytes_per_device = true;
+    request.expert_cache_bytes_per_device = 256*MiB;
+    common_resource_plan target;
+    REQUIRE(common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(target.context == current.context/2);
+    REQUIRE(common_resource_plan_json(current) == original);
+    for (size_t index = 0; index < target.devices.size(); ++index) {
+        REQUIRE(target.devices[index].expert_cache_bytes == 256*MiB);
+        REQUIRE(target.devices[index].kv_bytes <= current.devices[index].kv_bytes);
+        REQUIRE(target.devices[index].planned_bytes + target.devices[index].reserve_bytes <=
+                target.devices[index].capacity_bytes);
+    }
+
+    request.context = current.slots + 1;
+    REQUIRE(!common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(error.find("whole-token capacity") != std::string::npos);
+    REQUIRE(common_resource_plan_json(current) == original);
+
+    request.context = current.context;
+    request.expert_cache_bytes_per_device = std::numeric_limits<uint64_t>::max();
+    REQUIRE(!common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(error.find("overflows") != std::string::npos || error.find("reserve") != std::string::npos);
+    REQUIRE(common_resource_plan_json(current) == original);
+
+    request.expert_cache_bytes_per_device = 0;
+    REQUIRE(common_resource_rebalance_target(current, request, target, error));
+    for (const auto & device : target.devices) REQUIRE(device.expert_cache_bytes == 0);
+}
+
+void test_runtime_transient_policy_targets_are_explicit_and_pure() {
+    auto input = base_input();
+    common_resource_plan current;
+    common_resource_plan target;
+    std::string error;
+    REQUIRE(common_resource_plan_solve(input, current, error));
+    const std::string original = common_resource_plan_json(current);
+
+    common_resource_rebalance_request request;
+    request.set_transient_policy = true;
+    request.transient_policy = COMMON_TRANSIENT_POLICY_MTP_ONLY;
+    REQUIRE(common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(target.transient_policy == COMMON_TRANSIENT_POLICY_MTP_ONLY);
+    REQUIRE(target.transient_capacity_bytes == input.mtp_bytes);
+    REQUIRE(target.devices[1].transient_bytes == input.mtp_bytes);
+    REQUIRE(!target.transient_swap);
+    REQUIRE(target.draft_resident);
+    REQUIRE(common_resource_plan_json(current) == original);
+
+    request.transient_policy = COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY;
+    REQUIRE(common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(target.transient_capacity_bytes == input.multimodal_bytes);
+    REQUIRE(!target.draft_resident);
+
+    request.transient_policy = COMMON_TRANSIENT_POLICY_OFF;
+    REQUIRE(common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(target.transient_capacity_bytes == 0);
+    REQUIRE(target.devices[1].transient_bytes == 0);
+
+    request.transient_policy = COMMON_TRANSIENT_POLICY_SHARED;
+    auto missing_multimodal = current;
+    missing_multimodal.transient_multimodal_bytes = 0;
+    REQUIRE(!common_resource_rebalance_target(
+        missing_multimodal, request, target, error));
+    REQUIRE(error.find("requires configured MTP and multimodal") != std::string::npos);
+    REQUIRE(common_resource_plan_json(current) == original);
+
+    auto no_transient = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 10*MiB);
+    request.transient_policy = COMMON_TRANSIENT_POLICY_OFF;
+    REQUIRE(common_resource_rebalance_target(
+        no_transient, request, target, error));
+    REQUIRE(target.transient_policy == COMMON_TRANSIENT_POLICY_OFF);
+}
+
+void test_shared_transient_policy_preserves_request_swap_rollback_reserve() {
+    auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 10*MiB);
+    current.transient_device = 0;
+    current.transient_policy = COMMON_TRANSIENT_POLICY_SHARED;
+    current.transient_mtp_bytes = 15*MiB;
+    current.transient_multimodal_bytes = 25*MiB;
+    current.transient_capacity_bytes = 25*MiB;
+    current.transient_swap = true;
+    current.draft_resident = true;
+    current.devices.front().transient_bytes = 25*MiB;
+    current.devices.front().planned_bytes += 25*MiB;
+    current.devices.front().headroom_bytes -= 25*MiB;
+    REQUIRE(current.devices.front().headroom_bytes == 25*MiB);
+
+    common_resource_rebalance_request request;
+    request.context = current.context;
+    request.set_expert_cache_bytes_per_device = true;
+    request.expert_cache_bytes_per_device = 25*MiB;
+    common_resource_plan target;
+    std::string error;
+    REQUIRE(!common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(error.find("rollback reserve") != std::string::npos);
+}
+
+void test_preparation_peak_rejects_final_fit_without_double_buffer_headroom() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 40*MiB, 10*MiB);
+    const auto target = runtime_plan(100*MiB, 10*MiB, 10*MiB, 60*MiB, 10*MiB, 8192);
+    REQUIRE(target.devices.front().planned_bytes + target.devices.front().reserve_bytes <=
+            target.devices.front().capacity_bytes);
+
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(error.find("preparation peak crosses") != std::string::npos);
+}
+
+void test_preparation_peak_detects_u64_overflow_without_mutating_report() {
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    const auto current = runtime_plan(maximum, 0, 0, maximum - 5, 0);
+    const auto target = runtime_plan(maximum, 0, 0, maximum - 6, 0, 8192);
+    common_resource_preparation_peak report;
+    report.prepares_expert_cache = true;
+    report.devices.push_back({});
+    std::string error;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(error.find("preparation peak overflows") != std::string::npos);
+    REQUIRE(report.prepares_expert_cache);
+    REQUIRE(report.devices.size() == 1);
+}
+
+void test_preparation_peak_accepts_exact_reserve_boundary() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 10*MiB);
+    const auto target = runtime_plan(100*MiB, 10*MiB, 10*MiB, 50*MiB, 10*MiB, 8192);
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(report.prepares_kv);
+    REQUIRE(!report.prepares_expert_cache);
+    REQUIRE(report.devices.front().current_live_bytes == 40*MiB);
+    REQUIRE(report.devices.front().prepared_kv_bytes == 50*MiB);
+    REQUIRE(report.devices.front().prepared_expert_cache_bytes == 0);
+    REQUIRE(report.devices.front().peak_bytes == 90*MiB);
+    REQUIRE(report.devices.front().peak_headroom_bytes == 0);
+}
+
+void test_preparation_peak_reports_single_pool_replacement() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 10*MiB);
+    const auto target = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 30*MiB);
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(!report.prepares_kv);
+    REQUIRE(report.prepares_expert_cache);
+    REQUIRE(report.devices.front().prepared_kv_bytes == 0);
+    REQUIRE(report.devices.front().prepared_expert_cache_bytes == 30*MiB);
+    REQUIRE(report.devices.front().peak_bytes == 70*MiB);
+    REQUIRE(report.devices.front().peak_headroom_bytes == 20*MiB);
+
+    const std::string json = common_resource_preparation_peak_json(report);
+    REQUIRE(json.find("\"prepares_kv\":false") != std::string::npos);
+    REQUIRE(json.find("\"prepares_expert_cache\":true") != std::string::npos);
+    REQUIRE(json.find("\"peak_headroom_bytes\":20971520") != std::string::npos);
+}
+
+void test_preparation_peak_counts_transient_owner_replacement() {
+    auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 10*MiB);
+    current.transient_device = 0;
+    current.transient_policy = COMMON_TRANSIENT_POLICY_MTP_ONLY;
+    current.transient_mtp_bytes = 20*MiB;
+    current.transient_multimodal_bytes = 30*MiB;
+    current.transient_capacity_bytes = 20*MiB;
+    current.devices.front().transient_bytes = 20*MiB;
+    current.devices.front().planned_bytes += 20*MiB;
+    current.devices.front().headroom_bytes -= 20*MiB;
+
+    auto target = current;
+    target.transient_policy = COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY;
+    target.transient_capacity_bytes = 30*MiB;
+    target.draft_resident = false;
+    target.devices.front().transient_bytes = 30*MiB;
+    target.devices.front().planned_bytes += 10*MiB;
+    target.devices.front().headroom_bytes -= 10*MiB;
+
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(common_resource_rebalance_preparation_peak(
+        current, target, report, error));
+    REQUIRE(report.prepares_transient);
+    REQUIRE(report.devices.front().current_live_bytes == 60*MiB);
+    REQUIRE(report.devices.front().target_live_bytes == 70*MiB);
+    REQUIRE(report.devices.front().prepared_transient_bytes == 30*MiB);
+    REQUIRE(report.devices.front().peak_bytes == 90*MiB);
+    REQUIRE(report.devices.front().peak_headroom_bytes == 0);
+
+    const std::string json = common_resource_preparation_peak_json(report);
+    REQUIRE(json.find("\"prepares_transient\":true") != std::string::npos);
+    REQUIRE(json.find("\"prepared_transient_bytes\":31457280") != std::string::npos);
+}
+
+void test_preparation_peak_couples_shared_transient_owner_bounds() {
+    auto shared = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 10*MiB);
+    shared.transient_device = 0;
+    shared.transient_policy = COMMON_TRANSIENT_POLICY_SHARED;
+    shared.transient_mtp_bytes = 20*MiB;
+    shared.transient_multimodal_bytes = 30*MiB;
+    shared.transient_capacity_bytes = 30*MiB;
+    shared.transient_swap = true;
+    shared.draft_resident = true;
+    shared.devices.front().transient_bytes = 30*MiB;
+    shared.devices.front().planned_bytes += 30*MiB;
+    shared.devices.front().headroom_bytes -= 30*MiB;
+
+    for (const auto policy : {
+            COMMON_TRANSIENT_POLICY_MTP_ONLY,
+            COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY}) {
+        auto target = shared;
+        target.transient_policy = policy;
+        target.transient_swap = false;
+        target.draft_resident = policy == COMMON_TRANSIENT_POLICY_MTP_ONLY;
+        target.transient_capacity_bytes = policy == COMMON_TRANSIENT_POLICY_MTP_ONLY
+            ? 20*MiB : 30*MiB;
+        target.devices.front().planned_bytes -= target.devices.front().transient_bytes;
+        target.devices.front().transient_bytes = target.transient_capacity_bytes;
+        target.devices.front().planned_bytes += target.devices.front().transient_bytes;
+        target.devices.front().headroom_bytes =
+            target.devices.front().capacity_bytes - target.devices.front().reserve_bytes -
+            target.devices.front().planned_bytes;
+
+        common_resource_preparation_peak report;
+        std::string error;
+        REQUIRE(common_resource_rebalance_preparation_peak(
+            shared, target, report, error));
+        REQUIRE(report.prepares_transient);
+        // Worst case is one live owner plus the other prepared owner: A+B.
+        // The current shared capacity already contributes max(A,B), so only
+        // min(A,B) is additional at the exact reserve boundary.
+        REQUIRE(report.devices.front().prepared_transient_bytes == 20*MiB);
+        REQUIRE(report.devices.front().peak_bytes == 90*MiB);
+        REQUIRE(report.devices.front().peak_headroom_bytes == 0);
+    }
+
+    auto multimodal_only = shared;
+    multimodal_only.transient_policy = COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY;
+    multimodal_only.transient_swap = false;
+    multimodal_only.draft_resident = false;
+    common_resource_preparation_peak reverse;
+    std::string error;
+    REQUIRE(common_resource_rebalance_preparation_peak(
+        multimodal_only, shared, reverse, error));
+    REQUIRE(reverse.prepares_transient);
+    // Enabling shared mode preserves the already-resident multimodal owner.
+    REQUIRE(reverse.devices.front().prepared_transient_bytes == 0);
+    REQUIRE(reverse.devices.front().peak_bytes == 70*MiB);
+}
+
+void test_preparation_peak_counts_same_target_expert_reconciliation() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 25*MiB);
+    const auto target = current;
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(common_resource_rebalance_preparation_peak(
+            current, target, report, error, true));
+    REQUIRE(report.prepares_expert_cache);
+    REQUIRE(report.devices.front().current_live_bytes == 55*MiB);
+    REQUIRE(report.devices.front().prepared_expert_cache_bytes == 25*MiB);
+    REQUIRE(report.devices.front().peak_bytes == 80*MiB);
+    REQUIRE(report.devices.front().peak_headroom_bytes == 10*MiB);
+}
+
+void test_preparation_peak_rejects_same_target_expert_reconciliation_without_headroom() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 20*MiB, 35*MiB);
+    const auto target = current;
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(!common_resource_rebalance_preparation_peak(
+            current, target, report, error, true));
+    REQUIRE(error.find("preparation peak crosses") != std::string::npos);
+}
+
+void test_preparation_peak_rejects_combined_cross_pool_trade() {
+    const auto current = runtime_plan(100*MiB, 10*MiB, 10*MiB, 50*MiB, 10*MiB);
+    const auto target = runtime_plan(100*MiB, 10*MiB, 10*MiB, 10*MiB, 50*MiB, 8192);
+    REQUIRE(current.devices.front().planned_bytes == target.devices.front().planned_bytes);
+
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(error.find("preparation peak crosses") != std::string::npos);
+}
+
 void test_interface_parsers() {
     uint64_t bytes = 0;
     uint32_t tokens = 0;
@@ -153,12 +513,18 @@ void test_interface_parsers() {
     common_resource_preference preference;
     common_kv_quality quality;
     common_resource_backend backend;
+    common_transient_policy transient_policy;
     REQUIRE(common_parse_memory_policy("auto", policy));
     REQUIRE(common_parse_memory_policy("hybrid", policy));
     REQUIRE(policy == COMMON_MEMORY_POLICY_CACHE);
     REQUIRE(common_parse_resource_preference("throughput", preference));
     REQUIRE(common_parse_kv_quality("turbo4", quality));
     REQUIRE(common_parse_resource_backend("io_uring", backend));
+    REQUIRE(common_parse_transient_policy("shared", transient_policy));
+    REQUIRE(transient_policy == COMMON_TRANSIENT_POLICY_SHARED);
+    REQUIRE(common_transient_policy_name(COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY) ==
+            "multimodal-only");
+    REQUIRE(!common_parse_transient_policy("auto", transient_policy));
     REQUIRE(!common_parse_kv_quality("q4_0", quality));
 }
 
@@ -266,17 +632,173 @@ void test_native_override_normalization() {
     }
 }
 
+void test_calibrated_expert_split_solver() {
+    common_expert_split_input input;
+    input.calibration_complete = true;
+    input.cpu_confidence = input.upload_confidence = 0.95;
+    std::string error;
+    common_expert_split_plan plan;
+
+    input.misses = 1;
+    input.cpu_ns_per_expert = 100;
+    input.upload_ns_per_expert = 20;
+    REQUIRE(common_expert_split_solve(input, plan, error));
+    REQUIRE(plan.cpu_experts == 0 && plan.upload_experts == 1);
+
+    input.cpu_ns_per_expert = 20;
+    input.upload_ns_per_expert = 100;
+    REQUIRE(common_expert_split_solve(input, plan, error));
+    REQUIRE(plan.cpu_experts == 1 && plan.upload_experts == 0);
+
+    input.misses = 8;
+    input.cpu_ns_per_expert = input.upload_ns_per_expert = 100;
+    REQUIRE(common_expert_split_solve(input, plan, error));
+    REQUIRE(plan.cpu_experts == 4 && plan.upload_experts == 4);
+
+    input.previous_upload_experts = 3;
+    input.hysteresis_fraction = 0.30;
+    REQUIRE(common_expert_split_solve(input, plan, error));
+    REQUIRE(plan.upload_experts == 3 && plan.retained_by_hysteresis);
+
+    input.calibration_complete = false;
+    REQUIRE(!common_expert_split_solve(input, plan, error));
+    REQUIRE(error.find("incomplete") != std::string::npos);
+    input.calibration_complete = true;
+    input.cpu_confidence = 0.5;
+    REQUIRE(!common_expert_split_solve(input, plan, error));
+    REQUIRE(error.find("confidence") != std::string::npos);
+    input.cpu_confidence = 0.95;
+    input.cpu_ns_per_expert = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(!common_expert_split_solve(input, plan, error));
+}
+
+nlohmann::json calibrated_profile_json() {
+    const nlohmann::json format = {
+        {"ggml_type_id", 16},
+        {"input_width", 4096},
+        {"expert_width", 2048},
+        {"bytes_per_expert_component", 2162688},
+    };
+    nlohmann::json cpu = format;
+    cpu.update({
+        {"correctness", "single-thread-and-dequantized-scalar-reference"},
+        {"independent_reference_nrmse", 0.004},
+        {"sample_count", 21},
+        {"relative_standard_error", 0.02},
+        {"confidence", 0.92},
+    });
+    nlohmann::json contention = format;
+    contention.update({
+        {"cpu_ns_per_expert_component", 120000.0},
+        {"upload_ns_per_expert_component", 90000.0},
+        {"cpu_sample_count", 21},
+        {"cpu_relative_standard_error", 0.02},
+        {"cpu_confidence", 0.92},
+        {"upload_sample_count", 21},
+        {"upload_relative_standard_error", 0.02},
+        {"upload_confidence", 0.93},
+    });
+    nlohmann::json lease = format;
+    lease.update({
+        {"backend", "CUDA0"},
+        {"storage_backend", "pread"},
+        {"distribution", "warm-steady-state"},
+        {"sample_count", 21},
+        {"relative_standard_error", 0.02},
+        {"confidence", 0.94},
+    });
+    return {
+        {"benchmark_source", {
+            {"planner_ready", true},
+            {"calibration_level", "planner"},
+        }},
+        {"measurements", {
+            {"cpu_moe", {
+                {"status", "measured"},
+                {"model_profiles", nlohmann::json::array({cpu})},
+            }},
+            {"cpu_cache_contention", {
+                {"status", "measured"},
+                {"upload_path", "pread_to_bounded_ram_lease_to_async_upload"},
+                {"distribution", "warm-steady-state"},
+                {"devices", nlohmann::json::array({{
+                    {"backend", "CUDA0"},
+                    {"profiles", nlohmann::json::array({contention})},
+                }})},
+            }},
+            {"expert_cache_upload", {
+                {"status", "measured"},
+                {"lease_upload_profiles", nlohmann::json::array({lease})},
+            }},
+        }},
+    };
+}
+
+void test_native_calibration_profile_gate() {
+    common_expert_calibration_profile profile;
+    std::string error;
+    auto valid = calibrated_profile_json();
+    REQUIRE(common_expert_calibration_parse_json(valid.dump(), profile, error));
+    REQUIRE(profile.entries.size() == 1);
+    common_expert_calibration_entry entry;
+    common_expert_calibration_key key{"CUDA0", 16, 4096, 2048, 2162688};
+    REQUIRE(common_expert_calibration_lookup(profile, key, entry));
+    REQUIRE(entry.cpu_ns_per_expert_component == 120000.0);
+    REQUIRE(entry.upload_ns_per_expert_component == 90000.0);
+    common_expert_split_plan split;
+    REQUIRE(common_expert_split_solve_calibrated(
+            profile, {key, key}, 7, -1, 0.05, split, error));
+    REQUIRE(split.cpu_experts == 3 && split.upload_experts == 4);
+    common_expert_calibration_key missing = key;
+    missing.ggml_type = 19;
+    REQUIRE(!common_expert_split_solve_calibrated(
+            profile, {key, missing}, 7, -1, 0.05, split, error));
+    REQUIRE(error.find("required expert component") != std::string::npos);
+    key.backend = "CUDA1";
+    REQUIRE(!common_expert_calibration_lookup(profile, key, entry));
+
+    auto low_confidence = calibrated_profile_json();
+    low_confidence["measurements"]["cpu_cache_contention"]["devices"][0]["profiles"][0]["cpu_confidence"] = 0.79;
+    REQUIRE(!common_expert_calibration_parse_json(low_confidence.dump(), profile, error));
+    REQUIRE(error.find("confidence") != std::string::npos);
+
+    auto missing_lease = calibrated_profile_json();
+    missing_lease["measurements"]["expert_cache_upload"]["lease_upload_profiles"] = nlohmann::json::array();
+    REQUIRE(!common_expert_calibration_parse_json(missing_lease.dump(), profile, error));
+    REQUIRE(error.find("leased-upload") != std::string::npos);
+
+    auto forged_ready = calibrated_profile_json();
+    forged_ready["benchmark_source"]["planner_ready"] = false;
+    REQUIRE(!common_expert_calibration_parse_json(forged_ready.dump(), profile, error));
+    REQUIRE(error.find("planner-ready") != std::string::npos);
+}
+
 } // namespace
 
 int main() {
     test_deterministic_budget_and_json();
+    test_optional_prefill_staging_falls_back_without_violating_context_floor();
     test_preference_tradeoff();
     test_no_silent_fallbacks();
     test_atomic_rollback();
+    test_runtime_rebalance_target_is_pure_and_reserve_bounded();
+    test_runtime_transient_policy_targets_are_explicit_and_pure();
+    test_shared_transient_policy_preserves_request_swap_rollback_reserve();
+    test_preparation_peak_rejects_final_fit_without_double_buffer_headroom();
+    test_preparation_peak_detects_u64_overflow_without_mutating_report();
+    test_preparation_peak_accepts_exact_reserve_boundary();
+    test_preparation_peak_reports_single_pool_replacement();
+    test_preparation_peak_counts_transient_owner_replacement();
+    test_preparation_peak_couples_shared_transient_owner_bounds();
+    test_preparation_peak_counts_same_target_expert_reconciliation();
+    test_preparation_peak_rejects_same_target_expert_reconciliation_without_headroom();
+    test_preparation_peak_rejects_combined_cross_pool_trade();
     test_interface_parsers();
     test_compatibility_presets_and_host_budget();
     test_auto_unlimited_ram_and_minimum_expert_component();
     test_rollback_hook_failure_is_single_shot();
     test_native_override_normalization();
+    test_calibrated_expert_split_solver();
+    test_native_calibration_profile_gate();
     return 0;
 }

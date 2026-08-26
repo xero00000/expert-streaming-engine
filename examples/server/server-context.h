@@ -6,7 +6,10 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
+#include <atomic>
 #include <memory>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 
@@ -259,7 +262,10 @@ struct server_context {
     mtmd_context_params mctx_params = mtmd_context_params_default();
     std::unique_ptr<common_transient_module_manager> transient_manager;
 
-    int32_t n_ctx; // total context for all clients / slots
+    int32_t n_ctx;     // owner-thread active context for all clients / slots
+    int32_t n_ctx_max; // immutable load-time ceiling
+    std::atomic<int32_t> n_ctx_published{0}; // cross-thread HTTP view
+    mutable std::mutex resource_plan_mutex;
 
     // system prompt
     bool system_need_update = false;
@@ -294,8 +300,23 @@ struct server_context {
     void init();
 
     bool transient_enabled() const;
-    uint64_t acquire_transient(bool multimodal, std::string & error);
+    bool transient_supports(bool multimodal) const;
+    std::string resource_plan_json() const;
+    std::pair<int32_t, std::string> published_resource_state() const;
+    // Direct residency methods are owner-thread only. Prompt preprocessing on
+    // HTTP workers must use the queued wrappers so model owners are never
+    // swapped concurrently with inference.
+    uint64_t acquire_transient(
+        bool multimodal,
+        std::string & error,
+        bool restore_prior = false);
     void release_transient(uint64_t lease, bool success = true);
+    uint64_t acquire_transient_on_owner(
+        bool multimodal,
+        bool restore_prior,
+        std::string & error);
+    bool release_transient_on_owner(uint64_t lease, bool success, std::string & error);
+    void shutdown_transient_residency();
 
     std::vector<llama_token> tokenize(const json& json_prompt, bool add_special) const;
 

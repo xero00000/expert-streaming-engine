@@ -2,9 +2,15 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-ese.h"
+
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -274,6 +280,7 @@ void test_file_storage_backends() {
     for (size_t i = 0; i < 3; ++i) {
         try {
             const uint32_t source_id = uint32_t(i + 1);
+            REQUIRE(identify_file_source(path, source_id) == file_identity(source_id, bytes));
             auto storage = std::make_shared<file_source>(
                     source_id, file_identity(source_id, bytes), path, backends[i]);
             std::array<uint8_t, 32> output = {};
@@ -402,6 +409,138 @@ void test_cpu_kernel_exact_parity_and_no_original_fallback() {
     REQUIRE(*((const int32_t *) ids->data + 1) == route[1]);
 }
 
+void test_route_partition_is_complementary() {
+    ggml_init_params params = { 1024*1024, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    struct cleanup { ggml_context * ctx; ~cleanup() { ggml_free(ctx); } } free_ctx{ctx};
+
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, 2);
+    const std::array<int32_t, 8> route = {{ 7, 3, 5, 1, 2, -1, 6, 4 }};
+    std::memcpy(ids->data, route.data(), sizeof(route));
+    ggml_tensor * gpu_ids = ggml_ese_route_partition(ctx, ids, 0, 2);
+    ggml_tensor * cpu_ids = ggml_ese_route_partition(ctx, ids, 2, 2);
+    REQUIRE(ggml_ese_route_get_role(gpu_ids) == GGML_ESE_ROUTE_GPU);
+    REQUIRE(ggml_ese_route_get_role(cpu_ids) == GGML_ESE_ROUTE_CPU);
+    ggml_tensor * activations = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 4, 2);
+    ggml_tensor * biases = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 8);
+    std::fill_n(static_cast<float *>(activations->data), ggml_nelements(activations), 0.0f);
+    for (int expert = 0; expert < 8; ++expert) {
+        static_cast<float *>(biases->data)[2*expert + 0] = float(expert + 1);
+        static_cast<float *>(biases->data)[2*expert + 1] = float(100 + expert);
+    }
+    ggml_tensor * biased_cpu = ggml_add_id(ctx, activations, biases, cpu_ids);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(graph, gpu_ids);
+    ggml_build_forward_expand(graph, cpu_ids);
+    ggml_build_forward_expand(graph, biased_cpu);
+    ggml_cplan plan = ggml_graph_plan(graph, 2);
+    std::vector<uint8_t> work(plan.work_size);
+    plan.work_data = work.empty() ? nullptr : work.data();
+    REQUIRE(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS);
+
+    const auto * gpu = static_cast<const int32_t *>(gpu_ids->data);
+    const auto * cpu = static_cast<const int32_t *>(cpu_ids->data);
+    for (size_t i = 0; i < route.size(); ++i) {
+        const bool gpu_position = i%4 < 2;
+        REQUIRE(gpu[i] == (gpu_position ? route[i] : -1));
+        REQUIRE(cpu[i] == (gpu_position ? -1 : route[i]));
+        if (route[i] >= 0) {
+            REQUIRE((gpu[i] >= 0) != (cpu[i] >= 0));
+        }
+        const float * biased = static_cast<const float *>(biased_cpu->data) + 2*i;
+        if (gpu_position || route[i] < 0) {
+            REQUIRE(biased[0] == 0.0f && biased[1] == 0.0f);
+        } else {
+            REQUIRE(biased[0] == float(route[i] + 1));
+            REQUIRE(biased[1] == float(100 + route[i]));
+        }
+    }
+}
+
+std::vector<float> compute_cpu_fused_moe_layout(
+        bool merged,
+        const std::vector<ggml_fp16_t> & up_weights,
+        const std::vector<ggml_fp16_t> & gate_weights,
+        const std::vector<float> & input_values) {
+    constexpr int64_t k = 384;
+    constexpr int64_t m = 128;
+    constexpr int64_t n_experts = 2;
+    constexpr int64_t n_used = 2;
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr);
+    struct backend_cleanup { ggml_backend_t value; ~backend_cleanup() { ggml_backend_free(value); } } free_backend{backend};
+
+    ggml_init_params params = {
+        ggml_tensor_overhead()*20 + ggml_graph_overhead_custom(16, false), nullptr, true
+    };
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    struct context_cleanup { ggml_context * value; ~context_cleanup() { ggml_free(value); } } free_ctx{ctx};
+
+    ggml_tensor * up = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F16, k, merged ? 2*m : m, n_experts);
+    ggml_tensor * gate = merged ? nullptr : ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F16, k, m, n_experts);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
+    ggml_tensor * output = ggml_moe_up_gate(ctx, up, gate, input, ids, GGML_UNARY_OP_SILU);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    REQUIRE(buffer != nullptr);
+    struct buffer_cleanup {
+        ggml_backend_buffer_t value;
+        ~buffer_cleanup() { ggml_backend_buffer_free(value); }
+    } free_buffer{buffer};
+
+    REQUIRE(up_weights.size() == size_t(k*m*n_experts));
+    REQUIRE(gate_weights.size() == up_weights.size());
+    if (merged) {
+        std::vector<ggml_fp16_t> merged_weights(2*up_weights.size());
+        const size_t expert_elements = size_t(k*m);
+        for (int expert = 0; expert < n_experts; ++expert) {
+            auto * destination = merged_weights.data() + size_t(expert)*2*expert_elements;
+            std::copy_n(gate_weights.data() + size_t(expert)*expert_elements, expert_elements, destination);
+            std::copy_n(up_weights.data() + size_t(expert)*expert_elements, expert_elements,
+                    destination + expert_elements);
+        }
+        ggml_backend_tensor_set(up, merged_weights.data(), 0, merged_weights.size()*sizeof(merged_weights[0]));
+    } else {
+        ggml_backend_tensor_set(up, up_weights.data(), 0, up_weights.size()*sizeof(up_weights[0]));
+        ggml_backend_tensor_set(gate, gate_weights.data(), 0, gate_weights.size()*sizeof(gate_weights[0]));
+    }
+    REQUIRE(input_values.size() == size_t(k*n_used));
+    const std::array<int32_t, n_used> route = {{1, 0}};
+    ggml_backend_tensor_set(input, input_values.data(), 0, input_values.size()*sizeof(input_values[0]));
+    ggml_backend_tensor_set(ids, route.data(), 0, sizeof(route));
+
+    REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> result(size_t(ggml_nelements(output)));
+    ggml_backend_tensor_get(output, result.data(), 0, result.size()*sizeof(result[0]));
+    return result;
+}
+
+void test_cpu_fused_moe_merged_workspace() {
+    constexpr int64_t k = 384;
+    constexpr int64_t m = 128;
+    constexpr int64_t n_experts = 2;
+    std::vector<ggml_fp16_t> up(size_t(k*m*n_experts));
+    std::vector<ggml_fp16_t> gate(up.size());
+    for (size_t i = 0; i < up.size(); ++i) {
+        up[i] = ggml_fp32_to_fp16(float(int((i*17 + i/31) % 257) - 128)/64.0f);
+        gate[i] = ggml_fp32_to_fp16(float(int((i*29 + i/19) % 251) - 125)/64.0f);
+    }
+    std::vector<float> input(size_t(k*2));
+    for (size_t i = 0; i < input.size(); ++i) {
+        input[i] = float(int((i*13) % 97) - 48)/24.0f;
+    }
+    const auto separate = compute_cpu_fused_moe_layout(false, up, gate, input);
+    const auto merged = compute_cpu_fused_moe_layout(true, up, gate, input);
+    REQUIRE(merged == separate);
+}
+
 std::vector<float> compute_cuda_mul_mat_id(
         ggml_backend_t backend,
         const std::vector<ggml_fp16_t> & weights,
@@ -442,13 +581,83 @@ std::vector<float> compute_cuda_mul_mat_id(
     ggml_backend_tensor_set(input, input_values.data(), 0, input_values.size()*sizeof(input_values[0]));
     ggml_backend_tensor_set(ids, route.data(), 0, sizeof(route));
 
-    // The scheduler keeps the model's logical expert count while redirecting
-    // the tensor data pointer to a smaller slot buffer.  Reproduce that exact
-    // layout, including the original fourth-dimension stride.
+    // Reproduce the scheduler's redirected tensor geometry.  A compact cache
+    // can expose either the model's logical width or a larger capacity-sized
+    // physical slot width, including its matching fourth-dimension stride.
     tensor_weights->ne[2] = logical_experts;
     tensor_weights->nb[3] = tensor_weights->nb[2]*size_t(logical_experts);
 
     REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> result(size_t(ggml_nelements(output)));
+    ggml_backend_tensor_get(output, result.data(), 0, result.size()*sizeof(result[0]));
+    return result;
+}
+
+std::vector<float> compute_hybrid_mul_mat_id(
+        ggml_backend_t cuda_backend,
+        const std::vector<ggml_fp16_t> & weights,
+        int32_t gpu_expert,
+        const std::array<int32_t, 2> & cpu_route,
+        const std::array<int32_t, 2> & gpu_route,
+        const std::vector<float> & input_values) {
+    constexpr int64_t k = 768;
+    constexpr int64_t m = 384;
+    constexpr int64_t n_experts = 8;
+    constexpr int64_t n_used = 2;
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    REQUIRE(cpu_backend != nullptr);
+    struct cpu_cleanup { ggml_backend_t value; ~cpu_cleanup() { ggml_backend_free(value); } } free_cpu{cpu_backend};
+
+    ggml_init_params params = {
+        ggml_tensor_overhead()*32 + ggml_graph_overhead_custom(32, false), nullptr, true
+    };
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    struct context_cleanup { ggml_context * value; ~context_cleanup() { ggml_free(value); } } free_ctx{ctx};
+
+    ggml_tensor * cpu_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, k, m, n_experts);
+    ggml_tensor * gpu_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, k, m, 1);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, 1);
+    ggml_tensor * cpu_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
+    ggml_tensor * gpu_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
+    ggml_set_input(input);
+    ggml_set_input(cpu_ids);
+    ggml_set_input(gpu_ids);
+    ggml_tensor * cpu_output = ggml_mul_mat_id(ctx, cpu_weights, input, cpu_ids);
+    ggml_tensor * gpu_output = ggml_mul_mat_id(ctx, gpu_weights, input, gpu_ids);
+    ggml_tensor * branches[] = {gpu_output, cpu_output};
+    ggml_tensor * output = ggml_ese_reduce_to(ctx, branches, 2, GGML_OP_ADD, 0);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_t backends[] = {cuda_backend, cpu_backend};
+    ggml_backend_sched_t scheduler = ggml_backend_sched_new(
+            backends, nullptr, 2, 64, true);
+    REQUIRE(scheduler != nullptr);
+    struct scheduler_cleanup {
+        ggml_backend_sched_t value;
+        ~scheduler_cleanup() { ggml_backend_sched_free(value); }
+    } free_scheduler{scheduler};
+    ggml_backend_sched_set_split_mode_graph(scheduler, true, true);
+    ggml_backend_sched_set_tensor_backend(scheduler, cpu_weights, cpu_backend);
+    ggml_backend_sched_set_tensor_backend(scheduler, gpu_weights, cuda_backend);
+    ggml_backend_sched_set_tensor_backend(scheduler, cpu_output, cpu_backend);
+    ggml_backend_sched_set_tensor_backend(scheduler, gpu_output, cuda_backend);
+    REQUIRE(ggml_backend_sched_alloc_graph(scheduler, graph));
+
+    REQUIRE(weights.size() == size_t(k*m*n_experts));
+    REQUIRE(gpu_expert >= 0 && gpu_expert < n_experts);
+    REQUIRE(input_values.size() == size_t(k*n_used));
+    ggml_backend_tensor_set(cpu_weights, weights.data(), 0, weights.size()*sizeof(weights[0]));
+    ggml_backend_tensor_set(gpu_weights,
+            weights.data() + size_t(gpu_expert)*size_t(k*m), 0,
+            size_t(k*m)*sizeof(weights[0]));
+    ggml_backend_tensor_set(input, input_values.data(), 0, input_values.size()*sizeof(input_values[0]));
+    ggml_backend_tensor_set(cpu_ids, cpu_route.data(), 0, sizeof(cpu_route));
+    ggml_backend_tensor_set(gpu_ids, gpu_route.data(), 0, sizeof(gpu_route));
+    REQUIRE(ggml_backend_sched_graph_compute(scheduler, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_sched_synchronize(scheduler);
     std::vector<float> result(size_t(ggml_nelements(output)));
     ggml_backend_tensor_get(output, result.data(), 0, result.size()*sizeof(result[0]));
     return result;
@@ -545,6 +754,49 @@ void test_cuda_compact_remap_exact_parity() {
             backend, compact_weights, n_used, n_experts, remapped, input_values);
     REQUIRE(compact == full);
 
+    // Frontier MoE models can expose hundreds of logical experts while the
+    // bounded cache keeps only the routed experts resident.  The redirected
+    // tensor must accept that compact physical geometry after ids are remapped.
+    constexpr int64_t large_logical_experts = 256;
+    const auto compact_large_logical = compute_cuda_mul_mat_id(
+            backend, compact_weights, n_used, large_logical_experts, remapped, input_values);
+    REQUIRE(compact_large_logical == full);
+
+    // A capacity-sized cache may retain entries from multiple logical layers,
+    // so a remapped slot can be greater than the model's expert count.  The
+    // redirected tensor must expose the physical slot geometry to the kernel.
+    constexpr int64_t extended_slots = 10;
+    const std::array<int32_t, n_used> extended_route = {{ 8, 9 }};
+    std::vector<ggml_fp16_t> extended_weights(size_t(k*m*extended_slots), ggml_fp32_to_fp16(0.0f));
+    for (int slot = 0; slot < n_used; ++slot) {
+        std::copy_n(full_weights.data() + size_t(route[slot])*size_t(k*m), size_t(k*m),
+                extended_weights.data() + size_t(extended_route[slot])*size_t(k*m));
+    }
+    const auto extended = compute_cuda_mul_mat_id(
+            backend, extended_weights, extended_slots, extended_slots, extended_route, input_values);
+    REQUIRE(extended == full);
+
+    // Negative route sentinels turn unassigned route positions into exact
+    // zeroes. This permits independent CPU and GPU branches to execute on the
+    // same activation and sum back to the unsplit routed result.
+    const auto hybrid = compute_hybrid_mul_mat_id(
+            backend, full_weights, route[1], {{route[0], -1}}, {{-1, 0}}, input_values);
+    double squared_hybrid_error = 0;
+    double squared_full = 0;
+    for (size_t i = 0; i < full.size(); ++i) {
+        REQUIRE(std::isfinite(hybrid[i]));
+        const double error = double(hybrid[i]) - full[i];
+        squared_hybrid_error += error*error;
+        squared_full += double(full[i])*full[i];
+        if (i >= size_t(m)) {
+            // The GPU-owned route position is the same CUDA kernel plus an
+            // exact CPU zero, so a masked branch must not perturb it at all.
+            REQUIRE(hybrid[i] == full[i]);
+        }
+    }
+    const double hybrid_nrmse = std::sqrt(squared_hybrid_error/squared_full);
+    REQUIRE(hybrid_nrmse <= 5.0e-3);
+
     constexpr int64_t fused_k = 384;
     constexpr int64_t fused_m = 768;
     std::vector<ggml_fp16_t> full_fused_up(size_t(fused_k*fused_m*n_experts));
@@ -570,6 +822,206 @@ void test_cuda_compact_remap_exact_parity() {
     const auto compact_fused = compute_cuda_fused_moe(
             backend, compact_fused_up, compact_fused_gate, n_used, n_experts, remapped, fused_input);
     REQUIRE(compact_fused == full_fused);
+
+    std::vector<ggml_fp16_t> extended_fused_up(
+            size_t(fused_k*fused_m*extended_slots), ggml_fp32_to_fp16(0.0f));
+    std::vector<ggml_fp16_t> extended_fused_gate(
+            size_t(fused_k*fused_m*extended_slots), ggml_fp32_to_fp16(0.0f));
+    for (int slot = 0; slot < n_used; ++slot) {
+        std::copy_n(full_fused_up.data() + size_t(route[slot])*size_t(fused_k*fused_m), size_t(fused_k*fused_m),
+                extended_fused_up.data() + size_t(extended_route[slot])*size_t(fused_k*fused_m));
+        std::copy_n(full_fused_gate.data() + size_t(route[slot])*size_t(fused_k*fused_m), size_t(fused_k*fused_m),
+                extended_fused_gate.data() + size_t(extended_route[slot])*size_t(fused_k*fused_m));
+    }
+    const auto extended_fused = compute_cuda_fused_moe(
+            backend, extended_fused_up, extended_fused_gate,
+            extended_slots, extended_slots, extended_route, fused_input);
+    REQUIRE(extended_fused == full_fused);
+}
+
+void test_hybrid_runtime_guard_is_one_way_and_fail_closed() {
+    ggml_backend_expert_hybrid_guard_window window = {};
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 0, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_DISABLED);
+
+    // Prefill can exercise the bounded upload path before any mixed decode.
+    // It must not revoke a guard whose CPU branch has not executed yet.
+    window = { 3, 0, 50000, 50000, 50000, 0, 0 };
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 100, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING);
+
+    window = { 3, 0, 1000, 1000, 1000, 1600, 8 };
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 100, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING);
+
+    window.forced_fallbacks = 1;
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 100, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_FALLBACK);
+
+    window.forced_fallbacks = 0;
+    window.cpu_compute_ns = 6401;
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 100, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_CPU_DRIFT);
+
+    window.cpu_compute_ns = 1600;
+    window.lease_acquire_ns = 12001;
+    window.transfer_submit_ns = 0;
+    window.transfer_wait_ns = 0;
+    REQUIRE(ggml_backend_expert_hybrid_guard_evaluate(
+            &window, 100, 2, 1000, 4000000, 8) ==
+            GGML_BACKEND_EXPERT_HYBRID_GUARD_FAILED_UPLOAD_DRIFT);
+}
+
+void test_exact_cuda_pinned_staging_allocation() {
+#ifdef GGML_USE_CUDA
+    if (ggml_backend_cuda_get_device_count() == 0) return;
+    // Deliberately avoid a page/MiB boundary. The staging contract exposes the
+    // caller's exact usable byte count rather than an allocator size class.
+    constexpr size_t requested = 1000003;
+    ggml_backend_buffer_t buffer = ggml_backend_cuda_host_buffer_alloc(requested);
+    REQUIRE(buffer != nullptr);
+    REQUIRE(ggml_backend_buffer_get_size(buffer) == requested);
+    REQUIRE(std::strcmp(ggml_backend_buffer_name(buffer), "CUDA_Host") == 0);
+    ggml_backend_buffer_free(buffer);
+#endif
+}
+
+void test_expert_cache_transaction_state_machine() {
+    REQUIRE(ggml_backend_sched_expert_cache_prepare(nullptr, 0, 0, 1) == nullptr);
+    REQUIRE(!ggml_backend_sched_expert_cache_publish(nullptr));
+    REQUIRE(!ggml_backend_sched_expert_cache_rollback(nullptr));
+    REQUIRE(!ggml_backend_sched_expert_cache_finalize(nullptr));
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    REQUIRE(cpu != nullptr);
+    struct cpu_cleanup {
+        ggml_backend_t value;
+        ~cpu_cleanup() { ggml_backend_free(value); }
+    } free_cpu{cpu};
+
+    ggml_backend_t backends[] = {cpu};
+    ggml_backend_sched_t scheduler = ggml_backend_sched_new(
+            backends, nullptr, 1, 64, false);
+    REQUIRE(scheduler != nullptr);
+    struct scheduler_cleanup {
+        ggml_backend_sched_t value;
+        ~scheduler_cleanup() { ggml_backend_sched_free(value); }
+    } free_scheduler{scheduler};
+
+    auto * transaction = ggml_backend_sched_expert_cache_prepare(
+            scheduler, 0, 0, 1);
+    REQUIRE(transaction != nullptr);
+    REQUIRE(ggml_backend_sched_expert_cache_prepare(scheduler, 0, 0, 1) == nullptr);
+    REQUIRE(!ggml_backend_sched_expert_cache_rollback(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_publish(transaction));
+    REQUIRE(!ggml_backend_sched_expert_cache_publish(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_rollback(transaction));
+    REQUIRE(!ggml_backend_sched_expert_cache_rollback(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_finalize(transaction));
+
+    transaction = ggml_backend_sched_expert_cache_prepare(scheduler, 0, 0, 1);
+    REQUIRE(transaction != nullptr);
+    REQUIRE(ggml_backend_sched_expert_cache_finalize(transaction));
+
+    transaction = ggml_backend_sched_expert_cache_prepare(scheduler, 0, 0, 1);
+    REQUIRE(transaction != nullptr);
+    REQUIRE(ggml_backend_sched_expert_cache_publish(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_finalize(transaction));
+    REQUIRE(ggml_backend_sched_replace_expert_cache(scheduler, 0, 0, 1));
+
+    // A non-zero cache requires at least one device backend, and must fail
+    // without leaving an outstanding scheduler transaction.
+    REQUIRE(ggml_backend_sched_expert_cache_prepare(scheduler, 1, 0, 1) == nullptr);
+    REQUIRE(ggml_backend_sched_replace_expert_cache(scheduler, 0, 0, 1));
+}
+
+void test_expert_cache_partial_publication_rollback() {
+#ifdef GGML_USE_CUDA
+    if (ggml_backend_cuda_get_device_count() < 2) {
+        std::cout << "SKIP: partial expert-cache publication requires two CUDA devices\n";
+        return;
+    }
+
+    ggml_backend_t cuda0 = ggml_backend_cuda_init(0, nullptr, nullptr);
+    ggml_backend_t cuda1 = ggml_backend_cuda_init(1, nullptr, nullptr);
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    REQUIRE(cuda0 != nullptr && cuda1 != nullptr && cpu != nullptr);
+    struct backend_cleanup {
+        ggml_backend_t cuda0;
+        ggml_backend_t cuda1;
+        ggml_backend_t cpu;
+        ~backend_cleanup() {
+            ggml_backend_free(cuda0);
+            ggml_backend_free(cuda1);
+            ggml_backend_free(cpu);
+        }
+    } free_backends{cuda0, cuda1, cpu};
+
+    ggml_backend_t backends[] = {cuda0, cuda1, cpu};
+    ggml_backend_sched_t scheduler = ggml_backend_sched_new(
+            backends, nullptr, 3, 64, false);
+    REQUIRE(scheduler != nullptr);
+    struct scheduler_cleanup {
+        ggml_backend_sched_t value;
+        ~scheduler_cleanup() { ggml_backend_sched_free(value); }
+    } free_scheduler{scheduler};
+
+    ggml_backend_sched_set_expert_cache_capacity(scheduler, 0, 17, 3);
+    ggml_backend_sched_expert_cache_policy before_policy = {};
+    REQUIRE(ggml_backend_sched_expert_cache_get_policy(scheduler, &before_policy));
+    std::array<ggml_backend_sched_resource_device_stats, 2> before_devices = {};
+    REQUIRE(ggml_backend_sched_get_resource_device_stats(
+            scheduler, before_devices.data(), before_devices.size()));
+
+    auto * transaction = ggml_backend_sched_expert_cache_prepare(
+            scheduler, 0, 31, 5);
+    REQUIRE(transaction != nullptr);
+#if defined(_WIN32)
+    _putenv_s("ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES", "1");
+#else
+    setenv("ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES", "1", 1);
+#endif
+    REQUIRE(!ggml_backend_sched_expert_cache_publish(transaction));
+#if defined(_WIN32)
+    _putenv_s("ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES", "");
+#else
+    unsetenv("ESE_EXPERT_CACHE_TRANSACTION_FAIL_AFTER_PUBLISHED_DEVICES");
+#endif
+
+    ggml_backend_sched_expert_cache_policy after_policy = {};
+    REQUIRE(ggml_backend_sched_expert_cache_get_policy(scheduler, &after_policy));
+    REQUIRE(after_policy.capacity_bytes_per_device == before_policy.capacity_bytes_per_device);
+    REQUIRE(after_policy.reserve_bytes_per_device == before_policy.reserve_bytes_per_device);
+    REQUIRE(after_policy.minimum_observations == before_policy.minimum_observations);
+    REQUIRE(after_policy.slots == before_policy.slots);
+    std::array<ggml_backend_sched_resource_device_stats, 2> after_devices = {};
+    REQUIRE(ggml_backend_sched_get_resource_device_stats(
+            scheduler, after_devices.data(), after_devices.size()));
+    for (size_t index = 0; index < before_devices.size(); ++index) {
+        REQUIRE(after_devices[index].backend_id == before_devices[index].backend_id);
+        REQUIRE(after_devices[index].expert_cache_capacity_bytes ==
+                before_devices[index].expert_cache_capacity_bytes);
+        REQUIRE(after_devices[index].expert_cache_allocated_bytes ==
+                before_devices[index].expert_cache_allocated_bytes);
+        REQUIRE(after_devices[index].expert_cache_resident_bytes ==
+                before_devices[index].expert_cache_resident_bytes);
+    }
+
+    // The failed publish remains a prepared owner: it is exclusive, can be
+    // retried after the test fault is removed, and then finalizes normally.
+    REQUIRE(ggml_backend_sched_expert_cache_prepare(scheduler, 0, 17, 3) == nullptr);
+    REQUIRE(ggml_backend_sched_expert_cache_publish(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_finalize(transaction));
+    REQUIRE(ggml_backend_sched_expert_cache_get_policy(scheduler, &after_policy));
+    REQUIRE(after_policy.capacity_bytes_per_device == 0);
+    REQUIRE(after_policy.reserve_bytes_per_device == 31);
+    REQUIRE(after_policy.minimum_observations == 5);
+#endif
 }
 
 } // namespace
@@ -583,7 +1035,13 @@ int main() {
         test_file_storage_backends();
         test_concurrent_single_fill();
         test_cpu_kernel_exact_parity_and_no_original_fallback();
+        test_route_partition_is_complementary();
+        test_cpu_fused_moe_merged_workspace();
         test_cuda_compact_remap_exact_parity();
+        test_hybrid_runtime_guard_is_one_way_and_fail_closed();
+        test_exact_cuda_pinned_staging_allocation();
+        test_expert_cache_transaction_state_machine();
+        test_expert_cache_partial_publication_rollback();
         std::cout << "PASS: checked bounded expert caches and exact full/compact CUDA parity\n";
         return 0;
     } catch (const std::exception & error) {

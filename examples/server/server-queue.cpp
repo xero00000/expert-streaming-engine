@@ -18,6 +18,9 @@
 
 int server_queue::post(server_task task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (!accepting) {
+        throw std::runtime_error("server task queue is shutting down");
+    }
     if (task.id == -1) {
         task.id = id++;
         //LOG_VERBOSE("new task id", { {"new_id", task.id} });
@@ -28,30 +31,71 @@ int server_queue::post(server_task task) {
     return task.id;
 }
 
-void server_queue::cleanup_pending_task(int id_target) {
-    // no need lock because this is called exclusively by post()
-    auto rm_func = [id_target](const server_task& task) {
-        return task.id == id_target;
+bool server_queue::try_post(server_task task) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (!accepting) {
+        return false;
+    }
+    if (task.id == -1) {
+        task.id = id++;
+    }
+    queue_tasks.push_back(std::move(task));
+    condition_tasks.notify_one();
+    return true;
+}
+
+std::vector<server_task> server_queue::take_pending_tasks(int id_target) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    size_t count = 0;
+    for (const auto & task : queue_tasks) count += task.id == id_target;
+    for (const auto & task : queue_tasks_deferred) count += task.id == id_target;
+
+    std::vector<server_task> removed;
+    removed.reserve(count);
+    const auto extract = [&](auto & queue) {
+        for (auto it = queue.begin(); it != queue.end();) {
+            if (it->id == id_target) {
+                removed.push_back(std::move(*it));
+                it = queue.erase(it);
+            } else {
+                ++it;
+            }
+        }
     };
-    queue_tasks.erase(
-        std::remove_if(queue_tasks.begin(), queue_tasks.end(), rm_func),
-        queue_tasks.end());
-    queue_tasks_deferred.erase(
-        std::remove_if(queue_tasks_deferred.begin(), queue_tasks_deferred.end(), rm_func),
-        queue_tasks_deferred.end());
+    extract(queue_tasks);
+    extract(queue_tasks_deferred);
+    return removed;
+}
+
+std::vector<server_task> server_queue::take_all_pending_tasks() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    std::vector<server_task> removed;
+    removed.reserve(queue_tasks.size() + queue_tasks_deferred.size());
+    for (auto & task : queue_tasks) removed.push_back(std::move(task));
+    for (auto & task : queue_tasks_deferred) removed.push_back(std::move(task));
+    queue_tasks.clear();
+    queue_tasks_deferred.clear();
+    return removed;
 }
 
 // multi-task version of post()
 int server_queue::post(std::vector<server_task>&& tasks, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    for (auto& task : tasks) {
+    if (!accepting) {
+        throw std::runtime_error("server task queue is shutting down");
+    }
+    std::vector<int> task_ids;
+    task_ids.reserve(tasks.size());
+    for (auto & task : tasks) {
         if (task.id == -1) {
             task.id = id++;
         }
-        // if this is cancel task make sure to clean up pending tasks
-        if (task.type == SERVER_TASK_TYPE_CANCEL) {
-            cleanup_pending_task(task.id_target);
-        }
+        task_ids.push_back(task.id);
+    }
+
+    size_t inserted = 0;
+    try {
+        for (auto& task : tasks) {
         QUE_DBG("new task, id = %d/%d, front = %d\n", task.id, (int)tasks.size(), front);
         if (front) {
             queue_tasks.push_front(std::move(task));
@@ -59,6 +103,22 @@ int server_queue::post(std::vector<server_task>&& tasks, bool front) {
         else {
             queue_tasks.push_back(std::move(task));
         }
+            inserted++;
+        }
+    } catch (...) {
+        // Batch posting is failure-atomic. HTTP-side transient lease guards can
+        // safely release every task lease when this call throws because no
+        // partially enqueued task survives.
+        queue_tasks.erase(
+            std::remove_if(
+                queue_tasks.begin(), queue_tasks.end(),
+                [&](const server_task & queued) {
+                    return std::find(
+                        task_ids.begin(), task_ids.begin() + inserted,
+                        queued.id) != task_ids.begin() + inserted;
+                }),
+            queue_tasks.end());
+        throw;
     }
     condition_tasks.notify_one();
     return 0;
@@ -71,6 +131,9 @@ void server_queue::defer(server_task&& task) {
 
 int server_queue::get_new_id() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (!accepting) {
+        throw std::runtime_error("server task queue is shutting down");
+    }
     int new_id = id++;
     //LOG_VERBOSE("new task id", { {"new_id", new_id} });
     QUE_DBG("new task, id = %d\n", id);
@@ -92,8 +155,6 @@ void server_queue::on_new_task(std::function<void(server_task&&)> callback) {
 
 
 void server_queue::start_loop() {
-    running = true;
-
     while (true) {
         LOG_VERBOSE("new task may arrive", {});
 
@@ -178,11 +239,12 @@ void server_response::add_waiting_task_id(int id_task) {
 
 void server_response::add_waiting_tasks(const std::vector<server_task>& tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
-
+    auto candidate = waiting_task_ids;
     for (const auto& task : tasks) {
         SRV_DBG("add task %d to waiting list. current waiting = %d (before add)\n", task.id, (int)waiting_task_ids.size());
-        waiting_task_ids.insert(task.id);
+        candidate.insert(task.id);
     }
+    waiting_task_ids.swap(candidate);
 }
 
 void server_response::remove_waiting_task_id(int id_task) {
@@ -197,7 +259,7 @@ server_task_result server_response::recv(int id_task) {
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
         condition_results.wait(lock, [&] {
-            return !queue_results_legacy.empty();
+            return !queue_results_legacy.empty() || !running;
             });
 
         for (int i = 0; i < (int)queue_results_legacy.size(); i++) {
@@ -208,6 +270,9 @@ server_task_result server_response::recv(int id_task) {
                 return res;
             }
         }
+        if (!running) {
+            throw std::runtime_error("server response queue is shutting down");
+        }
     }
 
     // should never reach here
@@ -216,6 +281,7 @@ server_task_result server_response::recv(int id_task) {
 // same as recv(), but have timeout in seconds
 // if timeout is reached, nullptr is returned
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int>& id_tasks, int timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -227,10 +293,10 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
             }
         }
 
-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
+        std::cv_status cr_res = condition_results.wait_until(lock, deadline);
         if (!running) {
             SRV_DBG("%s : queue result stop\n", __func__);
-            std::terminate(); // we cannot return here since the caller is HTTP code
+            return nullptr;
         }
         if (cr_res == std::cv_status::timeout) {
             return nullptr;
@@ -239,6 +305,12 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
 
     // should never reach here
 }
+
+bool server_response::is_running() {
+    std::lock_guard<std::mutex> lock(mutex_results);
+    return running;
+}
+
 void server_response::remove_waiting_task_ids(const std::unordered_set<int>& id_tasks) {
     std::unique_lock<std::mutex> lock(mutex_results);
 

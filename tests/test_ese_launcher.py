@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+import json
+import os
 import struct
 import sys
 import tempfile
@@ -19,14 +22,28 @@ from tools.ese import (
     auto_tensor_split,
     build_launch_plan,
     discover_model_shards,
+    inspect_expert_geometry,
+    inspect_expert_geometries,
+    inspect_expert_layer_formats,
     parse_size,
     read_gguf_metadata,
+    read_gguf_index,
     select_policy,
     _execution_environment,
+    _baseline_hybrid_plan,
+    _parse_expert_cache_telemetry,
+    _plan_from_args,
     _doctor,
     _hardware_for_server,
     _server_supports_cuda,
     _repo_root,
+    _save_hybrid_verification,
+    _solve_calibrated_hybrid,
+    _validated_hybrid_telemetry,
+    _validated_calibration_drift,
+    _validated_cpu_calibration_drift,
+    hybrid_verification_reason,
+    model_fingerprint,
 )
 
 
@@ -47,6 +64,20 @@ def write_minimal_gguf(path: Path, metadata: dict[str, object]) -> None:
     path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, len(values)) + b"".join(values))
 
 
+def write_tensor_gguf(path: Path) -> None:
+    metadata = _gguf_string("general.alignment") + struct.pack("<II", 4, 32)
+    tensors = b"".join(
+        (
+            _gguf_string("blk.0.ffn_gate_exps.weight")
+            + struct.pack("<IQQQIQ", 3, 16, 32, 2, 1, 0),
+            _gguf_string("output.weight") + struct.pack("<IQQIQ", 2, 16, 16, 1, 1024),
+        )
+    )
+    header = b"GGUF" + struct.pack("<IQQ", 3, 2, 1) + metadata + tensors
+    data_offset = (len(header) + 31) // 32 * 32
+    path.write_bytes(header + bytes(data_offset - len(header)) + bytes(2048))
+
+
 def moe_model(size: int = 40 * GIB) -> ModelInfo:
     return ModelInfo(
         requested_path=Path("/model.gguf"),
@@ -55,7 +86,20 @@ def moe_model(size: int = 40 * GIB) -> ModelInfo:
         metadata={
             "general.architecture": "gpt-oss",
             "gpt-oss.expert_count": 128,
+            "gpt-oss.expert_used_count": 4,
             "gpt-oss.block_count": 36,
+        },
+    )
+
+
+def dense_model(size: int = 4 * GIB) -> ModelInfo:
+    return ModelInfo(
+        requested_path=Path("/dense.gguf"),
+        shards=(Path("/dense.gguf"),),
+        total_bytes=size,
+        metadata={
+            "general.architecture": "llama",
+            "llama.block_count": 32,
         },
     )
 
@@ -71,7 +115,373 @@ def hardware(*free_gib: int, ram_available: int = 100) -> HardwareInfo:
     )
 
 
+def verified_telemetry_summary() -> dict[str, int]:
+    return {
+        "layers": 4,
+        "misses": 8,
+        "route_positions": 16,
+        "gpu_route_positions": 8,
+        "forced_fallbacks": 0,
+        "predicted_upload_ns_per_expert": 100,
+        "upload_calibration_drift_ppm": 1_000_000,
+        "cpu_compute_ns": 1_000,
+        "cpu_compute_calls": 8,
+        "predicted_cpu_ns_per_expert": 100,
+        "cpu_calibration_drift_ppm": 1_250_000,
+    }
+
+
 class LauncherTests(unittest.TestCase):
+    def test_automatic_plan_requires_matching_workload_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model_path = root / "model.gguf"
+            write_minimal_gguf(model_path, {
+                "general.architecture": "gpt-oss", "gpt-oss.expert_count": 8,
+                "gpt-oss.expert_used_count": 3, "gpt-oss.block_count": 4,
+            })
+            evidence = root / "hybrid.json"
+            args = argparse.Namespace(
+                model=model_path, context=4096, slots=1, port=8080, policy="cache",
+                no_auto_hybrid=False, hardware_profile=root / "profile.json",
+                hybrid_candidate=None,
+                hybrid_verification=evidence, binary="/server", host="127.0.0.1",
+                threads=4, batch_threads=8, batch_size=64, ubatch_size=32,
+                kv="q8_0", reserve_vram=GIB, gpu_resident_moe=None,
+                tensor_split=None, prefetch_tail=0, expert_ram_cache=256 * 1024**2,
+                expert_ram_staging=32 * 1024**2, expert_vram_cache=256 * 1024**2,
+                expert_storage_backend="pread", expert_cache_min_observations=1,
+                extra=(),
+            )
+            identity = {"cpu": {"model": "test"}, "gpus": [{"uuid": "GPU-test"}]}
+            with (
+                mock.patch("tools.ese.detect_hardware", return_value=hardware(20)),
+                mock.patch("tools.ese.collect_hardware_identity", return_value=identity),
+                mock.patch(
+                    "tools.ese.calibrated_hybrid_gpu_experts",
+                    return_value=(1, "calibrated"),
+                ),
+                mock.patch(
+                    "tools.ese._calibrated_expert_cost_bounds",
+                    return_value=(100.0, 200.0),
+                ),
+            ):
+                blocked = _plan_from_args(args)
+                self.assertEqual(blocked.hybrid_gpu_experts, 0)
+                self.assertIn("validate-hybrid", blocked.hybrid_selection)
+
+                candidate = _plan_from_args(args, require_hybrid_verification=False)
+                _save_hybrid_verification(evidence, candidate, identity, {
+                    "passed": True, "output_parity": True, "speedup": 1.2,
+                    "minimum_speedup": 1.02, "telemetry_valid": True,
+                    "telemetry_summary": verified_telemetry_summary(),
+                })
+                allowed = _plan_from_args(args)
+                self.assertEqual(allowed.hybrid_gpu_experts, 1)
+
+                args.hybrid_candidate = 2
+                blocked_candidate = _plan_from_args(args)
+                self.assertEqual(blocked_candidate.hybrid_gpu_experts, 0)
+                candidate_two = _plan_from_args(args, require_hybrid_verification=False)
+                self.assertEqual(candidate_two.hybrid_gpu_experts, 2)
+                _save_hybrid_verification(evidence, candidate_two, identity, {
+                    "passed": True, "output_parity": True, "speedup": 1.3,
+                    "minimum_speedup": 1.02, "telemetry_valid": True,
+                    "telemetry_summary": verified_telemetry_summary(),
+                })
+                allowed_candidate = _plan_from_args(args)
+                self.assertEqual(allowed_candidate.hybrid_gpu_experts, 2)
+
+                args.policy = "resident"
+                with self.assertRaisesRegex(ESEError, "cache or stream"):
+                    _plan_from_args(args)
+
+    def test_hybrid_workload_evidence_is_model_hardware_and_plan_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model_path = root / "model.gguf"
+            write_minimal_gguf(
+                model_path,
+                {
+                    "general.architecture": "gpt-oss",
+                    "gpt-oss.expert_count": 8,
+                    "gpt-oss.expert_used_count": 2,
+                    "gpt-oss.block_count": 4,
+                },
+            )
+            model = ModelInfo(
+                requested_path=model_path,
+                shards=(model_path,),
+                total_bytes=model_path.stat().st_size,
+                metadata={
+                    "general.architecture": "gpt-oss",
+                    "gpt-oss.expert_count": 8,
+                    "gpt-oss.expert_used_count": 2,
+                    "gpt-oss.block_count": 4,
+                },
+            )
+            plan = build_launch_plan(
+                model=model,
+                hardware=hardware(20),
+                binary=Path("/server"),
+                policy="cache",
+                context=4096,
+                expert_storage_backend="pread",
+                expert_vram_cache=256 * 1024**2,
+                hybrid_gpu_experts=1,
+                hybrid_cpu_ns_per_expert=100,
+                hybrid_upload_ns_per_expert=200,
+            )
+            evidence = root / "hybrid.json"
+            identity = {"cpu": {"model": "test"}, "gpus": [{"uuid": "GPU-test"}]}
+            result = {
+                "passed": True,
+                "output_parity": True,
+                "speedup": 1.25,
+                "minimum_speedup": 1.02,
+                "telemetry_valid": True,
+                "telemetry_summary": verified_telemetry_summary(),
+            }
+            _save_hybrid_verification(evidence, plan, identity, result)
+            self.assertIsNone(hybrid_verification_reason(plan, identity, evidence))
+            self.assertEqual(os.stat(evidence).st_mode & 0o777, 0o600)
+
+            changed_identity = {"cpu": {"model": "other"}, "gpus": [{"uuid": "GPU-test"}]}
+            self.assertIn(
+                "no matching workload A/B verification",
+                hybrid_verification_reason(plan, changed_identity, evidence) or "",
+            )
+            changed_workload = build_launch_plan(
+                model=model,
+                hardware=hardware(20),
+                binary=Path("/server"),
+                policy="cache",
+                context=8192,
+                expert_storage_backend="pread",
+                expert_vram_cache=256 * 1024**2,
+                hybrid_gpu_experts=1,
+                hybrid_cpu_ns_per_expert=100,
+                hybrid_upload_ns_per_expert=200,
+            )
+            self.assertIn(
+                "no matching workload A/B verification",
+                hybrid_verification_reason(changed_workload, identity, evidence) or "",
+            )
+            saved = json.loads(evidence.read_text(encoding="utf-8"))
+            recorded_model_id = next(iter(saved["entries"].values()))["model_fingerprint"]
+            model_path.write_bytes(model_path.read_bytes() + b"changed")
+            self.assertNotEqual(model_fingerprint(model), recorded_model_id)
+
+    def test_losing_hybrid_evidence_fails_closed_and_baseline_removes_split(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            model_path = Path(temp) / "model.gguf"
+            write_minimal_gguf(model_path, {"general.architecture": "gpt-oss"})
+            model = ModelInfo(model_path, (model_path,), model_path.stat().st_size, {
+                "general.architecture": "gpt-oss", "gpt-oss.expert_count": 8,
+                "gpt-oss.expert_used_count": 2, "gpt-oss.block_count": 4,
+            })
+            plan = build_launch_plan(
+                model=model, hardware=hardware(20), binary=Path("/server"), policy="cache",
+                expert_storage_backend="pread", expert_vram_cache=256 * 1024**2,
+                hybrid_gpu_experts=1,
+                hybrid_cpu_ns_per_expert=100, hybrid_upload_ns_per_expert=200,
+            )
+            baseline = _baseline_hybrid_plan(plan)
+            self.assertNotIn("--expert-hybrid-gpu-experts", baseline.arguments)
+            self.assertNotIn("--expert-hybrid-cpu-ns-per-expert", baseline.arguments)
+            self.assertNotIn("--expert-hybrid-upload-ns-per-expert", baseline.arguments)
+            identity = {"cpu": {}, "gpus": []}
+            evidence = Path(temp) / "hybrid.json"
+            _save_hybrid_verification(evidence, plan, identity, {
+                "passed": True, "output_parity": True, "speedup": 1.2,
+                "minimum_speedup": 1.02,
+            })
+            self.assertIn(
+                "failed live hybrid telemetry checks",
+                hybrid_verification_reason(plan, identity, evidence) or "",
+            )
+            _save_hybrid_verification(evidence, plan, identity, {
+                "passed": False, "output_parity": True, "speedup": 0.95,
+                "minimum_speedup": 1.02, "telemetry_valid": True,
+                "telemetry_summary": verified_telemetry_summary(),
+            })
+            self.assertIn(
+                "did not beat",
+                hybrid_verification_reason(plan, identity, evidence) or "",
+            )
+            _save_hybrid_verification(evidence, plan, identity, {
+                "passed": True, "output_parity": True, "speedup": float("nan"),
+                "minimum_speedup": 1.02, "telemetry_valid": True,
+                "telemetry_summary": verified_telemetry_summary(),
+            })
+            self.assertIn(
+                "invalid performance evidence",
+                hybrid_verification_reason(plan, identity, evidence) or "",
+            )
+
+    def test_hybrid_telemetry_must_reconcile_and_prove_mixed_routing(self) -> None:
+        layer = {
+            "level": "vram-layer", "layer": 4, "routes": 6,
+            "route_positions": 12, "gpu_route_positions": 6,
+            "route_readback_ns": 100, "hits": 3, "misses": 3,
+            "lease_acquire_ns": 200, "lease_uploads": 9,
+            "transfer_submit_ns": 300, "transfer_wait_ns": 400,
+            "load_bytes": 500, "cpu_compute_ns": 600,
+            "cpu_compute_calls": 6,
+        }
+        total = {
+            "level": "vram-total", "hits": 3, "misses": 3,
+            "lease_uploads": 9, "transfer_submit_ns": 300,
+            "transfer_wait_ns": 400, "load_bytes": 500,
+            "forced_fallbacks": 0, "cpu_compute_ns": 600,
+            "cpu_compute_calls": 6,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "server.log"
+            log.write_text(
+                "noise\nexpert_cache_stats: " + json.dumps(layer) +
+                "\nexpert_cache_stats: " + json.dumps(total) + "\n",
+                encoding="utf-8",
+            )
+            telemetry = _parse_expert_cache_telemetry(log)
+        summary = _validated_hybrid_telemetry(telemetry)
+        self.assertEqual(summary["layers"], 1)
+        self.assertEqual(summary["gpu_route_positions"], 6)
+        self.assertLess(_validated_calibration_drift(summary, 400.0), 4.0)
+        self.assertLess(_validated_cpu_calibration_drift(summary, 100.0, 2), 4.0)
+
+        broken = json.loads(json.dumps(telemetry))
+        broken["totals"][0]["load_bytes"] = 499
+        with self.assertRaisesRegex(ESEError, "does not reconcile"):
+            _validated_hybrid_telemetry(broken)
+        fallback = json.loads(json.dumps(telemetry))
+        fallback["totals"][0]["forced_fallbacks"] = 1
+        with self.assertRaisesRegex(ESEError, "forbidden host-tensor fallback"):
+            _validated_hybrid_telemetry(fallback)
+        revoked = json.loads(json.dumps(telemetry))
+        revoked["guard_failures"] = [{"status": 3}]
+        with self.assertRaisesRegex(ESEError, "runtime guard revoked"):
+            _validated_hybrid_telemetry(revoked)
+        with self.assertRaisesRegex(ESEError, "contradicts calibration"):
+            _validated_calibration_drift(summary, 10.0)
+        with self.assertRaisesRegex(ESEError, "CPU-branch timing contradicts"):
+            _validated_cpu_calibration_drift(summary, 1.0, 2)
+
+    def test_calibrated_hybrid_solver_is_conservative_across_devices(self) -> None:
+        key = {
+            "ggml_type_id": 16,
+            "input_width": 4096,
+            "expert_width": 2048,
+            "bytes_per_expert_component": 2162688,
+        }
+        profile = {
+            "measurements": {
+                "cpu_cache_contention": {
+                    "devices": [
+                        {
+                            "backend": "CUDA0",
+                            "profiles": [{
+                                **key,
+                                "cpu_ns_per_expert_component": 120000.0,
+                                "upload_ns_per_expert_component": 90000.0,
+                            }],
+                        },
+                        {
+                            "backend": "CUDA1",
+                            "profiles": [{
+                                **key,
+                                "cpu_ns_per_expert_component": 120000.0,
+                                "upload_ns_per_expert_component": 150000.0,
+                            }],
+                        },
+                    ]
+                }
+            }
+        }
+        uploads, reason = _solve_calibrated_hybrid(
+            profile, [(tuple(key.values()), tuple(key.values()))], 7
+        )
+        self.assertEqual(uploads, 3)
+        self.assertIn("3 GPU and 4 CPU", reason)
+
+        single_device = {
+            "measurements": {
+                "cpu_cache_contention": {
+                    "devices": profile["measurements"]["cpu_cache_contention"]["devices"][:1]
+                }
+            }
+        }
+        uploads, _ = _solve_calibrated_hybrid(
+            single_device, [(tuple(key.values()), tuple(key.values()))], 7
+        )
+        self.assertEqual(uploads, 4)  # same golden case as the native solver
+
+        missing = dict(key)
+        missing["ggml_type_id"] = 19
+        uploads, reason = _solve_calibrated_hybrid(
+            profile, [(tuple(missing.values()),)], 7
+        )
+        self.assertEqual(uploads, 0)
+        self.assertIn("no exact component match", reason)
+
+        for cpu_cost, upload_cost, expected in (
+            (1.0, 1_000_000.0, "all-CPU"),
+            (1_000_000.0, 1.0, "all-GPU"),
+        ):
+            extreme = {
+                "measurements": {
+                    "cpu_cache_contention": {
+                        "devices": [{
+                            "backend": "CUDA0",
+                            "profiles": [{
+                                **key,
+                                "cpu_ns_per_expert_component": cpu_cost,
+                                "upload_ns_per_expert_component": upload_cost,
+                            }],
+                        }]
+                    }
+                }
+            }
+            uploads, reason = _solve_calibrated_hybrid(
+                extreme, [(tuple(key.values()),)], 7
+            )
+            self.assertEqual(uploads, 0)
+            self.assertIn(expected, reason)
+
+    def test_cache_plan_applies_a_verified_hybrid_split(self) -> None:
+        plan = build_launch_plan(
+            model=moe_model(),
+            hardware=hardware(20),
+            binary=Path("/server"),
+            policy="cache",
+            expert_vram_cache=256 * 1024**2,
+            expert_storage_backend="pread",
+            hybrid_gpu_experts=2,
+            hybrid_cpu_ns_per_expert=100,
+            hybrid_upload_ns_per_expert=200,
+            hybrid_selection="verified test profile",
+        )
+        position = plan.arguments.index("--expert-hybrid-gpu-experts")
+        self.assertEqual(plan.arguments[position + 1], "2")
+        cpu_guard = plan.arguments.index("--expert-hybrid-cpu-ns-per-expert")
+        upload_guard = plan.arguments.index("--expert-hybrid-upload-ns-per-expert")
+        self.assertEqual(plan.arguments[cpu_guard + 1], "100")
+        self.assertEqual(plan.arguments[upload_guard + 1], "200")
+        self.assertEqual(plan.hybrid_gpu_experts, 2)
+        self.assertEqual(plan.as_dict()["hybrid_routing"]["selection"], "verified test profile")
+
+        mmap_plan = build_launch_plan(
+            model=moe_model(),
+            hardware=hardware(20),
+            binary=Path("/server"),
+            policy="cache",
+            expert_vram_cache=256 * 1024**2,
+            hybrid_gpu_experts=2,
+            hybrid_cpu_ns_per_expert=100,
+            hybrid_upload_ns_per_expert=200,
+        )
+        self.assertNotIn("--expert-hybrid-gpu-experts", mmap_plan.arguments)
+        self.assertIn("pread bounded-lease", mmap_plan.hybrid_selection)
     def test_cpu_runtime_ignores_driver_visible_gpus(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             binary = Path(temp) / "build" / "bin" / "llama-server.exe"
@@ -139,6 +549,29 @@ class LauncherTests(unittest.TestCase):
             metadata = read_gguf_metadata(path)
             self.assertEqual(metadata["general.architecture"], "gpt-oss")
             self.assertEqual(metadata["gpt-oss.block_count"], 36)
+
+    def test_expert_layer_formats_preserve_component_multiplicity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "model.gguf"
+            write_tensor_gguf(path)
+            self.assertEqual(
+                inspect_expert_layer_formats(path),
+                (((1, 16, 32, 512),),),
+            )
+
+    def test_read_tensor_index_and_expert_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "model.gguf"
+            write_tensor_gguf(path)
+            metadata, tensors = read_gguf_index(path)
+            self.assertEqual(metadata["general.alignment"], 32)
+            self.assertEqual(tensors[0]["dimensions"], (16, 32, 2))
+            self.assertEqual(tensors[0]["span_bytes"], 1024)
+            expert = inspect_expert_geometry(path)
+            self.assertIsNotNone(expert)
+            self.assertEqual(expert["ggml_type"], 1)
+            self.assertEqual(expert["expert_component_bytes"], 512)
+            self.assertEqual(len(inspect_expert_geometries(path)), 1)
 
     def test_discover_split_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -210,7 +643,8 @@ class LauncherTests(unittest.TestCase):
             prefetch_tail=4,
             expert_storage_backend="mmap",
         )
-        self.assertEqual(plan.environment["GGML_CUDA_NO_PINNED"], "1")
+        self.assertEqual(plan.environment["GGML_CUDA_NO_MODEL_PINNED"], "1")
+        self.assertNotIn("GGML_CUDA_NO_PINNED", plan.environment)
         self.assertEqual(plan.environment["LLAMA_EXPERT_PREFETCH"], "1")
         self.assertEqual(plan.environment["LLAMA_EXPERT_PREFETCH_TAIL"], "4")
         self.assertIn("--defer-experts", plan.arguments)
@@ -263,6 +697,95 @@ class LauncherTests(unittest.TestCase):
                 binary=Path("/server"),
                 policy="stream",
                 prefetch_tail=1,
+            )
+
+    def test_parallel_slots_are_enabled_for_resident_models(self) -> None:
+        plan = build_launch_plan(
+            model=dense_model(),
+            hardware=hardware(7, 9, ram_available=47),
+            binary=Path("/server"),
+            policy="resident",
+            context=8192,
+            slots=2,
+        )
+
+        parallel = plan.arguments.index("-np")
+        self.assertEqual(plan.arguments[parallel + 1], "2")
+        self.assertNotIn("--expert-vram-cache-mib", plan.arguments)
+        self.assertNotIn("--expert-prefill-staging-mib", plan.arguments)
+        self.assertNotIn("-no-mmad", plan.arguments)
+        self.assertNotIn("-nkvo", plan.arguments)
+        self.assertEqual(plan.as_dict()["concurrency"], {
+            "slots": 2,
+            "total_context": 8192,
+            "context_per_slot": 4096,
+            "adaptive_expert_cache": False,
+            "kqv_offload": True,
+        })
+
+    def test_parallel_slots_reject_expert_offload_until_parity_is_proven(self) -> None:
+        for policy in ("hybrid", "cache", "stream"):
+            with self.subTest(policy=policy), self.assertRaisesRegex(
+                ESEError, "concurrent sessions currently require a dense resident model"
+            ):
+                build_launch_plan(
+                    model=moe_model(),
+                    hardware=hardware(7, 9),
+                    binary=Path("/server"),
+                    policy=policy,
+                    context=8192,
+                    slots=2,
+                )
+
+        with self.assertRaisesRegex(
+            ESEError, "concurrent sessions currently require a dense resident model"
+        ):
+            build_launch_plan(
+                model=moe_model(),
+                hardware=hardware(7, 9),
+                binary=Path("/server"),
+                policy="resident",
+                context=8192,
+                slots=2,
+            )
+
+    def test_parallel_slots_require_even_total_context(self) -> None:
+        with self.assertRaisesRegex(ESEError, "divide evenly"):
+            build_launch_plan(
+                model=moe_model(),
+                hardware=hardware(20),
+                binary=Path("/server"),
+                policy="cache",
+                context=4097,
+                slots=2,
+            )
+
+    def test_prefill_staging_is_auto_by_default_and_explicitly_controllable(self) -> None:
+        automatic = build_launch_plan(
+            model=moe_model(),
+            hardware=hardware(20),
+            binary=Path("/server"),
+            policy="cache",
+        )
+        self.assertNotIn("--expert-prefill-staging-mib", automatic.arguments)
+
+        explicit = build_launch_plan(
+            model=moe_model(),
+            hardware=hardware(20),
+            binary=Path("/server"),
+            policy="stream",
+            expert_prefill_staging=513 * 1024**2,
+        )
+        position = explicit.arguments.index("--expert-prefill-staging-mib")
+        self.assertEqual(explicit.arguments[position + 1], "513")
+
+        with self.assertRaisesRegex(ESEError, "cache or stream"):
+            build_launch_plan(
+                model=moe_model(),
+                hardware=hardware(20),
+                binary=Path("/server"),
+                policy="resident",
+                expert_prefill_staging=64 * 1024**2,
             )
 
     def test_dense_oversized_resident_plan_uses_native_fit(self) -> None:

@@ -45,6 +45,17 @@ test("package metadata bundles ESE and NVIDIA license notices", () => {
   }
 });
 
+test("runtime staging includes the complete Python launcher package", () => {
+  const stageRuntime = readFileSync(join(studioRoot, "scripts", "stage-runtime.mjs"), "utf8");
+  for (const module of ["ese.py", "hardware_profile.py", "__init__.py"]) {
+    assert.match(
+      stageRuntime,
+      new RegExp(`cpSync\\(join\\(repoRoot, "tools", "${module.replace(".", "\\.")}"\\)`),
+    );
+  }
+  assert.match(studioWorkflow, /"tools\/hardware_profile\.py"/);
+});
+
 test("NSIS packages the large CUDA runtime without solid compression", () => {
   assert.equal(tauriConfig.bundle.windows.nsis.template, "installer.nsi");
   const template = readFileSync(join(studioRoot, "src-tauri", "installer.nsi"), "utf8");
@@ -65,6 +76,10 @@ test("WiX splits the CUDA runtime across bounded embedded cabinets", () => {
 });
 
 test("cached Windows builds still stage and enforce CUDA redistributables", () => {
+  assert.match(
+    studioWorkflow,
+    /name: Studio frontend, Rust, and Windows installers[\s\S]*?timeout-minutes: 180/,
+  );
   const cudaInstall = studioWorkflow.match(
     /- name: Install CUDA toolkit\n(?<body>(?: {8,}.*\n){1,5})/,
   );
@@ -78,6 +93,17 @@ test("cached Windows builds still stage and enforce CUDA redistributables", () =
     releaseWorkflow,
     /verify-windows-runtime\.py[^\n]*\n\s+if \(\$LASTEXITCODE -ne 0\) \{ throw "Staged Windows runtime verification failed" \}/,
   );
+  assert.match(
+    studioWorkflow,
+    /- name: Verify staged Windows runtime[\s\S]*?- name: Save verified Windows CUDA runtime build\n\s+if: steps\.windows-cuda-cache\.outputs\.cache-hit != 'true'\n\s+uses: actions\/cache\/save@v4/,
+  );
+  for (const workflow of [studioWorkflow, releaseWorkflow]) {
+    assert.match(workflow, /prepare-restored-build\.py --build-root \.\\build-package/);
+    assert.match(workflow, /prepare-restored-build\.py --build-root build-package --record/);
+    assert.match(workflow, /hashFiles\([^\n]*'include\/\*\*'[^\n]*'vendor\/\*\*'[^\n]*prepare-restored-build\.py/);
+  }
+  const cacheKey = /key: (ese-windows-cuda-v2-[^\n]+)/;
+  assert.equal(studioWorkflow.match(cacheKey)?.[1], releaseWorkflow.match(cacheKey)?.[1]);
   for (const pattern of ["cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll"]) {
     assert.ok(studioWorkflow.split(pattern).length >= 3, `${pattern} is not gated in both installer jobs`);
   }

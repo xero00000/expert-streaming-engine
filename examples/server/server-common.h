@@ -422,6 +422,12 @@ public:
     // for compatibility with context shift and prompt truncation
     void resize(size_t size);
 
+    // Return the largest prefix no greater than requested which does not cut
+    // through a media chunk. The paired shrink is allocation-free/noexcept so
+    // it can be used after an irreversible resource transaction finalizes.
+    size_t media_safe_prefix_size(size_t requested) const noexcept;
+    void shrink_to_media_safe_prefix(size_t size) noexcept;
+
     llama_token* data();
 
     llama_tokens::iterator begin();

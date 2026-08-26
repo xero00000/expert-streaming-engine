@@ -1038,12 +1038,8 @@ uint8_t unicode_utf8_to_byte(const std::string & utf8) {
 }
 
 uint32_t unicode_tolower(uint32_t cpt) {
-    // binary search
-    auto it = std::lower_bound(unicode_map_lowercase.begin(), unicode_map_lowercase.end(), cpt,
-        [](const std::pair<uint32_t, uint32_t> & pair, uint32_t value) {
-            return pair.first < value;
-        });
-    if (it != unicode_map_lowercase.end() && it->first == cpt) {
+    const auto it = unicode_map_lowercase.find(cpt);
+    if (it != unicode_map_lowercase.end()) {
         return it->second;
     }
     return cpt;  // Return the original code point if no lowercase mapping is found
