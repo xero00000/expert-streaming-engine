@@ -133,5 +133,4 @@ selection, profitable depth selection, mapped-id scatter, and greedy full-target
 verification. End-to-end testing used a Qwen 3.6 image request followed by
 text/MTP generation on Turing and Ampere hardware with no stale state. Five
 workload panels recorded a 12.9% aggregate decode gain and 80.8% draft
-acceptance. The consolidated status and remaining boundaries are retained in
-the port roadmap.
+acceptance
