@@ -4,7 +4,7 @@
 
 **ESE (Expert Streaming Engine)** is an inference engine for oversized Mixture-of-Experts models.
 
-It turns your **NVMe SSD, system RAM, and GPU VRAM into one managed memory hierarchy**, allowing sparse MoE models to run even when the complete model cannot fit in VRAM—or safely remain resident in RAM.
+It turns your **NVMe SSD, system RAM, and GPU VRAM into one managed memory hierarchy**, allowing sparse MoE models to run even when the complete model cannot fit in VRAM—or safely remain resident[...]
 
 **Local. Open source. Multi-GPU. Built for models that don't fit.**
 
@@ -202,6 +202,8 @@ sudo dnf install ./ese-studio-0.2.0-1.x86_64.rpm
 ### Windows
 
 Download the NSIS installer or MSI from the latest release.
+
+v0.2.0 desktop installers are available for Windows and include `ese-studio_0.2.0_x64-setup.exe`.
 
 The Windows package includes NVIDIA CUDA support and a CPU fallback.
 
