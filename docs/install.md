@@ -1,46 +1,80 @@
 # Install Expert Streaming Engine
 
-ESE Studio installers contain the matching `ese` launcher and native
-`llama-server` runtime. Do not install a generic `llama.cpp` package when you
-need ESE's planner, resource controller, or bounded expert hierarchy.
+ESE Studio gives you a model library, local chat and measured configuration
+sweeps. Each package includes the matching ESE launcher and native server.
 
-## Published packages
+These instructions describe the prepared **v0.2.1 candidate**. Publication and
+signing remain pending; the latest public release may still be an earlier
+version. Check the version on the [GitHub release page](https://github.com/xero00000/expert-streaming-engine/releases)
+before choosing a file.
 
-Download the package and checksum file from the
-[latest GitHub release](https://github.com/xero00000/expert-streaming-engine/releases/latest).
-Package filenames include the release version; the examples below use `0.2.0`.
+## Pick the package for your PC
+
+| System | Download | Requirements |
+| --- | --- | --- |
+| Linux, CPU-only | `ESE-Studio_0.2.1_linux-x86_64_cpu.AppImage`, `.deb` or `.rpm` | x86_64, Python 3.10+, system OpenMP and a graphical session for Studio |
+| Linux, NVIDIA GPU | The same filename with `_cuda` instead of `_cpu` | Compatible NVIDIA driver; CUDA toolkit not required to run the package |
+| Windows | `ESE-Studio_0.2.1_windows-x64-setup.exe` or `ESE-Studio_0.2.1_windows-x64.msi` | x64 Windows; NVIDIA driver for CUDA, or automatic selection of the separate CPU runtime |
+
+Windows packages include both runtimes. Python, CMake, MSVC and the CUDA toolkit
+are not required to run the installed Windows application.
+
+## Verify and install
+
+Download `SHA256SUMS` with your package. Check its SHA-256 before installation.
+The current candidate has no verified publisher/updater signatures; apply
+updates by installing the next package manually.
 
 ### Linux
 
-The AppImage supports signed in-app updates:
+The AppImage is convenient for trying Studio without a system-wide install:
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
-chmod +x ese-studio_0.2.0_amd64.AppImage
-./ese-studio_0.2.0_amd64.AppImage
+chmod +x ESE-Studio_0.2.1_linux-x86_64_cpu.AppImage
+./ESE-Studio_0.2.1_linux-x86_64_cpu.AppImage
 ```
 
-Distribution packages integrate with APT or DNF:
+Replace `_cpu` with `_cuda` for NVIDIA acceleration. For package-manager
+integration use either:
 
 ```bash
-sudo apt install ./ese-studio_0.2.0_amd64.deb
-sudo dnf install ./ese-studio-0.2.0-1.x86_64.rpm
+sudo apt install ./ESE-Studio_0.2.1_linux-x86_64_cpu.deb
+sudo dnf install ./ESE-Studio_0.2.1_linux-x86_64_cpu.rpm
 ```
 
-Published Linux packages use a portable CPU runtime. Build from source when you
-want CUDA acceleration on Linux.
+DEB/RPM packages declare Python/OpenMP dependencies. AppImage users provide
+`python3` and `libgomp1` on Ubuntu/Debian, or `python3` and `libgomp` on Fedora.
+The package checks cover Ubuntu 24.04 and Fedora 44; other distribution versions
+are not established by those installation checks.
 
 ### Windows
 
-Download `ese-studio_0.2.0_x64-setup.exe` (recommended) or the MSI, compare its
-SHA-256 value with `SHA256SUMS-windows.txt`, and run it. The package includes a
-CUDA-enabled runtime for supported NVIDIA GPUs. Its bundled native runtime
-requires an installed NVIDIA driver, including for CPU execution. CPU-only
-Windows machines can build the CPU runtime from source with
-`./ese.cmd build --backend cpu`. Python, CMake, Visual Studio, and the CUDA toolkit
-are not required to run the installed application.
+In PowerShell, compare the hash with the matching line in `SHA256SUMS`:
 
-The NSIS installation supports signed update checks from **Settings → Updates**.
+```powershell
+Get-FileHash .\ESE-Studio_0.2.1_windows-x64-setup.exe -Algorithm SHA256
+```
+
+Run the setup EXE (or MSI), open ESE Studio and add your model folder. Current
+installers are unsigned. CPU executable and launcher selection checks passed in
+CI; actual installer execution and Windows GPU model inference remain
+unverified by that hosted run.
+
+## Check your PC and first model
+
+Use [What can my PC run?](WHAT_CAN_MY_PC_RUN.md) before choosing a large download.
+For the command line:
+
+```bash
+ese --version
+ese doctor
+ese plan /models/model.gguf --context 65536
+```
+
+On Windows use `ese.exe` and `C:\Models\model.gguf`. `plan` inspects the model;
+it does not benchmark a 64K prompt. The [demo record](LAUNCH_DEMO.md) identifies
+which exact model/context combinations have actually been measured.
 
 ## Install from source
 
@@ -61,22 +95,5 @@ cd expert-streaming-engine\studio
 .\install.ps1
 ```
 
-Both installers show missing dependencies and ask before installing anything.
-For a command-line-only build or manual CMake controls, see the
-[source-build guide](build.md).
-
-## Verify an installation
-
-```bash
-ese --version
-ese doctor
-ese plan /models/model.gguf
-```
-
-On Windows, use a Windows model path, for example:
-
-```powershell
-ese.exe plan C:\Models\model.gguf
-```
-
-The server listens on `http://127.0.0.1:8080` by default after `ese serve`.
+Both source installers show missing dependencies and ask before installing
+them. See the [source-build guide](build.md) for manual CMake controls.

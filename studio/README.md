@@ -1,6 +1,6 @@
 # ESE Studio
 
-ESE Studio is the Linux and Windows desktop control center for Expert Streaming Engine. It replaces the legacy launcher presentation while keeping ESE as the model-planning and serving authority.
+ESE Studio is the Linux and Windows desktop control center for Expert Streaming Engine. Use it to see what your PC can run, inspect a launch plan and measure the result. ESE remains the technical model-planning and serving authority.
 
 This foundation includes:
 
@@ -19,7 +19,7 @@ This foundation includes:
 - per-trial checkpoints, cancellation/resume, exclusive-GPU safety, and active-model restoration;
 - one-click promotion of verified context, KV, and batch settings into future model launches;
 - optional, off-by-default sharing of sanitized verified-sweep summaries through **Help improve ESE**;
-- a bundled ESE launcher/native runtime and signed in-app updates with visible progress;
+- a bundled ESE launcher/native runtime and an updater interface that verifies signed artifacts;
 - privacy-safe prefilled GitHub bug reports from visible errors;
 - versioned TOML configuration in the operating system's application-config
   directory, with the exact path shown in Settings.
@@ -58,9 +58,10 @@ are recognized rather than overwritten. Use `HF_TOKEN` or
 
 ## Linux install
 
-The AppImage, DEB, and RPM packages contain both Studio and ESE. Use the
-AppImage for signed in-app updating, or use the distribution package and apply
-future package updates through APT/DNF.
+The AppImage, DEB and RPM packages contain both Studio and ESE, with separate
+CPU and CUDA variants. The current v0.2.1 candidate is unsigned and uses manual
+package updates. See the [installation guide](../docs/install.md) for exact
+filenames and verification limits.
 
 The Linux ESE launcher requires Python 3.10 or newer and the system OpenMP
 runtime. DEB and RPM packages declare these dependencies. AppImage users must
@@ -102,7 +103,8 @@ pnpm tauri dev
 ## Windows source install
 
 The Windows installer bundles a CUDA-enabled ESE runtime for NVIDIA GPUs and
-falls back to the CPU backend when CUDA hardware is unavailable. Users do not
+includes a separate driver-independent CPU runtime selected when CUDA hardware
+is unavailable. Users do not
 need CMake, a compiler, Python, or the CUDA toolkit to run the installed app.
 The CUDA toolkit is only required when building the Windows package from
 source.

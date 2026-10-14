@@ -1,8 +1,10 @@
 # ESE v0.2.1 release notes
 
 **Working draft — unpublished.** This document describes the current candidate.
-Release-wide validation and packaging are incomplete. Experimental capabilities
-below are not a declaration of production support.
+Eight unsigned installer/package candidates have completed their recorded
+packaging checks. Signing, the new filled-64K flagship demonstration and broader
+release qualification remain incomplete. Experimental capabilities below are
+not a declaration of production support.
 
 ## More dependable local AI on the hardware you own
 
@@ -431,8 +433,9 @@ other visible cards. See [placement validation](GPU_PLACEMENT_OVERRIDE_VALIDATIO
 Server response flags, token counters and timing values now have defined
 defaults. Poisoned-storage direct/queued-copy regressions and strict sanitizer
 checks pass. Instrumented resize controls retain exact output within the same
-build. Linux installer candidates predate these changes and are not current
-source artifacts.
+build. The October 14 Linux rebuild includes these changes and the accepted GPU
+decode router-submission boundary. Its native payloads match the qualified
+source/runtime generation after the declared relocation.
 
 Launcher and Studio version fields now agree on `0.2.1`. Linux CPU runtime
 staging uses bundled native libraries and system libraries without retaining
@@ -454,8 +457,12 @@ payload digest checks. These candidates supersede the earlier RPMs.
 All 20 packaged resident controls and 20 cache shrink/regrow controls retain
 saved content and all 32 probabilities exactly. Eight non-root desktop startup
 captures show a ready runtime and optional sharing OFF. These are generated
-small-model checks. Signing, native Windows installers and release-wide
-readiness remain unqualified. See
+small-model checks. The October 14 private Windows CI also builds unsigned MSI/NSIS installers
+with a separate CPU runtime. Actual CPU executable and automatic launcher
+selection checks pass. Both extracted installers match all eight CUDA and five
+CPU native files, the standalone launcher and required licenses. Windows GPU
+inference, installer execution, signing and release-wide readiness remain
+unqualified. See
 [Linux CPU/CUDA packaging validation](LINUX_CUDA_PACKAGING_VALIDATION_20261013.md).
 
 The NCCL communicator shutdown leak is repaired: all three GPUs pass memory checks
@@ -618,6 +625,22 @@ Known limitations of this candidate include:
 - No new Qwen serving-slot, readiness or dual-protocol API qualification.
 
 ## Performance reporting
+
+The launch presentation now leads with using the PC you already own. Its
+[PC guide](WHAT_CAN_MY_PC_RUN.md) separates estimates from tested configurations,
+and its [flagship demo record](LAUNCH_DEMO.md) requires actual 64K prompt fill,
+sustained generation and measured RAM/VRAM before establishing a headline.
+
+A separate private Qwen3.8 Flash Next GSQ-RCO IQ2_XS benchmark on the RTX 3060 Ti
+and RTX 3080 records 6.7273 seconds for ESE and 1.2213 seconds for Strata to
+complete 32 warm output tokens, using the same raw prompt/count and fresh
+prompt/session state. ESE is about 5.51 times slower for those configurations.
+Policies and generated continuations differ; OS page-cache state is uncontrolled.
+Both immutable CPU references pass the selected model’s 33-token numerical
+control, but it has no filled-64K qualification. These results do not resolve the
+earlier original-model 33-token failure or enable the production Qwen gate.
+They are an experimental diagnostic, not the supported launch demonstration.
+
 
 There is no current matched release benchmark proving an ESE-versus-Strata
 speed ratio. Historical diagnostic runs used different speculation, cache,

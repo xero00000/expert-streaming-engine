@@ -4,18 +4,56 @@
 [![Latest release](https://img.shields.io/github/v/release/xero00000/expert-streaming-engine)](https://github.com/xero00000/expert-streaming-engine/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Run sparse Mixture-of-Experts GGUF models when the full model does not fit in
-VRAM—and, with deferred experts, when it cannot safely remain resident in RAM.
+**You shouldn’t need a new computer just to try a bigger model.**
 
-Expert Streaming Engine (ESE) is a Linux-focused `ik_llama.cpp`/`llama.cpp`
-fork. It combines a transparent `ese` launcher with a native global resource
-controller and a bounded `NVMe → RAM → VRAM` expert hierarchy. The result is a
-normal `llama-server` and OpenAI-compatible API with explicit memory limits,
-observable decisions, and no hidden backend or precision fallback.
+Try larger local AI models on the gaming PC you already own. Expert Streaming
+Engine (ESE) uses SSD storage, RAM and NVIDIA GPUs to run sparse GGUF models
+whose weights do not fit entirely in VRAM. CPU-only runtimes are available too.
 
-Qwen4Exp text inference remains validation gated and is disabled in normal
-runtime builds. Studio marks these models **Validation gated** and prevents
-launching them. Qwen4Exp vision and MTP are unsupported.
+A smaller memory budget can mean more storage reads and longer waits. Your
+model, quantization, CPU, SSD and filled context determine the speed. ESE shows
+its launch plan and measured results so you can decide what is practical.
+
+[What can my PC run?](docs/WHAT_CAN_MY_PC_RUN.md) ·
+[Install ESE](docs/install.md) ·
+[Reproduce the launch demo](docs/LAUNCH_DEMO.md)
+
+## See what a smaller memory budget can do
+
+Our launch demonstration is being qualified with **at least 64K tokens of actual
+prompt input**, followed by sustained generation. Its published record will name
+the exact model and quant, download revision, hardware, SSD, RAM/VRAM peaks,
+first-response time and generation speed. A 64K allocation with a short prompt
+will not be presented as a filled-64K result.
+
+**Current status:** the new low-memory flagship result is not yet qualified.
+The [demo record](docs/LAUNCH_DEMO.md) separates the test target from completed
+evidence. [Earlier engineering benchmarks](docs/ESE_BENCHMARKS.md) remain
+available with their original hardware and workload limits.
+
+## Quick start
+
+1. Install the CPU or NVIDIA CUDA package using the instructions below.
+2. Open ESE Studio, add your GGUF model folder, and review the model’s launch plan.
+3. Use a measured configuration from the demo record, or run a configuration
+   sweep before treating a context or speed estimate as verified.
+
+For the command line, start by inspecting your PC and model:
+
+```bash
+ese doctor
+ese plan /models/model.gguf --context 65536
+ese serve /models/model.gguf --context 65536
+```
+
+On Windows use `ese.exe` and a Windows model path. `plan` does not run inference;
+its memory and context estimates are not benchmark results.
+
+**Available today:** ESE Studio and the ESE launcher on Linux/Windows x86_64,
+CPU-only runtimes, NVIDIA CUDA runtimes, and bounded expert streaming for
+supported sparse models. Exact model/quant/context combinations still need
+workload verification. Experimental Qwen4Exp inference is disabled in production
+builds; vision and MTP on that path are unsupported.
 
 ## Install ESE Studio + ESE
 
@@ -128,9 +166,8 @@ commands and system libraries and asks before installing missing packages.
 
 Studio and ESE are versioned as one unit. From v0.1.1 onward, the packaged
 launcher/runtime is the one Studio uses; an unrelated older `ese` on `PATH`
-does not silently take precedence. Signed updates are checked manually from
-Settings, show byte progress, verify before installation, and leave the
-current install intact if a download or verification fails.
+does not silently take precedence. The updater interface checks signed artifacts before installing them. The
+current v0.2.1 candidate is unsigned and uses manual package installation.
 
 ![ESE Studio model library](docs/images/ese-studio-models.jpg)
 
@@ -191,7 +228,12 @@ sweeps. Raw submissions remain in a private collector; the public
 [community benchmark list](COMMUNITY_BENCHMARKS.md) contains grouped results
 only and suppresses groups with fewer than three samples.
 
-## Four execution policies
+## How ESE manages memory
+
+The following sections describe placement, caches and implementation details.
+For choosing a first model, start with the [PC guide](docs/WHAT_CAN_MY_PC_RUN.md).
+
+### Four execution policies
 
 `auto` is recommended. ESE inspects GGUF metadata, all model shards, available
 host RAM, and current per-GPU VRAM before choosing a native policy.
