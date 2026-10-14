@@ -10,6 +10,35 @@
 
 #include "ggml-quants.h"
 #include "ggml-impl.h"
+#include <assert.h>
+
+void dequantize_row_q2_0(const void * restrict vx, float * restrict y, int64_t k) {
+    assert(k % QK2_0 == 0);
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+    for (int64_t b = 0; b < k / QK2_0; ++b) {
+        const float d = GGML_FP16_TO_FP32(x[b].d);
+        for (int j = 0; j < QK2_0; ++j) {
+            y[b * QK2_0 + j] = d * (((x[b].qs[j / 4] >> (2 * (j % 4))) & 3) - 1);
+        }
+    }
+}
+
+void ggml_vec_dot_q2_0_f32(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+    assert(nrc == 1 && n % QK2_0 == 0);
+    (void) bs; (void) bx; (void) by; (void) nrc;
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+    const float * y = (const float *) vy;
+    float sum = 0.0f;
+    for (int b = 0; b < n / QK2_0; ++b) {
+        const float d = GGML_FP16_TO_FP32(x[b].d);
+        for (int j = 0; j < QK2_0; ++j) {
+            const int code = (x[b].qs[j / 4] >> (2 * (j % 4))) & 3;
+            sum += (d * (code - 1)) * y[b * QK2_0 + j];
+        }
+    }
+    *s = sum;
+}
+#include "ggml-impl.h"
 #if GGML_USE_IQK_MULMAT
 #include "iqk/iqk_config.h"
 #include "iqk/iqk_mul_mat.h"

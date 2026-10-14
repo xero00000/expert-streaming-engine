@@ -252,6 +252,25 @@ def main() -> int:
         storage[backend] = {"status": "pass", "stats": ram_stats}
     report["storage_parity"] = storage
 
+    # Runtime-only lease/worker requirements must not leak into the native
+    # controller's metadata-only probe (which deliberately has no RAM cache).
+    native = run_cli(args.cli, args.model, [
+        *cpu_only, *common_cache, "--expert-storage-backend", "pread",
+        "--expert-load-workers", "2", "--memory-policy", "stream",
+        "--max-ram", "4GiB", "--max-context", "1024", "-c", "1024",
+        "--min-kv-quality", "f16",
+    ], cpu_env)
+    require_success(native, "native strict-sidecar metadata probe")
+    if native["generated"] != baseline["generated"]:
+        raise RuntimeError("native strict-sidecar output differs from baseline")
+    native_ram = next((item for item in native["stats"] if item.get("level") == "ram"), None)
+    if not native_ram or native_ram["peak_resident_bytes"] > native_ram["capacity_bytes"]:
+        raise RuntimeError("native strict-sidecar run did not prove its RAM bound")
+    report["native_strict_sidecar"] = {
+        "status": "pass", "stats": native_ram,
+        "scope": "metadata probe and CPU lease execution; not GPU worker activity",
+    }
+
     cold_ms: list[float] = []
     warm_ms: list[float] = []
     for _ in range(args.runs):

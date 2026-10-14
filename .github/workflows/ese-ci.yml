@@ -40,11 +40,19 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install "numpy==2.4.6" "pytest==9.1.0" -e ./gguf-py
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.10.0"
+
       - name: Compile Python
         run: python -m compileall -q ese tools tests
 
       - name: Unit tests and native surface guard
         run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Reference adapter and benchmark replay guards
+        run: python -m pytest -q tests/test_qwen4exp_full_reference.py tests/test_qwen4exp_benchmark_replay.py
 
       - name: CLI smoke
         run: |
@@ -152,22 +160,44 @@ jobs:
           build-expert-sanitizers/bin/test-resource-planner
 
   cpu-build:
-    name: Native CPU server build
+    name: Complete native CPU regressions and server
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install template reference dependency
+        run: python -m pip install "Jinja2==3.1.6"
 
       - name: Configure
         run: >
           cmake -S . -B build-ci
           -DCMAKE_BUILD_TYPE=Release
           -DGGML_CUDA=OFF
-          -DLLAMA_BUILD_TESTS=OFF
+          -DGGML_NATIVE=OFF
+          -DESE_QWEN4EXP_PROBE_GATE=OFF
+          -DLLAMA_BUILD_TESTS=ON
           -DLLAMA_BUILD_SERVER=ON
 
-      - name: Build llama-server
-        run: cmake --build build-ci --target llama-server -j2
+      - name: Build all registered targets
+        run: cmake --build build-ci --parallel 2
+
+      - name: Require complete native regression suite
+        run: ctest --test-dir build-ci --output-on-failure --output-junit native-regressions.xml
+
+      - name: Preserve native regression results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ese-native-cpu-regressions-${{ github.sha }}
+          path: |
+            build-ci/native-regressions.xml
+            build-ci/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
 
       - name: Verify compiled policy surface
         shell: bash

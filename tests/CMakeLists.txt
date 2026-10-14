@@ -206,6 +206,175 @@ llama_build_and_test(test-regex-partial.cpp)
 
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
+llama_build(test-qwen4exp-probe.cpp)
+llama_test(test-qwen4exp-probe LABEL "model")
+llama_build(test-hybrid-state-copy.cpp)
+llama_test(test-hybrid-state-copy LABEL "model")
+llama_build(test-qwen4exp-output-ledger.cpp)
+llama_test(test-qwen4exp-output-ledger LABEL "model")
+llama_build(test-qwen4exp-hybrid-retier.cpp)
+llama_test(test-qwen4exp-hybrid-retier LABEL "model")
+llama_build(test-model-loader-splits.cpp)
+target_include_directories(test-model-loader-splits PRIVATE ${CMAKE_SOURCE_DIR}/src)
+llama_test(test-model-loader-splits LABEL "model")
+llama_build(test-speculative-sequence-isolation.cpp speculative-common-discard.cpp)
+llama_build(test-bf16-stable-batch.cpp)
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(test-speculative-sequence-isolation PRIVATE CUDA::cuda_driver)
+    target_link_libraries(test-bf16-stable-batch PRIVATE CUDA::cuda_driver)
+    llama_build(test-cuda-nccl-lifecycle.cpp)
+    llama_test(test-cuda-nccl-lifecycle LABEL "model")
+    set_tests_properties(test-cuda-nccl-lifecycle PROPERTIES RUN_SERIAL TRUE SKIP_RETURN_CODE 77 TIMEOUT 120)
+    llama_build(test-cuda-device-context.cpp)
+    target_link_libraries(test-cuda-device-context PRIVATE CUDA::cudart CUDA::cuda_driver)
+    llama_test(test-cuda-device-context LABEL "model")
+    llama_build(test-context-device-selection.cpp test-native-device-planning.cpp)
+    target_link_libraries(test-context-device-selection PRIVATE CUDA::cuda_driver)
+    llama_test(test-context-device-selection LABEL "model")
+    llama_test(test-context-device-selection NAME test-native-single-device-primary-contexts
+        LABEL "model" ARGS --primary-contexts)
+    set_tests_properties(test-native-single-device-primary-contexts PROPERTIES RUN_SERIAL TRUE)
+endif()
+llama_test(test-speculative-sequence-isolation LABEL "model")
+llama_test(test-bf16-stable-batch LABEL "model")
+llama_build(test-q2-0.cpp)
+llama_test(test-q2-0 LABEL "model")
+llama_build(test-gguf-unsupported-type.cpp)
+llama_test(test-gguf-unsupported-type LABEL "model")
+llama_build(test-deepseek-v41-engram.cpp)
+llama_build(test-deepseek-v41-expert.cpp)
+llama_build(test-deepseek-v41-ops.cpp)
+llama_build(test-deepseek-v41-layout.cpp)
+llama_build(test-deepseek-v41-index.cpp)
+llama_build(test-deepseek-v41-cache.cpp)
+llama_build(test-deepseek-v41-model.cpp)
+llama_build(test-deepseek-v41-forward.cpp)
+llama_build(test-deepseek-v41-moe.cpp)
+llama_build(test-deepseek-v41-runtime.cpp)
+llama_build(test-deepseek-v41-tokenizer.cpp)
+llama_test(test-deepseek-v41-runtime LABEL "model" ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/block-reference.json)
+llama_test(test-deepseek-v41-moe LABEL "model" ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/moe-reference.json)
+llama_test(test-deepseek-v41-forward NAME test-deepseek-v41-token LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/block-reference.json cpu --whole-model)
+llama_test(test-deepseek-v41-forward NAME test-deepseek-v41-block LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/block-reference.json cpu)
+llama_test(test-deepseek-v41-forward LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/forward-reference.json cpu)
+llama_test(test-deepseek-v41-forward NAME test-deepseek-v41-forward-bf16 LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/forward-bf16-reference.json cpu)
+llama_test(test-deepseek-v41-model LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/config.json
+         ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/mixedq2-gguf-inventory.json)
+llama_test(test-deepseek-v41-cache LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/config.json
+         ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/qat-reference.json)
+llama_test(test-deepseek-v41-index LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/index-reference.json)
+llama_test(test-deepseek-v41-ops NAME test-deepseek-v41-index-scores LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/index-reference.json cpu)
+llama_test(test-deepseek-v41-layout LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/config.json)
+llama_test(test-deepseek-v41-ops LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/ops-reference.json cpu)
+option(LLAMA_CUDA_MEMCHECK_TESTS "Register CUDA memory checks (requires a visible GPU)" OFF)
+if (LLAMA_CUDA_MEMCHECK_TESTS)
+    if (NOT GGML_CUDA)
+        message(FATAL_ERROR "LLAMA_CUDA_MEMCHECK_TESTS requires GGML_CUDA=ON")
+    endif()
+    find_program(LLAMA_COMPUTE_SANITIZER compute-sanitizer
+        HINTS ${CUDAToolkit_BIN_DIR} REQUIRED)
+    add_test(NAME test-cuda-shutdown-memcheck
+        COMMAND ${LLAMA_COMPUTE_SANITIZER} --tool memcheck --leak-check full --error-exitcode 99
+            $<TARGET_FILE:test-deepseek-v41-ops>
+            ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/ops-reference.json 0)
+    set_tests_properties(test-cuda-shutdown-memcheck PROPERTIES
+        LABELS "model;cuda;memcheck" RUN_SERIAL TRUE TIMEOUT 300)
+    add_test(NAME test-cuda-nccl-lifecycle-memcheck
+        COMMAND ${LLAMA_COMPUTE_SANITIZER} --tool memcheck --leak-check full --error-exitcode 99
+            $<TARGET_FILE:test-cuda-nccl-lifecycle>)
+    set_tests_properties(test-cuda-nccl-lifecycle-memcheck PROPERTIES
+        LABELS "model;cuda;memcheck" RUN_SERIAL TRUE SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()
+llama_test(test-deepseek-v41-ops NAME test-deepseek-v41-qat LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/qat-reference.json cpu)
+llama_test(test-deepseek-v41-ops NAME test-deepseek-v41-attention LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41/attention-reference.json cpu)
+llama_test(test-deepseek-v41-engram LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/deepseek-v41)
+llama_build(test-qwen4exp-ple.cpp)
+llama_test(test-qwen4exp-ple LABEL "model"
+    ARGS
+        ${CMAKE_CURRENT_SOURCE_DIR}/../docs/qwen4exp/ple-reference-trace.json
+        ${CMAKE_CURRENT_SOURCE_DIR}/../docs/qwen4exp/ple-iq4nl-row-fixture.json)
+llama_build(test-qwen4exp-ple-storage.cpp)
+llama_test(test-qwen4exp-ple-storage LABEL "model")
+llama_build(test-qwen4exp-ple-cache.cpp)
+llama_test(test-qwen4exp-ple-cache LABEL "model")
+llama_build(test-graph-arena-budget.cpp)
+llama_test(test-graph-arena-budget LABEL "model")
+llama_build(test-prefill-backoff.cpp)
+llama_test(test-prefill-backoff LABEL "model")
+llama_build(test-decode-status.cpp)
+llama_test(test-decode-status LABEL "model")
+llama_build(test-copy-transpose-layout.cpp)
+llama_test(test-copy-transpose-layout)
+llama_build(test-cuda-pool-memory.cpp)
+llama_test(test-cuda-pool-memory LABEL "model")
+llama_build(test-shared-memory-budget.cpp)
+llama_test(test-shared-memory-budget LABEL "model")
+
+llama_build(test-handoff-allocation.cpp)
+llama_test(test-handoff-allocation LABEL "model")
+
+llama_build(test-qwen4exp-ple-provider-metadata.cpp)
+llama_test(test-qwen4exp-ple-provider-metadata LABEL "model")
+
+llama_build(test-qwen4exp-ple-row-store.cpp)
+llama_test(test-qwen4exp-ple-row-store LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/qwen4exp/ple-iq4nl-row-fixture.json)
+llama_build(test-qwen4exp-ple-page-store.cpp)
+llama_test(test-qwen4exp-ple-page-store LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/qwen4exp/ple-iq4nl-row-fixture.json)
+llama_build(test-qwen4exp-schema.cpp)
+llama_test(test-qwen4exp-schema LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/qwen4exp/ud-iq1-s.manifest.json)
+llama_build(test-qwen4exp-ops.cpp)
+llama_build(test-qwen4exp-prefix-state.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-qwen4exp-prefix-state PRIVATE CUDA::cuda_driver)
+endif()
+llama_test(test-qwen4exp-prefix-state LABEL "model")
+llama_build(test-qwen4exp-ple-journal.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-qwen4exp-ple-journal PRIVATE CUDA::cuda_driver)
+endif()
+llama_test(test-qwen4exp-ple-journal LABEL "model")
+# Reuse the bundled SHA-256 implementation to identify bounded real GGUF payloads.
+target_sources(test-qwen4exp-ops PRIVATE ../examples/gguf-hash/deps/sha256/sha256.c)
+target_include_directories(test-qwen4exp-ops PRIVATE ../examples/gguf-hash/deps)
+llama_test(test-qwen4exp-ops LABEL "model"
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../docs/qwen4exp/operator-reference-fixture.json)
+# Tiny synthetic qwen4exp GGUF generated in-test: exercises the metadata path
+# without the 58 GiB production quant and keeps the production gate closed.
+llama_build(test-qwen4exp-fixture.cpp)
+llama_test(test-qwen4exp-fixture LABEL "model")
+
+llama_build(test-qwen4exp-cache-sizing.cpp)
+llama_test(test-qwen4exp-cache-sizing LABEL "model")
+
+llama_build(test-model-resource-bytes.cpp)
+llama_test(test-model-resource-bytes LABEL "model")
+
+llama_build(test-sumrows-div-fusion.cpp)
+llama_test(test-sumrows-div-fusion LABEL "model")
+
+llama_build(test-ssm-conv-boundary.cpp)
+llama_test(test-ssm-conv-boundary LABEL "model")
+
+# Requires caller-supplied GGUF shard paths; exercised manually against the
+# maintainer's local artifact (see test-qwen4exp-artifact.cpp usage).
+llama_build(test-qwen4exp-artifact.cpp)
 
 
 
@@ -218,6 +387,9 @@ llama_test(test-turbo-kv-policy)
 
 # Phase 2 expert hierarchy: checked descriptors and bounded lease lifetime.
 llama_build(test-expert-cache.cpp)
+if (GGML_EXPERT_CHUNKING AND GGML_IQK_MUL_MAT)
+    target_compile_definitions(test-expert-cache PRIVATE ESE_TEST_EXPERT_LEASE_CHUNKING)
+endif()
 llama_test(test-expert-cache)
 llama_build(test-expert-cache-transaction.cpp)
 
@@ -237,6 +409,9 @@ llama_test(test-resource-planner)
 llama_build(test-kda-delta-net.cpp)
 llama_test(test-kda-delta-net)
 
+llama_build(test-delta-net-layout.cpp)
+llama_test(test-delta-net-layout)
+
 llama_build(test-mapped-draft.cpp)
 llama_test(test-mapped-draft)
 
@@ -248,6 +423,93 @@ llama_build(test-turbo-kv-recurrent.cpp)
 if (GGML_CUDA)
     llama_build(test-turbo-kv-cuda.cpp)
     llama_test(test-turbo-kv-cuda)
+
+    # ggml enables CUDA in its own directory; initialize it in this scope too.
+    enable_language(CUDA)
+    add_executable(test-iq3-cuda-dot test-iq3-cuda-dot.cu)
+    target_include_directories(test-iq3-cuda-dot PRIVATE ../ggml/src ../ggml/src/ggml-cuda)
+    target_compile_definitions(test-iq3-cuda-dot PRIVATE
+        GGML_CUDA_FUSION=${GGML_CUDA_FUSION}
+        GGML_CUDA_MIN_BATCH_OFFLOAD=${GGML_CUDA_MIN_BATCH_OFFLOAD})
+    target_compile_options(test-iq3-cuda-dot PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    target_link_libraries(test-iq3-cuda-dot PRIVATE ggml CUDA::cudart CUDA::cuda_driver)
+    set_target_properties(test-iq3-cuda-dot PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+    llama_test(test-iq3-cuda-dot)
+    set_tests_properties(test-iq3-cuda-dot PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+llama_build(test-get-rows-bf16.cpp)
+llama_build(test-expert-f32.cpp)
+llama_build(test-expert-iq-formats.cpp)
+target_include_directories(test-expert-iq-formats PRIVATE ../ggml/src)
+llama_test(test-expert-iq-formats)
+llama_build(test-shared-f32.cpp)
+llama_build(test-q6-direct.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-shared-f32 PRIVATE CUDA::cuda_driver)
+    target_link_libraries(test-q6-direct PRIVATE CUDA::cuda_driver)
+endif()
+target_include_directories(test-expert-f32 PRIVATE ../ggml/src)
+if (GGML_CUDA)
+    target_link_libraries(test-expert-f32 PRIVATE CUDA::cuda_driver)
+    llama_build(test-expert-f32-graph.cpp)
+    target_include_directories(test-expert-f32-graph PRIVATE ../ggml/src)
+    target_link_libraries(test-expert-f32-graph PRIVATE CUDA::cuda_driver)
+    llama_build(test-expert-f32-cache.cpp)
+    target_include_directories(test-expert-f32-cache PRIVATE ../ggml/src)
+    target_link_libraries(test-expert-f32-cache PRIVATE CUDA::cuda_driver)
+endif()
+llama_test(test-get-rows-bf16)
+llama_build(test-bf16-head.cpp)
+llama_test(test-bf16-head)
+llama_build(test-scalar-row-projection.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-scalar-row-projection PRIVATE CUDA::cuda_driver)
+endif()
+llama_test(test-scalar-row-projection LABEL "model")
+llama_build(test-rms-layout.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-rms-layout PRIVATE CUDA::cuda_driver)
+endif()
+llama_test(test-rms-layout LABEL "model")
+llama_build(test-attention-precision.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-attention-precision PRIVATE CUDA::cuda_driver)
+endif()
+llama_test(test-attention-precision LABEL "model")
+llama_build(test-attention-batch.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-attention-batch PRIVATE CUDA::cuda_driver)
+endif()
+llama_test(test-attention-batch LABEL "model")
+set_tests_properties(test-attention-batch PROPERTIES ENVIRONMENT "ESE_CUDA_ATTENTION_STABLE_BATCH=1")
+llama_build(test-qwen4exp-cache-order.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-qwen4exp-cache-order PRIVATE CUDA::cuda_driver)
+endif()
+llama_test(test-qwen4exp-cache-order LABEL "model")
+llama_build(test-qwen4exp-attention-layout.cpp)
+llama_test(test-qwen4exp-attention-layout LABEL "model")
+llama_build(test-cuda-graph-layout.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-cuda-graph-layout PRIVATE CUDA::cuda_driver)
+endif()
+llama_test(test-cuda-graph-layout LABEL "model")
+llama_build(test-qwen4exp-qsa-selection.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-qwen4exp-qsa-selection PRIVATE CUDA::cuda_driver)
+endif()
+llama_test(test-qwen4exp-qsa-selection LABEL "model")
+llama_build(test-fused-dense-batch.cpp)
+if (GGML_CUDA)
+    target_link_libraries(test-fused-dense-batch PRIVATE CUDA::cuda_driver)
+endif()
+llama_test(test-fused-dense-batch LABEL "model")
+set_tests_properties(test-fused-dense-batch PROPERTIES ENVIRONMENT "ESE_CUDA_FUSED_BATCH_VECTOR=1")
+llama_build(test-explicit-projection.cpp)
+llama_test(test-explicit-projection)
+if (GGML_CUDA)
+    set_tests_properties(test-explicit-projection PROPERTIES ENVIRONMENT "ESE_CUDA_EXPLICIT_AUTOTUNE=1;CUDA_DEVICE_ORDER=PCI_BUS_ID")
 endif()
 
 # dummy executable - not installed

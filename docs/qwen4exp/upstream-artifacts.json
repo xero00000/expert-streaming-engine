@@ -1,0 +1,42 @@
+{
+  "official_model": {
+    "repository": "Qwen/Qwen3.8-Flash-Next",
+    "revision": "f5d08274bafd880402bd16f5e3e6c514136ec06c",
+    "files": {
+      "LICENSE": "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08",
+      "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+      "config.json": "889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b",
+      "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+      "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+      "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+      "tokenizer_config.json": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+      "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    },
+    "license": "qwen-community-1.0"
+  },
+  "technical_report": {
+    "repository": "QwenLM/Qwen3.8-Flash-Next",
+    "revision": "513aa6e18a335296fc13e538232a8735b230877d",
+    "files": {
+      "tech_report.pdf": "04f263446d74a35cb7cea368574e0c561f3b05c133be2c777ac884404063655d"
+    }
+  },
+  "transformers_reference": {
+    "repository": "huggingface/transformers",
+    "revision": "fc5c5bde8e656dad91cbf34e61940d984b1c7b91",
+    "files": {
+      "configuration_qwen4_exp.py": "26b47995740e3bc596b44b2011ee6c3d971d46136438b00dd5fad9557bec4254",
+      "modeling_qwen4_exp.py": "77fec77d87f2a0eb23b95fa04276fb5779698a7c7f523cf5061e49c118bcc459",
+      "modular_qwen4_exp.py": "54b9e147c1e1b95169419a4258c0ea4cefeaf7c37b9af2456e57ebc92a4ecc56"
+    }
+  },
+  "gguf_repository": {
+    "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    "revision": "d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249",
+    "files": {
+      "README.md": "416909d02c9fe39b44a9350a3e4e0a2efec97807b797f5485722f02c4201b19d"
+    },
+    "license": "qwen-community-1.0",
+    "license_evidence": "Model card declaration and base-model link; no LICENSE file exists at the pinned GGUF revision."
+  }
+}

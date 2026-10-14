@@ -161,6 +161,9 @@ struct server_slot {
     // speculative decoding
     struct common_speculative * spec = nullptr;
     struct common_params_sampling sparams;
+    // ignore_eos is request-scoped even when explicit logit biases persist.
+    struct saved_eog_bias { llama_token token; bool present; float bias; };
+    std::vector<saved_eog_bias> ignore_eos_biases;
     common_sampler * ctx_sampling = nullptr;
 
     // expiring logit bias
@@ -335,6 +338,7 @@ struct server_context {
     bool launch_slot_with_task(server_slot& slot, server_task& task);
 
     void kv_cache_clear();
+    void invalidate_failed_decode_context();
 
     void system_prompt_update();
 

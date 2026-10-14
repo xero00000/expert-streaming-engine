@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ESE Studio",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "io.github.xero00000.ese-studio",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -34,7 +34,10 @@
       "../runtime/ese/": "ese/",
       "../../LICENSE": "licenses/ESE-MIT-LICENSE.txt",
       "../../THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt",
-      "../licenses/NVIDIA-CUDA-12.4-LICENSE.txt": "licenses/NVIDIA-CUDA-12.4-LICENSE.txt"
+      "../licenses/NVIDIA-CUDA-12.4-LICENSE.txt": "licenses/NVIDIA-CUDA-12.4-LICENSE.txt",
+      "../licenses/NVIDIA-CUDA-12.8-LICENSE.txt": "licenses/NVIDIA-CUDA-12.8-LICENSE.txt",
+      "../licenses/NVIDIA-NCCL-LICENSE.txt": "licenses/NVIDIA-NCCL-LICENSE.txt",
+      "../licenses/NVIDIA-NVTX-LICENSE.txt": "licenses/NVIDIA-NVTX-LICENSE.txt"
     },
     "windows": {
       "wix": {
@@ -50,7 +53,24 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "linux": {
+      "deb": {
+        "depends": [
+          "python3 (>= 3.10)",
+          "libgomp1"
+        ]
+      },
+      "rpm": {
+        "depends": [
+          "python3",
+          "libgomp"
+        ],
+        "compression": {
+          "type": "none"
+        }
+      }
+    }
   },
   "plugins": {
     "updater": {

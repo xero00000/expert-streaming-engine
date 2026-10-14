@@ -1,5 +1,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-f16-interface.cuh"
+#include <cstdlib>
+#include <cstring>
 
 static __global__ void k_repack_q(int nelements, int ne0, int ne0_1, const float * src, float * dst1, float * dst2) {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
@@ -153,6 +155,13 @@ template <int D, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
+    // Keep short verification batches on the scalar decode tile. The launch
+    // gives each query tile an independent scalar-equivalent Stream-K partition.
+    if (ggml_cuda_fattn_stable_batch_enabled() && Q->ne[1] <= 32) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<D, 8/ncols2, ncols2>(ctx, dst);
+        return;
+    }
+
     if (Q->ne[1] <= 8/ncols2) {
         ggml_cuda_flash_attn_ext_mma_f16_case<D, 8/ncols2, ncols2>(ctx, dst);
         return;
@@ -256,7 +265,7 @@ void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tens
 
 bool ggml_cuda_fattn_mma_f16_is_supported([[maybe_unused]] ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     auto K = dst->src[1];
-    auto V = dst->src[1];
+    auto V = dst->src[2];
     if (K->ne[0] != V->ne[0]) return false;
     return K->ne[0] == 64 || K->ne[0] == 80 || K->ne[0] == 96 || K->ne[0] == 112 || K->ne[0] == 128 || K->ne[0] == 192 || K->ne[0] == 256;
 }

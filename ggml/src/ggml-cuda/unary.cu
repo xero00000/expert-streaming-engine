@@ -737,11 +737,13 @@ static __device__ __forceinline__ float op_exp(float x) {
 }
 
 static __device__ __forceinline__ float op_softplus(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+    // Double intermediates avoid --use_fast_math's approximate exp/log mapping;
+    // negative tails must stay positive and retain float-precision relative accuracy.
+    return (x > 20.0f) ? x : float(log1p(exp(double(x))));
 }
 
 static __device__ __forceinline__ float op_sqrt_softplus(float x) {
-    return (x > 20.0f) ? sqrtf(x) : sqrtf(logf(1.0f + expf(x)));
+    return sqrtf(op_softplus(x));
 }
 
 static __device__ __forceinline__ float op_sin(float x) {
@@ -753,7 +755,20 @@ static __device__ __forceinline__ float op_cos(float x) {
 }
 
 static __device__ __forceinline__ float op_log(float x) {
-    return logf(x);
+    // --use_fast_math flushes positive F32 subnormals in logf to zero.
+    // Inspect bits for the common sparse-mask values and preserve other inputs
+    // through the F64 path, including subnormals and negative-domain NaNs.
+    const unsigned int bits = __float_as_uint(x);
+    if ((bits & 0x7fffffffu) == 0) return __uint_as_float(0xff800000u);
+    if (bits == 0x3f800000u) return 0.0f;
+    if ((bits & 0x7f800000u) == 0) {
+        // The float-to-double conversion can also flush its F32 input. Build
+        // the exact subnormal value from its integer significand instead.
+        double value = ldexp(double(bits & 0x007fffffu), -149);
+        if (bits & 0x80000000u) value = -value;
+        return float(log(value));
+    }
+    return float(log(double(x)));
 }
 
 static __device__ __forceinline__ float op_elu(float x) {

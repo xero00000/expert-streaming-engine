@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-ese.h"
+#include "../ggml/src/ggml-expert-loader.h"
 
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
@@ -14,14 +15,19 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <future>
+#include <condition_variable>
+#include <chrono>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 #include <vector>
 
 #if defined(__linux__)
 #include <unistd.h>
+#include <fcntl.h>
 #endif
 
 using namespace llama_expert_cache;
@@ -62,14 +68,81 @@ public:
         ++reads_;
     }
 
-    uint64_t reads() const { return reads_; }
+    uint64_t reads() const { return reads_.load(); }
 
 private:
     uint32_t id_;
     source_identity identity_;
     read_backend backend_;
     std::vector<uint8_t> bytes_;
-    mutable uint64_t reads_ = 0;
+    mutable std::atomic<uint64_t> reads_{0};
+};
+
+// A source gate makes concurrency observable without relying on disk speed.
+// Each 32-byte component can be held independently, including both extents.
+class gated_source final : public source {
+public:
+    uint32_t id() const override { return 1; }
+    source_identity identity() const override { return { 77, 88 }; }
+    uint64_t size() const override { return 256; }
+    read_backend backend() const override { return read_backend::pread; }
+    void read(uint64_t offset, void * destination, size_t length) const override {
+        if (offset + length > size()) throw std::out_of_range("gated source range");
+        const size_t component = offset / 32;
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++calls_[component];
+        changed_.notify_all();
+        changed_.wait(lock, [&] { return !held_[component]; });
+        if (failed_[component]) throw std::runtime_error("injected storage failure");
+        lock.unlock();
+        auto * bytes = static_cast<uint8_t *>(destination);
+        for (size_t i = 0; i < length; ++i) bytes[i] = uint8_t(offset + i);
+    }
+    void hold(size_t component) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        held_[component] = true;
+    }
+    bool entered(size_t component) const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return changed_.wait_for(lock, std::chrono::seconds(2), [&] { return calls_[component] != 0; });
+    }
+    void release_all() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        held_.fill(false);
+        changed_.notify_all();
+    }
+    void fail(size_t component, bool enabled) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        failed_[component] = enabled;
+    }
+    uint64_t calls(size_t component) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return calls_[component];
+    }
+    bool advise_will_need(uint64_t offset, uint64_t length) const override {
+        if (offset > size() || length > size() - offset) throw std::out_of_range("gated advice range");
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++advice_calls_[offset / 32];
+        advised_bytes_ += length;
+        changed_.notify_all();
+        return true;
+    }
+    bool advised(size_t component) const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return changed_.wait_for(lock, std::chrono::seconds(2), [&] { return advice_calls_[component] == 2; });
+    }
+    uint64_t advised_bytes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return advised_bytes_;
+    }
+private:
+    mutable std::mutex mutex_;
+    mutable std::condition_variable changed_;
+    std::array<bool, 8> held_{};
+    std::array<bool, 8> failed_{};
+    mutable std::array<uint64_t, 8> calls_{};
+    mutable std::array<uint64_t, 8> advice_calls_{};
+    mutable uint64_t advised_bytes_ = 0;
 };
 
 descriptor_spec make_spec(expert_key key, uint32_t source_id, source_identity source_id_value, uint64_t offset) {
@@ -185,7 +258,7 @@ void test_exact_reads_hits_and_backend_telemetry() {
     }
 }
 
-void test_deterministic_eviction_and_lease_lifetime() {
+void test_deterministic_eviction_and_lease_lifetime(bool frequency = false) {
     const source_identity identity = { 0xaaaa, 0xbbbb };
     std::vector<uint8_t> bytes(256);
     for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = uint8_t(i);
@@ -197,7 +270,7 @@ void test_deterministic_eviction_and_lease_lifetime() {
     auto d = descriptor::make(make_spec({ 0, 3, component::gate }, 1, identity, 96), sizes);
     // Two 32-byte payloads require 96 bytes in the fixed arena because every
     // independently leased component begins at a 64-byte boundary.
-    ram_cache cache({ 96, 32 }, { storage });
+    ram_cache cache({ 96, 32, frequency }, { storage });
 
     auto lease_a = cache.acquire(a);
     {
@@ -211,11 +284,13 @@ void test_deterministic_eviction_and_lease_lifetime() {
     REQUIRE(lease_c.data()[0] == 64);
 
     const auto before_failure = cache.stats();
+    const auto reads_before_failure = storage->reads();
     require_throws<capacity_error>([&] { cache.acquire(d); });
     const auto after_failure = cache.stats();
     REQUIRE(after_failure.resident_bytes == before_failure.resident_bytes);
     REQUIRE(after_failure.evictions == before_failure.evictions);
     REQUIRE(after_failure.pinned_capacity_failures == before_failure.pinned_capacity_failures + 1);
+    REQUIRE(storage->reads() == reads_before_failure); // reject before storage I/O
     REQUIRE(!cache.erase(a->key()));
     require_throws<capacity_error>([&] { cache.clear(); });
 
@@ -224,6 +299,38 @@ void test_deterministic_eviction_and_lease_lifetime() {
     REQUIRE(lease_d.data()[0] == 96);
     REQUIRE(cache.stats().resident_bytes == 64);
     REQUIRE(cache.stats().evictions == 2);
+}
+
+void test_ram_frequency_retention() {
+    const source_identity identity = { 41, 92 };
+    std::vector<uint8_t> bytes(256);
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = uint8_t(i);
+    auto storage = std::make_shared<memory_source>(1, identity, read_backend::pread, bytes);
+    std::vector<std::shared_ptr<const descriptor>> descriptors;
+    for (int i = 0; i < 8; ++i) descriptors.push_back(descriptor::make(
+        make_spec({0, uint32_t(i), component::gate}, 1, identity, i * 32), {{1, storage->size()}}));
+    auto sweep = [&](bool frequency) {
+        ram_cache cache({160, 32, frequency}, {storage});
+        auto access = [&](int i) {
+            auto value = cache.acquire(descriptors[i]);
+            REQUIRE(value.size() == 32 && std::memcmp(value.data(), bytes.data() + i*32, 32) == 0);
+        };
+        for (int i = 0; i < 10; ++i) access(0);
+        for (int pass = 0; pass < 40; ++pass) {
+            access(0);
+            for (int i = 1; i < 8; ++i) access(i);
+        }
+        const auto misses = cache.stats().misses;
+        // Cross two aging epochs through ready hits. Every read remains exact,
+        // and clear resets the retention history while preserving identities.
+        for (int i = 0; i < 33000; ++i) access(0);
+        cache.clear(); access(7); access(0);
+        REQUIRE(cache.stats().resident_bytes <= 160);
+        return misses;
+    };
+    const auto lru = sweep(false), frequency = sweep(true);
+    REQUIRE(frequency < lru);
+    std::cout << "RAM frequency retention sweep: " << lru << " -> " << frequency << " storage reads\n";
 }
 
 void test_capacity_and_identity_fail_closed() {
@@ -278,22 +385,59 @@ void test_file_storage_backends() {
 
     const read_backend backends[] = { read_backend::mmap, read_backend::pread, read_backend::io_uring };
     for (size_t i = 0; i < 3; ++i) {
+        const uint32_t source_id = uint32_t(i + 1);
+        REQUIRE(identify_file_source(path, source_id) == file_identity(source_id, bytes));
+        std::shared_ptr<file_source> storage;
         try {
-            const uint32_t source_id = uint32_t(i + 1);
-            REQUIRE(identify_file_source(path, source_id) == file_identity(source_id, bytes));
-            auto storage = std::make_shared<file_source>(
+            storage = std::make_shared<file_source>(
                     source_id, file_identity(source_id, bytes), path, backends[i]);
+        } catch (const std::runtime_error & error) {
+            REQUIRE(backends[i] == read_backend::io_uring);
+            REQUIRE(std::string(error.what()).find("io_uring is unavailable") != std::string::npos);
+            std::cout << "SKIP: native io_uring unavailable: " << error.what() << '\n';
+            continue;
+        }
+        {
             std::array<uint8_t, 32> output = {};
             storage->read(32, output.data(), output.size());
             REQUIRE(std::equal(output.begin(), output.end(), bytes.begin() + 32));
+            std::array<uint8_t, 8> batch_a = {};
+            std::array<uint8_t, 8> batch_b = {};
+            storage->read_many({
+                {8, batch_a.data(), batch_a.size()},
+                {96, batch_b.data(), batch_b.size()},
+            });
+            REQUIRE(std::equal(batch_a.begin(), batch_a.end(), bytes.begin() + 8));
+            REQUIRE(std::equal(batch_b.begin(), batch_b.end(), bytes.begin() + 96));
+            // Cross the 64-entry ring boundary and exercise bit 63 in the
+            // allocation-free completion-identity mask.
+            std::array<uint8_t, 129> many_output{};
+            std::vector<source::read_request> many_requests;
+            for (size_t index = 0; index < many_output.size(); ++index)
+                many_requests.push_back({index % bytes.size(), &many_output[index], 1});
+            storage->read_many(many_requests);
+            for (size_t index = 0; index < many_output.size(); ++index)
+                REQUIRE(many_output[index] == bytes[index % bytes.size()]);
+            storage->evict_range_from_os_cache(0, bytes.size());
+            require_throws<std::out_of_range>([&] { storage->evict_range_from_os_cache(120, 16); });
             require_throws<std::out_of_range>([&] { storage->read(120, output.data(), output.size()); });
             require_throws<std::invalid_argument>([&] { storage->read(0, nullptr, 1); });
-        } catch (const std::runtime_error & error) {
-            // Sandboxes commonly deny io_uring_setup. The backend must report
-            // that denial explicitly; it must never relabel a pread fallback.
-            REQUIRE(backends[i] == read_backend::io_uring);
-            REQUIRE(std::string(error.what()).find("io_uring") != std::string::npos);
-            std::cout << "SKIP: native io_uring unavailable: " << error.what() << '\n';
+            if (backends[i] == read_backend::io_uring) {
+                // A short completion must not poison the next read's CQ state.
+                const int writer = ::open(path, O_WRONLY);
+                REQUIRE(writer >= 0);
+                REQUIRE(::ftruncate(writer, 16) == 0);
+                require_throws<std::runtime_error>([&] { storage->read(32, output.data(), output.size()); });
+                storage->read(0, batch_a.data(), batch_a.size());
+                REQUIRE(std::equal(batch_a.begin(), batch_a.end(), bytes.begin()));
+                require_throws<std::runtime_error>([&] {
+                    storage->read_many({{0, batch_a.data(), batch_a.size()}, {96, batch_b.data(), batch_b.size()}});
+                });
+                storage->read_many({{0, batch_b.data(), batch_b.size()}});
+                REQUIRE(std::equal(batch_b.begin(), batch_b.end(), bytes.begin()));
+                REQUIRE(::pwrite(writer, bytes.data(), bytes.size(), 0) == ssize_t(bytes.size()));
+                REQUIRE(::close(writer) == 0);
+            }
         }
     }
 #endif
@@ -325,6 +469,198 @@ void test_concurrent_single_fill() {
     REQUIRE(stats.active_leases == 0);
 }
 
+void test_ready_hit_during_blocked_miss() {
+    auto storage = std::make_shared<gated_source>();
+    auto make = [&](uint32_t i) {
+        return descriptor::make(make_spec({0, i, component::up}, 1, storage->identity(), i*32), {{1, 256}});
+    };
+    const auto a = make(0), b = make(1);
+    ram_cache cache({128, 32}, {storage});
+    auto resident = cache.acquire(a);
+    storage->hold(1);
+    auto miss = std::async(std::launch::async, [&] { return cache.acquire(b); });
+    const bool entered = storage->entered(1);
+    auto hit = std::async(std::launch::async, [&] { return cache.acquire(a); });
+    const bool responsive = hit.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    // Always release the source before asserting, including on the old code.
+    storage->release_all();
+    auto hit_lease = hit.get();
+    auto miss_lease = miss.get();
+    REQUIRE(entered);
+    REQUIRE(responsive);
+    REQUIRE(hit_lease.data() == resident.data());
+    REQUIRE(miss_lease.data()[0] == 32);
+}
+
+void test_independent_fills_share_bounded_staging() {
+    auto storage = std::make_shared<gated_source>();
+    auto make = [&](uint32_t i) {
+        return descriptor::make(make_spec({0, i, component::up}, 1, storage->identity(), i*32), {{1, 256}});
+    };
+    const auto a = make(0), b = make(1);
+    ram_cache cache({128, 64}, {storage});
+    storage->hold(0);
+    storage->hold(1);
+    auto first = std::async(std::launch::async, [&] { return cache.acquire(a); });
+    const bool first_entered = storage->entered(0);
+    auto second = std::async(std::launch::async, [&] { return cache.acquire(b); });
+    const bool second_entered = storage->entered(1);
+    storage->release_all();
+    auto x = first.get();
+    auto y = second.get();
+    REQUIRE(first_entered && second_entered);
+    REQUIRE(x.data() != y.data());
+    for (size_t i = 0; i < 32; ++i) {
+        REQUIRE(x.data()[i] == i);
+        REQUIRE(y.data()[i] == 32 + i);
+    }
+    const auto stats = cache.stats();
+    REQUIRE(stats.peak_active_loads == 2);
+    REQUIRE(stats.peak_staging_used_bytes == 64);
+    REQUIRE(stats.staging_capacity_bytes == 64);
+    REQUIRE(stats.active_loads == 0 && stats.staging_used_bytes == 0 && stats.reserved_bytes == 0);
+}
+
+template<class Predicate>
+bool eventually(Predicate predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+void test_staging_backpressure_preserves_ready_hits() {
+    auto storage = std::make_shared<gated_source>();
+    auto make = [&](uint32_t i) {
+        return descriptor::make(make_spec({0, i, component::up}, 1, storage->identity(), i*32), {{1, 256}});
+    };
+    const auto a = make(0), b = make(1), c = make(2);
+    ram_cache cache({192, 32}, {storage});
+    auto ready = cache.acquire(a);
+    storage->hold(1);
+    auto first = std::async(std::launch::async, [&] { return cache.acquire(b); });
+    const bool entered = storage->entered(1);
+    auto second = std::async(std::launch::async, [&] { return cache.acquire(c); });
+    const bool waited = eventually([&] { return cache.stats().staging_waits != 0; });
+    const bool no_early_read = storage->calls(2) == 0;
+    auto hit = cache.acquire(a);
+    storage->release_all();
+    auto x = first.get();
+    auto y = second.get();
+    REQUIRE(entered && waited && no_early_read);
+    REQUIRE(hit.data() == ready.data());
+    REQUIRE(x.data()[0] == 32 && y.data()[0] == 64);
+    REQUIRE(cache.stats().peak_staging_used_bytes == 32);
+    REQUIRE(cache.stats().peak_active_loads == 1);
+}
+
+void test_failed_fill_preserves_victims_and_coalesces_error() {
+    auto storage = std::make_shared<gated_source>();
+    const auto a = descriptor::make(make_spec({0, 0, component::up}, 1, storage->identity(), 0), {{1, 256}});
+    const auto b = descriptor::make(make_spec({0, 1, component::up}, 1, storage->identity(), 32), {{1, 256}});
+    ram_cache cache({32, 32}, {storage});
+    { auto ready = cache.acquire(a); }
+    storage->hold(1);
+    storage->fail(1, true);
+    auto failing = [&] {
+        try { cache.acquire(b); return false; }
+        catch (const std::runtime_error & error) { return std::string(error.what()) == "injected storage failure"; }
+    };
+    auto first = std::async(std::launch::async, failing);
+    const bool entered = storage->entered(1);
+    auto second = std::async(std::launch::async, failing);
+    const bool coalesced = eventually([&] { return cache.stats().coalesced_loads == 1; });
+    const bool protected_from_erase = !cache.erase(a->key());
+    bool clear_rejected = false;
+    try { cache.clear(); } catch (const capacity_error &) { clear_rejected = true; }
+    auto still_ready = cache.acquire(a); // reserved victims remain readable
+    storage->release_all();
+    const bool first_failed = first.get(), second_failed = second.get();
+    REQUIRE(entered && coalesced && protected_from_erase && clear_rejected);
+    REQUIRE(first_failed && second_failed);
+    REQUIRE(still_ready.data()[0] == 0);
+    REQUIRE(storage->calls(1) == 1);
+    REQUIRE(cache.stats().evictions == 0 && cache.stats().resident_bytes == 32);
+    REQUIRE(cache.stats().failed_loads == 1 && cache.stats().reserved_bytes == 0);
+    REQUIRE(cache.stats().active_loads == 0 && cache.stats().staging_used_bytes == 0);
+    still_ready = {};
+    storage->fail(1, false);
+    auto retry = cache.acquire(b);
+    REQUIRE(retry.data()[0] == 32);
+    REQUIRE(cache.stats().evictions == 1);
+}
+
+void test_reserved_victim_can_become_leased() {
+    for (bool alternate_region : {false, true}) {
+        auto storage = std::make_shared<gated_source>();
+        auto make = [&](uint32_t i) {
+            return descriptor::make(make_spec({0, i, component::up}, 1, storage->identity(), i*32), {{1, 256}});
+        };
+        const auto a = make(0), b = make(1), c = make(2);
+        ram_cache cache({alternate_region ? 96u : 32u, 32}, {storage});
+        { auto ready = cache.acquire(a); }
+        if (alternate_region) { auto ready = cache.acquire(c); }
+        storage->hold(1);
+        auto miss = std::async(std::launch::async, [&] { return cache.acquire(b); });
+        const bool entered = storage->entered(1);
+        auto protected_victim = cache.acquire(a);
+        storage->release_all();
+        bool rejected = false;
+        ram_cache::lease result;
+        try { result = miss.get(); } catch (const capacity_error &) { rejected = true; }
+        REQUIRE(entered);
+        REQUIRE(protected_victim.data()[0] == 0);
+        REQUIRE(rejected == !alternate_region);
+        if (alternate_region) REQUIRE(result.data()[0] == 32);
+        REQUIRE(cache.stats().evictions == (alternate_region ? 1 : 0));
+        REQUIRE(cache.stats().active_loads == 0 && cache.stats().reserved_bytes == 0);
+    }
+}
+
+void test_concurrent_eviction_stress(bool frequency = false) {
+    std::vector<uint8_t> bytes(256);
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = uint8_t(i);
+    auto storage = std::make_shared<memory_source>(1, source_identity{77, 88}, read_backend::pread, bytes);
+    std::array<std::shared_ptr<const descriptor>, 8> descriptors;
+    for (uint32_t i = 0; i < descriptors.size(); ++i) {
+        descriptors[i] = descriptor::make(make_spec({0, i, component::up}, 1, storage->identity(), i*32), {{1, 256}});
+    }
+    ram_cache cache({256, 96, frequency}, {storage});
+    std::array<std::future<size_t>, 8> tasks;
+    std::atomic<bool> start{false};
+    for (size_t worker = 0; worker < tasks.size(); ++worker) {
+        tasks[worker] = std::async(std::launch::async, [&, worker] {
+            while (!start.load()) std::this_thread::yield();
+            size_t completed = 0;
+            for (size_t step = 0; step < (frequency ? 4096 : 256); ++step) {
+                const size_t index = (step*5 + worker*3) % descriptors.size();
+                try {
+                    auto value = cache.acquire(descriptors[index]);
+                    std::this_thread::yield(); // permit other fills/evictions while leased
+                    for (size_t byte = 0; byte < value.size(); ++byte) REQUIRE(value.data()[byte] == index*32 + byte);
+                    ++completed;
+                } catch (const capacity_error &) {
+                    // In-flight leases may occupy every admissible destination.
+                }
+            }
+            return completed;
+        });
+    }
+    start.store(true);
+    size_t completed = 0;
+    for (auto & task : tasks) completed += task.get();
+    REQUIRE(completed > 0);
+    const auto stats = cache.stats();
+    REQUIRE(stats.peak_staging_used_bytes <= 96);
+    REQUIRE(stats.peak_resident_bytes <= 256);
+    REQUIRE(stats.active_loads == 0 && stats.active_leases == 0);
+    REQUIRE(stats.staging_used_bytes == 0 && stats.reserved_bytes == 0);
+    cache.clear();
+    REQUIRE(cache.stats().resident_bytes == 0);
+}
+
 struct alignas(64) kernel_lease_fixture {
     std::array<std::array<float, 32*32>, 3> experts;
     std::atomic<uint64_t> acquires{0};
@@ -346,6 +682,195 @@ void kernel_lease_release(void * user_data, void * handle) {
     auto * fixture = static_cast<kernel_lease_fixture *>(user_data);
     delete static_cast<int *>(handle);
     ++fixture->releases;
+}
+
+void test_load_queue_completion_order_and_bounds() {
+    auto storage = std::make_shared<gated_source>();
+    auto make = [&](uint32_t i) {
+        return descriptor::make(make_spec({0, i, component::up}, 1, storage->identity(), i*32), {{1, 256}});
+    };
+    const auto a = make(0), b = make(1), c = make(2);
+    ram_cache cache({256, 64}, {storage});
+    load_queue queue(cache, 2, 2, 64);
+    storage->hold(0);
+    const bool first = queue.try_submit(10, a);
+    const bool entered = storage->entered(0);
+    const bool second = queue.try_submit(20, b);
+    const bool full = !queue.try_submit(30, c);
+    auto take = std::async(std::launch::async, [&] {
+        load_queue::completion result;
+        queue.next(result, true);
+        return result;
+    });
+    const bool independent = take.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    storage->release_all();
+    auto fast = take.get();
+    REQUIRE(first && entered && second && full && independent);
+    REQUIRE(fast.id == 20 && !fast.error && fast.payload.data()[0] == 32);
+    load_queue::completion slow;
+    REQUIRE(queue.next(slow, true));
+    REQUIRE(slow.id == 10 && !slow.error && slow.payload.data()[0] == 0);
+    REQUIRE(queue.stats().outstanding_bytes == 0);
+    REQUIRE(queue.stats().peak_outstanding_bytes == 64);
+    REQUIRE(cache.stats().peak_active_loads == 2);
+    REQUIRE(!queue.next(slow, true));
+
+    // Results remain lease protected after removal from the queue.
+    REQUIRE(queue.try_submit(30, c));
+    load_queue::completion third;
+    REQUIRE(queue.next(third, true));
+    REQUIRE(!third.error && third.payload.data()[0] == 64);
+    REQUIRE(fast.payload.data()[0] == 32 && slow.payload.data()[0] == 0);
+}
+
+void test_load_queue_ready_hits_and_error_recovery() {
+    auto storage = std::make_shared<gated_source>();
+    auto make = [&](uint32_t i) {
+        return descriptor::make(make_spec({0, i, component::up}, 1, storage->identity(), i*32), {{1, 256}});
+    };
+    const auto a = make(0), b = make(1), c = make(2), d = make(3);
+    ram_cache cache({256, 96}, {storage});
+    { auto ready = cache.acquire(c); }
+    load_queue queue(cache, 2, 3, 96);
+    storage->hold(0);
+    storage->hold(1);
+    const bool first = queue.try_submit(0, a), second = queue.try_submit(1, b);
+    const bool both = storage->entered(0) && storage->entered(1);
+    const bool hit = queue.try_submit(2, c);
+    load_queue::completion result;
+    const bool immediate = queue.next(result, false);
+    const bool right_hit = immediate && result.id == 2 && result.payload && result.payload.data()[0] == 64;
+    storage->release_all();
+    REQUIRE(first && second && both && hit && right_hit);
+    REQUIRE(queue.stats().ready_hits == 1);
+    result.payload = {};
+    REQUIRE(queue.next(result, true));
+    result.payload = {};
+    REQUIRE(queue.next(result, true));
+    result.payload = {};
+
+    storage->fail(3, true);
+    REQUIRE(queue.try_submit(3, d));
+    require_throws<std::invalid_argument>([&] { queue.try_submit(3, d); });
+    REQUIRE(queue.next(result, true));
+    REQUIRE(result.id == 3 && result.error && !result.payload);
+    require_throws<std::runtime_error>([&] { std::rethrow_exception(result.error); });
+    storage->fail(3, false);
+    REQUIRE(queue.try_submit(3, d));
+    REQUIRE(queue.next(result, true));
+    REQUIRE(!result.error && result.payload.data()[0] == 96);
+    result.payload = {};
+    REQUIRE(queue.stats().outstanding_bytes == 0);
+    REQUIRE(cache.stats().active_leases == 0);
+    REQUIRE(cache.stats().reserved_bytes == 0);
+    require_throws<std::invalid_argument>([&] { load_queue invalid(cache, 0, 1, 32); });
+    require_throws<std::invalid_argument>([&] { load_queue invalid(cache, 2, 1, 32); });
+    require_throws<std::invalid_argument>([&] { load_queue invalid(cache, 1, 1, 97); });
+    load_queue small(cache, 1, 1, 16);
+    REQUIRE(!small.try_submit(0, a));
+}
+
+void test_load_queue_shutdown_joins_reads() {
+    auto storage = std::make_shared<gated_source>();
+    auto a = descriptor::make(make_spec({0, 0, component::up}, 1, storage->identity(), 0), {{1, 256}});
+    ram_cache cache({128, 32}, {storage});
+    auto queue = std::make_unique<load_queue>(cache, 1, 1, 32);
+    storage->hold(0);
+    const bool submitted = queue->try_submit(0, a);
+    const bool entered = storage->entered(0);
+    auto close = std::async(std::launch::async, [owned = std::move(queue)]() mutable { owned.reset(); });
+    const bool waits = close.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+    storage->release_all();
+    close.get();
+    REQUIRE(submitted && entered && waits);
+    REQUIRE(cache.stats().active_loads == 0);
+    REQUIRE(cache.stats().active_leases == 0);
+    REQUIRE(cache.stats().staging_used_bytes == 0);
+}
+
+void test_read_ahead_identity_and_retention() {
+    auto storage = std::make_shared<gated_source>();
+    auto make = [&](uint32_t i) {
+        return descriptor::make(make_spec({i, i, component::up}, 1, storage->identity(), i*32), {{1, 256}});
+    };
+    const auto a = make(0), b = make(1);
+    ram_cache cache({128, 64, true}, {storage});
+    REQUIRE(cache.advise_will_need(b) == 32);
+    REQUIRE(storage->advised_bytes() == 32);
+    REQUIRE(cache.stats().misses == 0 && cache.stats().hits == 0 && cache.stats().resident_bytes == 0);
+    { auto lease = cache.acquire(a); }
+    const auto before = cache.stats();
+    REQUIRE(cache.advise_will_need(a) == 0);
+    REQUIRE(cache.stats().hits == before.hits && cache.stats().misses == before.misses);
+    REQUIRE(storage->advised_bytes() == 32);
+    require_throws<std::invalid_argument>([&] { cache.advise_will_need(make(0)); });
+    require_throws<std::invalid_argument>([&] { cache.advise_will_need(nullptr); });
+    auto bad = make_spec({2, 2, component::up}, 1, storage->identity(), 64);
+    ++bad.extents[1].identity.high;
+    const auto bad_desc = descriptor::make(bad, {{1, 256}});
+    require_throws<std::invalid_argument>([&] { cache.advise_will_need(bad_desc); });
+    REQUIRE(storage->advised_bytes() == 32); // all extents validated before the first hint
+}
+
+void test_external_resident_arena_ownership() {
+    auto storage = std::make_shared<gated_source>();
+    const auto desc = descriptor::make(make_spec({0, 0, component::gate}, 1, storage->identity(), 0), {{1, 256}});
+    auto * buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), 256);
+    REQUIRE(buffer != nullptr);
+    const auto address = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(buffer));
+    auto * base = reinterpret_cast<uint8_t *>((address + 63) & ~uintptr_t(63));
+    REQUIRE(uintptr_t(base) - address + 128 <= ggml_backend_buffer_get_size(buffer));
+    int frees = 0;
+    std::shared_ptr<uint8_t> arena(base, [&](uint8_t *) { ++frees; ggml_backend_buffer_free(buffer); });
+    {
+        std::shared_ptr<uint8_t> misaligned(arena, base + 1);
+        require_throws<std::invalid_argument>([&] { ram_cache invalid({128, 32}, {storage}, misaligned); });
+    }
+    {
+        ram_cache cache({128, 32}, {storage}, arena);
+        arena.reset();
+        auto lease = cache.acquire(desc);
+        REQUIRE(lease.data() == base && lease.size() == 32);
+        for (size_t i = 0; i < lease.size(); ++i) REQUIRE(lease.data()[i] == uint8_t(i));
+        REQUIRE(frees == 0 && cache.stats().resident_bytes == 32);
+    }
+    REQUIRE(frees == 1);
+}
+
+void test_read_ahead_demand_priority_budget_and_expiration() {
+    auto storage = std::make_shared<gated_source>();
+    auto make = [&](uint32_t i) {
+        return descriptor::make(make_spec({i, i, component::up}, 1, storage->identity(), i*32), {{1, 256}});
+    };
+    const auto demand_desc = make(0), a = make(1), b = make(2), c = make(3);
+    ram_cache cache({256, 64}, {storage});
+    load_queue demand(cache, 1, 1, 32);
+    storage->hold(0);
+    const bool submitted = demand.try_submit(0, demand_desc);
+    const bool entered = storage->entered(0);
+    read_ahead_queue future(cache, &demand, 64);
+    future.advance(1, 1, 0);
+    const bool accepted = future.submit(a) && future.submit(b);
+    const bool bounded = !future.submit(c) && !future.submit(a);
+    future.advance(1, 1, 1);
+    const bool deadline = future.stats().expired == 1;
+    future.advance(1, 2, 0);
+    const bool new_pass = future.stats().expired == 2 && future.submit(c);
+    const bool priority = storage->advised_bytes() == 0;
+    const bool in_flight_skipped = cache.advise_will_need(demand_desc) == 0;
+    storage->release_all(); // release before checking failures so teardown cannot block
+    load_queue::completion completion;
+    const bool taken = demand.next(completion, true);
+    const bool advised = storage->advised(3);
+    future.stop();
+    REQUIRE(submitted && entered && accepted && bounded && deadline && new_pass && priority && in_flight_skipped);
+    REQUIRE(taken && !completion.error && completion.payload.data()[0] == 0 && advised);
+    REQUIRE(future.stats().advised_bytes == 32 && future.stats().outstanding_bytes == 0);
+    REQUIRE(future.stats().peak_outstanding_bytes == 64 && future.stats().failed == 0);
+    REQUIRE(cache.stats().misses == 1 && storage->calls(3) == 0);
+    REQUIRE(!future.submit(a));
+    require_throws<std::invalid_argument>([&] { read_ahead_queue invalid(cache, nullptr, 0); });
+    require_throws<std::invalid_argument>([&] { read_ahead_queue invalid(cache, nullptr, (1ULL << 30) + 1); });
 }
 
 void test_cpu_kernel_exact_parity_and_no_original_fallback() {
@@ -409,6 +934,147 @@ void test_cpu_kernel_exact_parity_and_no_original_fallback() {
     REQUIRE(*((const int32_t *) ids->data + 1) == route[1]);
 }
 
+void test_cpu_lease_chunks_with_bounded_cache() {
+#if !defined(_WIN32) && defined(ESE_TEST_EXPERT_LEASE_CHUNKING)
+    const char * old = std::getenv("ESE_CPU_EXPERT_LEASE_CHUNKING");
+    const bool had_old = old != nullptr;
+    const std::string saved = old ? old : "";
+    struct restore_setting {
+        bool present; std::string value;
+        ~restore_setting() {
+            if (present) setenv("ESE_CPU_EXPERT_LEASE_CHUNKING", value.c_str(), 1);
+            else unsetenv("ESE_CPU_EXPERT_LEASE_CHUNKING");
+        }
+    } restore{had_old, saved};
+    struct fixture {
+        std::unique_ptr<ram_cache> cache;
+        std::vector<std::shared_ptr<const descriptor>> descriptors;
+        std::atomic<uint64_t> acquired{0}, released{0}, active{0}, peak{0}, refused{0};
+        static bool acquire(void * opaque, int layer, int expert, int component, ggml_expert_lease * out) {
+            auto & f = *static_cast<fixture *>(opaque);
+            if (layer != 0 || component != 2 || expert < 0 || size_t(expert) >= f.descriptors.size()) return false;
+            try {
+                auto lease = std::make_unique<ram_cache::lease>(f.cache->acquire(f.descriptors[size_t(expert)]));
+                out->data = lease->data(); out->size = lease->size(); out->handle = lease.release();
+                ++f.acquired;
+                const uint64_t active = ++f.active;
+                uint64_t peak = f.peak.load();
+                while (peak < active && !f.peak.compare_exchange_weak(peak, active)) {}
+                return true;
+            } catch (const capacity_error &) { ++f.refused; return false; }
+        }
+        static void release(void * opaque, void * handle) {
+            auto & f = *static_cast<fixture *>(opaque);
+            delete static_cast<ram_cache::lease *>(handle);
+            --f.active; ++f.released;
+        }
+    } f;
+    constexpr int experts = 8, used = 8, tokens = 3;
+    struct shape { ggml_type type; int64_t k, m; };
+    // Production gate/up and down dimensions/types, plus a small float case
+    // whose row count leaves some of eight threads without an initial chunk.
+    for (const shape s : {shape{GGML_TYPE_F32, 256, 96}, shape{GGML_TYPE_IQ3_S, 2560, 640},
+                         shape{GGML_TYPE_IQ4_NL, 640, 2560}, shape{GGML_TYPE_Q2_0, 640, 2560}}) {
+        std::cout << "Checking leased CPU " << ggml_type_name(s.type) << std::endl;
+        ggml_init_params params = {1024*1024, nullptr, true};
+        auto * ctx = ggml_init(params);
+        REQUIRE(ctx != nullptr);
+        struct context_cleanup { ggml_context * ctx; ~context_cleanup() { ggml_free(ctx); } } cleanup{ctx};
+        auto * w = ggml_new_tensor_3d(ctx, s.type, s.k, s.m, experts);
+        ggml_set_name(w, "blk.0.ffn_down_exps.weight");
+        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, s.k, s.type == GGML_TYPE_IQ3_S ? 1 : used, tokens);
+        auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
+        auto * y = ggml_mul_mat_id(ctx, w, x, ids);
+        auto * graph = ggml_new_graph_custom(ctx, 16, false);
+        ggml_build_forward_expand(graph, y);
+        auto * buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+        REQUIRE(buffer != nullptr);
+        struct buffer_cleanup { ggml_backend_buffer_t buffer; ~buffer_cleanup() { ggml_backend_buffer_free(buffer); } } free_buffer{buffer};
+        std::vector<float> values(size_t(s.k*s.m*experts));
+        for (size_t i = 0; i < values.size(); ++i) values[i] = float(int((i*37 + i/127)%509) - 254)/512;
+        std::vector<uint8_t> bytes(ggml_nbytes(w));
+        if (s.type == GGML_TYPE_Q2_0) {
+            // GSQ Q2_0 is decode-only; construct valid production-format blocks.
+            const size_t block = ggml_type_size(s.type);
+            for (size_t i = 0; i < bytes.size(); i += block) {
+                const auto scale = ggml_fp32_to_fp16(float(1 + i/block%7)/64);
+                std::memcpy(bytes.data()+i, &scale, sizeof(scale));
+                for (size_t j = 2; j < block; ++j) bytes[i+j] = uint8_t((i/block*37+j*19)%256);
+            }
+        } else {
+            std::vector<float> importance(size_t(s.k), 1.0f);
+            REQUIRE(ggml_quantize_chunk(s.type, values.data(), bytes.data(), 0, s.m*experts, s.k,
+                    importance.data(), nullptr) == bytes.size());
+        }
+        ggml_backend_tensor_set(w, bytes.data(), 0, bytes.size());
+        auto storage = std::make_shared<memory_source>(1, source_identity{12, 34}, read_backend::pread, bytes);
+        f.descriptors.clear();
+        for (int e = 0; e < experts; ++e) {
+            descriptor_spec spec;
+            spec.key = {0, uint32_t(e), component::down}; spec.ggml_type = uint32_t(s.type);
+            spec.rank = 2; spec.quant_axis = 0;
+            spec.block_elements = uint32_t(ggml_blck_size(s.type)); spec.block_bytes = uint32_t(ggml_type_size(s.type));
+            spec.dimensions = {{uint64_t(s.k), uint64_t(s.m), 0, 0}};
+            spec.strides = {{ggml_type_size(s.type), w->nb[1], 0, 0}};
+            spec.model_identity = {56, 78}; spec.extents = {{1, storage->identity(), uint64_t(e)*w->nb[2], w->nb[2]}};
+            f.descriptors.push_back(descriptor::make(spec, {{1, storage->size()}}));
+        }
+        std::vector<float> input(size_t(ggml_nelements(x)));
+        for (size_t i = 0; i < input.size(); ++i) input[i] = float(int(i%31) - 15)/17;
+        ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+        std::array<int32_t, used*tokens> routes;
+        for (size_t i = 0; i < routes.size(); ++i) routes[i] = i%used == 7 ? -1 : int32_t((i + i/used)%experts);
+        ggml_backend_tensor_set(ids, routes.data(), 0, sizeof(routes));
+        auto compute = [&](bool leased, bool chunked) {
+            setenv("ESE_CPU_EXPERT_LEASE_CHUNKING", chunked ? "1" : "0", 1);
+            auto plan = ggml_graph_plan(graph, 8);
+            std::vector<uint8_t> work(plan.work_size);
+            plan.work_data = work.data();
+            if (leased) {
+                plan.expert_lease_acquire = fixture::acquire; plan.expert_lease_release = fixture::release;
+                plan.expert_lease_user_data = &f; plan.expert_lease_required = true;
+            }
+            REQUIRE(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS);
+            std::vector<float> result(size_t(ggml_nelements(y)));
+            std::memcpy(result.data(), y->data, ggml_nbytes(y));
+            return result;
+        };
+        const auto uncached = compute(false, false);
+        // Every successful cached calculation must use leases, not these zeros.
+        std::memset(w->data, 0, ggml_nbytes(w));
+        f.cache = std::make_unique<ram_cache>(cache_config{uint64_t(experts)*w->nb[2], w->nb[2]},
+                std::vector<std::shared_ptr<const source>>{storage});
+        const auto reference = compute(true, false);
+        if (s.type != GGML_TYPE_F32) REQUIRE(reference == uncached);
+        for (int slots : {1, 4}) {
+            f.cache = std::make_unique<ram_cache>(cache_config{uint64_t(slots)*w->nb[2], w->nb[2]},
+                    std::vector<std::shared_ptr<const source>>{storage});
+            const uint64_t old_acquires = f.acquired.load();
+            f.peak = 0; f.refused = 0;
+            REQUIRE(compute(true, true) == reference);
+            REQUIRE(f.active == 0 && f.acquired == f.released);
+            REQUIRE(f.cache->stats().active_leases == 0 && f.cache->stats().reserved_bytes == 0);
+            REQUIRE(f.cache->stats().resident_bytes <= uint64_t(slots)*w->nb[2]);
+#if defined(ESE_TEST_EXPERT_LEASE_CHUNKING)
+            REQUIRE(f.acquired - old_acquires == experts);
+            REQUIRE(f.peak <= uint64_t(slots));
+            if (slots == 1) REQUIRE(f.refused > 0);
+#endif
+            REQUIRE(f.cache->stats().evictions > 0);
+            // Reuse the node after both grouped and tiny-cache forced evictions.
+            REQUIRE(compute(true, true) == reference);
+            REQUIRE(f.active == 0 && f.acquired == f.released);
+            std::cout << "Leased CPU " << ggml_type_name(s.type) << ", slots=" << slots
+                      << ": exact, acquisitions=" << f.acquired - old_acquires
+                      << ", peak=" << f.peak << ", refused=" << f.refused << '\n';
+        }
+        f.cache.reset();
+    }
+#else
+    std::cout << "SKIP: CPU lease chunks require IQK, expert chunking and POSIX environment controls\n";
+#endif
+}
+
 void test_route_partition_is_complementary() {
     ggml_init_params params = { 1024*1024, nullptr, false };
     ggml_context * ctx = ggml_init(params);
@@ -454,6 +1120,50 @@ void test_route_partition_is_complementary() {
         } else {
             REQUIRE(biased[0] == float(route[i] + 1));
             REQUIRE(biased[1] == float(100 + route[i]));
+        }
+    }
+}
+
+void test_masked_route_preserves_weighted_positions() {
+    ggml_init_params params = {1024*1024, nullptr, false};
+    auto * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    struct cleanup { ggml_context * ctx; ~cleanup() { ggml_free(ctx); } } free_ctx{ctx};
+    auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, 2);
+    // Distinct weights, padding and a repeated expert make reordering only IDs,
+    // dropping a route position, or evaluating a position twice observable.
+    const std::array<int32_t, 8> route = {{7, 3, 5, 1, 2, -1, 6, 2}};
+    std::memcpy(ids->data, route.data(), sizeof(route));
+    auto * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, 2);
+    auto * matrix = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 8, 8);
+    auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 1, 2);
+    auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 4, 2);
+    for (int i = 0; i < ggml_nelements(matrix); ++i)
+        static_cast<float *>(matrix->data)[i] = float((i/256 + 1)*(i%3 - 1))/8.0f;
+    for (int i = 0; i < ggml_nelements(input); ++i)
+        static_cast<float *>(input->data)[i] = float(i%7 - 3)/16.0f;
+    for (int i = 0; i < 8; ++i) static_cast<float *>(weights->data)[i] = float(i + 1)/16.0f;
+    auto * gpu_ids = ggml_ese_route_partition_masked(ctx, ids, mask, GGML_ESE_ROUTE_GPU);
+    auto * cpu_ids = ggml_ese_route_partition_masked(ctx, ids, mask, GGML_ESE_ROUTE_CPU);
+    auto * full = ggml_mul(ctx, ggml_mul_mat_id(ctx, matrix, input, ids), weights);
+    auto * split = ggml_add(ctx,
+            ggml_mul(ctx, ggml_mul_mat_id(ctx, matrix, input, gpu_ids), weights),
+            ggml_mul(ctx, ggml_mul_mat_id(ctx, matrix, input, cpu_ids), weights));
+    auto * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, full);
+    ggml_build_forward_expand(graph, split);
+    auto plan = ggml_graph_plan(graph, 2);
+    std::vector<uint8_t> work(plan.work_size);
+    plan.work_data = work.empty() ? nullptr : work.data();
+    for (unsigned pattern : {0u, 255u, 170u, 85u, 132u, 57u, 16u, 64u}) {
+        for (int i = 0; i < 8; ++i) static_cast<int32_t *>(mask->data)[i] = (pattern >> i)&1;
+        REQUIRE(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS);
+        REQUIRE(std::memcmp(full->data, split->data, ggml_nbytes(full)) == 0);
+        const auto * gpu = static_cast<const int32_t *>(gpu_ids->data);
+        const auto * cpu = static_cast<const int32_t *>(cpu_ids->data);
+        for (size_t i = 0; i < route.size(); ++i) {
+            if (route[i] >= 0) REQUIRE((gpu[i] == route[i]) != (cpu[i] == route[i]));
+            else REQUIRE(gpu[i] == -1 && cpu[i] == -1);
         }
     }
 }
@@ -716,6 +1426,298 @@ std::vector<float> compute_cuda_fused_moe(
     return result;
 }
 
+// Verify the CUDA kernels read nb[2], including the quantized fused path.
+// Poison between experts makes accidentally using a packed stride observable.
+std::vector<float> compute_cuda_padded_experts(
+        ggml_backend_t backend, ggml_type type, bool fused, size_t padding, int64_t tokens = 1,
+        bool sparse = false, bool fuse_down = false, int64_t experts = 4, int32_t slot_shift = 0) {
+    constexpr int64_t k = 768, m = 128;
+    REQUIRE(experts >= 4 + slot_shift && slot_shift >= 0);
+    ggml_init_params params = {ggml_tensor_overhead()*20 + ggml_graph_overhead_custom(16, false), nullptr, true};
+    auto * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    struct context_cleanup { ggml_context * ctx; ~context_cleanup() { ggml_free(ctx); } } free_ctx{ctx};
+    auto * up = ggml_new_tensor_3d(ctx, type, k, m, experts);
+    auto * gate = fused ? ggml_new_tensor_3d(ctx, type, k, m, experts) : nullptr;
+    auto * down = fuse_down ? ggml_new_tensor_3d(ctx, GGML_TYPE_IQ4_NL, m, k, experts) : nullptr;
+    up->nb[2] += padding;
+    up->nb[3] = up->nb[2]*experts;
+    if (gate) { gate->nb[2] = up->nb[2]; gate->nb[3] = up->nb[3]; }
+    const int64_t used = sparse ? 10 : 2;
+    auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, sparse && !fused ? used : 1, tokens);
+    auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
+    auto * output = fused ? ggml_moe_up_gate(ctx, up, gate, input, ids, GGML_UNARY_OP_SILU)
+                         : ggml_mul_mat_id(ctx, up, input, ids);
+    auto * hidden = output;
+    if (down) output = ggml_mul_mat_id(ctx, down, hidden, ids);
+    auto * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, output);
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    REQUIRE(buffer != nullptr);
+    struct buffer_cleanup { ggml_backend_buffer_t buffer; ~buffer_cleanup() { ggml_backend_buffer_free(buffer); } } free_buffer{buffer};
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_EXPERT_CACHE);
+    std::vector<float> importance(k, 1.0f);
+    struct retained_tail { ggml_tensor view; size_t offset; std::vector<uint8_t> bytes; };
+    std::vector<retained_tail> tails;
+    for (auto * tensor : {up, gate, down}) {
+        if (!tensor) continue;
+        const size_t tensor_payload = tensor->nb[2] - (tensor == down ? 0 : padding);
+        std::vector<float> values(size_t(tensor->ne[0]*tensor->ne[1]*experts));
+        for (size_t i = 0; i < values.size(); ++i) {
+            const size_t shift = size_t(slot_shift*tensor->ne[0]*tensor->ne[1]);
+            const size_t semantic_index = i >= shift ? i - shift : 0;
+            values[i] = float(int((semantic_index*(tensor == up ? 7 : 11)) % 37) - 18)/128.0f;
+        }
+        std::vector<uint8_t> packed(tensor_payload*experts);
+        REQUIRE(ggml_quantize_chunk(tensor->type, values.data(), packed.data(), 0, tensor->ne[1]*experts, tensor->ne[0],
+                importance.data(), nullptr) == packed.size());
+        std::vector<uint8_t> storage(ggml_nbytes(tensor), 0xff);
+        for (size_t expert = 0; expert < experts; ++expert) {
+            std::memcpy(storage.data() + expert*tensor->nb[2], packed.data() + expert*tensor_payload, tensor_payload);
+        }
+        ggml_backend_tensor_set(tensor, storage.data(), 0, storage.size());
+        const size_t span = ggml_nbytes(tensor);
+        const size_t allocation = ggml_backend_buffer_get_alloc_size(buffer, tensor);
+        if (allocation > span) {
+            // A shorter alias can end inside a larger retained payload. Use
+            // finite quantization bytes there and verify neither alias init
+            // nor indexed execution clears them. The cache owns this region.
+            retained_tail tail{*tensor, span, std::vector<uint8_t>(allocation - span, 0x3f)};
+            tail.view.type = GGML_TYPE_I8;
+            tail.view.ne[0] = int64_t(allocation);
+            tail.view.ne[1] = tail.view.ne[2] = tail.view.ne[3] = 1;
+            tail.view.nb[0] = 1;
+            tail.view.nb[1] = tail.view.nb[2] = tail.view.nb[3] = allocation;
+            ggml_backend_tensor_set(&tail.view, tail.bytes.data(), span, tail.bytes.size());
+            ggml_backend_buffer_init_tensor(buffer, tensor);
+            tails.push_back(std::move(tail));
+        }
+    }
+    std::vector<float> input_values(size_t(ggml_nelements(input)));
+    for (size_t i = 0; i < input_values.size(); ++i) input_values[i] = float(int((i % k) % 13) - 6)/16.0f;
+    std::vector<int32_t> route(size_t(used*tokens));
+    for (size_t i = 0; i < route.size(); ++i)
+        route[i] = sparse ? (i%used == 0 ? 3 : i%used == 8 ? 1 : -1) : i % 2 ? 1 : 3;
+    for (auto & id : route) if (id >= 0) id += slot_shift;
+    ggml_backend_tensor_set(input, input_values.data(), 0, ggml_nbytes(input));
+    ggml_backend_tensor_set(ids, route.data(), 0, route.size()*sizeof(int32_t));
+    if (sparse) {
+        for (auto * tensor : {hidden, output}) {
+            std::vector<float> poison(size_t(ggml_nelements(tensor)), std::numeric_limits<float>::quiet_NaN());
+            ggml_backend_tensor_set(tensor, poison.data(), 0, ggml_nbytes(tensor));
+        }
+    }
+    REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> result(size_t(ggml_nelements(output)));
+    ggml_backend_tensor_get(output, result.data(), 0, ggml_nbytes(output));
+    for (auto & tail : tails) {
+        std::vector<uint8_t> actual(tail.bytes.size());
+        ggml_backend_tensor_get(&tail.view, actual.data(), tail.offset, actual.size());
+        REQUIRE(actual == tail.bytes);
+    }
+    REQUIRE(std::all_of(result.begin(), result.end(), [](float x) { return std::isfinite(x); }));
+    if (sparse) {
+        for (size_t i = 0; i < route.size(); ++i) {
+            if (route[i] < 0) {
+                for (int64_t row = 0; row < output->ne[0]; ++row)
+                    REQUIRE(result[i*size_t(output->ne[0]) + size_t(row)] == 0.0f);
+            }
+        }
+    }
+    return result;
+}
+
+void test_cuda_router_precedes_compact_staging() {
+#ifdef GGML_USE_CUDA
+    if (ggml_backend_cuda_get_device_count() == 0) return;
+    constexpr int width = 256, rows = 8, experts = 16, used = 10;
+    auto * cuda = ggml_backend_cuda_init(0, nullptr, nullptr);
+    auto * cpu = ggml_backend_cpu_init();
+    REQUIRE(cuda && cpu);
+    struct backend_cleanup {
+        ggml_backend_t cuda, cpu;
+        ~backend_cleanup() { ggml_backend_free(cuda); ggml_backend_free(cpu); }
+    } free_backends{cuda, cpu};
+    auto * ctx = ggml_init({1 << 20, nullptr, true});
+    REQUIRE(ctx);
+    struct context_cleanup { ggml_context * ctx; ~context_cleanup() { ggml_free(ctx); } } free_ctx{ctx};
+    auto * weight = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, width, rows, experts);
+    ggml_set_name(weight, "blk.0.ffn_up_exps.weight");
+    auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 1, 1);
+    auto * router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, 1);
+    ggml_set_input(input); ggml_set_input(router);
+    std::vector<ggml_backend_buffer_t> buffers;
+    struct buffer_cleanup {
+        std::vector<ggml_backend_buffer_t> & buffers;
+        ~buffer_cleanup() { for (auto * buffer : buffers) ggml_backend_buffer_free(buffer); }
+    } free_buffers{buffers};
+    for (auto * tensor : {weight, input, router}) {
+        auto buft = ggml_backend_get_default_buffer_type(tensor == weight ? cpu : cuda);
+        auto buffer = ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, tensor));
+        REQUIRE(buffer); buffers.push_back(buffer);
+        ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer));
+        if (tensor == weight) {
+            ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_clear(buffer, 0xff); // Leases must supply every actual weight byte.
+        }
+    }
+    auto * ids = ggml_top_k(ctx, router, used);
+    REQUIRE(ids->nb[1] == 512*sizeof(int32_t));
+    auto * output = ggml_mul_mat_id(ctx, weight, input, ids);
+    ggml_set_output(output);
+    auto * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_t backends[] = {cuda, cpu};
+    auto * scheduler = ggml_backend_sched_new(backends, nullptr, 2, 128, false);
+    REQUIRE(scheduler);
+    struct scheduler_cleanup {
+        ggml_backend_sched_t scheduler;
+        ~scheduler_cleanup() { if (scheduler) ggml_backend_sched_free(scheduler); }
+    };
+    struct provider {
+        std::vector<ggml_fp16_t> values;
+        ggml_tensor * ids;
+        const int32_t * expected = nullptr;
+        size_t acquires = 0, releases = 0, active = 0;
+        struct lease { provider * owner; };
+        static bool acquire(void * opaque, int layer, int expert, int component,
+                ggml_backend_expert_lease * result) {
+            auto & source = *static_cast<provider *>(opaque);
+            REQUIRE(layer == 0 && component == 1 && expert >= 0 && expert < experts);
+            // This callback runs during copy_inputs, before expert graph_compute.
+            // Its IDs must already be the computed TOP_K, not graph-arena bytes.
+            std::array<int32_t, used> actual;
+            ggml_backend_tensor_get(source.ids, actual.data(), 0, sizeof(actual));
+            REQUIRE(std::equal(actual.begin(), actual.end(), source.expected));
+            auto * handle = new lease{&source};
+            result->data = source.values.data() + size_t(expert)*width*rows;
+            result->size = width*rows*sizeof(ggml_fp16_t);
+            result->handle = handle;
+            ++source.acquires; ++source.active;
+            return true;
+        }
+        static void release(void * opaque, void * handle) {
+            auto & source = *static_cast<provider *>(opaque);
+            std::unique_ptr<lease> held(static_cast<lease *>(handle));
+            REQUIRE(held->owner == &source && source.active > 0);
+            ++source.releases; --source.active;
+        }
+    } source;
+    scheduler_cleanup free_scheduler{scheduler};
+    source.ids = ids;
+    source.values.resize(width*rows*experts);
+    for (int expert = 0; expert < experts; ++expert) for (int row = 0; row < rows; ++row) {
+        const auto value = ggml_fp32_to_fp16(float((expert + 1)*(row + 1))/256.f);
+        std::fill_n(source.values.data() + (expert*rows + row)*width, width, value);
+    }
+    ggml_backend_sched_set_active_expert_decode(scheduler, true);
+    ggml_backend_sched_set_only_active_experts(scheduler, true);
+    ggml_backend_sched_set_expert_lease_callbacks(scheduler, provider::acquire, provider::release, &source, true);
+    const uint64_t capacity = 64*256 + 13*weight->nb[2] + 256;
+    ggml_backend_sched_set_expert_cache_capacity(scheduler, capacity, 0, 1);
+    for (auto * tensor : {input, router, ids, output}) ggml_backend_sched_set_tensor_backend(scheduler, tensor, cuda);
+    REQUIRE(ggml_backend_sched_alloc_graph(scheduler, graph));
+    REQUIRE(ggml_backend_sched_get_tensor_backend(scheduler, output) == cuda);
+    REQUIRE(output->src[0]->ne[2] < experts); // Exercise a real bounded compact copy.
+    const std::array<std::array<int32_t, used>, 4> routes = {{
+        {{10,5,0,8,11,3,14,4,6,2}}, {{10,5,0,8,11,3,14,4,6,2}},
+        {{15,12,13,7,1,10,5,0,8,11}}, {{10,5,0,8,11,3,14,4,6,2}},
+    }};
+    std::vector<float> input_values(width, 1.f/width);
+    for (size_t pass = 0; pass < routes.size(); ++pass) {
+        source.expected = routes[pass].data();
+        const auto before = source.acquires;
+        std::vector<float> logits(512, -1000.f);
+        for (int position = 0; position < used; ++position) logits[routes[pass][position]] = 100.f - position;
+        ggml_backend_tensor_set(input, input_values.data(), 0, input_values.size()*sizeof(float));
+        ggml_backend_tensor_set(router, logits.data(), 0, logits.size()*sizeof(float));
+        // The old scheduler reads these arbitrary negative F32 bit patterns
+        // before its same-split ARGSORT producer has executed, then aborts.
+        std::array<int32_t, used> poison;
+        poison.fill(-1070692928);
+        ggml_backend_tensor_set(ids, poison.data(), 0, sizeof(poison));
+        REQUIRE(ggml_backend_sched_graph_compute(scheduler, graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_sched_synchronize(scheduler);
+        std::array<int32_t, used> computed;
+        ggml_backend_tensor_get(ids, computed.data(), 0, sizeof(computed));
+        REQUIRE(computed == routes[pass]);
+        std::vector<float> actual(rows*used);
+        ggml_backend_tensor_get(output, actual.data(), 0, actual.size()*sizeof(float));
+        for (int position = 0; position < used; ++position) for (int row = 0; row < rows; ++row) {
+            // Constant representable F16 rows dotted with 256 copies of 1/256.
+            // This oracle needs neither production decoding nor another backend.
+            const double expected = double((routes[pass][position] + 1)*(row + 1))/256;
+            REQUIRE(std::isfinite(actual[position*rows + row]));
+            REQUIRE(std::abs(actual[position*rows + row] - expected) <= 2e-5*(1 + std::abs(expected)));
+        }
+        if (pass == 1) REQUIRE(source.acquires == before);
+        std::array<ggml_backend_sched_resource_device_stats, 2> stats;
+        REQUIRE(ggml_backend_sched_get_resource_device_stats(scheduler, stats.data(), stats.size()));
+        REQUIRE(stats[0].expert_cache_allocated_bytes <= capacity);
+    }
+    // Release the scheduler before checking its pending upload leases.
+    ggml_backend_sched_free(scheduler); free_scheduler.scheduler = nullptr;
+    REQUIRE(source.acquires > 0 && source.acquires == source.releases && source.active == 0);
+#endif
+}
+
+void test_cuda_stable_expert_reduction() {
+#ifdef GGML_USE_CUDA
+    if (ggml_backend_cuda_get_device_count() == 0) return;
+    auto * backend = ggml_backend_cuda_init(0, nullptr, nullptr);
+    REQUIRE(backend != nullptr);
+    struct cleanup { ggml_backend_t backend; ~cleanup() { ggml_backend_free(backend); } } free_backend{backend};
+    // More than eight route positions forces indexed MMQ. Poisoned negative
+    // positions and slot shifts check both the virtual empty bounds and the
+    // independence of reduction arithmetic from the expert table geometry.
+    for (const auto type : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_IQ3_XXS}) {
+        for (const int tokens : {1, 2}) {
+            const auto reference = compute_cuda_padded_experts(backend, type, false, 0, tokens, true);
+            for (const int count : {17, 64, 97}) {
+                REQUIRE(compute_cuda_padded_experts(backend, type, false, 4096, tokens, true, false,
+                        count, count - 4) == reference);
+            }
+        }
+    }
+#endif
+}
+
+void test_cuda_sparse_quantized_routes() {
+#ifdef GGML_USE_CUDA
+    if (ggml_backend_cuda_get_device_count() == 0) return;
+    auto * backend = ggml_backend_cuda_init(0, nullptr, nullptr);
+    REQUIRE(backend != nullptr);
+    struct cleanup { ggml_backend_t backend; ~cleanup() { ggml_backend_free(backend); } } free_backend{backend};
+    // Top-10 reaches indexed MMQ for down projections; fused up/gate reaches
+    // MMVQ and its fused successor. Poison destination rows before each run.
+    for (auto type : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S}) {
+        for (bool fused : {false, true}) {
+            for (int64_t tokens : {1, 2}) {
+                std::cout << "Sparse CUDA case: type=" << ggml_type_name(type)
+                          << " fused=" << fused << " tokens=" << tokens << std::endl;
+                const auto sparse = compute_cuda_padded_experts(backend, type, fused, 4096, tokens, true);
+                const auto dense = compute_cuda_padded_experts(backend, type, fused, 0, tokens);
+                float max_error = 0;
+                for (int64_t token = 0; token < tokens; ++token) {
+                    for (int expert = 0; expert < 2; ++expert) {
+                        for (int row = 0; row < 128; ++row) {
+                            const size_t sparse_offset = size_t((token*10 + (expert ? 8 : 0))*128 + row);
+                            const size_t dense_offset = size_t((token*2 + expert)*128 + row);
+                            max_error = std::max(max_error, std::abs(sparse[sparse_offset] - dense[dense_offset]));
+                        }
+                    }
+                }
+                // Different MMVQ/MMQ tile widths can change accumulation;
+                // valid expert rows must still agree with the dense control.
+                std::cout << "Sparse/dense valid-row error: " << max_error << std::endl;
+                REQUIRE(max_error < 2e-3f);
+            }
+        }
+    }
+    compute_cuda_padded_experts(backend, GGML_TYPE_IQ3_XXS, true, 4096, 1, true, true);
+#endif
+}
+
 void test_cuda_compact_remap_exact_parity() {
     ggml_backend_t backend = nullptr;
     for (size_t i = 0; i < ggml_backend_reg_get_count(); ++i) {
@@ -726,6 +1728,18 @@ void test_cuda_compact_remap_exact_parity() {
     }
     if (!backend) return;
     struct backend_cleanup { ggml_backend_t backend; ~backend_cleanup() { ggml_backend_free(backend); } } free_backend{backend};
+
+    for (auto type : {GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q2_K}) {
+        for (bool fused : {false, true}) {
+            const auto packed = compute_cuda_padded_experts(backend, type, fused, 0);
+            const auto padded = compute_cuda_padded_experts(backend, type, fused, 4096);
+            REQUIRE(packed == padded);
+        }
+        // Two tokens exercise indexed MMQ instead of the one-token MMVQ
+        // shortcut, including its temporary-compute padding-clear guard.
+        REQUIRE(compute_cuda_padded_experts(backend, type, false, 0, 2) ==
+                compute_cuda_padded_experts(backend, type, false, 4096, 2));
+    }
 
     constexpr int64_t k = 768;
     constexpr int64_t m = 384;
@@ -891,6 +1905,433 @@ void test_exact_cuda_pinned_staging_allocation() {
 #endif
 }
 
+std::vector<float> compute_cuda_cache_preflight(bool reverse_completions, bool with_bias = false, bool cached = true, bool mixed_layout = false, ggml_type first_type = GGML_TYPE_F16,
+        bool frequency_sweep = false, size_t * acquisition_count = nullptr, int token_batch = 1, bool cross_device = false,
+        bool check_residency_choice = false, bool check_route_protection = false,
+        bool check_packing_capacity = false, bool shared_layer_ids = false) {
+#ifdef GGML_USE_CUDA
+    if (ggml_backend_cuda_get_device_count() < (cross_device ? 2 : 1)) return {};
+    struct mock_source {
+        ggml_tensor * up = nullptr;
+        ggml_tensor * down = nullptr;
+        size_t batches = 0;
+        size_t acquires = 0;
+        struct batch { mock_source * source; std::vector<int> experts; int component; int layer; size_t remaining; };
+        static bool acquire(void * user, int layer, int expert, int component, ggml_backend_expert_lease * result) {
+            auto & source = *static_cast<mock_source *>(user);
+            ++source.acquires;
+            auto * tensor = layer == 1 || component != 1 ? source.down : source.up;
+            auto data = std::make_unique<std::vector<uint8_t>>(tensor->nb[2]);
+            std::memcpy(data->data(), static_cast<uint8_t *>(tensor->data) + expert*tensor->nb[2], data->size());
+            result->data = data->data(); result->size = data->size(); result->handle = data.release();
+            return true;
+        }
+        static void release(void *, void * handle) { delete static_cast<std::vector<uint8_t> *>(handle); }
+        static void * begin(void * user, int layer, const int * experts, size_t count, int component) {
+            auto * source = static_cast<mock_source *>(user);
+            ++source->batches;
+            return new batch{source, std::vector<int>(experts, experts+count), component, layer, count};
+        }
+        static bool next(void * opaque, size_t * index, ggml_backend_expert_lease * result) {
+            auto & b = *static_cast<batch *>(opaque);
+            REQUIRE(b.remaining > 0);
+            *index = --b.remaining;
+            return acquire(b.source, b.layer, b.experts[*index], b.component, result);
+        }
+        static void end(void * opaque) { delete static_cast<batch *>(opaque); }
+    } source;
+
+    ggml_backend_t cuda = ggml_backend_cuda_init(0, nullptr, nullptr);
+    ggml_backend_t activation = cross_device ? ggml_backend_cuda_init(1, nullptr, nullptr) : cuda;
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    REQUIRE(cuda != nullptr && cpu != nullptr);
+    struct backend_cleanup {
+        ggml_backend_t cuda;
+        ggml_backend_t cpu;
+        ggml_backend_t activation;
+        ~backend_cleanup() { if (activation != cuda) ggml_backend_free(activation); ggml_backend_free(cuda); ggml_backend_free(cpu); }
+    } free_backends{cuda, cpu, activation};
+
+    ggml_init_params params = {
+        ggml_tensor_overhead()*32 + ggml_graph_overhead_custom(32, false), nullptr, true
+    };
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    struct context_cleanup { ggml_context * value; ~context_cleanup() { ggml_free(value); } } free_ctx{ctx};
+
+    constexpr int64_t width = 64;
+    const int64_t experts = check_packing_capacity ? 128 : 8;
+    constexpr int64_t used = 2;
+    ggml_tensor * up = ggml_new_tensor_3d(ctx, first_type, width, width, experts);
+    ggml_tensor * down = ggml_new_tensor_3d(ctx, mixed_layout ? GGML_TYPE_F32 : GGML_TYPE_F16, width, width, experts);
+    ggml_set_name(up, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(down, mixed_layout ? "blk.1.ffn_up_exps.weight" : "blk.0.ffn_down_exps.weight");
+    source.up = up; source.down = down;
+    REQUIRE(token_batch >= 1 && token_batch <= 8 && (token_batch == 1 || !mixed_layout));
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, used, token_batch);
+    const int64_t id_width = used + (token_batch > 1 ? 2 : 0);
+    ggml_tensor * ids_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, id_width, token_batch);
+    ggml_tensor * ids = token_batch > 1 ? ggml_view_2d(ctx, ids_storage, used, token_batch, ids_storage->nb[1], 0) : ids_storage;
+    ggml_tensor * second_ids = mixed_layout && !shared_layer_ids ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, 1) : ids;
+    if (mixed_layout || token_batch == 1) ggml_set_input(second_ids);
+    ggml_set_input(input);
+    if (token_batch == 1) ggml_set_input(ids);
+    ggml_set_input(ids_storage);
+    ggml_tensor * up_bias = with_bias ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, experts) : nullptr;
+    ggml_tensor * down_bias = with_bias ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, experts) : nullptr;
+    if (with_bias) {
+        ggml_set_name(up_bias, "blk.0.ffn_up_exps.bias");
+        ggml_set_name(down_bias, mixed_layout ? "blk.1.ffn_up_exps.bias" : "blk.0.ffn_down_exps.bias");
+    }
+    ggml_tensor * hidden = ggml_mul_mat_id(ctx, up, input, ids);
+    ggml_tensor * first_projection = hidden;
+    if (with_bias) hidden = ggml_add_id(ctx, hidden, up_bias, ids);
+    ggml_tensor * output = ggml_mul_mat_id(ctx, down, hidden, second_ids);
+    ggml_tensor * second_projection = output;
+    if (with_bias) output = ggml_add_id(ctx, output, down_bias, second_ids);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, output);
+
+    auto cpu_buft = ggml_backend_get_default_buffer_type(cpu);
+    const size_t alignment = ggml_backend_buft_get_alignment(cpu_buft);
+    const size_t up_bytes = ggml_backend_buft_get_alloc_size(cpu_buft, up);
+    const size_t down_offset = (up_bytes + alignment - 1)/alignment*alignment;
+    const size_t down_bytes = ggml_backend_buft_get_alloc_size(cpu_buft, down);
+    const size_t bias_offset = (down_offset + down_bytes + alignment - 1)/alignment*alignment;
+    const size_t bias_stride = with_bias ?
+            (ggml_backend_buft_get_alloc_size(cpu_buft, up_bias) + alignment - 1)/alignment*alignment : 0;
+    ggml_backend_buffer_t weights = ggml_backend_buft_alloc_buffer(
+            cpu_buft, bias_offset + 2*bias_stride);
+    REQUIRE(weights != nullptr);
+    struct buffer_cleanup {
+        ggml_backend_buffer_t value;
+        ~buffer_cleanup() { ggml_backend_buffer_free(value); }
+    } free_weights{weights};
+    ggml_backend_buffer_set_usage(weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(weights));
+    ggml_backend_tensor_alloc(weights, up, base);
+    ggml_backend_tensor_alloc(weights, down, base + down_offset);
+    if (with_bias) {
+        ggml_backend_tensor_alloc(weights, up_bias, base + bias_offset);
+        ggml_backend_tensor_alloc(weights, down_bias, base + bias_offset + bias_stride);
+    }
+
+    std::vector<ggml_backend_t> backends = {cuda};
+    if (cross_device) backends.push_back(activation);
+    backends.push_back(cpu);
+    ggml_backend_sched_t scheduler = ggml_backend_sched_new(
+            backends.data(), nullptr, backends.size(), 128, false);
+    REQUIRE(scheduler != nullptr);
+    struct scheduler_cleanup {
+        ggml_backend_sched_t value;
+        ~scheduler_cleanup() { ggml_backend_sched_free(value); }
+    } free_scheduler{scheduler};
+    ggml_backend_sched_set_only_active_experts(scheduler, true);
+    if (reverse_completions) {
+        ggml_backend_sched_set_expert_lease_callbacks(scheduler, mock_source::acquire, mock_source::release, &source, true);
+        ggml_backend_sched_set_expert_load_callbacks(scheduler, {mock_source::begin, mock_source::next, mock_source::end});
+    }
+    // Four compact slots plus allocator headroom: the biased regression must
+    // exercise both ID remapping and eviction, not only a warm identity map.
+    const uint64_t capacity = check_packing_capacity ? 64*256 + 192*width*width*3 : with_bias && token_batch == 1 ? 64*256 + 5*2*width*width*sizeof(ggml_fp16_t) : 16ULL*1024*1024;
+    if (cached) ggml_backend_sched_set_expert_cache_capacity(scheduler, capacity, 0, 1);
+    ggml_backend_sched_set_tensor_backend(scheduler, hidden, cuda);
+    ggml_backend_sched_set_tensor_backend(scheduler, output, cuda);
+    ggml_backend_sched_set_tensor_backend(scheduler, input, activation);
+    ggml_backend_sched_set_tensor_backend(scheduler, ids, activation);
+    ggml_backend_sched_set_tensor_backend(scheduler, ids_storage, activation);
+    ggml_backend_sched_set_tensor_backend(scheduler, second_ids, activation);
+    REQUIRE(ggml_backend_sched_alloc_graph(scheduler, graph));
+
+    REQUIRE(ggml_backend_sched_get_tensor_backend(scheduler, hidden) == cuda);
+    REQUIRE(ggml_backend_sched_get_tensor_backend(scheduler, output) == cuda);
+    std::vector<ggml_backend_sched_resource_device_stats> stats(cross_device ? 2 : 1);
+    REQUIRE(ggml_backend_sched_get_resource_device_stats(
+            scheduler, stats.data(), stats.size()));
+    if (cached) {
+        REQUIRE(stats[0].expert_cache_capacity_bytes > 0);
+        REQUIRE(stats[0].expert_cache_allocated_bytes > 64*256);
+        REQUIRE(stats[0].expert_cache_allocated_bytes <= capacity);
+        if (check_packing_capacity) {
+            // F16 and F32 layers get independent local ID spaces. At this
+            // budget uniform F32 slots hold only 143 entries; packing must
+            // provide at least 192 without exceeding the same charged bytes.
+            REQUIRE(mixed_layout && first_type == GGML_TYPE_F16);
+            REQUIRE(first_projection->src[0]->ne[2] + second_projection->src[0]->ne[2] >= 192);
+        }
+        // Expert data already belongs to the cache. Graph scratch must not
+        // allocate a second slot-sized copy of each component.
+        REQUIRE(ggml_backend_sched_get_buffer_size(scheduler, cuda) < 1024*1024);
+    }
+
+    std::vector<ggml_fp16_t> weight_values(size_t(width*width*experts));
+    for (size_t index = 0; index < weight_values.size(); ++index) {
+        // Exactly representable diagonal math isolates bias/slot ownership
+        // from the different accumulation precision of resident/cache kernels.
+        const bool diagonal = index % width == (index/width) % width;
+        const float value = with_bias ? (diagonal ? float(index/(width*width) + 1)/8.0f : 0.0f)
+                                      : float(int(index % 31) - 15)/32.0f;
+        weight_values[index] = ggml_fp32_to_fp16(value);
+    }
+    std::vector<float> input_values(size_t(width*used*token_batch));
+    for (size_t index = 0; index < input_values.size(); ++index) {
+        input_values[index] = first_type != GGML_TYPE_F16 ? 0.0f :
+                with_bias ? float(int(index % 3) - 1)/2.0f : float(int(index % 17) - 8)/16.0f;
+    }
+    if (with_bias) {
+        std::vector<float> biases(size_t(width*experts));
+        for (size_t i = 0; i < biases.size(); ++i) biases[i] = float(i/width + 1)/8.0f;
+        ggml_backend_tensor_set(up_bias, biases.data(), 0, ggml_nbytes(up_bias));
+        for (float & value : biases) value *= -0.5f;
+        ggml_backend_tensor_set(down_bias, biases.data(), 0, ggml_nbytes(down_bias));
+    }
+    std::vector<std::array<int32_t, used>> routes = mixed_layout
+            ? std::vector<std::array<int32_t, used>>{{1, 6}, {1, 6}, {3, 7}, {3, 7}, {6, 1}}
+            : std::vector<std::array<int32_t, used>>{{1, 6}, {3, 7}, {0, 4}, {6, 1}, {3, 7}};
+    if (frequency_sweep) {
+        REQUIRE(with_bias && !mixed_layout);
+        routes.clear();
+        for (int i = 0; i < 36; ++i) routes.push_back({2*(i%3), 2*(i%3)+1});
+    }
+    if (check_route_protection) {
+        REQUIRE(with_bias && !mixed_layout && token_batch == 1);
+        // Fill all four slots, then put a miss before the oldest resident in
+        // the next route. That resident must survive admission of expert 0.
+        routes = {{1, 6}, {3, 7}, {0, 1}};
+    }
+    if (first_type == GGML_TYPE_F16) {
+        ggml_backend_tensor_set(up, weight_values.data(), 0, ggml_nbytes(up));
+    } else {
+        std::vector<float> values(weight_values.size());
+        std::transform(weight_values.begin(), weight_values.end(), values.begin(), ggml_fp16_to_fp32);
+        std::vector<uint8_t> packed(ggml_nbytes(up));
+        REQUIRE(ggml_quantize_chunk(first_type, values.data(), packed.data(), 0, width*experts, width,
+                nullptr, nullptr) == packed.size());
+        ggml_backend_tensor_set(up, packed.data(), 0, packed.size());
+    }
+    if (!with_bias) std::reverse(weight_values.begin(), weight_values.end());
+    if (mixed_layout) {
+        std::vector<float> second_weights(weight_values.size());
+        std::transform(weight_values.begin(), weight_values.end(), second_weights.begin(), ggml_fp16_to_fp32);
+        ggml_backend_tensor_set(down, second_weights.data(), 0, ggml_nbytes(down));
+    } else {
+        ggml_backend_tensor_set(down, weight_values.data(), 0, ggml_nbytes(down));
+    }
+    std::vector<float> result;
+    for (size_t pass = 0; pass < (with_bias ? routes.size() : 1); ++pass) {
+        const auto acquires_before = source.acquires;
+        ggml_backend_tensor_set(input, input_values.data(), 0, ggml_nbytes(input));
+        std::vector<int32_t> batch_ids(size_t(id_width*token_batch), -777);
+        for (int token = 0; token < token_batch; ++token)
+            std::copy(routes[(pass + token)%routes.size()].begin(), routes[(pass + token)%routes.size()].end(),
+                    batch_ids.begin() + token*id_width);
+        ggml_backend_tensor_set(ids_storage, batch_ids.data(), 0, batch_ids.size()*sizeof(int32_t));
+        if (mixed_layout) ggml_backend_tensor_set(second_ids, routes[pass].data(), 0, sizeof(routes[pass]));
+        REQUIRE(ggml_backend_sched_graph_compute(scheduler, graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_sched_synchronize(scheduler);
+        if (check_route_protection && cached && pass == 2) {
+            // One cold expert, two weight components. Re-uploading expert 1
+            // would add two more acquisitions without changing the result.
+            REQUIRE(source.acquires - acquires_before == 2);
+        }
+        if (check_residency_choice && pass == 0) {
+            // A complete warm expert lies behind a cold expert and a padding
+            // sentinel. Readiness must include both projections on the actual
+            // output device, rather than an OR of all devices' ready bits.
+            ggml_init_params probe_params = {1024*1024, nullptr, false};
+            auto * probe_ctx = ggml_init(probe_params);
+            REQUIRE(probe_ctx != nullptr);
+            struct probe_cleanup { ggml_context * ctx; ~probe_cleanup() { ggml_free(ctx); } } free_probe{probe_ctx};
+            auto * probe_ids = ggml_new_tensor_2d(probe_ctx, GGML_TYPE_I32, 4, 1);
+            const std::array<int32_t, 4> probe_route = {{ -1, 0, 6, 1 }};
+            std::memcpy(probe_ids->data, probe_route.data(), sizeof(probe_route));
+            const auto evaluate = [&](ggml_tensor * up_source, ggml_tensor * gate_source, ggml_tensor * anchor) {
+                auto * mask = ggml_backend_sched_expert_route_choice(
+                        probe_ctx, scheduler, probe_ids, 0, 1, up_source, gate_source, down);
+                ggml_backend_sched_expert_route_bind_gpu_output(mask, anchor);
+                auto * gpu = ggml_ese_route_partition_masked(probe_ctx, probe_ids, mask, GGML_ESE_ROUTE_GPU);
+                auto * cpu_ids = ggml_ese_route_partition_masked(probe_ctx, probe_ids, mask, GGML_ESE_ROUTE_CPU);
+                REQUIRE(ggml_ese_route_get_role(gpu) == GGML_ESE_ROUTE_GPU);
+                REQUIRE(ggml_ese_route_get_role(cpu_ids) == GGML_ESE_ROUTE_CPU);
+                auto * probe_graph = ggml_new_graph_custom(probe_ctx, 16, false);
+                ggml_build_forward_expand(probe_graph, gpu);
+                ggml_build_forward_expand(probe_graph, cpu_ids);
+                REQUIRE(ggml_backend_graph_compute(cpu, probe_graph) == GGML_STATUS_SUCCESS);
+                const auto * gpu_ids = static_cast<const int32_t *>(gpu->data);
+                const auto * cpu_route = static_cast<const int32_t *>(cpu_ids->data);
+                for (size_t i = 0; i < probe_route.size(); ++i) {
+                    REQUIRE(gpu_ids[i] == -1 || gpu_ids[i] == probe_route[i]);
+                    REQUIRE(cpu_route[i] == -1 || cpu_route[i] == probe_route[i]);
+                    if (probe_route[i] >= 0) REQUIRE((gpu_ids[i] >= 0) != (cpu_route[i] >= 0));
+                }
+                std::array<int32_t, 4> result;
+                std::memcpy(result.data(), mask->data, sizeof(result));
+                return result;
+            };
+            const std::array<int32_t, 4> warm = {{0, 0, 1, 0}}, cold = {{0, 1, 0, 0}};
+            REQUIRE(evaluate(up, nullptr, output) == (cached && !mixed_layout ? warm : cold));
+            // A gate component that has never been uploaded makes an expert
+            // incomplete, even though up/down exist. A wrong quantized layout
+            // likewise must not count as a hit.
+            auto * missing_gate = ggml_new_tensor_3d(probe_ctx, GGML_TYPE_F16, width, width, experts);
+            ggml_set_name(missing_gate, "blk.0.ffn_gate_exps.weight");
+            REQUIRE(evaluate(up, missing_gate, output) == cold);
+            auto * wrong_layout = ggml_new_tensor_3d(probe_ctx, GGML_TYPE_F32, width, width, experts);
+            ggml_set_name(wrong_layout, "blk.0.ffn_up_exps.weight");
+            REQUIRE(evaluate(wrong_layout, nullptr, output) == cold);
+            if (cross_device) REQUIRE(evaluate(up, nullptr, input) == cold);
+        }
+        if (mixed_layout && cached && (pass == 1 || pass == 3)) {
+            // A different layer/layout ran since this payload was used. With
+            // retained payloads, an identical route must not acquire/upload it.
+            REQUIRE(source.acquires == acquires_before);
+        }
+        const size_t offset = result.size();
+        result.resize(offset + size_t(ggml_nelements(output)));
+        ggml_backend_tensor_get(output, result.data() + offset, 0, ggml_nbytes(output));
+        if (with_bias) {
+            for (size_t i = 0; i < size_t(width*used*token_batch); ++i) {
+                const size_t token = i/(width*used);
+                const float gain = float(routes[(pass + token)%routes.size()][(i/width)%used] + 1)/8.0f;
+                const float expected = (input_values[i]*gain + gain)*gain - gain/2;
+                REQUIRE(result[offset + i] == expected);
+            }
+        }
+        REQUIRE(std::all_of(result.begin(), result.end(), [](float value) { return std::isfinite(value); }));
+        if (mixed_layout && cached && first_type != GGML_TYPE_F16 && (pass == 0 || pass == 2)) {
+            // A graph rebuild initializes aliases of a shorter quantized
+            // layout. Its CUDA tail clear must not overwrite the F32 payload
+            // retained in the final slot of this shared cache allocation.
+            ggml_tensor alias = *first_projection->src[0];
+            REQUIRE(ggml_backend_buffer_get_usage(alias.buffer) == GGML_BACKEND_BUFFER_USAGE_EXPERT_CACHE);
+            ggml_backend_buffer_init_tensor(alias.buffer, &alias);
+        }
+        if (mixed_layout && cached && (pass == 1 || pass == 3)) {
+            // Reuse the graph after the old cache buffers are freed, and after
+            // a publication rollback. Input aliases and the preflight stamp
+            // must follow the currently published cache in both cases.
+            const uint64_t replacement = pass == 1 ? capacity + 2*width*width*sizeof(float) : capacity;
+            auto transaction = ggml_backend_sched_expert_cache_prepare(scheduler, replacement, 0, 1);
+            REQUIRE(transaction != nullptr);
+            REQUIRE(ggml_backend_sched_expert_cache_publish(transaction));
+            if (pass == 3) REQUIRE(ggml_backend_sched_expert_cache_rollback(transaction));
+            REQUIRE(ggml_backend_sched_expert_cache_finalize(transaction));
+        }
+    }
+    if (reverse_completions) REQUIRE(source.batches >= 2);
+    if (acquisition_count) *acquisition_count = source.acquires;
+    return result;
+#else
+    (void) reverse_completions;
+    (void) with_bias;
+    (void) cached;
+    (void) mixed_layout;
+    (void) first_type;
+    (void) frequency_sweep;
+    (void) acquisition_count;
+    (void) token_batch;
+    (void) cross_device;
+    (void) check_residency_choice;
+    (void) check_route_protection;
+    (void) check_packing_capacity;
+    (void) shared_layer_ids;
+    return {};
+#endif
+}
+
+void test_cuda_layout_pool_capacity_and_lifetimes() {
+#if defined(GGML_USE_CUDA) && !defined(_WIN32)
+    const char * previous = std::getenv("ESE_EXPERT_CACHE_PACKING");
+    const bool had_previous = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    setenv("ESE_EXPERT_CACHE_PACKING", "1", 1);
+    struct restore_setting {
+        bool present;
+        std::string value;
+        ~restore_setting() {
+            if (present) setenv("ESE_EXPERT_CACHE_PACKING", value.c_str(), 1);
+            else unsetenv("ESE_EXPERT_CACHE_PACKING");
+        }
+    } restore{had_previous, saved};
+    // Exact diagonal/bias oracle, reversed completion, warm reuse, capacity
+    // replacement, finalized old buffers, and publication rollback all run
+    // through the existing helper. A second quantized case checks pool tails.
+    const auto resident = compute_cuda_cache_preflight(false, true, false, true);
+    REQUIRE(compute_cuda_cache_preflight(true, true, true, true, GGML_TYPE_F16,
+            false, nullptr, 1, false, false, false, true) == resident);
+    // Reusing logical routing IDs in another layer must create that layer's
+    // own remap, rather than reuse physical slots from the first pool.
+    REQUIRE(compute_cuda_cache_preflight(true, true, true, true, GGML_TYPE_F16,
+            false, nullptr, 1, false, false, false, true, true) == resident);
+    REQUIRE(compute_cuda_cache_preflight(true, true, true, true, GGML_TYPE_Q4_0) ==
+            compute_cuda_cache_preflight(false, true, false, true, GGML_TYPE_Q4_0));
+#endif
+}
+
+void test_cuda_route_residents_survive_admission() {
+#if defined(GGML_USE_CUDA) && !defined(_WIN32)
+    if (ggml_backend_cuda_get_device_count() == 0) return;
+    const char * prior = getenv("ESE_EXPERT_CACHE_RETENTION");
+    struct restore_env {
+        bool present; std::string value;
+        ~restore_env() {
+            if (present) setenv("ESE_EXPERT_CACHE_RETENTION", value.c_str(), 1);
+            else unsetenv("ESE_EXPERT_CACHE_RETENTION");
+        }
+    } restore{prior != nullptr, prior ? prior : ""};
+    setenv("ESE_EXPERT_CACHE_RETENTION", "lru", 1);
+    const auto resident = compute_cuda_cache_preflight(false, true, false, false,
+            GGML_TYPE_F16, false, nullptr, 1, false, false, true);
+    const auto cached = compute_cuda_cache_preflight(true, true, true, false,
+            GGML_TYPE_F16, false, nullptr, 1, false, false, true);
+    REQUIRE(cached == resident);
+#endif
+}
+
+void test_cuda_frequency_retention() {
+#if defined(GGML_USE_CUDA) && !defined(_WIN32)
+    if (ggml_backend_cuda_get_device_count() == 0) return;
+    const char * prior = getenv("ESE_EXPERT_CACHE_RETENTION");
+    struct restore_env {
+        bool present; std::string value;
+        ~restore_env() {
+            if (present) setenv("ESE_EXPERT_CACHE_RETENTION", value.c_str(), 1);
+            else unsetenv("ESE_EXPERT_CACHE_RETENTION");
+        }
+    } restore{prior != nullptr, prior ? prior : ""};
+    size_t lru_reads = 0, frequency_reads = 0;
+    setenv("ESE_EXPERT_CACHE_RETENTION", "lru", 1);
+    auto lru = compute_cuda_cache_preflight(true, true, true, false, GGML_TYPE_F16, true, &lru_reads);
+    setenv("ESE_EXPERT_CACHE_RETENTION", "frequency", 1);
+    auto frequency = compute_cuda_cache_preflight(true, true, true, false, GGML_TYPE_F16, true, &frequency_reads);
+    REQUIRE(lru == frequency);
+    REQUIRE(frequency_reads < lru_reads);
+    std::cout << "Frequency retention sweep: " << lru_reads << " -> " << frequency_reads << " lease uploads\n";
+#endif
+}
+
+void test_cuda_cache_preflight_realizes_all_components() {
+    const auto sequential = compute_cuda_cache_preflight(false);
+    const auto reversed = compute_cuda_cache_preflight(true);
+    REQUIRE(sequential == reversed);
+    const auto resident_bias = compute_cuda_cache_preflight(false, true, false);
+    const auto cached_bias = compute_cuda_cache_preflight(true, true, true);
+    REQUIRE(resident_bias.size() == cached_bias.size());
+    REQUIRE(resident_bias == cached_bias);
+    const auto resident_batch = compute_cuda_cache_preflight(false, true, false, false, GGML_TYPE_F16, false, nullptr, 4);
+    const auto cached_batch = compute_cuda_cache_preflight(true, true, true, false, GGML_TYPE_F16, false, nullptr, 4);
+    REQUIRE(resident_batch == cached_batch);
+    const auto remote_batch = compute_cuda_cache_preflight(true, true, true, false, GGML_TYPE_F16, false, nullptr, 4, true);
+    if (!remote_batch.empty()) REQUIRE(remote_batch == resident_batch);
+    const auto resident_mixed = compute_cuda_cache_preflight(false, true, false, true);
+    const auto cached_mixed = compute_cuda_cache_preflight(true, true, true, true);
+    REQUIRE(resident_mixed == cached_mixed);
+    const auto quantized_resident = compute_cuda_cache_preflight(false, true, false, true, GGML_TYPE_Q4_0);
+    const auto quantized_cached = compute_cuda_cache_preflight(true, true, true, true, GGML_TYPE_Q4_0);
+    REQUIRE(quantized_resident == quantized_cached);
+}
+
 void test_expert_cache_transaction_state_machine() {
     REQUIRE(ggml_backend_sched_expert_cache_prepare(nullptr, 0, 0, 1) == nullptr);
     REQUIRE(!ggml_backend_sched_expert_cache_publish(nullptr));
@@ -1026,20 +2467,79 @@ void test_expert_cache_partial_publication_rollback() {
 
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--router-cache-only") == 0) {
+            test_cuda_router_precedes_compact_staging();
+            std::cout << "PASS: computed GPU router precedes compact expert staging\n";
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--sparse-cuda-only") == 0) {
+            test_cuda_sparse_quantized_routes();
+            std::cout << "PASS: sparse quantized CUDA route sentinels\n";
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--packing-cache-only") == 0) {
+            test_cuda_layout_pool_capacity_and_lifetimes();
+            std::cout << "PASS: packed cache capacity, aliases and replacement\n";
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--stable-mmq-only") == 0) {
+            test_cuda_stable_expert_reduction();
+            std::cout << "PASS: stable indexed MMQ across cache geometry\n";
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--route-cache-only") == 0) {
+            test_cuda_route_residents_survive_admission();
+            std::cout << "PASS: cached route residents survive miss admission\n";
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--cpu-lease-chunks-only") == 0) {
+            test_cpu_lease_chunks_with_bounded_cache();
+            std::cout << "PASS: exact CPU lease chunks under bounded cache and forced eviction\n";
+            return 0;
+        }
         test_descriptor_validation();
         test_exact_reads_hits_and_backend_telemetry();
         test_deterministic_eviction_and_lease_lifetime();
+        test_deterministic_eviction_and_lease_lifetime(true);
+        test_ram_frequency_retention();
         test_capacity_and_identity_fail_closed();
         test_file_storage_backends();
         test_concurrent_single_fill();
+        test_ready_hit_during_blocked_miss();
+        test_independent_fills_share_bounded_staging();
+        test_staging_backpressure_preserves_ready_hits();
+        test_failed_fill_preserves_victims_and_coalesces_error();
+        test_reserved_victim_can_become_leased();
+        test_concurrent_eviction_stress();
+        test_concurrent_eviction_stress(true);
+        test_load_queue_completion_order_and_bounds();
+        test_load_queue_ready_hits_and_error_recovery();
+        test_load_queue_shutdown_joins_reads();
+        test_read_ahead_identity_and_retention();
+        test_external_resident_arena_ownership();
+        test_read_ahead_demand_priority_budget_and_expiration();
         test_cpu_kernel_exact_parity_and_no_original_fallback();
+        test_cpu_lease_chunks_with_bounded_cache();
         test_route_partition_is_complementary();
+        test_masked_route_preserves_weighted_positions();
         test_cpu_fused_moe_merged_workspace();
         test_cuda_compact_remap_exact_parity();
+        test_cuda_router_precedes_compact_staging();
+        test_cuda_sparse_quantized_routes();
+        test_cuda_route_residents_survive_admission();
+        test_cuda_frequency_retention();
         test_hybrid_runtime_guard_is_one_way_and_fail_closed();
         test_exact_cuda_pinned_staging_allocation();
+        test_cuda_cache_preflight_realizes_all_components();
+        test_cuda_layout_pool_capacity_and_lifetimes();
+        REQUIRE(compute_cuda_cache_preflight(false, false, true, false, GGML_TYPE_F16,
+                    false, nullptr, 1, false, true) ==
+                compute_cuda_cache_preflight(false, false, false, false, GGML_TYPE_F16,
+                    false, nullptr, 1, false, true));
+        compute_cuda_cache_preflight(false, false, true, false, GGML_TYPE_F16,
+                false, nullptr, 1, true, true);
         test_expert_cache_transaction_state_machine();
         test_expert_cache_partial_publication_rollback();
         std::cout << "PASS: checked bounded expert caches and exact full/compact CUDA parity\n";

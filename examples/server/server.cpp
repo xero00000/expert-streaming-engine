@@ -34,6 +34,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <set>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <signal.h>
@@ -562,7 +563,9 @@ auto res_err = [](httplib::Response& res, json error_data) {
 };
 
 auto res_ok = [](httplib::Response& res, const json& data) {
-    res.set_content(data.dump(), "application/json; charset=utf-8");
+    // Token probability candidates can contain incomplete UTF-8 byte pieces,
+    // just as streamed tokens can. Use the established safe response encoder.
+    res.set_content(safe_json_to_str(data), "application/json; charset=utf-8");
     res.status = 200;
 };
 
@@ -605,9 +608,12 @@ static bool server_parse_resource_plan(
         plan.slots = value.at("slots").get<uint32_t>();
         plan.batch = value.at("batch").get<uint32_t>();
         plan.ubatch = value.at("ubatch").get<uint32_t>();
+        plan.kv_native_sizing = value.value("kv_native_sizing",false);
         plan.ram_capacity_bytes = value.at("ram_capacity_bytes").get<uint64_t>();
         plan.ram_planned_bytes = value.at("ram_planned_bytes").get<uint64_t>();
+        plan.host_graph_metadata_bytes = value.value("host_graph_metadata_bytes", uint64_t(0));
         plan.expert_ram_bytes = value.at("expert_ram_bytes").get<uint64_t>();
+        plan.qwen4exp_ple_ram_bytes = value.value("qwen4exp_ple_ram_bytes", uint64_t(0));
         plan.aux_ram_bytes = value.at("aux_ram_bytes").get<uint64_t>();
         plan.io_staging_bytes = value.at("io_staging_bytes").get<uint64_t>();
         plan.transient_device = value.at("transient_device").get<int>();
@@ -1016,12 +1022,13 @@ int main(int argc, char ** argv) {
         res.status = 200; // HTTP OK
     };
 
-    const auto request_ese_resources = [&ctx_server]() {
+    const auto request_ese_resources = [&ctx_server](uint32_t kv_context = 0) {
         server_task task;
         task.id = ctx_server.queue_tasks.get_new_id();
         task.id_multi = -1;
         task.id_target = -1;
         task.type = SERVER_TASK_TYPE_METRICS;
+        if (kv_context != 0) task.data["kv_preparation_context"] = kv_context;
 
         ctx_server.queue_results.add_waiting_task_id(task.id);
         ctx_server.queue_tasks.post(std::move(task));
@@ -1115,13 +1122,23 @@ int main(int argc, char ** argv) {
             common_resource_plan current;
             common_resource_plan target;
             std::string error;
-            if (!server_parse_resource_plan(current_json, current, error) ||
-                    !common_resource_rebalance_target(current, request, target, error)) {
+            if (!server_parse_resource_plan(current_json,current,error)) {
+                res_err(res,format_error_response(error,ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            if (current.kv_native_sizing) {
+                const auto cp=common_context_params_to_llama(ctx_server.params_base);
+                if (!common_resource_bind_native_cache_query(current,ctx_server.model,cp.idx_type_k,cp.mla_attn,cp.flash_attn)) {
+                    res_err(res,format_error_response("cannot retain native cache sizing metadata",ERROR_TYPE_SERVER));
+                    return;
+                }
+            }
+            if (!common_resource_rebalance_target(current, request, target, error)) {
                 res_err(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
 
-            server_task_result live = request_ese_resources();
+            server_task_result live = request_ese_resources(target.context != current.context ? target.context : 0);
             if (live.error) {
                 res_err(res, live.data);
                 return;
@@ -1213,6 +1230,82 @@ int main(int argc, char ** argv) {
                 }
             }
 
+            std::vector<common_resource_device_memory> tracked_memory;
+            common_resource_host_memory tracked_host;
+            for (const auto & device : preparation_current.devices) {
+                if (device.id >= 0) tracked_memory.push_back({device.id, 0, 0});
+            }
+            for (const auto & pool : resources.at("memory_inventory").at("pools")) {
+                if (pool.at("device_id").is_null()) {
+                    res_err(res, format_error_response(
+                        "tracked accelerator memory has no supported device mapping",
+                        ERROR_TYPE_NOT_SUPPORTED));
+                    return;
+                }
+                const int id = pool.at("device_id").get<int>();
+                if (id < 0) {
+                    uint64_t * total = nullptr;
+                    switch (pool.at("category").get<int>()) {
+                        case LLAMA_RESOURCE_MEMORY_WEIGHTS: total = &tracked_host.weights_bytes; break;
+                        case LLAMA_RESOURCE_MEMORY_PLE_CACHE: total = &tracked_host.ple_cache_bytes; break;
+                        case LLAMA_RESOURCE_MEMORY_GRAPH:
+                        case LLAMA_RESOURCE_MEMORY_CHECKPOINT:
+                        case LLAMA_RESOURCE_MEMORY_OUTPUT:
+                        case LLAMA_RESOURCE_MEMORY_HOST_METADATA:
+                        case LLAMA_RESOURCE_MEMORY_HOST_JOURNAL:
+                        case LLAMA_RESOURCE_MEMORY_HANDOFF:
+                        case LLAMA_RESOURCE_MEMORY_PLE_STAGING:
+                            total = &tracked_host.fixed_bytes;
+                            break;
+                        default: break;
+                    }
+                    const uint64_t bytes = pool.at("bytes").get<uint64_t>();
+                    if (total && bytes > UINT64_MAX - *total) {
+                        res_err(res, format_error_response(
+                            "tracked host memory overflows 64-bit accounting", ERROR_TYPE_SERVER));
+                        return;
+                    }
+                    if (total) *total += bytes;
+                    continue;
+                }
+                auto device = std::find_if(tracked_memory.begin(), tracked_memory.end(),
+                        [id](const common_resource_device_memory & row) { return row.id == id; });
+                if (device == tracked_memory.end()) {
+                    res_err(res, format_error_response(
+                        "tracked accelerator memory lies outside the resource plan",
+                        ERROR_TYPE_SERVER));
+                    return;
+                }
+                const int category = pool.at("category").get<int>();
+                uint64_t * total = nullptr;
+                switch (category) {
+                    case LLAMA_RESOURCE_MEMORY_WEIGHTS:
+                        total = &device->weights_bytes;
+                        break;
+                    case LLAMA_RESOURCE_MEMORY_GRAPH:
+                    case LLAMA_RESOURCE_MEMORY_CUDA_POOL:
+                    case LLAMA_RESOURCE_MEMORY_CHECKPOINT:
+                    case LLAMA_RESOURCE_MEMORY_OUTPUT:
+                    case LLAMA_RESOURCE_MEMORY_HANDOFF:
+                        total = &device->fixed_bytes;
+                        break;
+                    default: break;
+                }
+                const uint64_t bytes = pool.at("bytes").get<uint64_t>();
+                if (total && bytes > UINT64_MAX - *total) {
+                    res_err(res, format_error_response(
+                        "tracked accelerator memory overflows 64-bit accounting",
+                        ERROR_TYPE_SERVER));
+                    return;
+                }
+                if (total) *total += bytes;
+            }
+            if (!common_resource_reconcile_device_memory(
+                        preparation_current, preparation_target, tracked_memory, error)) {
+                res_err(res, format_error_response(error, ERROR_TYPE_SERVER));
+                return;
+            }
+
             if (current.transient_device >= 0 && resources.contains("transient")) {
                 auto live_device = std::find_if(
                     preparation_current.devices.begin(), preparation_current.devices.end(),
@@ -1266,11 +1359,38 @@ int main(int argc, char ** argv) {
                 (transient_policy_change || transient_manager_mismatch);
 
             common_resource_preparation_peak preparation_peak;
+            common_resource_kv_preparation native_kv;
+            std::map<int32_t, uint64_t> live_kv;
+            for (const auto & pool : resources.at("memory_inventory").at("pools")) {
+                if (pool.at("category").get<int>() != LLAMA_RESOURCE_MEMORY_KV) continue;
+                const int32_t id = pool.at("device_id").get<int32_t>();
+                const uint64_t bytes = pool.at("bytes").get<uint64_t>();
+                if (bytes > UINT64_MAX-live_kv[id]) {
+                    res_err(res, format_error_response("live KV storage overflows accounting", ERROR_TYPE_SERVER));
+                    return;
+                }
+                live_kv[id] += bytes;
+            }
+            for (const auto & entry : live_kv) native_kv.current.push_back({entry.first, entry.second});
+            if (target.context != current.context) {
+                if (!resources.contains("kv_preparation") || resources.at("kv_preparation").is_null()) {
+                    res_err(res, format_error_response("native KV replacement sizing is unavailable for this layout",
+                        ERROR_TYPE_NOT_SUPPORTED));
+                    return;
+                }
+                const auto & receipt = resources.at("kv_preparation");
+                native_kv.host_metadata_bytes = receipt.at("host_metadata_bytes").get<uint64_t>();
+                native_kv.host_staging_bytes = receipt.at("host_staging_bytes").get<uint64_t>();
+                for (const auto & row : receipt.at("devices"))
+                    native_kv.target.push_back({row.at("id").get<int32_t>(), row.at("kv_bytes").get<uint64_t>()});
+            } else {
+                native_kv.target = native_kv.current;
+            }
             if (!common_resource_rebalance_preparation_peak(
                         preparation_current, preparation_target,
                         preparation_peak, error,
                         request.set_expert_cache_bytes_per_device,
-                        transient_operation)) {
+                        transient_operation, &tracked_host, &native_kv)) {
                 res_err(res, format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
@@ -1345,6 +1465,17 @@ int main(int argc, char ** argv) {
             task.id_multi = -1;
             task.id_target = -1;
             task.type = SERVER_TASK_TYPE_RESOURCE_REBALANCE;
+            json current_kv_storage = json::array();
+            for (const auto & row : native_kv.current)
+                current_kv_storage.push_back({{"id", row.device_id}, {"kv_bytes", row.kv_bytes}});
+            json device_memory_limits = json::array();
+            for (const auto & device : preparation_current.devices) {
+                if (device.id >= 0) device_memory_limits.push_back({
+                    {"id", device.id},
+                    {"weights_bytes", device.dense_bytes},
+                    {"fixed_bytes", device.graph_bytes},
+                });
+            }
             task.data = {
                 {"target_context", target.context},
                 {"target_expert_cache_bytes_per_device",
@@ -1359,6 +1490,14 @@ int main(int argc, char ** argv) {
                 {"expected_previous_plan", current_plan_text},
                 {"previous_plan", current_json},
                 {"target_plan", target_json},
+                {"device_memory_limits", std::move(device_memory_limits)},
+                {"host_memory_limits", {
+                    {"weights_bytes", preparation_peak.ram_host_weights_limit_bytes},
+                    {"fixed_bytes", preparation_peak.ram_host_fixed_limit_bytes},
+                    {"ple_cache_bytes", preparation_peak.ram_host_ple_cache_limit_bytes},
+                }},
+                {"kv_preparation", target.context != current.context ? resources.at("kv_preparation") : json(nullptr)},
+                {"current_kv_storage", std::move(current_kv_storage)},
             };
             ctx_server.queue_results.add_waiting_task_id(task.id);
             ctx_server.queue_tasks.post(std::move(task));

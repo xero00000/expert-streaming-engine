@@ -46,6 +46,7 @@ from tools.hardware_profile import (
     HardwareProfileError,
     build_hardware_profile,
     collect_hardware_identity,
+    cuda_device_uuids,
     default_profile_path,
     hardware_fingerprint,
     load_hardware_profile,
@@ -81,6 +82,8 @@ class GPUInfo:
     name: str
     total_bytes: int
     free_bytes: int
+    uuid: str = ""
+    nvml_index: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,6 +166,193 @@ class HardwareInfo:
     @property
     def free_vram(self) -> int:
         return sum(g.free_bytes for g in self.gpus)
+
+
+@dataclasses.dataclass(frozen=True)
+class _NativePlacement:
+    hardware: HardwareInfo
+    gpu_layers: int | None
+    tensor_split: str | None
+    split_mode: str
+    extra_args: tuple[str, ...]
+
+
+# Native options with a following value. Skip their values when locating
+# placement flags, so a literal prompt or filename such as "--device" stays data.
+_NATIVE_VALUE_FLAGS = frozenset({
+    '--adaptive-decay', '--adaptive-target', '--alias', '--allowlist-keyword', '--allowlist-keyword-delay',
+    '--allowlist-pieces', '--allowlist-unicode-rule', '--api-key', '--api-key-file', '--attention',
+    '--attention-max-batch', '--audio', '--banned-n', '--banned-string-file', '--batch-size',
+    '--binary-file', '--cache-ram', '--cache-ram-n-min', '--cache-ram-similarity', '--cache-type-k-first',
+    '--cache-type-k-last', '--cache-type-v-first', '--cache-type-v-last', '--cfg-negative-prompt', '--cfg-negative-prompt-file',
+    '--cfg-scale', '--chat-template', '--chat-template-file', '--chat-template-kwargs', '--chunk',
+    '--chunk-separator', '--chunk-size', '--chunks', '--context-file', '--context-shift',
+    '--control-vector', '--control-vector-layer-range', '--control-vector-scaled', '--ctx-checkpoints', '--ctx-checkpoints-eviction',
+    '--ctx-checkpoints-interval', '--ctx-checkpoints-tolerance', '--ctx-size', '--ctx-size-draft', '--cuda-params',
+    '--defrag-thold', '--device', '--device-draft', '--draft', '--draft-max',
+    '--draft-min', '--draft-n', '--draft-n-min', '--draft-output', '--draft-output-file',
+    '--draft-p-min', '--draft-params', '--dry-allowed-length', '--dry-base', '--dry-multiplier',
+    '--dry-penalty-last-n', '--dry-sequence-breaker', '--dsa-top-k', '--dynatemp-exp', '--dynatemp-range',
+    '--embd-normalize', '--embd-output-format', '--embd-separator', '--ese-ple-cache-mib', '--ese-ple-mode',
+    '--ese-ple-queue-depth', '--expert-cache-min-observations', '--expert-hybrid-cpu-ns-per-expert', '--expert-hybrid-gpu-experts', '--expert-hybrid-maximum-drift-ppm',
+    '--expert-hybrid-minimum-cpu-calls', '--expert-hybrid-upload-ns-per-expert', '--expert-load-workers', '--expert-prefill-staging-mib', '--expert-ram-cache-mib',
+    '--expert-ram-staging-mib', '--expert-storage-backend', '--expert-vram-cache-mib', '--expert-vram-reserve-mib', '--expiring-logit-bias-file',
+    '--file', '--fit-margin', '--flash-attn', '--frequency-penalty', '--from-chunk',
+    '--fused-delta-net', '--gpu-fit-margin', '--gpu-layers', '--gpu-layers-draft', '--grammar',
+    '--grammar-file', '--graph-attn-precision', '--graph-reduce-type', '--grp-attn-n', '--grp-attn-w',
+    '--hellaswag-tasks', '--hf-file', '--hf-repo', '--host', '--image',
+    '--image-max-tokens', '--image-min-tokens', '--in-file', '--in-prefix', '--in-suffix',
+    '--json-schema', '--junk', '--keep', '--kl-divergence-base', '--log-format',
+    '--logdir', '--logit-bias', '--lookup-cache-dynamic', '--lookup-cache-static', '--lora',
+    '--lora-scaled', '--main-gpu', '--max-context', '--max-extra-alloc', '--max-gpu',
+    '--max-ram', '--memory-policy', '--method', '--min-kv-quality', '--min-p',
+    '--mirostat', '--mirostat-ent', '--mirostat-lr', '--mla-use', '--mmproj',
+    '--mmproj-url', '--model', '--model-draft', '--model-url', '--mtmd-kq-type',
+    '--mtp-requantize-output-tensor', '--multiple-choice-tasks', '--n-cpu-moe', '--n-gpu-layers', '--n-gpu-layers-draft',
+    '--n-predict', '--n-repetitions', '--negative-file', '--numa', '--offload-policy',
+    '--output', '--output-draft', '--output-file', '--output-format', '--output-frequency',
+    '--override-kv', '--override-tensor', '--p-split', '--parallel', '--path',
+    '--pca-batch', '--pca-iter', '--pooling', '--port', '--pos',
+    '--positive-file', '--ppl-output-type', '--ppl-stride', '--predict', '--prefetch-experts-threads',
+    '--presence-penalty', '--print-token-count', '--prompt', '--prompt-cache', '--reasoning',
+    '--reasoning-budget', '--reasoning-budget-message', '--reasoning-format', '--reasoning-tokens', '--recurrent-ckpt-mode',
+    '--repeat-last-n', '--repeat-penalty', '--reserve-vram', '--resource-preference', '--reverse-prompt',
+    '--rope-freq-base', '--rope-freq-scale', '--rope-scale', '--rope-scaling', '--rpc',
+    '--samplers', '--sampling-seq', '--save-all-logits', '--save-frequency', '--seed',
+    '--sequences', '--slot-prompt-similarity', '--slot-save-path', '--smart-expert-reduction', '--spec-ckpt-mode',
+    '--spec-ngram-min-hits', '--spec-ngram-size-m', '--spec-ngram-size-n', '--spec-replace', '--spec-stage',
+    '--spec-type', '--split-mode', '--sql-save-file', '--sqlite-zstd-ext-file', '--ssl-cert-file',
+    '--ssl-key-file', '--suffix-corpus', '--suffix-max-depth', '--suffix-pattern-len', '--system-prompt-file',
+    '--temp', '--tensor-split', '--tfs', '--threads', '--threads-batch',
+    '--threads-batch-draft', '--threads-draft', '--threads-http', '--threads-mtmd', '--timeout',
+    '--top-k', '--top-n-sigma', '--top-p', '--transient-mmproj-mib', '--transient-mtp-mib',
+    '--transient-vram-budget-mib', '--transient-vram-reserve-mib', '--typical', '--ubatch-size', '--verbosity',
+    '--webui', '--winogrande-tasks', '--worst-graph-tokens', '--xtc-probability', '--xtc-threshold',
+    '--yarn-attn-factor', '--yarn-beta-fast', '--yarn-beta-slow', '--yarn-ext-factor', '--yarn-orig-ctx',
+    '-a', '-amb', '-b', '-bf', '-c',
+    '-cd', '-cram', '-cram-n-min', '-crs', '-ctk-first',
+    '-ctk-last', '-ctv-first', '-ctv-last', '-ctx-ckpt', '-ctx-ckpt-e',
+    '-ctx-ckpt-i', '-ctx-ckpt-t', '-cuda', '-dev', '-devd',
+    '-draft', '-dsatk', '-dt', '-f', '-fa',
+    '-fdn', '-gan', '-gap', '-gaw', '-gfm',
+    '-grt', '-hff', '-hfr', '-j', '-l',
+    '-lcd', '-lcs', '-ld', '-m', '-md',
+    '-mea', '-mg', '-mla', '-mtprot', '-mu',
+    '-n', '-ncmoe', '-ngl', '-ngld', '-np',
+    '-npl', '-npp', '-nrep', '-ns', '-ntg',
+    '-o', '-ofreq', '-okv', '-op', '-ot',
+    '-p', '-ps', '-ptc', '-r', '-rea',
+    '-s', '-ser', '-sm', '-spf', '-sps',
+    '-t', '-tb', '-tbd', '-td', '-tm',
+    '-to', '-ts', '-ub', '-wgt',
+})
+
+
+def _native_placement(
+    hardware: HardwareInfo,
+    extra_args: Sequence[str],
+    *,
+    gpu_layers: int | None = None,
+    tensor_split: str | None = None,
+) -> _NativePlacement:
+    """Apply native placement overrides before launcher budgets and calibration."""
+    extra = list(extra_args)
+    if extra and extra[0] == "--":
+        extra.pop(0)
+    aliases = {
+        "-dev": "--device", "--device": "--device",
+        "-mg": "--main-gpu", "--main-gpu": "--main-gpu",
+        "-sm": "--split-mode", "--split-mode": "--split-mode",
+        "-ts": "--tensor-split", "--tensor-split": "--tensor-split",
+        "-ngl": "--gpu-layers", "--gpu-layers": "--gpu-layers",
+        "--n-gpu-layers": "--gpu-layers",
+    }
+    placement: dict[str, str] = {}
+    forwarded: list[str] = []
+    index = 0
+    while index < len(extra):
+        option = extra[index].replace("_", "-")
+        canonical = aliases.get(option)
+        if canonical is None:
+            forwarded.append(extra[index])
+            index += 1
+            if option in _NATIVE_VALUE_FLAGS and index < len(extra):
+                forwarded.append(extra[index])
+                index += 1
+            continue
+        if index + 1 == len(extra):
+            raise ESEError(f"{option} requires a value")
+        value = extra[index + 1]
+        if canonical in ("--main-gpu", "--gpu-layers"):
+            if re.fullmatch(r"[+-]?\d+", value) is None:
+                raise ESEError(f"{option} requires an integer")
+            number = int(value)
+            if number < (-1 if canonical == "--gpu-layers" else 0):
+                raise ESEError(f"{option} has an invalid negative value")
+            if canonical == "--gpu-layers":
+                gpu_layers = None if number == -1 else number
+        elif canonical == "--split-mode" and value not in ("none", "layer", "graph", "attn"):
+            raise ESEError("--split-mode must be none, layer, graph, or attn")
+        elif canonical == "--tensor-split":
+            tensor_split = value
+        placement[canonical] = value
+        index += 2
+
+    selected = hardware.gpus
+    if "--device" in placement:
+        names = placement["--device"].split(",")
+        if names in (["none"], ["CPU"]):
+            selected = ()
+            placement["--device"] = "none"
+        else:
+            by_name = {f"CUDA{gpu.index}": gpu for gpu in hardware.gpus}
+            if len(set(names)) != len(names):
+                raise ESEError("--device cannot contain duplicate CUDA devices")
+            unavailable = [name for name in names if name not in by_name]
+            if unavailable:
+                if not hardware.gpus and all(name and not name.startswith("CUDA") for name in names):
+                    # CUDA telemetry does not describe Metal, Vulkan, RPC, or
+                    # other native backends. Preserve their existing passthrough
+                    # behavior without assigning them NVIDIA memory budgets.
+                    selected = ()
+                else:
+                    raise ESEError(f"--device names an unavailable CUDA device: {unavailable[0]}")
+            else:
+                selected = tuple(by_name[name] for name in names)
+    if tensor_split is not None:
+        try:
+            weights = [float(value) for value in re.split(r"[,/]+", tensor_split)]
+        except ValueError as exc:
+            raise ESEError("--tensor-split requires comma- or slash-separated numbers") from exc
+        if not weights or any(not math.isfinite(value) or value < 0 for value in weights):
+            raise ESEError("--tensor-split weights must be finite and nonnegative")
+        if selected and len(weights) > len(selected):
+            raise ESEError("--tensor-split has more weights than the selected device list")
+    main_gpu = int(placement.get("--main-gpu", "0"))
+    if selected and main_gpu >= len(selected):
+        raise ESEError("--main-gpu index is outside the selected device list")
+    split_mode = placement.get("--split-mode", "layer")
+    if selected and split_mode == "none":
+        selected = (selected[main_gpu],)
+    if gpu_layers == 0:
+        selected = ()
+    for option in ("--device", "--split-mode", "--main-gpu"):
+        if option in placement:
+            forwarded.extend((option, placement[option]))
+    return _NativePlacement(
+        dataclasses.replace(hardware, gpus=selected), gpu_layers, tensor_split,
+        split_mode, tuple(forwarded),
+    )
+
+
+def _placement_hardware_identity(
+    hardware: HardwareInfo, identity: dict[str, Any]
+) -> dict[str, Any]:
+    # Measurements are bound to physical UUIDs in selected order. Native CUDA
+    # ordinals can differ from a calibration made with restricted visibility.
+    if all(gpu.uuid for gpu in hardware.gpus):
+        return {**identity, "cuda_devices": [gpu.uuid for gpu in hardware.gpus]}
+    return identity
 
 
 @dataclasses.dataclass(frozen=True)
@@ -489,29 +679,41 @@ def detect_nvidia_gpus() -> tuple[GPUInfo, ...]:
     output = _run_capture(
         (
             "nvidia-smi",
-            "--query-gpu=index,name,memory.total,memory.free",
+            "--query-gpu=index,uuid,name,memory.total,memory.free",
             "--format=csv,noheader,nounits",
         )
     )
     if not output:
         return ()
-    result: list[GPUInfo] = []
+    telemetry: dict[str, GPUInfo] = {}
     for line in output.splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) != 4:
+        if len(parts) != 5:
             continue
         try:
-            result.append(
-                GPUInfo(
-                    index=int(parts[0]),
-                    name=parts[1],
-                    total_bytes=int(float(parts[2]) * MIB),
-                    free_bytes=int(float(parts[3]) * MIB),
-                )
+            gpu = GPUInfo(
+                index=int(parts[0]),
+                uuid=parts[1].lower(),
+                nvml_index=int(parts[0]),
+                name=parts[2],
+                total_bytes=int(float(parts[3]) * MIB),
+                free_bytes=int(float(parts[4]) * MIB),
             )
         except ValueError:
             continue
-    return tuple(sorted(result, key=lambda gpu: gpu.index))
+        if gpu.uuid in telemetry:
+            raise ESEError("NVIDIA memory telemetry contains duplicate GPU identities")
+        telemetry[gpu.uuid] = gpu
+    visible = cuda_device_uuids()
+    if visible is None:
+        raise ESEError("cannot discover CUDA devices; check the NVIDIA driver or use a CPU runtime")
+    result: list[GPUInfo] = []
+    for ordinal, device_uuid in enumerate(visible):
+        gpu = telemetry.get(device_uuid.lower())
+        if gpu is None:
+            raise ESEError(f"memory telemetry is unavailable for CUDA device {ordinal} ({device_uuid})")
+        result.append(dataclasses.replace(gpu, index=ordinal, uuid=device_uuid))
+    return tuple(result)
 
 
 def detect_host_memory() -> HostMemory:
@@ -590,10 +792,11 @@ def _server_supports_cuda(binary: Path) -> bool:
 
 
 def _hardware_for_server(binary: Path) -> HardwareInfo:
-    hardware = detect_hardware()
-    if hardware.gpus and not _server_supports_cuda(binary):
-        return dataclasses.replace(hardware, gpus=())
-    return hardware
+    if not _server_supports_cuda(binary):
+        return HardwareInfo(
+            host=detect_host_memory(), gpus=(), logical_cpus=max(1, os.cpu_count() or 1)
+        )
+    return detect_hardware()
 
 
 _SPLIT_RE = re.compile(
@@ -1104,6 +1307,7 @@ def build_launch_plan(
     ubatch_size: int | None = None,
     kv_type: str = "auto",
     reserve_vram: int = GIB,
+    gpu_layers: int | None = None,
     gpu_resident_moe: int | None = None,
     tensor_split: str | None = None,
     prefetch_tail: int = 0,
@@ -1121,12 +1325,20 @@ def build_launch_plan(
     hybrid_selection: str = "automatic hybrid routing was not evaluated",
     extra_args: Sequence[str] = (),
 ) -> LaunchPlan:
+    placement = _native_placement(
+        hardware, extra_args, gpu_layers=gpu_layers, tensor_split=tensor_split,
+    )
+    hardware = placement.hardware
+    gpu_layers = placement.gpu_layers
+    tensor_split = placement.tensor_split
     if slots < 1:
         raise ESEError("--slots must be positive")
     if context < slots or context % slots:
         raise ESEError("--context must divide evenly across --slots")
     if reserve_vram < 0:
         raise ESEError("--reserve-vram cannot be negative")
+    if gpu_layers is not None and gpu_layers < 0:
+        raise ESEError("--gpu-layers cannot be negative")
     if not 0 <= prefetch_tail <= 32:
         raise ESEError("--prefetch-tail must be between 0 and 32")
     selected_policy, reason = select_policy(model, hardware, policy)
@@ -1140,7 +1352,9 @@ def build_launch_plan(
     threads = threads or decode_default
     batch_threads = batch_threads or batch_default
     kv = choose_kv_type(kv_type, context, hardware, reserve_vram)
-    split = tensor_split or auto_tensor_split(hardware.gpus)
+    split = tensor_split or (
+        None if placement.split_mode == "none" else auto_tensor_split(hardware.gpus)
+    )
     if expert_storage_backend not in (None, "mmap", "pread", "io_uring"):
         raise ESEError("--expert-storage-backend must be mmap, pread, or io_uring")
     if expert_cache_min_observations < 1:
@@ -1160,21 +1374,23 @@ def build_launch_plan(
     if hybrid_minimum_cpu_calls < 1:
         raise ESEError("hybrid runtime guard requires at least one CPU call")
 
-    args: list[str] = [
-        "-m",
-        str(model.requested_path),
-        "--memory-policy",
-        policy,
-        "--max-ram",
-        f"{hardware.host.available_bytes}B",
-        "--reserve-vram",
-        f"{reserve_vram}B",
-        "--min-kv-quality",
-        "turbo4",
-        "--max-context",
-        str(context),
-        "--resource-preference",
-        "balanced",
+    args: list[str] = ["-m", str(model.requested_path)]
+    if gpu_layers is None:
+        args.extend([
+            "--memory-policy",
+            policy,
+            "--max-ram",
+            f"{hardware.host.available_bytes}B",
+            "--reserve-vram",
+            f"{reserve_vram}B",
+            "--min-kv-quality",
+            "turbo4",
+            "--max-context",
+            str(context),
+            "--resource-preference",
+            "balanced",
+        ])
+    args.extend([
         "-c",
         str(context),
         "-np",
@@ -1193,7 +1409,7 @@ def build_launch_plan(
         kv,
         "-ctv",
         kv,
-    ]
+    ])
     env: dict[str, str] = {}
     if split:
         args.extend(("--tensor-split", split))
@@ -1204,8 +1420,8 @@ def build_launch_plan(
         ))
 
     if selected_policy == "resident":
-        args.extend(("-ngl", "99"))
-        if hardware.gpus and model.total_bytes > int(hardware.free_vram * 0.85):
+        args.extend(("-ngl", str(gpu_layers if gpu_layers is not None else 99)))
+        if gpu_layers is None and hardware.gpus and model.total_bytes > int(hardware.free_vram * 0.85):
             args.append("--fit")
         if batch_size is not None:
             args.extend(("-b", str(batch_size)))
@@ -1213,6 +1429,8 @@ def build_launch_plan(
             args.extend(("-ub", str(ubatch_size)))
 
     elif selected_policy == "hybrid":
+        if gpu_layers is not None:
+            raise ESEError("--gpu-layers currently requires --policy resident")
         if not model.is_moe:
             raise ESEError("--policy hybrid requires a sparse MoE model")
         args.extend(("-ngl", "99"))
@@ -1222,6 +1440,8 @@ def build_launch_plan(
         args.extend(("-b", str(batch_size or 1024), "-ub", str(ubatch_size or 512)))
 
     elif selected_policy in ("cache", "stream"):
+        if gpu_layers is not None:
+            raise ESEError("--gpu-layers currently requires --policy resident")
         if not model.is_moe:
             raise ESEError(f"--policy {selected_policy} requires a sparse MoE model")
         # Streaming must not pin the model's potentially enormous CPU tensor
@@ -1251,6 +1471,14 @@ def build_launch_plan(
             if expert_vram_cache is not None
             else _default_expert_vram_cache(hardware, reserve_vram)
         )
+        if (
+            hybrid_gpu_experts == 0
+            and hybrid_selection == "calibration selected the established all-CPU expert path"
+        ):
+            # A positive adaptive cache sends decode experts to the GPU even
+            # without a mixed split. Apply the selected CPU endpoint to its
+            # cache capacity as well as the route count.
+            vram_cache = 0
         args.extend(("-ngl", "99"))
         if selected_policy == "stream":
             args.append("--defer-experts")
@@ -1308,10 +1536,7 @@ def build_launch_plan(
     else:
         raise ESEError(f"unknown policy: {selected_policy}")
 
-    cleaned_extra = list(extra_args)
-    if cleaned_extra and cleaned_extra[0] == "--":
-        cleaned_extra.pop(0)
-    args.extend(cleaned_extra)
+    args.extend(placement.extra_args)
 
     return LaunchPlan(
         policy=selected_policy,
@@ -1746,7 +1971,7 @@ def _validate_hybrid(args: argparse.Namespace) -> int:
     if candidate.hybrid_gpu_experts <= 0:
         raise ESEError(candidate.hybrid_selection)
     baseline = _baseline_hybrid_plan(candidate)
-    current_identity = collect_hardware_identity()
+    current_identity = _placement_hardware_identity(candidate.hardware, collect_hardware_identity())
     evidence_path = args.hybrid_verification.expanduser().resolve()
     prompt = args.prompt or (
         "A careful local ESE benchmark validates deterministic expert routing, "
@@ -1836,6 +2061,28 @@ def _validate_hybrid(args: argparse.Namespace) -> int:
     return 0 if passed else 2
 
 
+def _select_packaged_windows_binary(binary: Path, binary_root: Path) -> Path:
+    """Select a separate packaged CPU server before loading a CUDA-linked PE."""
+    cpu = binary_root / "cpu" / "bin" / "llama-server.exe"
+    if not cpu.is_file():
+        return binary
+    try:
+        marker = json.loads(cpu.with_name("ese-runtime.json").read_text(encoding="utf-8"))
+        valid_cpu = marker.get("cuda") is False
+    except (OSError, ValueError, AttributeError):
+        valid_cpu = False
+    if not valid_cpu:
+        raise ESEError("packaged CPU runtime is missing its CPU-only runtime marker")
+    backend = os.environ.get("ESE_SERVER_BACKEND", "").strip().lower()
+    if backend == "cpu":
+        return cpu.resolve()
+    if backend == "cuda":
+        return binary
+    if _server_supports_cuda(binary) and not cuda_device_uuids():
+        return cpu.resolve()
+    return binary
+
+
 def _resolve_binary(value: str | None, build_dir: Path | None = None) -> Path:
     server_name = "llama-server.exe" if os.name == "nt" else "llama-server"
     if value:
@@ -1856,7 +2103,10 @@ def _resolve_binary(value: str | None, build_dir: Path | None = None) -> Path:
         binary_root / "bin" / "RelWithDebInfo" / server_name,
         binary_root / "bin" / "Debug" / server_name,
     ]
-    return next((candidate.resolve() for candidate in candidates if candidate.is_file()), candidates[0].resolve())
+    binary = next((candidate.resolve() for candidate in candidates if candidate.is_file()), candidates[0].resolve())
+    if os.name == "nt" and build_dir is None:
+        return _select_packaged_windows_binary(binary, binary_root)
+    return binary
 
 
 def _windows_msvc_installation() -> str | None:
@@ -2166,6 +2416,11 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         help="VRAM safety reserve used by KV planning (default: 1GiB)",
     )
     parser.add_argument(
+        "--gpu-layers",
+        type=int,
+        help="resident policy: fixed repeating-layer GPU offload count (disables native --fit)",
+    )
+    parser.add_argument(
         "--gpu-resident-moe",
         type=int,
         help="hybrid/stream: number of final MoE layers retained on GPU",
@@ -2250,7 +2505,7 @@ def _make_parser() -> argparse.ArgumentParser:
         prog="ese",
         description="One front door for resident, hybrid, cached, and disk-streamed ESE inference.",
     )
-    parser.add_argument("--version", action="version", version="ese 0.2.0")
+    parser.add_argument("--version", action="version", version="ese 0.2.1")
     commands = parser.add_subparsers(dest="command", required=True)
 
     doctor = commands.add_parser("doctor", help="inspect build tools, RAM, and GPUs")
@@ -2324,9 +2579,13 @@ def _plan_from_args(
     # host.  Runtime-aware detection also lets the Windows CUDA marker select
     # GPU planning without requiring build tools in the installed package.
     hardware = _hardware_for_server(binary)
+    placement = _native_placement(
+        hardware, args.extra, gpu_layers=getattr(args, "gpu_layers", None),
+        tensor_split=args.tensor_split,
+    )
     hybrid_gpu_experts = 0
     current_identity: dict[str, Any] | None = None
-    selected_policy, _ = select_policy(model, hardware, args.policy)
+    selected_policy, _ = select_policy(model, placement.hardware, args.policy)
     hybrid_selection = "automatic hybrid routing is not used by the selected policy"
     hybrid_candidate = getattr(args, "hybrid_candidate", None)
     if hybrid_candidate is not None and selected_policy not in ("cache", "stream"):
@@ -2336,10 +2595,20 @@ def _plan_from_args(
     if selected_policy in ("cache", "stream") and args.no_auto_hybrid:
         hybrid_selection = "automatic hybrid routing disabled by --no-auto-hybrid"
     elif selected_policy in ("cache", "stream"):
-        current_identity = collect_hardware_identity()
-        hybrid_gpu_experts, hybrid_selection = calibrated_hybrid_gpu_experts(
-            model, args.hardware_profile, current_identity
-        )
+        if not placement.hardware.gpus:
+            hybrid_selection = "automatic hybrid routing disabled: no CUDA device is selected"
+        elif placement.split_mode in ("graph", "attn"):
+            hybrid_selection = (
+                "automatic hybrid routing disabled: native graph/attention splits "
+                "change the calibrated expert component layouts"
+            )
+        else:
+            current_identity = _placement_hardware_identity(
+                placement.hardware, collect_hardware_identity(),
+            )
+            hybrid_gpu_experts, hybrid_selection = calibrated_hybrid_gpu_experts(
+                model, args.hardware_profile, current_identity
+            )
         if hybrid_candidate is not None:
             expert_used = model.expert_used_count
             if expert_used is None or not 1 <= hybrid_candidate < expert_used:
@@ -2382,6 +2651,7 @@ def _plan_from_args(
         ubatch_size=args.ubatch_size,
         kv_type=args.kv,
         reserve_vram=args.reserve_vram,
+        gpu_layers=getattr(args, "gpu_layers", None),
         gpu_resident_moe=args.gpu_resident_moe,
         tensor_split=args.tensor_split,
         prefetch_tail=args.prefetch_tail,
@@ -2400,7 +2670,9 @@ def _plan_from_args(
     plan = build_launch_plan(**plan_arguments)
     if require_hybrid_verification and plan.hybrid_gpu_experts > 0:
         if current_identity is None:
-            current_identity = collect_hardware_identity()
+            current_identity = _placement_hardware_identity(
+                plan.hardware, collect_hardware_identity(),
+            )
         reason = hybrid_verification_reason(
             plan, current_identity, args.hybrid_verification.expanduser().resolve()
         )

@@ -149,6 +149,9 @@ int main(int argc, char ** argv) {
     if (!params.sweep_bench_output_jsonl) {
         LOG_TEE("\n");
         LOG_TEE("%s: n_kv_max = %d, n_batch = %d, n_ubatch = %d, flash_attn = %d, n_gpu_layers = %d, n_threads = %u, n_threads_batch = %u\n", __func__, n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch);
+        LOG_TEE("%s: qwen4exp_ple_mode = %s, qwen4exp_ple_cache_mib = %lld, qwen4exp_ple_queue_depth = %d\n",
+                __func__, params.qwen4exp_ple_mode.c_str(),
+                (long long) params.qwen4exp_ple_cache_mib, params.qwen4exp_ple_queue_depth);
         LOG_TEE("\n");
         LOG_TEE("|%6s | %6s | %6s | %8s | %8s | %8s | %8s |\n", "PP", "TG", "N_KV", "T_PP s", "S_PP t/s", "T_TG s", "S_TG t/s");
         LOG_TEE("|%6s-|-%6s-|-%6s-|-%8s-|-%8s-|-%8s-|-%8s-|\n", "------", "------", "------", "--------", "--------", "--------", "--------");
@@ -255,8 +258,11 @@ int main(int argc, char ** argv) {
         if(params.sweep_bench_output_jsonl) {
             LOG_TEE(
                 "{\"n_kv_max\": %d, \"n_batch\": %d, \"n_ubatch\": %d, \"flash_attn\": %d, \"n_gpu_layers\": %d, \"n_threads\": %u, \"n_threads_batch\": %u, "
+                "\"qwen4exp_ple_mode\": \"%s\", \"qwen4exp_ple_cache_mib\": %lld, \"qwen4exp_ple_queue_depth\": %d, "
                 "\"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f }\n",
                 n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch,
+                params.qwen4exp_ple_mode.c_str(), (long long) params.qwen4exp_ple_cache_mib,
+                params.qwen4exp_ple_queue_depth,
                 pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg
             );
         } else {

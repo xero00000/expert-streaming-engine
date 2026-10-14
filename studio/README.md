@@ -30,6 +30,11 @@ Concurrent serving currently requires a dense resident plan. ESE refuses
 parallel MoE, hybrid, cache, and stream plans until their multi-sequence output
 parity gate passes; those modes continue to use one session safely.
 
+Qwen4Exp models are discovered with an **Experimental** badge and
+**Validation gated** availability. Normal builds disable their text inference,
+and Studio prevents launching them. Their vision and MTP capabilities are
+unsupported.
+
 Before a measured sweep starts, Studio stops its managed model and checks for
 unmanaged `llama-server` instances and external CUDA processes using at least
 512 MiB in aggregate. A blocked preflight identifies the process and PID rather
@@ -53,9 +58,24 @@ are recognized rather than overwritten. Use `HF_TOKEN` or
 
 ## Linux install
 
-The v0.2.0 AppImage, DEB, and RPM packages contain both Studio and ESE. Use the
+The AppImage, DEB, and RPM packages contain both Studio and ESE. Use the
 AppImage for signed in-app updating, or use the distribution package and apply
 future package updates through APT/DNF.
+
+The Linux ESE launcher requires Python 3.10 or newer and the system OpenMP
+runtime. DEB and RPM packages declare these dependencies. AppImage users must
+provide them on the host (`python3` and `libgomp1` on Ubuntu/Debian, or `python3`
+and `libgomp` on Fedora). The AppImage also uses the host's graphical session.
+
+The CPU package runs without an NVIDIA driver. A Linux CUDA package bundles
+the CUDA runtime, cuBLAS, and linked NCCL shared libraries and their license
+notices; it requires a compatible NVIDIA driver on the host. The CUDA toolkit
+is required to build that package from source. Select a CPU package for a
+system without an NVIDIA driver.
+
+Use `pnpm package:linux` when building the Linux release packages. This entry
+point preserves NVIDIA runtime files and keeps host driver libraries out of
+the AppImage. Linux release packaging currently targets x86_64.
 
 For a local source build from the repository root, run:
 
@@ -165,7 +185,7 @@ pnpm build
 cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
-pnpm tauri build --bundles deb,rpm --config src-tauri/tauri.unsigned.conf.json       # Linux source package
+pnpm package:linux --bundles appimage,deb,rpm --config src-tauri/tauri.unsigned.conf.json # Linux source packages
 pnpm tauri build --bundles nsis,msi --config src-tauri/tauri.unsigned.conf.json      # Windows source package
 ```
 

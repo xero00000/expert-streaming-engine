@@ -1,6 +1,7 @@
 #pragma once
 
 #include "transient-policy.h"
+#include "llama.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -58,6 +59,7 @@ struct common_resource_plan_input {
     uint64_t expert_source_bytes = 0;
     uint64_t requested_expert_ram_bytes = 0;
     uint64_t min_expert_ram_bytes = 0;
+    uint64_t qwen4exp_ple_ram_bytes = 0;
     uint64_t requested_aux_ram_bytes = 0;
     uint64_t requested_expert_vram_bytes_per_device = 0;
     // Total bytes for two independent whole-layer prefill staging lanes on
@@ -87,6 +89,10 @@ struct common_resource_plan_input {
     // Missing or zero entries are unavailable.
     uint64_t kv_bytes_per_token[COMMON_KV_QUALITY_F16 + 1] = {};
     std::vector<common_resource_device_input> devices;
+    // Exact native tensor-payload query for the candidate context. Zero marks
+    // an unavailable quality; UINT64_MAX marks an unrepresentable estimate.
+    std::function<uint64_t(common_kv_quality, uint32_t)> kv_bytes_for_context;
+    uint64_t host_graph_metadata_bytes = 0;
 };
 
 struct common_resource_device_plan {
@@ -114,6 +120,7 @@ struct common_resource_plan {
     uint64_t ram_capacity_bytes = 0;
     uint64_t ram_planned_bytes = 0;
     uint64_t expert_ram_bytes = 0;
+    uint64_t qwen4exp_ple_ram_bytes = 0;
     uint64_t aux_ram_bytes = 0;
     uint64_t io_staging_bytes = 0;
     // The transient device and module bounds remain serialized even when the
@@ -129,6 +136,9 @@ struct common_resource_plan {
     bool draft_resident = false;
     std::string reason;
     std::vector<common_resource_device_plan> devices;
+    bool kv_native_sizing = false;
+    std::function<uint64_t(uint32_t)> kv_bytes_for_context;
+    uint64_t host_graph_metadata_bytes = 0;
 };
 
 struct common_resource_transition_stats {
@@ -138,6 +148,12 @@ struct common_resource_transition_stats {
     uint64_t prepare_failures = 0;
     uint64_t commit_failures = 0;
 };
+
+std::function<uint64_t(ggml_type,uint32_t)> common_native_cache_query(
+        const llama_model * model, ggml_type indexer_type, int32_t mla_attention,
+        uint32_t slots, bool flash_attention);
+bool common_resource_bind_native_cache_query(common_resource_plan & plan,
+        const llama_model * model, ggml_type indexer_type, int32_t mla_attention, bool flash_attention);
 
 // A zero context leaves the current context unchanged. Expert-cache changes
 // are explicit because zero is itself a valid request that disables the pool.
@@ -173,6 +189,48 @@ struct common_resource_preparation_peak {
     bool prepares_expert_cache = false;
     bool prepares_transient = false;
     std::vector<common_resource_device_preparation_peak> devices;
+    // Combined RAM reservations and host non-weight allocations. Zero capacity
+    // means no RAM budget was supplied. Host device reserves also bound usable
+    // RAM; host dense weights are already included in ram_planned_bytes.
+    uint64_t ram_capacity_bytes = 0;
+    uint64_t ram_usable_bytes = 0;
+    uint64_t ram_current_bytes = 0;
+    uint64_t ram_target_bytes = 0;
+    uint64_t ram_peak_bytes = 0;
+    uint64_t ram_peak_headroom_bytes = 0;
+    // Additional tracked host bytes beyond existing graph/weight/PLE reserves.
+    uint64_t ram_tracked_extra_bytes = 0;
+    uint64_t ram_host_weights_limit_bytes = 0;
+    uint64_t ram_host_fixed_limit_bytes = 0;
+    uint64_t ram_host_ple_cache_limit_bytes = 0;
+    uint64_t prepared_host_metadata_bytes = 0;
+    uint64_t prepared_host_staging_bytes = 0;
+};
+
+// Tracked accelerator allocations that remain live across a rebalance.
+// fixed_bytes includes separate graph/pool backing, checkpoints, output and
+// handoff buffers, excluding KV, expert caches and transient module owners.
+struct common_resource_device_memory {
+    int id = 0;
+    uint64_t weights_bytes = 0;
+    uint64_t fixed_bytes = 0;
+};
+
+// Live allocated host capacity. Mapped weight spans are deliberately excluded.
+// fixed_bytes includes graph/output, checkpoint/handoff, metadata/journals and
+// PLE staging. PLE cache backing is separate to reuse its existing reservation.
+// KV and native expert/auxiliary arenas retain their distinct plan accounting.
+struct common_resource_host_memory {
+    uint64_t weights_bytes = 0;
+    uint64_t fixed_bytes = 0;
+    uint64_t ple_cache_bytes = 0;
+};
+
+struct common_resource_kv_preparation {
+    std::vector<llama_kv_preparation_device> current;
+    std::vector<llama_kv_preparation_device> target;
+    uint64_t host_metadata_bytes = 0;
+    uint64_t host_staging_bytes = 0;
 };
 
 struct common_expert_split_input {
@@ -234,6 +292,15 @@ bool common_resource_rebalance_target(
     common_resource_plan & target,
     std::string & error);
 
+// Raise immutable weight/graph forecasts to the tracked live floors in both
+// preparation plans. Preserves larger forecasts. Requires exact accelerator
+// identity coverage; failures leave both plans unchanged.
+bool common_resource_reconcile_device_memory(
+    common_resource_plan & current,
+    common_resource_plan & target,
+    const std::vector<common_resource_device_memory> & memory,
+    std::string & error);
+
 // Validate the double-buffer preparation peak for a derived target. A pool is
 // treated as a whole-plan replacement when its context/allocation differs on
 // any device; its complete target allocation is then counted on every device.
@@ -247,6 +314,31 @@ bool common_resource_rebalance_preparation_peak(
     std::string & error,
     bool force_expert_cache_preparation = false,
     bool force_transient_preparation = false);
+
+// Include tracked host floors without changing serialized plan reservations.
+// The original overload retains its existing behavior for callers with no
+// owner-thread memory snapshot. Failures leave report unchanged.
+bool common_resource_rebalance_preparation_peak(
+    const common_resource_plan & current,
+    const common_resource_plan & target,
+    common_resource_preparation_peak & report,
+    std::string & error,
+    bool force_expert_cache_preparation,
+    bool force_transient_preparation,
+    const common_resource_host_memory * tracked_host);
+
+// Use actual current KV placement and native replacement allocation requests.
+// Host KV is included even when the policy has no host device row. Metadata
+// and migration scratch are additional temporary RAM above the live floors.
+bool common_resource_rebalance_preparation_peak(
+    const common_resource_plan & current,
+    const common_resource_plan & target,
+    common_resource_preparation_peak & report,
+    std::string & error,
+    bool force_expert_cache_preparation,
+    bool force_transient_preparation,
+    const common_resource_host_memory * tracked_host,
+    const common_resource_kv_preparation * native_kv);
 
 bool common_expert_split_solve(
     const common_expert_split_input & input,

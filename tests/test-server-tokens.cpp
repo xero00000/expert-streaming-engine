@@ -86,7 +86,27 @@ static void test_response_timeout_is_not_starved_by_unrelated_results() {
     CHECK(elapsed < std::chrono::milliseconds(1400));
 }
 
+static void test_queued_result_releases_derived_resources() {
+    bool destroyed = false;
+    struct owned_error : server_task_result_error {
+        bool & destroyed;
+        explicit owned_error(bool & flag) : destroyed(flag) {}
+        ~owned_error() override { destroyed = true; }
+    };
+    {
+        server_response responses;
+        responses.add_waiting_task_id(7);
+        auto result = std::make_unique<owned_error>(destroyed);
+        result->id = 7;
+        result->err_msg = "owned error payload";
+        responses.send(std::move(result));
+        CHECK(!destroyed);
+    }
+    CHECK(destroyed);
+}
+
 int main() {
+    test_queued_result_releases_derived_resources();
     server_tokens tokens(llama_tokens {}, true);
     tokens.push_back(11);
     tokens.push_back(12);

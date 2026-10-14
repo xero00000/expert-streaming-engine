@@ -1,0 +1,190 @@
+[
+  {
+    "backend": "CPU",
+    "results": [
+      {
+        "case": "attention-d64-t1",
+        "max_absolute_errors": {
+          "attended": 0.0007519721984863281,
+          "output": 2.457946538925171e-05
+        }
+      },
+      {
+        "case": "attention-d64-t3",
+        "max_absolute_errors": {
+          "attended": 0.0006924867630004883,
+          "output": 3.405474126338959e-05
+        }
+      },
+      {
+        "case": "attention-d64-t17",
+        "max_absolute_errors": {
+          "attended": 0.0009531676769256592,
+          "output": 6.146814121166244e-05
+        }
+      },
+      {
+        "case": "attention-d512-t1",
+        "max_absolute_errors": {
+          "attended": 0.0009940862655639648,
+          "output": 8.074939250946045e-05
+        }
+      },
+      {
+        "case": "attention-d512-t3",
+        "max_absolute_errors": {
+          "attended": 0.0009177327156066895,
+          "output": 0.00015067681670188904
+        }
+      },
+      {
+        "case": "attention-d512-t17",
+        "max_absolute_errors": {
+          "attended": 0.0012567639350891113,
+          "output": 0.00016847997903823853
+        }
+      }
+    ]
+  },
+  {
+    "backend": "CUDA0",
+    "results": [
+      {
+        "case": "attention-d64-t1",
+        "max_absolute_errors": {
+          "attended": 0.0002841651439666748,
+          "output": 1.3932585716247559e-05
+        }
+      },
+      {
+        "case": "attention-d64-t3",
+        "max_absolute_errors": {
+          "attended": 0.00045162439346313477,
+          "output": 2.3952219635248184e-05
+        }
+      },
+      {
+        "case": "attention-d64-t17",
+        "max_absolute_errors": {
+          "attended": 0.00054931640625,
+          "output": 4.298519343137741e-05
+        }
+      },
+      {
+        "case": "attention-d512-t1",
+        "max_absolute_errors": {
+          "attended": 0.0007386207580566406,
+          "output": 0.00011523067951202393
+        }
+      },
+      {
+        "case": "attention-d512-t3",
+        "max_absolute_errors": {
+          "attended": 0.0005888938903808594,
+          "output": 9.407807374373078e-05
+        }
+      },
+      {
+        "case": "attention-d512-t17",
+        "max_absolute_errors": {
+          "attended": 0.0005668997764587402,
+          "output": 0.0001489664427936077
+        }
+      }
+    ]
+  },
+  {
+    "backend": "CUDA1",
+    "results": [
+      {
+        "case": "attention-d64-t1",
+        "max_absolute_errors": {
+          "attended": 0.0002841651439666748,
+          "output": 1.3928860425949097e-05
+        }
+      },
+      {
+        "case": "attention-d64-t3",
+        "max_absolute_errors": {
+          "attended": 0.00045162439346313477,
+          "output": 2.3952219635248184e-05
+        }
+      },
+      {
+        "case": "attention-d64-t17",
+        "max_absolute_errors": {
+          "attended": 0.00054931640625,
+          "output": 4.1435472667217255e-05
+        }
+      },
+      {
+        "case": "attention-d512-t1",
+        "max_absolute_errors": {
+          "attended": 0.0007386207580566406,
+          "output": 0.00011523067951202393
+        }
+      },
+      {
+        "case": "attention-d512-t3",
+        "max_absolute_errors": {
+          "attended": 0.0005888938903808594,
+          "output": 9.407807374373078e-05
+        }
+      },
+      {
+        "case": "attention-d512-t17",
+        "max_absolute_errors": {
+          "attended": 0.0005668997764587402,
+          "output": 0.00012789014726877213
+        }
+      }
+    ]
+  },
+  {
+    "backend": "CUDA2",
+    "results": [
+      {
+        "case": "attention-d64-t1",
+        "max_absolute_errors": {
+          "attended": 0.0002841651439666748,
+          "output": 1.3932585716247559e-05
+        }
+      },
+      {
+        "case": "attention-d64-t3",
+        "max_absolute_errors": {
+          "attended": 0.00045162439346313477,
+          "output": 2.3952219635248184e-05
+        }
+      },
+      {
+        "case": "attention-d64-t17",
+        "max_absolute_errors": {
+          "attended": 0.00054931640625,
+          "output": 4.298519343137741e-05
+        }
+      },
+      {
+        "case": "attention-d512-t1",
+        "max_absolute_errors": {
+          "attended": 0.0007386207580566406,
+          "output": 0.00011523067951202393
+        }
+      },
+      {
+        "case": "attention-d512-t3",
+        "max_absolute_errors": {
+          "attended": 0.0005888938903808594,
+          "output": 9.407807374373078e-05
+        }
+      },
+      {
+        "case": "attention-d512-t17",
+        "max_absolute_errors": {
+          "attended": 0.0005668997764587402,
+          "output": 0.0001489664427936077
+        }
+      }
+    ]
+  }
+]

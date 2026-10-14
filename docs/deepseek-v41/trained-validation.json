@@ -1,0 +1,292 @@
+{
+  "scope": "Initial local text checks and sequential cache probes; OS page cache uncontrolled; not a capability benchmark",
+  "package_manifest_sha256": "7420a2c64f4396e1c9d120f3865a4a6a5bc7cda3a2bd61d892e5aeed438fcb43",
+  "runs": [
+    {
+      "run": "native-smoke-05-repaired",
+      "status": "exited",
+      "returncode": 0,
+      "question": "What is 2 + 2? Answer briefly.",
+      "output": "4",
+      "expert_ram_mib": 8192,
+      "expert_vram_mib": 1024,
+      "peak_rss_gib": 22.456371307373047,
+      "wall_seconds": 37.014060974121094,
+      "gpu_peak_used_mib": null,
+      "first_output_seconds": null,
+      "prefill": {
+        "milliseconds": 22434.86,
+        "tokens": 15,
+        "tokens_per_second": 0.6686023447438495
+      },
+      "decode": {
+        "milliseconds": 2070.27,
+        "tokens": 2,
+        "tokens_per_second": 0.9660575673704396
+      },
+      "vram": {
+        "hits": 0,
+        "misses": 240,
+        "load_bytes": 2388787200,
+        "transfer_submit_ns": 1465303902
+      },
+      "ram": {
+        "hits": 81600,
+        "misses": 5520,
+        "bytes_pread": 18314035200,
+        "storage_read_ns": 16792668921,
+        "peak_resident_bytes": 8589680640
+      }
+    },
+    {
+      "run": "native-smoke-06-baseline",
+      "status": "exited",
+      "returncode": 0,
+      "question": "Explain why the sky is blue in two short sentences.",
+      "output": "The sky is blue because tiny air molecules scatter shorter blue wavelengths of sunlight much more strongly than longer red ones. This scattered blue light reaches our eyes from every direction, making the sky appear blue.",
+      "expert_ram_mib": 8192,
+      "expert_vram_mib": 1024,
+      "peak_rss_gib": 22.440876007080078,
+      "wall_seconds": 91.02361130714417,
+      "gpu_peak_used_mib": null,
+      "first_output_seconds": null,
+      "prefill": {
+        "milliseconds": 22070.46,
+        "tokens": 15,
+        "tokens_per_second": 0.679641475528829
+      },
+      "decode": {
+        "milliseconds": 56446.45,
+        "tokens": 40,
+        "tokens_per_second": 0.7086362384171193
+      },
+      "vram": {
+        "hits": 3636,
+        "misses": 5724,
+        "load_bytes": 56972574720,
+        "transfer_submit_ns": 31297800213
+      },
+      "ram": {
+        "hits": 86128,
+        "misses": 17444,
+        "bytes_pread": 57873623040,
+        "storage_read_ns": 49821873894,
+        "peak_resident_bytes": 8589680640
+      }
+    },
+    {
+      "run": "native-smoke-07-tuned",
+      "status": "exited",
+      "returncode": 0,
+      "question": "Explain why the sky is blue in two short sentences.",
+      "output": "The sky is blue because tiny air molecules scatter shorter blue wavelengths of sunlight much more strongly than longer red ones. This scattered blue light reaches our eyes from every direction, making the sky appear blue.",
+      "expert_ram_mib": 12288,
+      "expert_vram_mib": 1280,
+      "peak_rss_gib": 25.61772918701172,
+      "wall_seconds": 89.38815426826477,
+      "gpu_peak_used_mib": {
+        "0": 6989,
+        "1": 6650,
+        "2": 8624
+      },
+      "first_output_seconds": 34.556989431381226,
+      "prefill": {
+        "milliseconds": 22826.04,
+        "tokens": 15,
+        "tokens_per_second": 0.6571442089823727
+      },
+      "decode": {
+        "milliseconds": 54405.09,
+        "tokens": 40,
+        "tokens_per_second": 0.7352253254245146
+      },
+      "vram": {
+        "hits": 3777,
+        "misses": 5583,
+        "load_bytes": 55569162240,
+        "transfer_submit_ns": 31470673486
+      },
+      "ram": {
+        "hits": 88430,
+        "misses": 14719,
+        "bytes_pread": 48834662400,
+        "storage_read_ns": 44157551308,
+        "peak_resident_bytes": 12883415040
+      }
+    },
+    {
+      "run": "native-smoke-08-recall",
+      "status": "exited",
+      "returncode": 0,
+      "question": "Remember this code word: COBALT.\n\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\nThe garden has green leaves and small flowers.\n\nReply with only the code word stated at the beginning.",
+      "output": "COBALT",
+      "expert_ram_mib": 8192,
+      "expert_vram_mib": 1024,
+      "peak_rss_gib": 22.28481674194336,
+      "wall_seconds": 149.40168714523315,
+      "gpu_peak_used_mib": {
+        "0": 6733,
+        "1": 6394,
+        "2": 8368
+      },
+      "first_output_seconds": 143.30895733833313,
+      "prefill": {
+        "milliseconds": 128383.81,
+        "tokens": 168,
+        "tokens_per_second": 1.3085762137764878
+      },
+      "decode": {
+        "milliseconds": 5220.46,
+        "tokens": 4,
+        "tokens_per_second": 0.7662160039536746
+      },
+      "vram": {
+        "hits": 181,
+        "misses": 539,
+        "load_bytes": 5364817920,
+        "transfer_submit_ns": 3085753326
+      },
+      "ram": {
+        "hits": 916458,
+        "misses": 52839,
+        "bytes_pread": 175303802880,
+        "storage_read_ns": 72827500891,
+        "peak_resident_bytes": 8589680640
+      }
+    },
+    {
+      "run": "native-smoke-09-cache16",
+      "status": "exited",
+      "returncode": 0,
+      "question": "Explain why the sky is blue in two short sentences.",
+      "output": "The sky is blue because tiny air molecules scatter shorter blue wavelengths of sunlight much more strongly than longer red ones. This scattered blue light reaches our eyes from every direction, making the sky appear blue.",
+      "expert_ram_mib": 16384,
+      "expert_vram_mib": 1280,
+      "peak_rss_gib": 26.77509307861328,
+      "wall_seconds": 92.50628972053528,
+      "gpu_peak_used_mib": {
+        "0": 6989,
+        "1": 6650,
+        "2": 8624
+      },
+      "first_output_seconds": 36.619731426239014,
+      "prefill": {
+        "milliseconds": 25211.76,
+        "tokens": 15,
+        "tokens_per_second": 0.5949604470294815
+      },
+      "decode": {
+        "milliseconds": 54424.67,
+        "tokens": 40,
+        "tokens_per_second": 0.7349608183200743
+      },
+      "vram": {
+        "hits": 3777,
+        "misses": 5583,
+        "load_bytes": 55569162240,
+        "transfer_submit_ns": 31241240344
+      },
+      "ram": {
+        "hits": 90633,
+        "misses": 12516,
+        "bytes_pread": 41525913600,
+        "storage_read_ns": 43151578747,
+        "peak_resident_bytes": 17179361280
+      }
+    },
+    {
+      "run": "native-smoke-10-code",
+      "status": "exited",
+      "returncode": 0,
+      "question": "Write a Python function square(n) that returns n*n. Return only code.",
+      "output": "```python\ndef square(n):\n    return n * n\n```",
+      "expert_ram_mib": 8192,
+      "expert_vram_mib": 1024,
+      "peak_rss_gib": 21.473785400390625,
+      "wall_seconds": 67.0198335647583,
+      "gpu_peak_used_mib": {
+        "0": 6733,
+        "1": 6394,
+        "2": 8368
+      },
+      "first_output_seconds": 44.676931858062744,
+      "prefill": {
+        "milliseconds": 32034.51,
+        "tokens": 20,
+        "tokens_per_second": 0.6243267026715876
+      },
+      "decode": {
+        "milliseconds": 21356.0,
+        "tokens": 15,
+        "tokens_per_second": 0.7023787226072298
+      }
+    },
+    {
+      "run": "native-smoke-11-fact",
+      "status": "exited",
+      "returncode": 0,
+      "question": "What is the capital of France? Reply with the city name only.",
+      "output": "Paris",
+      "expert_ram_mib": 8192,
+      "expert_vram_mib": 1024,
+      "peak_rss_gib": 22.463607788085938,
+      "wall_seconds": 41.653292179107666,
+      "gpu_peak_used_mib": {
+        "0": 6733,
+        "1": 6394,
+        "2": 8368
+      },
+      "first_output_seconds": 38.595667123794556,
+      "prefill": {
+        "milliseconds": 26289.63,
+        "tokens": 18,
+        "tokens_per_second": 0.6846806136107659
+      },
+      "decode": {
+        "milliseconds": 2035.07,
+        "tokens": 2,
+        "tokens_per_second": 0.9827671775418045
+      }
+    }
+  ],
+  "cache_probe_outputs_identical": true,
+  "quality_checks": [
+    {
+      "name": "arithmetic",
+      "passed": true
+    },
+    {
+      "name": "explanation",
+      "passed": true,
+      "method": "reviewed two coherent sentences explaining wavelength-dependent scattering"
+    },
+    {
+      "name": "compressed_history_recall",
+      "passed": true,
+      "prompt_tokens": 168
+    },
+    {
+      "name": "python_function",
+      "passed": true,
+      "inputs": [
+        -3,
+        0,
+        4
+      ],
+      "expected": [
+        9,
+        0,
+        16
+      ]
+    },
+    {
+      "name": "factual",
+      "passed": true
+    }
+  ],
+  "recommendation": {
+    "expert_ram_mib": 8192,
+    "expert_vram_mib": 1024,
+    "reason": "Conservative memory use; larger-cache gains small in sequential probes with uncontrolled OS page cache"
+  }
+}

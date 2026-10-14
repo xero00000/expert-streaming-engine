@@ -1,0 +1,57 @@
+{
+  "exe": "/home/xero/Desktop/test/strata/Strata-main/engine/strata",
+  "args": [
+    "--pack",
+    "/home/xero/Desktop/strata/Strata-data/packs/coder-iq1_m",
+    "--native",
+    "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+    "--ple-gguf",
+    "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+    "--expert-profile",
+    "/home/xero/Desktop/test/strata/Strata-main/data/expert-profile-coder.bin",
+    "--expert-cache",
+    "auto",
+    "--prefill",
+    "1024",
+    "--spec",
+    "4",
+    "--mtp",
+    "/home/xero/Desktop/strata/Strata-data/mtp/rt",
+    "--max-context",
+    "131072",
+    "--kv",
+    "int8",
+    "--kv-resident",
+    "32768",
+    "--vision",
+    "--vram-reserve-mib",
+    "700",
+    "--spec-min-p",
+    "0.5"
+  ],
+  "cwd": "/home/xero/Desktop/test/strata/Strata-main",
+  "tokenizer": "/home/xero/Desktop/strata/Strata-data/packs/coder-iq1_m/tokenizer",
+  "model_name": "qwen3.8-flash-next-coder-iq1_m",
+  "log": "/home/xero/Desktop/test/ESE-v0.2.1-qwen4exp-plan/docs/qwen4exp/strata-engine.log",
+  "lib_dirs": [
+    "/usr/local/cuda-13.4/bin",
+    "/usr/local/cuda-13.4/lib64"
+  ],
+  "port": 8080,
+  "gpu": [
+    0,
+    2
+  ],
+  "gpus_asked": true,
+  "layer_split": "auto",
+  "vision": {
+    "exe": "/home/xero/Desktop/test/strata/Strata-main/engine/strata-vision",
+    "mmproj": "/home/xero/Desktop/strata/Strata-data/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "model": "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+    "gpu": true,
+    "max_tokens": 1024
+  },
+  "env": {
+    "STRATA_SPLIT_OWN": "1"
+  }
+}

@@ -1,0 +1,5 @@
+set(TARGET qwen4exp-lifecycle-probe)
+add_executable(${TARGET} qwen4exp-lifecycle-probe.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

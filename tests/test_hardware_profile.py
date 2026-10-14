@@ -20,6 +20,7 @@ from tools.hardware_profile import (
     stale_profile_reasons,
 )
 from tools.ese import _calibrate, _hardware_profile_status
+from tools import hardware_profile as profile_module
 
 
 def identity() -> dict[str, object]:
@@ -115,6 +116,74 @@ def complete_planner_profile() -> dict[str, object]:
 
 
 class HardwareProfileTests(unittest.TestCase):
+    def test_cuda_visible_device_order_invalidates_calibration(self) -> None:
+        original = {**identity(), "cuda_devices": ("GPU-a", "GPU-b")}
+        profile = build_hardware_profile(original, {"host_memory": {"copy_gbps": 42}}, benchmark_source={})
+        # Match identities before and after their JSON round trip.
+        persisted = json.loads(json.dumps(profile))
+        self.assertEqual(stale_profile_reasons(persisted, original), [])
+        for visible in [("GPU-b", "GPU-a"), ("GPU-a",), (), None]:
+            changed = {**original, "cuda_devices": visible}
+            self.assertIn("CUDA-visible devices or device order changed", stale_profile_reasons(persisted, changed))
+
+    def test_cuda_discovery_uses_driver_ordinals_and_uuid_v2(self) -> None:
+        import ctypes
+        import uuid
+        driver = mock.Mock()
+        driver.cuInit.return_value = 0
+        driver.cuDeviceGetCount.side_effect = lambda count: (setattr(count._obj, "value", 2), 0)[1]
+        driver.cuDeviceGet.side_effect = lambda device, ordinal: (setattr(device._obj, "value", ordinal + 10), 0)[1]
+        expected = ["11111111-2222-3333-4444-555555555555", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]
+        def get_uuid(raw, device):
+            data = uuid.UUID(expected[device.value - 10]).bytes
+            ctypes.memmove(raw, data, 16)
+            return 0
+        driver.cuDeviceGetUuid_v2.side_effect = get_uuid
+        with mock.patch("tools.hardware_profile.ctypes.CDLL", return_value=driver):
+            self.assertEqual(profile_module.cuda_device_uuids(), tuple("GPU-" + value for value in expected))
+        driver.cuDeviceGetUuid.assert_not_called()
+        self.assertEqual([call.args[1] for call in driver.cuDeviceGet.call_args_list], [0, 1])
+
+    def test_cuda_discovery_distinguishes_no_devices_from_failure(self) -> None:
+        for status, expected in [(100, ()), (3, None)]:
+            driver = mock.Mock()
+            driver.cuInit.return_value = status
+            with self.subTest(status=status), mock.patch("tools.hardware_profile.ctypes.CDLL", return_value=driver):
+                self.assertEqual(profile_module.cuda_device_uuids(), expected)
+                driver.cuDeviceGetCount.assert_not_called()
+        with mock.patch("tools.hardware_profile.ctypes.CDLL", side_effect=OSError("no driver")):
+            self.assertIsNone(profile_module.cuda_device_uuids())
+
+    def test_cuda_discovery_uses_windows_driver_loader(self) -> None:
+        driver = mock.Mock()
+        driver.cuInit.return_value = 100
+        with (
+            mock.patch("tools.hardware_profile.os.name", "nt"),
+            mock.patch("tools.hardware_profile.ctypes.WinDLL", return_value=driver, create=True) as load,
+            mock.patch("tools.hardware_profile.ctypes.CDLL") as linux_load,
+        ):
+            self.assertEqual(profile_module.cuda_device_uuids(), ())
+            load.assert_called_once_with("nvcuda.dll")
+            linux_load.assert_not_called()
+
+    def test_cuda_discovery_rejects_partial_or_duplicate_results(self) -> None:
+        for failed_phase in ["count", "device", "uuid", "duplicate"]:
+            driver = mock.Mock()
+            driver.cuInit.return_value = 0
+            driver.cuDeviceGetCount.side_effect = lambda count: (setattr(count._obj, "value", 2), 0)[1]
+            driver.cuDeviceGet.side_effect = lambda device, ordinal: (setattr(device._obj, "value", ordinal), 0)[1]
+            driver.cuDeviceGetUuid_v2.return_value = 0
+            if failed_phase == "count":
+                driver.cuDeviceGetCount.side_effect = None
+                driver.cuDeviceGetCount.return_value = 3
+            elif failed_phase == "device":
+                driver.cuDeviceGet.side_effect = None
+                driver.cuDeviceGet.return_value = 3
+            elif failed_phase == "uuid":
+                driver.cuDeviceGetUuid_v2.return_value = 3
+            with self.subTest(phase=failed_phase), mock.patch("tools.hardware_profile.ctypes.CDLL", return_value=driver):
+                self.assertIsNone(profile_module.cuda_device_uuids())
+
     def test_identity_is_stable_and_ignores_volatile_free_memory(self) -> None:
         first = identity()
         second = json.loads(json.dumps(first))
@@ -171,11 +240,15 @@ class HardwareProfileTests(unittest.TestCase):
                 return "GPU0    X    PHB\nGPU0 CPU Affinity 0-7 NUMA 0"
             return None
 
-        with mock.patch("tools.hardware_profile._linux_cpu_model", return_value="Test CPU"):
+        with (
+            mock.patch("tools.hardware_profile._linux_cpu_model", return_value="Test CPU"),
+            mock.patch("tools.hardware_profile.cuda_device_uuids", return_value=("GPU-b",)),
+        ):
             detected = collect_hardware_identity(capture)
         self.assertEqual(detected["cpu"]["physical_cores"], 8)
         self.assertEqual(detected["gpus"][0]["index"], 0)
         self.assertEqual(detected["gpus"][0]["uuid"], "GPU-b")
+        self.assertEqual(detected["cuda_devices"], ("GPU-b",))
         self.assertEqual(detected["nvidia_topology"], "GPU0 X PHB\nGPU0 CPU Affinity 0-7 NUMA 0")
 
     def test_calibrate_wraps_native_measurements_with_current_identity(self) -> None:

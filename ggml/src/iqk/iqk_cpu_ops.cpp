@@ -141,10 +141,15 @@ inline void biased_sigmoid(int n, const float * x, const float * bias, float * y
 }
 }
 
-void iqk_sumrows_div(struct ggml_tensor * div, int ith, int nth) {
+void iqk_sumrows_div(struct ggml_tensor * div, int ith, int nth,
+        void (*sum_f32)(int, float *, const float *)) {
     auto src = div->src[0];
+    auto sums = div->src[1];
     GGML_ASSERT(src->type == GGML_TYPE_F32);
     GGML_ASSERT(div->type == GGML_TYPE_F32);
+    GGML_ASSERT(sums->op == GGML_OP_SUM_ROWS && sums->op_params[0] == 0);
+    GGML_ASSERT(src->nb[0] == sizeof(float) && div->nb[0] == sizeof(float));
+    GGML_ASSERT(sum_f32 != nullptr);
 
     int ne00  = src->ne[0];
     int nrows = ggml_nrows(src);
@@ -154,12 +159,22 @@ void iqk_sumrows_div(struct ggml_tensor * div, int ith, int nth) {
     if (last < first) return;
 
     for (int ir = first; ir < last; ++ir) {
-        auto values = (const float *)((const char *)src->data + ir*src->nb[1]);
+        const int64_t i3 = ir / (src->ne[1]*src->ne[2]);
+        const int64_t i2 = (ir - i3*src->ne[1]*src->ne[2]) / src->ne[1];
+        const int64_t i1 = ir - i3*src->ne[1]*src->ne[2] - i2*src->ne[1];
+        auto values = (const float *)((const char *)src->data +
+                i1*src->nb[1] + i2*src->nb[2] + i3*src->nb[3]);
         float sum = 0;
-        for (int j = 0; j < ne00; ++j) sum += values[j];
-        float norm = sum > 0 ? 1/sum : 0.0f;
-        auto result = (float *)((char *)div->data + ir*div->nb[1]);
-        for (int j = 0; j < ne00; ++j) result[j] = values[j]*norm;
+        // Reuse the ordinary SUM_ROWS reduction, including its accumulator
+        // and platform implementation. Keep DIV's rounded division semantics.
+        sum_f32(ne00, &sum, values);
+        if (!std::isfinite(sum)) GGML_ABORT("Fatal error: nonfinite row sum");
+        auto sum_result = (float *)((char *)sums->data +
+                i1*sums->nb[1] + i2*sums->nb[2] + i3*sums->nb[3]);
+        *sum_result = sum;
+        auto result = (float *)((char *)div->data +
+                i1*div->nb[1] + i2*div->nb[2] + i3*div->nb[3]);
+        for (int j = 0; j < ne00; ++j) result[j] = values[j]/sum;
     }
 }
 

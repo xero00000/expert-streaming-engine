@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-05",
+  "architecture": "qwen4exp",
+  "workload_sha256": "603a6aff92566c84d0ae74362e9f45c032bc7921e957ea25764d2f2f16876291",
+  "engine": "strata",
+  "toggles": {
+    "phase": "decode",
+    "cache_state": "warm",
+    "mtp": "on",
+    "kv_policy": "resident"
+  },
+  "plan": {
+    "service_command": [
+      "/home/xero/Desktop/test/strata/strata_service.sh",
+      "start"
+    ],
+    "service_stop": [
+      "/home/xero/Desktop/test/strata/strata_service.sh",
+      "stop"
+    ],
+    "health_url": "http://127.0.0.1:8080/health",
+    "request_url": "http://127.0.0.1:8080/v1/chat/completions",
+    "runtime": {
+      "python": "/home/xero/Desktop/test/strata/Strata-main/.venv/bin/python",
+      "server": "/home/xero/Desktop/test/strata/Strata-main/serve/server.py",
+      "port": 8080,
+      "cwd": "/home/xero/Desktop/test/strata/Strata-main",
+      "model_name": "qwen3.8-flash-next-coder-iq1_m"
+    },
+    "config_template": {
+      "exe": "/home/xero/Desktop/test/strata/Strata-main/engine/strata",
+      "args": [
+        "--pack",
+        "/home/xero/Desktop/strata/Strata-data/packs/coder-iq1_m",
+        "--native",
+        "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+        "--ple-gguf",
+        "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+        "--expert-profile",
+        "/home/xero/Desktop/test/strata/Strata-main/data/expert-profile-coder.bin",
+        "--expert-cache",
+        "auto",
+        "--prefill",
+        "1024",
+        "--spec",
+        "4",
+        "--mtp",
+        "/home/xero/Desktop/strata/Strata-data/mtp/rt",
+        "--max-context",
+        "131072",
+        "--kv",
+        "int8",
+        "--kv-resident",
+        "32768",
+        "--vision",
+        "--vram-reserve-mib",
+        "700",
+        "--spec-min-p",
+        "0.5"
+      ],
+      "cwd": "/home/xero/Desktop/test/strata/Strata-main",
+      "tokenizer": "/home/xero/Desktop/strata/Strata-data/packs/coder-iq1_m/tokenizer",
+      "model_name": "qwen3.8-flash-next-coder-iq1_m",
+      "log": "/home/xero/Desktop/test/strata/Strata-main/strata-coder-iq1_m.log",
+      "lib_dirs": [
+        "/usr/local/cuda-13.4/bin",
+        "/usr/local/cuda-13.4/lib64"
+      ],
+      "port": 8080,
+      "gpu": [
+        0,
+        2
+      ],
+      "gpus_asked": true,
+      "layer_split": "auto",
+      "vision": {
+        "exe": "/home/xero/Desktop/test/strata/Strata-main/engine/strata-vision",
+        "mmproj": "/home/xero/Desktop/strata/Strata-data/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+        "model": "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+        "gpu": true,
+        "max_tokens": 1024
+      },
+      "env": {
+        "STRATA_SPLIT_OWN": "1"
+      }
+    },
+    "engine_args": [
+      "--pack",
+      "/home/xero/Desktop/strata/Strata-data/packs/coder-iq1_m",
+      "--native",
+      "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+      "--ple-gguf",
+      "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+      "--expert-profile",
+      "/home/xero/Desktop/test/strata/Strata-main/data/expert-profile-coder.bin",
+      "--expert-cache",
+      "auto",
+      "--prefill",
+      "1024",
+      "--spec",
+      "4",
+      "--mtp",
+      "/home/xero/Desktop/strata/Strata-data/mtp/rt",
+      "--max-context",
+      "131072",
+      "--kv",
+      "int8",
+      "--kv-resident",
+      "32768",
+      "--vision",
+      "--vram-reserve-mib",
+      "700",
+      "--spec-min-p",
+      "0.5"
+    ],
+    "request": {
+      "model": "qwen3.8-flash-next-coder-iq1_m",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "max_tokens": 128,
+      "temperature": 0.0,
+      "seed": 1,
+      "stream": false
+    }
+  },
+  "executed": true,
+  "cache_state": {
+    "method": "none",
+    "physical_device_cache_claim": false,
+    "note": "warm: OS page cache left as-is"
+  },
+  "env": {},
+  "result": {
+    "exit_code": 1,
+    "wall_ms": 3004.1046139999708,
+    "stdout_path": "docs/qwen4exp/baseline-strata-decode-warm-20261005.json.stdout.log",
+    "stderr_path": "docs/qwen4exp/baseline-strata-decode-warm-20261005.json.stderr.log",
+    "metrics": {},
+    "ready": false,
+    "health": {},
+    "engine_log_path": "docs/qwen4exp/strata-engine.log",
+    "engine_config_path": "docs/qwen4exp/strata-run-config.json"
+  },
+  "scope": {
+    "diagnostic_only": true,
+    "parity_qualified": false,
+    "note": "reference-engine timing only; the ESE side of this workload is not output-comparable yet"
+  },
+  "evidence_sha256": "ffd2e66d2c8a3ebd5a03fc62a1234837628cf71e4076d59bf3814f9b830b7afb"
+}

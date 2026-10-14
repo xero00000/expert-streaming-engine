@@ -42,6 +42,7 @@ printf '%s\n' \
     '#!/usr/bin/env bash' \
     'set -euo pipefail' \
     'export WEBKIT_DISABLE_DMABUF_RENDERER=1' \
+    "$([[ "${ESE_ENABLE_QWEN4EXP_TEST:-0}" == "1" ]] && printf '%s' 'export ESE_QWEN4EXP_LOCAL_TEST=1' || printf '%s' ':')" \
     'export ESE_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/ese-studio/ese/ese"' \
     'exec "${XDG_DATA_HOME:-$HOME/.local/share}/ese-studio/ese-studio" "$@"' \
     >"$wrapper_tmp"

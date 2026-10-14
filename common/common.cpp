@@ -17,6 +17,7 @@
 #include "chat.h"
 #include "json-schema-to-grammar.h"
 #include "resource-planner.h"
+#include <memory>
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
@@ -2260,6 +2261,16 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--expert-load-workers") {
+        CHECK_ARG;
+        size_t consumed = 0;
+        const int value = std::stoi(argv[i], &consumed);
+        if (consumed != std::strlen(argv[i]) || value < 0 || value > 8) {
+            fprintf(stderr, "error: --expert-load-workers must be between 0 and 8\n");
+            invalid_param = true;
+        } else params.expert_load_workers = uint32_t(value);
+        return true;
+    }
     if (arg == "--expert-storage-backend") {
         CHECK_ARG;
         params.expert_storage_backend = argv[i];
@@ -2272,6 +2283,34 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "--expert-sidecar-only") {
         params.expert_sidecar_only = true;
+        return true;
+    }
+    if (arg == "--ese-ple-mode") {
+        CHECK_ARG;
+        params.qwen4exp_ple_mode = argv[i];
+        if (params.qwen4exp_ple_mode != "auto" && params.qwen4exp_ple_mode != "mmap" &&
+                params.qwen4exp_ple_mode != "async" && params.qwen4exp_ple_mode != "ram") {
+            fprintf(stderr, "error: --ese-ple-mode must be auto, mmap, async, or ram\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--ese-ple-cache-mib") {
+        CHECK_ARG;
+        params.qwen4exp_ple_cache_mib = std::stoll(argv[i]);
+        if (params.qwen4exp_ple_cache_mib < 1) {
+            fprintf(stderr, "error: --ese-ple-cache-mib must be >= 1\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--ese-ple-queue-depth") {
+        CHECK_ARG;
+        params.qwen4exp_ple_queue_depth = std::stoi(argv[i]);
+        if (params.qwen4exp_ple_queue_depth < 1 || params.qwen4exp_ple_queue_depth > 64) {
+            fprintf(stderr, "error: --ese-ple-queue-depth must be between 1 and 64\n");
+            invalid_param = true;
+        }
         return true;
     }
     if (arg == "--expert-vram-cache-mib" || arg == "--expert-vram-reserve-mib") {
@@ -3480,10 +3519,14 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ncmoe, --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
     options.push_back({ "*",           "       --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
+    options.push_back({ "*",           "       --expert-load-workers N", "GPU-route load workers, 0..8 (default: 0, synchronous); shares the RAM staging budget"});
     options.push_back({ "*",           "       --expert-ram-cache-mib N", "bounded native RAM expert cache capacity in MiB (default: disabled)"});
     options.push_back({ "*",           "       --expert-ram-staging-mib N", "bounded miss-staging capacity in MiB (default: max(largest expert component, min(cache, 64)))"});
     options.push_back({ "*",           "       --expert-storage-backend NAME", "expert source backend: mmap, pread, or io_uring (default: pread)"});
     options.push_back({ "*",           "       --expert-sidecar-only", "reject any expert read that bypasses the checked descriptor/lease hierarchy"});
+    options.push_back({ "*",           "       --ese-ple-mode MODE", "Qwen4Exp PLE storage: auto, mmap, async, or ram (default: auto)"});
+    options.push_back({ "*",           "       --ese-ple-cache-mib N", "bounded Qwen4Exp PLE cache capacity in MiB (default: 256)"});
+    options.push_back({ "*",           "       --ese-ple-queue-depth N", "Qwen4Exp PLE maximum source batch width, 1-64 (default: 32)"});
     options.push_back({ "*",           "       --expert-vram-cache-mib N", "per-device adaptive GPU expert-cache bound in MiB (default: disabled)"});
     options.push_back({ "*",           "       --expert-vram-reserve-mib N", "VRAM that the expert cache must leave unallocated per device"});
     options.push_back({ "*",           "       --expert-prefill-staging-mib N", "separate two-lane whole-layer prefill staging total per device (default: native-policy auto; 0 disables)"});
@@ -4235,6 +4278,25 @@ static ggml_type resource_quality_type(common_kv_quality quality) {
     return GGML_TYPE_COUNT;
 }
 
+std::function<uint64_t(ggml_type,uint32_t)> common_native_cache_query(
+        const llama_model * model, ggml_type indexer_type, int32_t mla_attention,
+        uint32_t slots, bool flash_attention) {
+    std::shared_ptr<llama_kv_size_profile> profile(llama_model_kv_size_profile_create(model),llama_kv_size_profile_free);
+    if (!profile) return {};
+    return [profile,indexer_type,mla_attention,slots,flash_attention](ggml_type type,uint32_t context) {
+        return llama_kv_size_profile_bytes(profile.get(),type,type,indexer_type,context,mla_attention,slots,flash_attention);
+    };
+}
+
+bool common_resource_bind_native_cache_query(common_resource_plan & plan,
+        const llama_model * model, ggml_type indexer_type, int32_t mla_attention, bool flash_attention) {
+    auto query=common_native_cache_query(model,indexer_type,mla_attention,plan.slots,flash_attention);
+    if (!query) return false;
+    plan.kv_native_sizing=true;
+    plan.kv_bytes_for_context=[query,type=resource_quality_type(plan.kv_quality)](uint32_t context) { return query(type,context); };
+    return true;
+}
+
 static llama_model * common_load_model_for_params(
         const gpt_params & params,
         const llama_model_params & mparams) {
@@ -4269,6 +4331,10 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
     // real load below.
     probe_params.defer_experts = true;
     probe_params.expert_ram_cache_mib = 0;
+    // The metadata probe allocates no cache and executes no expert reads.
+    // Keep runtime-only lease/worker requirements on the real load, not here.
+    probe_params.expert_sidecar_only = false;
+    probe_params.expert_load_workers = 0;
     probe_params.expert_vram_cache_mib = 0;
     probe_params.expert_prefill_staging_mib = 0;
     llama_model_params probe_mparams = common_model_params_to_llama(probe_params);
@@ -4288,6 +4354,8 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
     input.max_ram_bytes = params.max_ram_bytes;
     input.requested_expert_ram_bytes = common_resource_cache_limit_bytes(params.expert_ram_cache_mib);
     input.min_expert_ram_bytes = llama_model_largest_expert_component(probe);
+    input.qwen4exp_ple_ram_bytes = std::strcmp(llama_model_arch_string(probe), "qwen4exp") == 0
+        ? uint64_t(params.qwen4exp_ple_cache_mib)*1024ULL*1024ULL : 0;
     input.requested_aux_ram_bytes = params.cache_ram_mib > 0
         ? uint64_t(params.cache_ram_mib)*1024ULL*1024ULL : 0;
     input.requested_expert_vram_bytes_per_device = common_resource_cache_limit_bytes(params.expert_vram_cache_mib);
@@ -4322,7 +4390,9 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
     input.multimodal_bytes = params.transient_mmproj_mib > 0
         ? uint64_t(params.transient_mmproj_mib)*1024ULL*1024ULL : 0;
     input.require_draft = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
-    input.transient_device = params.main_gpu;
+    // main_gpu indexes the selected model device list; resource plans use raw
+    // device IDs. Resolve that index while reading the model's device rows.
+    input.transient_device = -1;
     input.requested_context = params.n_ctx > 0 ? (uint32_t) params.n_ctx
         : params.max_context > 0 ? params.max_context : llama_n_ctx_train(probe);
     input.max_context = params.max_context;
@@ -4333,23 +4403,48 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
     input.requested_ubatch = std::max(1, params.n_ubatch);
     input.min_kv_quality = quality_floor;
 
-    constexpr uint32_t kv_sample_context = 4096;
-    for (int q = COMMON_KV_QUALITY_TURBO1; q <= COMMON_KV_QUALITY_F16; ++q) {
-        const auto type = resource_quality_type((common_kv_quality) q);
-        const uint64_t sample = llama_model_kv_bytes(
-            probe, type, type, GGML_TYPE_F16, kv_sample_context,
-            params.mla_attn, input.slots, params.flash_attn);
-        if (sample != 0 && sample != UINT64_MAX) {
-            input.kv_bytes_per_token[q] = (sample + kv_sample_context - 1)/kv_sample_context;
-        }
+    auto metadata_params = common_context_params_to_llama(params);
+    metadata_params.n_ctx = input.requested_context;
+    if (!llama_model_graph_metadata_bytes(probe, metadata_params, &input.host_graph_metadata_bytes)) {
+        llama_free_model(probe);
+        error = "cannot forecast native computation graph host metadata";
+        return false;
     }
 
-    for (size_t i = 0; i < llama_model_device_count(probe); ++i) {
+    const auto query=common_native_cache_query(probe,probe_mparams.idx_type_k,
+            params.mla_attn,input.slots,params.flash_attn);
+    if (!query) {
+        llama_free_model(probe);
+        error="cannot retain native cache sizing metadata";
+        return false;
+    }
+    input.kv_bytes_for_context=[query](common_kv_quality quality,uint32_t context) {
+        return query(resource_quality_type(quality),context);
+    };
+
+    const size_t selected_device_count = llama_model_device_count(probe);
+    if (selected_device_count && params.split_mode == LLAMA_SPLIT_MODE_NONE &&
+            (params.main_gpu < 0 || size_t(params.main_gpu) >= selected_device_count)) {
+        llama_free_model(probe);
+        error = "main GPU index is outside the selected device list";
+        return false;
+    }
+    bool transient_device_resolved = false;
+    for (size_t i = 0; i < selected_device_count; ++i) {
+        // Single-device execution initializes only this backend. Including
+        // other visible cards would budget memory the context cannot use.
+        if (params.split_mode == LLAMA_SPLIT_MODE_NONE && i != size_t(params.main_gpu)) {
+            continue;
+        }
         int32_t id = 0;
         uint64_t free_bytes = 0;
         uint64_t total_bytes = 0;
         if (!llama_model_device_memory(probe, i, &id, &free_bytes, &total_bytes)) {
             continue;
+        }
+        if (i == size_t(params.main_gpu)) {
+            input.transient_device = id;
+            transient_device_resolved = true;
         }
         common_resource_device_input device;
         device.id = id;
@@ -4357,6 +4452,12 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
         device.reserve_bytes = params.reserve_vram_bytes;
         device.graph_bytes = uint64_t(std::max(0, params.max_extra_alloc_MiB))*1024ULL*1024ULL;
         input.devices.push_back(device);
+    }
+    if (!input.devices.empty() && !transient_device_resolved &&
+            (input.mtp_bytes || input.multimodal_bytes)) {
+        llama_free_model(probe);
+        error = "cannot resolve the transient main GPU in the selected device list";
+        return false;
     }
     if (input.devices.empty()) {
         common_resource_device_input host;
@@ -4446,9 +4547,9 @@ static bool common_prepare_native_resource_plan(gpt_params & params, common_reso
 
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
+    common_resource_plan resource_plan;
 
     if (!params.memory_policy.empty()) {
-        common_resource_plan resource_plan;
         std::string error;
         if (!common_prepare_native_resource_plan(params, resource_plan, error)) {
             fprintf(stderr, "%s: error: resource planning failed: %s\n", __func__, error.c_str());
@@ -4469,7 +4570,27 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
 
     auto cparams = common_context_params_to_llama(params);
 
-    llama_context * lctx = llama_init_from_model(model, cparams);
+    llama_context_host_limits host_limits = {};
+    if (!params.memory_policy.empty() && resource_plan.ram_capacity_bytes) {
+        host_limits.capacity_bytes = resource_plan.ram_capacity_bytes;
+        host_limits.ple_cache_reservation_bytes = resource_plan.qwen4exp_ple_ram_bytes;
+        host_limits.fixed_reservation_bytes = resource_plan.host_graph_metadata_bytes;
+        uint64_t other = 0;
+        for (uint64_t bytes : {resource_plan.expert_ram_bytes, resource_plan.aux_ram_bytes, resource_plan.io_staging_bytes}) {
+            if (bytes > UINT64_MAX-other) { llama_free_model(model); return iparams; }
+            other += bytes;
+        }
+        host_limits.other_reservation_bytes = other;
+        uint64_t unweighted = other;
+        for (uint64_t bytes : {host_limits.ple_cache_reservation_bytes, host_limits.fixed_reservation_bytes}) {
+            if (bytes > UINT64_MAX-unweighted) { llama_free_model(model); return iparams; }
+            unweighted += bytes;
+        }
+        if (unweighted > resource_plan.ram_planned_bytes) { llama_free_model(model); return iparams; }
+        host_limits.weights_reservation_bytes = resource_plan.ram_planned_bytes-unweighted;
+    }
+    llama_context * lctx = llama_init_from_model_with_host_limits(model, cparams,
+            host_limits.capacity_bytes ? &host_limits : nullptr);
     if (lctx == NULL) {
         fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, params.model.c_str());
         llama_free_model(model);
@@ -4686,11 +4807,14 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.defer_experts   = params.defer_experts;
     constexpr uint64_t mib = 1024ULL*1024ULL;
     if (uint64_t(params.expert_ram_cache_mib) > UINT64_MAX/mib ||
-            uint64_t(params.expert_ram_staging_mib) > UINT64_MAX/mib) {
+            uint64_t(params.expert_ram_staging_mib) > UINT64_MAX/mib ||
+            params.qwen4exp_ple_cache_mib < 1 ||
+            uint64_t(params.qwen4exp_ple_cache_mib) > UINT64_MAX/mib) {
         throw std::runtime_error("expert cache capacity overflows 64-bit bytes");
     }
     mparams.expert_ram_cache_bytes = uint64_t(params.expert_ram_cache_mib)*mib;
     mparams.expert_ram_staging_bytes = uint64_t(params.expert_ram_staging_mib)*mib;
+    mparams.expert_load_workers = params.expert_load_workers;
     if (params.expert_storage_backend == "mmap") {
         mparams.expert_storage_backend = LLAMA_EXPERT_STORAGE_MMAP;
     } else if (params.expert_storage_backend == "io_uring") {
@@ -4699,6 +4823,17 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
         mparams.expert_storage_backend = LLAMA_EXPERT_STORAGE_PREAD;
     }
     mparams.expert_sidecar_only = params.expert_sidecar_only;
+    mparams.qwen4exp_ple_cache_bytes = uint64_t(params.qwen4exp_ple_cache_mib)*mib;
+    mparams.qwen4exp_ple_queue_depth = uint32_t(params.qwen4exp_ple_queue_depth);
+    if (params.qwen4exp_ple_mode == "mmap") {
+        mparams.qwen4exp_ple_mode = LLAMA_QWEN4EXP_PLE_MMAP;
+    } else if (params.qwen4exp_ple_mode == "async") {
+        mparams.qwen4exp_ple_mode = LLAMA_QWEN4EXP_PLE_ASYNC;
+    } else if (params.qwen4exp_ple_mode == "ram") {
+        mparams.qwen4exp_ple_mode = LLAMA_QWEN4EXP_PLE_RAM;
+    } else {
+        mparams.qwen4exp_ple_mode = LLAMA_QWEN4EXP_PLE_AUTO;
+    }
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {
@@ -5808,6 +5943,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "defer_experts: %s # default: false\n", params.defer_experts ? "true" : "false");
     fprintf(stream, "prefetch_experts: %s # default: false\n", params.prefetch_experts ? "true" : "false");
     fprintf(stream, "prefetch_experts_threads: %d # default: 0 (auto)\n", params.prefetch_experts_threads);
+    fprintf(stream, "expert_load_workers: %u # default: 0 (synchronous)\n", params.expert_load_workers);
     fprintf(stream, "expert_ram_cache_mib: %lld # default: 0 (disabled)\n", (long long) params.expert_ram_cache_mib);
     fprintf(stream, "expert_ram_staging_mib: %lld # default: 0 (bounded auto)\n", (long long) params.expert_ram_staging_mib);
     fprintf(stream, "expert_storage_backend: %s # default: pread\n", params.expert_storage_backend.c_str());

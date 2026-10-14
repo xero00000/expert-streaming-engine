@@ -9,6 +9,12 @@
 #include "ggml-common.h"
 
 #include <chrono>
+#include <mutex>
+#ifdef GGML_USE_NCCL
+// Private CUDA implementation helpers; no public backend API/layout change.
+std::mutex & ggml_cuda_nccl_mutex();
+bool ggml_cuda_nccl_initialize();
+#endif
 
 template <typename T, int block_size>
 static __global__ void k_add(int nelem, const T * __restrict__ src, T * __restrict__ dst) {
@@ -194,25 +200,33 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
 #else
     constexpr bool bf16_supported = false;
 #endif
-    if (info.have_nccl && dst->type != GGML_TYPE_Q8_0 && nhave == nreduce && (nhave == 2 || dst->ne[1] < 32) &&
-       (dst->type != GGML_TYPE_BF16 || bf16_supported)) {
-        GGML_ASSERT(info.have_nccl);
-        GGML_ASSERT(info.device_count == nreduce);
-        auto data_type = dst->type == GGML_TYPE_F32 ? ncclFloat : dst->type == GGML_TYPE_BF16 ? ncclBfloat16 : ncclHalf;
-        ncclGroupStart();
-        for (int i = 0; i < nreduce; ++i) {
-            ggml_cuda_set_device(i);
-            auto status = ncclAllReduce(dst->src[i] ? dst->src[i]->data : nullptr,
-                    dst->src[i] ? dst->src[i]->data : nullptr,
-                    ggml_nelements(dst), data_type, ncclSum, info.nccl_coms[i], all_ctx[i]->stream());
+    if (dst->type != GGML_TYPE_Q8_0 && nhave == nreduce && info.device_count == nreduce &&
+            (nhave == 2 || dst->ne[1] < 32) &&
+            (dst->type != GGML_TYPE_BF16 || bf16_supported)) {
+        std::unique_lock<std::mutex> lock(ggml_cuda_nccl_mutex());
+        if (ggml_cuda_nccl_initialize()) {
+            const auto data_type = dst->type == GGML_TYPE_F32 ? ncclFloat :
+                    dst->type == GGML_TYPE_BF16 ? ncclBfloat16 : ncclHalf;
+            auto status = ncclGroupStart();
             if (status != ncclSuccess) {
-                fprintf(stderr, "%s: ncclAllReduce failed with status %d\n", __func__, (int)status);
-                GGML_ABORT("Fatal error");
+                GGML_ABORT("ncclGroupStart failed: %s", ncclGetErrorString(status));
             }
+            for (int i = 0; i < nreduce; ++i) {
+                ggml_cuda_set_device(i);
+                status = ncclAllReduce(dst->src[i] ? dst->src[i]->data : nullptr,
+                        dst->src[i] ? dst->src[i]->data : nullptr,
+                        ggml_nelements(dst), data_type, ncclSum, info.nccl_coms[i], all_ctx[i]->stream());
+                if (status != ncclSuccess) {
+                    GGML_ABORT("ncclAllReduce failed: %s", ncclGetErrorString(status));
+                }
+            }
+            status = ncclGroupEnd();
+            if (status != ncclSuccess) {
+                GGML_ABORT("ncclGroupEnd failed: %s", ncclGetErrorString(status));
+            }
+            ggml_cuda_set_device(ctx.device);
+            return;
         }
-        ncclGroupEnd();
-        ggml_cuda_set_device(ctx.device);
-        return;
     }
 #endif
     GGML_ASSERT(dst->data == dst->src[ctx.device]->data);

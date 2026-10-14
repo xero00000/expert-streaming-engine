@@ -1,6 +1,7 @@
 #include "resource-planner.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <stdexcept>
@@ -22,6 +23,7 @@ common_resource_plan_input base_input() {
     input.dense_ram_bytes = 8ULL*1024*MiB;
     input.expert_source_bytes = 24ULL*1024*MiB;
     input.requested_expert_ram_bytes = 16ULL*1024*MiB;
+    input.qwen4exp_ple_ram_bytes = 256*MiB;
     input.requested_aux_ram_bytes = 4ULL*1024*MiB;
     input.requested_expert_vram_bytes_per_device = 512*MiB;
     input.requested_expert_prefill_staging_bytes_per_device = 256*MiB;
@@ -78,7 +80,10 @@ void test_deterministic_budget_and_json() {
     REQUIRE(common_resource_plan_json(first) == common_resource_plan_json(second));
     REQUIRE(first.policy == COMMON_MEMORY_POLICY_CACHE);
     REQUIRE(first.expert_ram_bytes == input.requested_expert_ram_bytes);
+    REQUIRE(first.qwen4exp_ple_ram_bytes == input.qwen4exp_ple_ram_bytes);
     REQUIRE(first.aux_ram_bytes == 4ULL*1024*MiB);
+    REQUIRE(first.ram_planned_bytes == input.dense_ram_bytes + first.expert_ram_bytes +
+        first.qwen4exp_ple_ram_bytes + first.aux_ram_bytes);
     REQUIRE(first.context == input.requested_context);
     REQUIRE(first.kv_quality == COMMON_KV_QUALITY_TURBO8);
     REQUIRE(first.transient_swap);
@@ -100,6 +105,7 @@ void test_deterministic_budget_and_json() {
     REQUIRE(json.find("\"policy\":\"cache\"") != std::string::npos);
     REQUIRE(json.find("\"kv_quality\":\"turbo8\"") != std::string::npos);
     REQUIRE(json.find("\"expert_prefill_staging_enabled\":true") != std::string::npos);
+    REQUIRE(json.find("\"qwen4exp_ple_ram_bytes\":268435456") != std::string::npos);
     REQUIRE(json.find("\"transient_policy\":\"shared\"") != std::string::npos);
 }
 
@@ -579,7 +585,7 @@ void test_auto_unlimited_ram_and_minimum_expert_component() {
 
     input = base_input();
     input.requested_policy = COMMON_MEMORY_POLICY_CACHE;
-    input.max_ram_bytes = input.dense_ram_bytes + 32*MiB;
+    input.max_ram_bytes = input.dense_ram_bytes + input.qwen4exp_ple_ram_bytes + 32*MiB;
     input.min_expert_ram_bytes = 64*MiB;
     REQUIRE(common_resource_plan_solve(input, plan, error));
     REQUIRE(plan.expert_ram_bytes == 0);
@@ -773,9 +779,493 @@ void test_native_calibration_profile_gate() {
     REQUIRE(error.find("planner-ready") != std::string::npos);
 }
 
+common_resource_plan_input forecast_input() {
+    auto input = base_input();
+    input.requested_policy = COMMON_MEMORY_POLICY_CACHE;
+    input.max_ram_bytes = 1024*MiB;
+    input.dense_ram_bytes = 64*MiB;
+    input.qwen4exp_ple_ram_bytes = 0;
+    input.requested_expert_ram_bytes = input.requested_aux_ram_bytes = 0;
+    input.requested_expert_vram_bytes_per_device = 0;
+    input.requested_expert_prefill_staging_bytes_per_device = 0;
+    input.mtp_bytes = input.multimodal_bytes = 0;
+    input.slots = 1;
+    input.requested_context = input.max_context = 65536;
+    input.min_context = 4096;
+    input.context_alignment = 256;
+    input.min_kv_quality = COMMON_KV_QUALITY_F16;
+    for (auto & bytes : input.kv_bytes_per_token) bytes = 0;
+    input.kv_bytes_per_token[COMMON_KV_QUALITY_F16] = (64*MiB+4096*1024)/4096;
+    input.kv_bytes_for_context = [](common_kv_quality quality, uint32_t context) {
+        return quality == COMMON_KV_QUALITY_F16 ? 64*MiB+uint64_t(context)*1024 : 0;
+    };
+    input.devices = {{0,256*MiB,16*MiB,0,0}};
+    input.transient_device = 0;
+    return input;
+}
+
+void test_native_forecast_long_context() {
+    auto input = forecast_input();
+    common_resource_plan plan;
+    std::string error;
+    REQUIRE(common_resource_plan_solve(input,plan,error));
+    REQUIRE(plan.context == 65536);
+    REQUIRE(plan.devices.front().kv_bytes == 128*MiB);
+    REQUIRE(plan.kv_native_sizing && bool(plan.kv_bytes_for_context));
+    REQUIRE(plan.kv_bytes_for_context(512) == 64*MiB+512*1024);
+}
+
+void test_native_forecast_short_context() {
+    auto input = forecast_input();
+    input.requested_context = input.max_context = input.min_context = 512;
+    input.devices.front().free_bytes = 32*MiB;
+    input.devices.front().reserve_bytes = 0;
+    common_resource_plan plan;
+    std::string error;
+    REQUIRE(!common_resource_plan_solve(input,plan,error));
+}
+
+void test_native_forecast_rebalance() {
+    auto current = runtime_plan(1024*MiB,16*MiB,32*MiB,128*MiB,0,65536);
+    current.kv_native_sizing = true;
+    current.kv_bytes_for_context = [](uint32_t context) { return 64*MiB+uint64_t(context)*1024; };
+    common_resource_rebalance_request request;
+    request.context = 4096;
+    common_resource_plan target;
+    std::string error;
+    REQUIRE(common_resource_rebalance_target(current,request,target,error));
+    REQUIRE(target.devices.front().kv_bytes == 68*MiB);
+    REQUIRE(current.devices.front().kv_bytes == 128*MiB);
+    REQUIRE(target.kv_native_sizing && target.kv_bytes_for_context(65536) == 128*MiB);
+}
+
+void test_native_forecast_step_storage() {
+    auto current = runtime_plan(1024*MiB,16*MiB,32*MiB,80*MiB,0,65536);
+    current.kv_native_sizing = true;
+    current.kv_bytes_for_context = [](uint32_t context) { return (16+uint64_t((context+1023)/1024))*MiB; };
+    common_resource_rebalance_request request;
+    request.context = 65024;
+    common_resource_plan target;
+    std::string error;
+    REQUIRE(common_resource_rebalance_target(current,request,target,error));
+    REQUIRE(target.devices.front().kv_bytes == 80*MiB);
+}
+
+void test_native_forecast_failure_and_rounding() {
+    auto current=runtime_plan(1024*MiB,16*MiB,32*MiB,128*MiB,0,65536);
+    current.kv_native_sizing=true;
+    common_resource_rebalance_request request;request.context=4096;
+    common_resource_plan target;
+    std::string error;
+    REQUIRE(!common_resource_rebalance_target(current,request,target,error));
+    for (uint64_t unavailable:{uint64_t(0),uint64_t(UINT64_MAX)}) {
+        current.kv_bytes_for_context=[unavailable](uint32_t){return unavailable;};
+        REQUIRE(!common_resource_rebalance_target(current,request,target,error));
+    }
+    const uint64_t half=1ULL<<62;
+    current.devices={runtime_plan(UINT64_MAX,0,0,half,0).devices[0],runtime_plan(UINT64_MAX,0,0,half,0).devices[0]};
+    current.devices[1].id=1;
+    current.kv_bytes_for_context=[half](uint32_t){return 2*(half-1);};
+    REQUIRE(common_resource_rebalance_target(current,request,target,error));
+    REQUIRE(target.devices[0].kv_bytes==half-1 && target.devices[1].kv_bytes==half-1);
+    current.devices={runtime_plan(1024*MiB,0,0,43*MiB+1,0).devices[0],
+                     runtime_plan(1024*MiB,0,0,20*MiB+2,0).devices[0],
+                     runtime_plan(1024*MiB,0,0,37*MiB-3,0).devices[0]};
+    current.devices[1].id=1;current.devices[2].id=2;
+    current.kv_bytes_for_context=[](uint32_t){return 80*MiB;};
+    REQUIRE(common_resource_rebalance_target(current,request,target,error));
+    uint64_t total=0;for (const auto & device:target.devices)total+=device.kv_bytes;
+    REQUIRE(total>=80*MiB && total<=80*MiB+2);
+    REQUIRE(current.devices[0].kv_bytes==43*MiB+1);
+    auto input=forecast_input();input.slots=8192;input.min_context=4096;
+    REQUIRE(common_resource_plan_solve(input,target,error));
+    REQUIRE(target.context>=input.slots);
+    input.min_context=UINT32_MAX;input.context_alignment=256;
+    REQUIRE(!common_resource_plan_solve(input,target,error));
+}
+
+void test_native_forecast_host_budget() {
+    auto current=runtime_plan(1024*MiB,0,128*MiB,256*MiB,0,4096);
+    auto & host=current.devices.front();host.id=-1;
+    host.graph_bytes=64*MiB;host.planned_bytes+=64*MiB;host.headroom_bytes-=64*MiB;
+    current.ram_capacity_bytes=1024*MiB;
+    current.ram_planned_bytes=640*MiB;
+    current.expert_ram_bytes=512*MiB;
+    current.kv_native_sizing=true;
+    current.kv_bytes_for_context=[](uint32_t context){return 128*MiB+uint64_t(context)*32768;};
+    common_resource_rebalance_request request;request.context=8192;
+    common_resource_plan target;
+    std::string error;
+    REQUIRE(!common_resource_rebalance_target(current,request,target,error));
+    REQUIRE(current.devices.front().kv_bytes==256*MiB && current.expert_ram_bytes==512*MiB);
+}
+
+void test_host_cache_preparation_peak_rejects_combined_budget() {
+    auto current=runtime_plan(1024*MiB,0,128*MiB,256*MiB,0,4096);
+    auto & host=current.devices.front();host.id=-1;
+    host.graph_bytes=64*MiB;host.planned_bytes+=64*MiB;host.headroom_bytes-=64*MiB;
+    current.ram_capacity_bytes=1024*MiB;
+    current.ram_planned_bytes=640*MiB;
+    current.expert_ram_bytes=512*MiB;
+    current.kv_native_sizing=true;
+    current.kv_bytes_for_context=[](uint32_t context){return 128*MiB+uint64_t(context)*32768;};
+    common_resource_rebalance_request request;request.context=2048;
+    common_resource_plan target;
+    std::string error;
+    REQUIRE(common_resource_rebalance_target(current,request,target,error));
+    REQUIRE(target.devices.front().kv_bytes==192*MiB);
+    // Final usage is 896 MiB. Preparing the complete new KV cache while the
+    // old one is rollback-capable needs 1152 MiB including the RAM cache.
+    common_resource_preparation_peak report;report.prepares_transient=true;
+    report.devices.push_back({});report.devices.front().peak_bytes=123;
+    const auto before=common_resource_plan_json(current);
+    REQUIRE(!common_resource_rebalance_preparation_peak(current,target,report,error));
+    REQUIRE(error.find("RAM preparation peak")!=std::string::npos);
+    REQUIRE(report.prepares_transient && report.devices.size()==1 && report.devices.front().peak_bytes==123);
+    REQUIRE(common_resource_plan_json(current)==before);
+}
+
+void test_host_transient_preparation_peak_rejects_combined_budget() {
+    auto current=runtime_plan(128*MiB,0,16*MiB,16*MiB,0,4096);
+    auto & host=current.devices.front();host.id=-1;
+    host.graph_bytes=8*MiB;host.transient_bytes=24*MiB;
+    host.planned_bytes+=32*MiB;host.headroom_bytes-=32*MiB;
+    current.ram_capacity_bytes=128*MiB;current.ram_planned_bytes=64*MiB;
+    current.expert_ram_bytes=48*MiB;
+    current.transient_device=-1;current.transient_policy=COMMON_TRANSIENT_POLICY_MTP_ONLY;
+    current.transient_mtp_bytes=24*MiB;current.transient_multimodal_bytes=32*MiB;
+    current.transient_capacity_bytes=24*MiB;
+    auto target=current;target.transient_policy=COMMON_TRANSIENT_POLICY_MULTIMODAL_ONLY;
+    target.transient_capacity_bytes=32*MiB;target.devices.front().transient_bytes=32*MiB;
+    target.devices.front().planned_bytes+=8*MiB;target.devices.front().headroom_bytes-=8*MiB;
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current,target,report,error));
+    REQUIRE(error.find("RAM preparation peak")!=std::string::npos);
+    current.ram_capacity_bytes=target.ram_capacity_bytes=160*MiB;
+    current.devices.front().capacity_bytes=target.devices.front().capacity_bytes=160*MiB;
+    current.devices.front().headroom_bytes+=32*MiB;target.devices.front().headroom_bytes+=32*MiB;
+    REQUIRE(common_resource_rebalance_preparation_peak(current,target,report,error));
+    REQUIRE(report.devices.front().prepared_transient_bytes==32*MiB);
+    REQUIRE(report.ram_current_bytes==112*MiB && report.ram_target_bytes==120*MiB);
+    REQUIRE(report.ram_peak_bytes==144*MiB && report.ram_peak_headroom_bytes==16*MiB);
+}
+
+void test_host_cache_preparation_peak_boundaries() {
+    for(uint64_t cache:{uint64_t(0),384*MiB,512*MiB})for(uint64_t reserve:{uint64_t(0),16*MiB})for(int margin:{-1,0,1}) {
+        const uint64_t expected_peak=640*MiB+cache;
+        const uint64_t usable=margin<0?expected_peak-1:expected_peak+margin;
+        auto current=runtime_plan(usable+reserve,reserve,128*MiB,256*MiB,0,4096);
+        auto & host=current.devices.front();host.id=-1;
+        host.graph_bytes=64*MiB;host.planned_bytes+=64*MiB;host.headroom_bytes-=64*MiB;
+        current.ram_capacity_bytes=usable+reserve;current.ram_planned_bytes=128*MiB+cache;
+        current.expert_ram_bytes=cache;current.kv_native_sizing=true;
+        current.kv_bytes_for_context=[](uint32_t context){return 128*MiB+uint64_t(context)*32768;};
+        common_resource_rebalance_request request;request.context=2048;
+        common_resource_plan target;
+        std::string error;
+        REQUIRE(common_resource_rebalance_target(current,request,target,error));
+        common_resource_preparation_peak report;report.ram_peak_bytes=123;
+        if(margin<0) {
+            REQUIRE(!common_resource_rebalance_preparation_peak(current,target,report,error));
+            REQUIRE(report.ram_peak_bytes==123);
+        }else {
+            REQUIRE(common_resource_rebalance_preparation_peak(current,target,report,error));
+            REQUIRE(report.ram_capacity_bytes==usable+reserve && report.ram_usable_bytes==usable);
+            REQUIRE(report.ram_current_bytes==448*MiB+cache && report.ram_target_bytes==384*MiB+cache);
+            REQUIRE(report.ram_peak_bytes==expected_peak && report.ram_peak_headroom_bytes==uint64_t(margin));
+            REQUIRE(report.devices.front().prepared_kv_bytes==192*MiB);
+            const auto json=common_resource_preparation_peak_json(report);
+            REQUIRE(json.find("\"ram_peak_bytes\":"+std::to_string(expected_peak))!=std::string::npos);
+        }
+    }
+}
+
+void test_host_cache_preparation_peak_overflow_and_immutable_budget() {
+    auto current=runtime_plan(UINT64_MAX,0,0,32,0,4096);current.devices.front().id=-1;
+    current.ram_capacity_bytes=UINT64_MAX;current.ram_planned_bytes=UINT64_MAX-50;
+    auto target=current;target.context=8192;target.devices.front().kv_bytes=64;
+    target.devices.front().planned_bytes=64;target.devices.front().headroom_bytes=UINT64_MAX-64;
+    common_resource_preparation_peak report;report.ram_peak_bytes=123;
+    std::string error;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current,target,report,error));
+    REQUIRE(error.find("RAM preparation peak overflows")!=std::string::npos && report.ram_peak_bytes==123);
+    target=current;target.ram_capacity_bytes--;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current,target,report,error));
+    REQUIRE(error.find("immutable RAM")!=std::string::npos);
+    target=current;target.ram_planned_bytes--;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current,target,report,error));
+    REQUIRE(error.find("immutable RAM")!=std::string::npos);
+}
+
+void test_tracked_device_memory_preparation() {
+    // The old zero fixed forecast admits a 96 MiB double-buffer peak; actual
+    // weights plus cached workspace raise it to 144 MiB and cross the reserve.
+    auto current = runtime_plan(128*MiB, 8*MiB, 0, 64*MiB, 0, 4096);
+    current.devices.front().id = 2;
+    common_resource_rebalance_request request;
+    request.context = 2048;
+    common_resource_plan target;
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(report.devices.front().peak_bytes == 96*MiB);
+    const auto original_current = common_resource_plan_json(current);
+    const auto original_target = common_resource_plan_json(target);
+    for (const std::vector<common_resource_device_memory> & bad : {
+            std::vector<common_resource_device_memory>{},
+            {{0, 16*MiB, 32*MiB}}, {{2, 16*MiB, 32*MiB}, {2, 0, 0}},
+            {{2, 16*MiB, 32*MiB}, {0, 0, 0}}, {{-1, 0, 0}},
+            {{2, UINT64_MAX, 1}}}) {
+        REQUIRE(!common_resource_reconcile_device_memory(current, target, bad, error));
+        REQUIRE(common_resource_plan_json(current) == original_current);
+        REQUIRE(common_resource_plan_json(target) == original_target);
+    }
+    REQUIRE(common_resource_reconcile_device_memory(current, target, {{2, 16*MiB, 32*MiB}}, error));
+    REQUIRE(current.devices.front().dense_bytes == 16*MiB && current.devices.front().graph_bytes == 32*MiB);
+    REQUIRE(target.devices.front().dense_bytes == 16*MiB && target.devices.front().graph_bytes == 32*MiB);
+    REQUIRE(current.devices.front().planned_bytes == 112*MiB && target.devices.front().planned_bytes == 80*MiB);
+    REQUIRE(!common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(report.devices.front().peak_bytes == 96*MiB); // failure leaves report intact
+    current.devices.front().capacity_bytes = target.devices.front().capacity_bytes = 160*MiB;
+    current.devices.front().headroom_bytes = 40*MiB;
+    target.devices.front().headroom_bytes = 72*MiB;
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(report.devices.front().peak_bytes == 144*MiB);
+    REQUIRE(report.devices.front().peak_headroom_bytes == 8*MiB);
+    // A second inventory read must not add the same backing twice or lower a
+    // larger forecast when observed allocations shrink.
+    const auto reconciled = common_resource_plan_json(current);
+    REQUIRE(common_resource_reconcile_device_memory(current, target, {{2, 8*MiB, 16*MiB}}, error));
+    REQUIRE(common_resource_plan_json(current) == reconciled);
+    auto stale = current;
+    ++stale.devices.front().planned_bytes;
+    const auto stale_before = common_resource_plan_json(stale);
+    REQUIRE(!common_resource_reconcile_device_memory(stale, target, {{2, 0, 0}}, error));
+    REQUIRE(common_resource_plan_json(stale) == stale_before);
+    auto host = current;
+    host.devices.front().id = -1;
+    auto host_target = host;
+    const auto host_before = common_resource_plan_json(host);
+    REQUIRE(common_resource_reconcile_device_memory(host, host_target, {}, error));
+    REQUIRE(common_resource_plan_json(host) == host_before);
+    // Input order may differ from scheduler/plan order on noncontiguous GPUs.
+    current.devices.push_back(current.devices.front());
+    target.devices.push_back(target.devices.front());
+    current.devices.back().id = target.devices.back().id = 0;
+    REQUIRE(common_resource_reconcile_device_memory(current, target, {{0, 24*MiB, 0}, {2, 0, 0}}, error));
+    REQUIRE(current.devices.front().dense_bytes == 16*MiB && current.devices.back().dense_bytes == 24*MiB);
+}
+
+void test_tracked_host_memory_preparation() {
+    auto current = runtime_plan(256*MiB, 8*MiB, 16*MiB, 64*MiB, 0, 4096);
+    auto & host = current.devices.front();
+    host.id = -1;
+    host.graph_bytes = 16*MiB;
+    host.planned_bytes += 16*MiB;
+    host.headroom_bytes -= 16*MiB;
+    current.ram_capacity_bytes = 256*MiB;
+    current.ram_planned_bytes = 96*MiB;
+    current.expert_ram_bytes = 40*MiB;
+    current.qwen4exp_ple_ram_bytes = 32*MiB;
+    current.aux_ram_bytes = 8*MiB;
+    common_resource_rebalance_request request;
+    request.context = 2048;
+    common_resource_plan target;
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(common_resource_rebalance_target(current, request, target, error));
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(report.ram_peak_bytes == 208*MiB && report.ram_tracked_extra_bytes == 0);
+    const auto before = common_resource_preparation_peak_json(report);
+    const common_resource_host_memory observed{24*MiB, 40*MiB, 48*MiB};
+    REQUIRE(!common_resource_rebalance_preparation_peak(current, target, report, error, false, false, &observed));
+    REQUIRE(error.find("RAM preparation peak") != std::string::npos);
+    REQUIRE(common_resource_preparation_peak_json(report) == before);
+    current.ram_capacity_bytes = target.ram_capacity_bytes = 272*MiB;
+    current.devices.front().capacity_bytes = target.devices.front().capacity_bytes = 272*MiB;
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error, false, false, &observed));
+    REQUIRE(report.ram_current_bytes == 224*MiB && report.ram_target_bytes == 192*MiB);
+    REQUIRE(report.ram_peak_bytes == 256*MiB && report.ram_tracked_extra_bytes == 48*MiB);
+    REQUIRE(report.ram_peak_headroom_bytes == 8*MiB);
+    REQUIRE(report.ram_host_weights_limit_bytes == 24*MiB && report.ram_host_fixed_limit_bytes == 40*MiB &&
+            report.ram_host_ple_cache_limit_bytes == 48*MiB);
+    const auto once = common_resource_preparation_peak_json(report);
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error, false, false, &observed));
+    REQUIRE(common_resource_preparation_peak_json(report) == once);
+    // Existing reservations cover smaller actual backing without being added
+    // again. A mapped span never enters the allocated-weight input.
+    const common_resource_host_memory covered{8*MiB, 8*MiB, 16*MiB};
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error, false, false, &covered));
+    REQUIRE(report.ram_tracked_extra_bytes == 0 && report.ram_peak_bytes == 208*MiB);
+    REQUIRE(report.ram_host_weights_limit_bytes == 16*MiB && report.ram_host_fixed_limit_bytes == 16*MiB &&
+            report.ram_host_ple_cache_limit_bytes == 32*MiB);
+    const auto covered_report = common_resource_preparation_peak_json(report);
+    const common_resource_host_memory overflowing{UINT64_MAX, 1, 0};
+    REQUIRE(!common_resource_rebalance_preparation_peak(current, target, report, error, false, false, &overflowing));
+    REQUIRE(common_resource_preparation_peak_json(report) == covered_report);
+    auto wrong = target;
+    ++wrong.expert_ram_bytes;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current, wrong, report, error, false, false, &covered));
+    REQUIRE(common_resource_preparation_peak_json(report) == covered_report);
+    wrong = current;
+    wrong.io_staging_bytes = 32*MiB;
+    REQUIRE(!common_resource_rebalance_preparation_peak(wrong, wrong, report, error, false, false, &covered));
+    REQUIRE(common_resource_preparation_peak_json(report) == covered_report);
+    // GPU-only plans still own host graph/output/metadata. Their RAM budget
+    // must include these bytes even without a serialized host device row.
+    current.devices.front().id = target.devices.front().id = 2;
+    for (int margin : {-1, 0, 1}) {
+        current.ram_capacity_bytes = target.ram_capacity_bytes = 160*MiB + margin;
+        const bool accepted = common_resource_rebalance_preparation_peak(
+            current, target, report, error, false, false, &observed);
+        REQUIRE(accepted == (margin >= 0));
+        if (accepted) {
+            REQUIRE(report.ram_current_bytes == 160*MiB && report.ram_peak_bytes == 160*MiB);
+            REQUIRE(report.ram_tracked_extra_bytes == 64*MiB && report.ram_peak_headroom_bytes == uint64_t(margin));
+        }
+    }
+    current.ram_capacity_bytes = target.ram_capacity_bytes = 0;
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error, false, false, &observed));
+    REQUIRE(report.ram_capacity_bytes == 0 && report.ram_usable_bytes == UINT64_MAX && report.ram_peak_bytes == 160*MiB);
+    REQUIRE(common_resource_rebalance_preparation_peak(current, target, report, error));
+    REQUIRE(report.ram_capacity_bytes == 0 && report.ram_peak_bytes == 0); // original overload retained
+}
+
+void test_native_kv_preparation_receipt() {
+    auto current = runtime_plan(128*MiB, 0, 8*MiB, 20*MiB, 0, 4096);
+    current.devices.front().id = 2;
+    current.devices.front().graph_bytes = 4*MiB;
+    current.devices.front().planned_bytes += 4*MiB;
+    current.devices.front().headroom_bytes -= 4*MiB;
+    current.ram_capacity_bytes = 48*MiB;
+    current.ram_planned_bytes = 16*MiB;
+    common_resource_rebalance_request request;
+    request.context = 2048;
+    common_resource_plan target;
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(common_resource_rebalance_target(current, request, target, error));
+    const common_resource_host_memory host{0, 8*MiB, 0};
+    common_resource_kv_preparation kv;
+    kv.current = {{2,20*MiB},{-1,4*MiB}};
+    kv.target = {{2,16*MiB},{-1,8*MiB}};
+    kv.host_metadata_bytes = 2*MiB;
+    kv.host_staging_bytes = MiB;
+    REQUIRE(common_resource_rebalance_preparation_peak(current,target,report,error,false,false,&host,&kv));
+    REQUIRE(report.devices.front().current_live_bytes==32*MiB && report.devices.front().prepared_kv_bytes==16*MiB);
+    REQUIRE(report.devices.front().peak_bytes==48*MiB);
+    REQUIRE(report.ram_current_bytes==28*MiB && report.ram_target_bytes==32*MiB && report.ram_peak_bytes==39*MiB);
+    REQUIRE(report.prepared_host_metadata_bytes==2*MiB && report.prepared_host_staging_bytes==MiB);
+    for(int margin:{-1,0,1}) {
+        current.ram_capacity_bytes=target.ram_capacity_bytes=39*MiB+margin;
+        const auto before=common_resource_preparation_peak_json(report);
+        const bool accepted=common_resource_rebalance_preparation_peak(current,target,report,error,false,false,&host,&kv);
+        REQUIRE(accepted==(margin>=0));
+        if(accepted) REQUIRE(report.ram_peak_headroom_bytes==uint64_t(margin));
+        else REQUIRE(common_resource_preparation_peak_json(report)==before);
+    }
+    const auto good=common_resource_preparation_peak_json(report);
+    for(const std::vector<llama_kv_preparation_device> & bad:{
+            std::vector<llama_kv_preparation_device>{{2,16*MiB},{2,0}}, {{3,0}}, {{-2,0}}, {{2,UINT64_MAX}}}) {
+        auto wrong=kv;wrong.target=bad;
+        REQUIRE(!common_resource_rebalance_preparation_peak(current,target,report,error,false,false,&host,&wrong));
+        REQUIRE(common_resource_preparation_peak_json(report)==good);
+    }
+    auto overflow=kv;overflow.host_staging_bytes=UINT64_MAX;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current,target,report,error,false,false,&host,&overflow));
+    REQUIRE(common_resource_preparation_peak_json(report)==good);
+    auto same=kv;same.target=same.current;same.host_metadata_bytes=same.host_staging_bytes=0;
+    REQUIRE(common_resource_rebalance_preparation_peak(current,current,report,error,false,false,&host,&same));
+    REQUIRE(!report.prepares_kv && report.ram_peak_bytes==28*MiB);
+    // A planned host row already includes its KV; the receipt must not add it again.
+    current.devices.front().id=target.devices.front().id=-1;
+    kv.current={{-1,20*MiB}};kv.target={{-1,16*MiB}};
+    current.ram_capacity_bytes=target.ram_capacity_bytes=128*MiB;
+    REQUIRE(common_resource_rebalance_preparation_peak(current,target,report,error,false,false,&host,&kv));
+    REQUIRE(report.ram_current_bytes==44*MiB && report.ram_target_bytes==40*MiB && report.ram_peak_bytes==63*MiB);
+}
+
+void test_gpu_cache_preparation_preserves_host_ram_budget() {
+    auto current=runtime_plan(100*MiB,0,10*MiB,20*MiB,10*MiB,4096);
+    current.ram_capacity_bytes=current.ram_planned_bytes=512*MiB;
+    auto target=current;target.devices.front().expert_cache_bytes=20*MiB;
+    target.devices.front().planned_bytes+=10*MiB;target.devices.front().headroom_bytes-=10*MiB;
+    common_resource_preparation_peak report;
+    std::string error;
+    REQUIRE(common_resource_rebalance_preparation_peak(current,target,report,error));
+    REQUIRE(report.prepares_expert_cache && report.devices.front().prepared_expert_cache_bytes==20*MiB);
+    REQUIRE(report.ram_current_bytes==512*MiB && report.ram_target_bytes==512*MiB);
+    REQUIRE(report.ram_peak_bytes==512*MiB && report.ram_peak_headroom_bytes==0);
+    current.ram_planned_bytes++;target=current;
+    REQUIRE(!common_resource_rebalance_preparation_peak(current,target,report,error));
+    REQUIRE(error.find("combined RAM")!=std::string::npos);
+}
+
+void test_host_graph_metadata_reservation() {
+    common_resource_plan_input input;
+    input.requested_policy = COMMON_MEMORY_POLICY_CACHE;
+    input.dense_ram_bytes = 4*MiB;
+    input.host_graph_metadata_bytes = 8*MiB;
+    input.requested_context = input.max_context = input.min_context = 512;
+    input.context_alignment = 32;
+    input.slots = 1;
+    input.requested_batch = input.requested_ubatch = 32;
+    input.min_kv_quality = COMMON_KV_QUALITY_F16;
+    input.kv_bytes_per_token[COMMON_KV_QUALITY_F16] = 32;
+    const uint64_t exact = 12*MiB + 512*32;
+    std::string error;
+    common_resource_plan plan;
+    for (int delta : {-1, 0, 1}) {
+        input.max_ram_bytes = exact + delta;
+        input.devices = {{-1, input.max_ram_bytes, 0, 4*MiB, 0}};
+        const bool accepted = common_resource_plan_solve(input, plan, error);
+        REQUIRE(accepted == (delta >= 0));
+        if (accepted) {
+            REQUIRE(plan.ram_planned_bytes == 12*MiB && plan.host_graph_metadata_bytes == 8*MiB);
+            REQUIRE(nlohmann::json::parse(common_resource_plan_json(plan)).at("host_graph_metadata_bytes") == 8*MiB);
+        }
+    }
+    input.max_ram_bytes = 16*MiB;
+    input.devices.front().free_bytes = input.max_ram_bytes;
+    REQUIRE(common_resource_plan_solve(input, plan, error));
+    common_resource_host_memory host = {4*MiB, 8*MiB, 0};
+    common_resource_preparation_peak report;
+    REQUIRE(common_resource_rebalance_preparation_peak(plan, plan, report, error, false, false, &host));
+    REQUIRE(report.ram_current_bytes == exact && report.ram_peak_bytes == exact && report.ram_tracked_extra_bytes == 0);
+    REQUIRE(report.ram_host_weights_limit_bytes == 4*MiB && report.ram_host_fixed_limit_bytes == 8*MiB);
+    host.fixed_bytes = 10*MiB;
+    REQUIRE(common_resource_rebalance_preparation_peak(plan, plan, report, error, false, false, &host));
+    REQUIRE(report.ram_current_bytes == exact + 2*MiB && report.ram_tracked_extra_bytes == 2*MiB);
+    auto changed = plan;
+    changed.host_graph_metadata_bytes++;
+    const auto previous = common_resource_preparation_peak_json(report);
+    REQUIRE(!common_resource_rebalance_preparation_peak(plan, changed, report, error, false, false, &host));
+    REQUIRE(common_resource_preparation_peak_json(report) == previous);
+    input.host_graph_metadata_bytes = UINT64_MAX;
+    REQUIRE(!common_resource_plan_solve(input, changed, error));
+    std::puts("PASS: graph metadata reserved before startup solve, byte boundaries/overflow, tracked-host reuse and immutable reservation");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    try {
+    if (argc == 3 && std::string(argv[1]) == "--forecast-case") {
+        const std::string name = argv[2];
+        if (name == "long") test_native_forecast_long_context();
+        else if (name == "short") test_native_forecast_short_context();
+        else if (name == "rebalance") test_native_forecast_rebalance();
+        else if (name == "step") test_native_forecast_step_storage();
+        else if (name == "host") test_native_forecast_host_budget();
+        else if (name == "host-peak") test_host_cache_preparation_peak_rejects_combined_budget();
+        else if (name == "host-transient-peak") test_host_transient_preparation_peak_rejects_combined_budget();
+        else throw std::runtime_error("unknown forecast case");
+        std::puts("PASS: selected context forecast control");
+        return 0;
+    }
+    REQUIRE(argc == 1);
     test_deterministic_budget_and_json();
     test_optional_prefill_staging_falls_back_without_violating_context_floor();
     test_preference_tradeoff();
@@ -800,5 +1290,25 @@ int main() {
     test_native_override_normalization();
     test_calibrated_expert_split_solver();
     test_native_calibration_profile_gate();
+    test_native_forecast_long_context();
+    test_native_forecast_short_context();
+    test_native_forecast_rebalance();
+    test_native_forecast_step_storage();
+    test_native_forecast_failure_and_rounding();
+    test_native_forecast_host_budget();
+    test_host_cache_preparation_peak_rejects_combined_budget();
+    test_host_transient_preparation_peak_rejects_combined_budget();
+    test_host_cache_preparation_peak_boundaries();
+    test_host_cache_preparation_peak_overflow_and_immutable_budget();
+    test_gpu_cache_preparation_preserves_host_ram_budget();
+    test_tracked_device_memory_preparation();
+    test_tracked_host_memory_preparation();
+    test_native_kv_preparation_receipt();
+    test_host_graph_metadata_reservation();
+    std::puts("PASS: resource planning including fixed/stepped native cache forecasts");
     return 0;
+    } catch (const std::exception & error) {
+        std::fprintf(stderr,"FAIL: %s\n",error.what());
+        return 1;
+    }
 }

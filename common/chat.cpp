@@ -1866,6 +1866,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     common_chat_params data;
 
     const bool is_v4 = tmpl.source().find("function_calls") == std::string::npos;
+    const bool is_v41 = tmpl.source().find("DeepSeek-V4.1") != std::string::npos;
 
     std::optional<json> adjusted_messages;
     if (is_v4) {
@@ -1891,13 +1892,14 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     const std::string DSML         = "｜DSML｜";
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
-    const std::string TC_BLOCK     = is_v4 ? "tool_calls" : "function_calls";
+    const std::string TC_BLOCK     = is_v41 ? " calls" : is_v4 ? "tool_calls" : "function_calls";
+    const std::string TAG_SPACE    = is_v41 ? " " : "";
     const std::string FC_START     = "<" + DSML + TC_BLOCK + ">";
     const std::string FC_END       = "</" + DSML + TC_BLOCK + ">";
-    const std::string INVOKE_START = "<" + DSML + "invoke";
-    const std::string INVOKE_END   = "</" + DSML + "invoke>";
-    const std::string PARAM_START  = "<" + DSML + "parameter";
-    const std::string PARAM_END    = "</" + DSML + "parameter>";
+    const std::string INVOKE_START = "<" + DSML + TAG_SPACE + "invoke";
+    const std::string INVOKE_END   = "</" + DSML + TAG_SPACE + "invoke>";
+    const std::string PARAM_START  = "<" + DSML + TAG_SPACE + "parameter";
+    const std::string PARAM_END    = "</" + DSML + TAG_SPACE + "parameter>";
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.prefix(inputs.generation_prompt, THINK_START);

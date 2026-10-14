@@ -154,6 +154,29 @@ struct llama_hparams {
     float    dsv4_hc_eps             = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios = {};
 
+    // Qwen4-Exp hybrid schedule, hyper-connections, and PLE metadata.
+    uint32_t qwen4exp_full_attention_interval = 0;
+    uint32_t qwen4exp_hc_count = 0;
+    uint32_t qwen4exp_hc_low_rank = 0;
+    uint32_t qwen4exp_embd_per_layer_input = 0;
+    uint32_t qwen4exp_ple_conv_kernel = 0;
+    uint32_t qwen4exp_ple_eos_token_id = 0;
+    uint32_t qwen4exp_ple_image_token_id = 0;
+    uint32_t qwen4exp_ple_heads_per_ngram = 0;
+    uint32_t qwen4exp_ple_ngram_size = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> qwen4exp_compress_ratios = {};
+    std::array<bool, LLAMA_MAX_LAYERS> qwen4exp_ple_layers = {};
+    std::array<uint64_t, 16> qwen4exp_ple_head_offsets = {};
+    std::array<uint64_t, 16> qwen4exp_ple_head_vocab_sizes = {};
+    std::array<uint64_t, 3> qwen4exp_ple_layer_multipliers = {};
+
+    uint32_t qwen4exp_ple_conv_state_size(uint32_t il) const {
+        if (il >= n_layer || !qwen4exp_ple_layers[il] || qwen4exp_ple_conv_kernel == 0 || qwen4exp_ple_ngram_size == 0) {
+            return 0;
+        }
+        return n_embd * qwen4exp_hc_count * (qwen4exp_ple_conv_kernel - 1) * qwen4exp_ple_ngram_size;
+    }
+
 	// qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
 
@@ -254,7 +277,7 @@ struct llama_hparams {
     }
 
     bool has_kv(uint32_t il) const {
-        return n_layer_kv_from_start > 0 ? il < n_layer_kv_from_start : true;
+        return n_layer_kv_from_start >= 0 ? il < uint32_t(n_layer_kv_from_start) : true;
     }
 
     uint32_t n_head(uint32_t il = 0) const {

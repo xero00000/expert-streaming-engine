@@ -33,6 +33,21 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
+#define VDR_Q2_0_Q8_1_MMVQ 1
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ y, const int & kbx, const int & iqs) {
+    const block_q2_0 * x = (const block_q2_0 *) vbq + kbx;
+    int sum = 0;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const int e = iqs * 32 + j;
+        const int code = (x->qs[e / 4] >> (2 * (e % 4))) & 3;
+        sum += (code - 1) * y[iqs].qs[j];
+    }
+    return sum * (__half2float(x->d) * __low2float(y[iqs].ds));
+}
+
 #define VDR_TQ2_0_Q8_1_MMVQ 1
 
 #define VDR_Q4_0_Q8_1_MMVQ 2
@@ -1027,9 +1042,11 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     }
 
     const int ls = aux32 >> 28;
-    sumi = (ls*sumi + sumi/2)/2;
+    // IQ3_XXS stores (2*ls + 1)/4. Integer division here discards
+    // half-integer contributions for both positive and negative dot products.
+    const float scaled_sum = (2*ls + 1) * 0.25f * sumi;
     const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    return d * scaled_sum;
 }
 
 #define VDR_IQ3_S_Q8_1_MMVQ 2

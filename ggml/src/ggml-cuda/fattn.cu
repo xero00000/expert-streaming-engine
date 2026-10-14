@@ -130,6 +130,23 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    // Honor explicit FP32 arithmetic for batches as well as decode. Tensor-core
+    // paths round queries/accumulation to half, regardless of the output type.
+    if (precision == GGML_PREC_F32 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+        GGML_ASSERT(ggml_cuda_fattn_vec_f32_is_supported(ctx, dst));
+        ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
+        return;
+    }
+    float softcap;
+    memcpy(&softcap, &KQV->op_params[2], sizeof(softcap));
+    // The half MMA/vector softcap specializations for width 64 are stubs.
+    const bool f32_softcap = softcap != 0.f && Q->ne[0] == 64 && V->ne[0] == 64;
+    if (f32_softcap && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+        ggml_cuda_fattn_vec_f32_is_supported(ctx, dst)) {
+        ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
+        return;
+    }
+
     // On AMD the tile kernels perform poorly, use the vec kernel instead:
     if (cc >= CC_OFFSET_AMD) {
         if (precision == GGML_PREC_DEFAULT && fast_fp16_available(cc)) {
@@ -258,6 +275,15 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
         local_dst.src[2] = is_turbo_kv_type(V->type) ? &local_V : dst->src[2];
         return ggml_cuda_fattn_is_supported(ctx, &local_dst);
     }
+    // Do not advertise half MMA as a fallback for an unsupported F32 request.
+    // Architecture-private indexed attention has its own dispatch contract.
+    if (precision == GGML_PREC_F32 && !dst->src[5] && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16)
+        return ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
+    float softcap;
+    memcpy(&softcap, &KQV->op_params[2], sizeof(softcap));
+    const bool f32_softcap = softcap != 0.f && Q->ne[0] == 64 && V->ne[0] == 64;
+    if (f32_softcap && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+        ggml_cuda_fattn_vec_f32_is_supported(ctx, dst)) return true;
     if (cc >= CC_OFFSET_AMD) {
         return precision == GGML_PREC_DEFAULT ? ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)
                                               : ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);

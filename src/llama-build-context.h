@@ -238,6 +238,10 @@ struct llm_build_context {
 
     ggml_cgraph * build_qwen3next();
 
+    // Correctness-first text graph under construction. It remains undispatched
+    // while QSA sparse attention is incomplete and the load-time gate is closed.
+    ggml_cgraph * build_qwen4exp();
+
     ggml_cgraph * build_qwen35moe();
 
     ggml_cgraph * build_qwen35();
@@ -290,6 +294,7 @@ struct llm_build_context {
 
     ggml_cgraph * build_deepseek2();
     ggml_cgraph * build_deepseek4();
+    ggml_cgraph * build_deepseek41();
     ggml_cgraph * build_openpangu();
 
     // openPangu attention sublayer body (shared by base layers and the NextN/MTP head):
@@ -435,7 +440,7 @@ struct llm_build_context {
 
     //
     static ggml_tensor * llm_build_lora_mm(llama_context & lctx, ggml_context * ctx0,
-            ggml_tensor * w, ggml_tensor * cur);
+            ggml_tensor * w, ggml_tensor * cur, enum ggml_prec precision = GGML_PREC_DEFAULT);
 
     static ggml_tensor * llm_build_lora_mm_id(llama_context & lctx, ggml_context * ctx0,
           ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids);

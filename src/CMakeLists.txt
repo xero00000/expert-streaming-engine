@@ -50,6 +50,22 @@ add_library(llama
             llama-spec-features-dflash.cpp
             llama-dflash.cpp
             llama-dsv4.cpp
+            llama-deepseek-v41-engram.h
+            llama-deepseek-v41-engram.cpp
+            llama-deepseek-v41-ops.h
+            llama-deepseek-v41-ops.cpp
+            llama-deepseek-v41-layout.h
+            llama-deepseek-v41-layout.cpp
+            llama-deepseek-v41-index.h
+            llama-deepseek-v41-index.cpp
+            llama-deepseek-v41-cache.h
+            llama-deepseek-v41-cache.cpp
+            llama-deepseek-v41-model.h
+            llama-deepseek-v41-model.cpp
+            llama-deepseek-v41-forward.h
+            llama-deepseek-v41-forward.cpp
+            llama-deepseek-v41-dspark.cpp
+    llama-deepseek-v41-runtime.cpp
             llama-vocab.cpp
             llama-grammar.cpp
             llama-sampling.cpp
@@ -69,6 +85,13 @@ add_library(llama
             llama-hparams.cpp
             llama-delta-net.h
             llama-delta-net.cpp
+            llama-memory-accounting.h
+            llama-qwen4exp-ple.h
+            llama-qwen4exp-ple.cpp
+            llama-qwen4exp-ops.h
+            llama-qwen4exp-ops.cpp
+            llama-qwen4exp-ple-storage.h
+            llama-qwen4exp-ple-storage.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp
@@ -98,6 +121,7 @@ add_library(llama
             graphs/build_mellum.cpp
             graphs/build_maple.cpp
             graphs/build_qwen3next.cpp
+            graphs/build_qwen4exp.cpp
             graphs/build_qwen35.cpp
             graphs/build_kimi_linear.cpp
             graphs/build_phi2.cpp
@@ -149,6 +173,16 @@ target_link_libraries(llama PUBLIC ggml)
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_SHARED LLAMA_BUILD)
+endif()
+
+if (ESE_QWEN4EXP_PROBE_GATE)
+    # Private to the llama target: only dedicated probe builds may combine
+    # this with the per-run ESE_QWEN4EXP_PROBE_GATE=1 opt-in (see
+    # llm_load_arch in llama.cpp). Default builds keep the hard rejection.
+    target_compile_definitions(llama PRIVATE ESE_QWEN4EXP_PROBE_GATE)
+    message(WARNING "ESE_QWEN4EXP_PROBE_GATE=ON: this build can load qwen4exp "
+            "only when a run also sets ESE_QWEN4EXP_PROBE_GATE=1; never package "
+            "or ship this configuration")
 endif()
 
 if (GGML_MAX_CONTEXTS)

@@ -1,0 +1,28 @@
+# RAM allocation planner checkpoint
+
+September 4, 2026. Artifacts: `/home/xero/Desktop/test/results/benchmarks/ese-cache-allocator-20260904`.
+
+The previous planner sorted eviction candidates even when free capacity already fit, then rebuilt and sorted occupied intervals after each candidate eviction. Decode lease-acquisition measurements motivated investigating this host work, but those aggregate timers do not prove the entire lease duration is allocation overhead.
+
+The candidate sorts occupied spans once, returns immediately for free admission, and otherwise maintains free gaps while considering the same deterministic LRU prefix. Reclaimed spans exclude other pending reservations, including reservations overlapping still-readable victims. Own-reservation replanning retains its existing semantics. Cache lifetimes, memory budgets, loading states, and source I/O are unchanged.
+
+The integrated change is limited to `src/llama-expert-cache.cpp`. Validation-only copied headers expose private metadata to an isolated fixture; that friend declaration is not in the engine. `allocation-plan.patch` and `source-checkpoint.json` identify the change against the preceding dirty worktree.
+
+## Completed checks
+
+- Baseline and revised candidate make identical placement, victim-order, and reservation decisions in 10,000 deterministic fragmented/pinned/reserved snapshots. The fixture also independently checks capacity, alignment, victim eligibility, and exclusion of retained entries and other reservations.
+- The same 10,000 cases pass standalone AddressSanitizer and UndefinedBehaviorSanitizer with `halt_on_error=1` and empty stderr.
+- The project CPU cache suite passes, exercising concurrent fills, lease ownership, publication failures, and rollback. The Release CUDA cache suite passes with all three GPUs visible, including partial multi-GPU publication rollback.
+- The project ASAN suite exits successfully in UBSAN recovery mode, but it is **not a clean UBSAN pass**. Strict mode reports the existing GGML FP16 conversion callback being invoked through an incompatible function-pointer type at `ggml.c:18812`. The callback cast is at the F16 `type_traits` entry. The allocator patch does not modify that code; frozen baseline and candidate `libggml.so` hashes are identical. `strict-ubsan-failure.log` and the recovery-mode log preserve the report. The separate fix is now validated: `ggml_fp32_to_fp16_row_generic` matches the callback signature and delegates to the existing typed converter. Strict ASAN/UBSAN, CPU cache tests, multi-GPU cache tests, and Qwen64/GPT32 exact-logit comparisons pass after the adapter. Evidence is in `../ese-fp16-callback-20260904/` relative to the allocator artifacts. The historical failing logs remain preserved; this does not claim all GGML callback types have been audited.
+
+## Timing evidence and next gate
+
+The first prototype regressed a small fragmented free admission. The revised free-admission path removes that regression in the fixture. Across five process repeats, metadata-only free admissions improve about 1.48–4.21x, and a 27-victim fragmented plan improves 5.15x. Full-cache single-victim cases range from effectively unchanged to about 1.13x. These synthetic timings are not model speedups.
+
+Frozen baseline libraries already include the validated GPU payload-retention change. The candidate differs in `libllama.so`; `libggml.so` is identical. Qwen64 (248,320 logits per step) and GPT32 (201,088 logits per step) match the frozen baseline exactly, with all values finite. The five-prompt paired 256-token NVMe screen completed all ten runs. Paired output tokens, RAM hit/miss/eviction counts, GPU payload bytes, and cache allocations match exactly for every prompt. Median paired throughput ratio is 1.4509; ready-TTFT ratio is 0.6197, with P95/P99 gap ratios of 0.6947/0.6652. Every prompt improves in this screen. Physical decode reads vary from nearly zero to several GiB, despite sequential source warming; this is not fully warm-cache evidence. See `screen-ab-summary.json`. Source warming and physical read counters distinguish the screening conditions. A single paired repeat per prompt can screen the candidate, but cannot establish promotion or broader performance.
+
+The sustained comparison completed all 50 runs (25 pairs), reversing order in repeats 1/3 and balancing the final repeat. The initial ten screen runs form repeat 0; this is not a second independent set of 50 trials. Frozen libraries, source warming, NVMe model, hardware fingerprint, and resource limits remain identical throughout.
+
+Median decode throughput is 9.385 tokens/s for the baseline and 14.048 tokens/s for the candidate. Median paired throughput ratio is 1.4763 (95% prompt-clustered bootstrap interval 1.4460–1.4947). Median paired ready-TTFT ratio is 0.6265 (interval 0.5970–0.6418), and startup-to-first-token ratio is 0.7362. Paired P95/P99 token-gap ratios are 0.6304/0.6812. Every paired output sequence, RAM hit/miss/eviction count, uploaded payload total, slot count, and cache allocation matches. All measured RAM/cache resource bounds pass. Both decode and TTFT gates pass for this short-context fixture.
+
+See `sustained-ab-summary.json`. Physical reads varied despite warming, although the median physical decode read count is zero for both versions. Five prompt clusters and short actual prompt fill limit generalization. This justifies retaining the allocator change for broader testing; it does not establish long-context, resident, cold-source, or arbitrary-model performance. Do not multiply this ratio by the earlier retention ratio to claim a directly measured combined gain.

@@ -1,0 +1,280 @@
+{
+  "manifest_version": 1,
+  "created_utc_date": "2026-10-05",
+  "owner_task": "ROADMAP_WORKLOG.md A2",
+  "purpose": "Pin the exact source revisions, read-only artifacts, tokenizer/template, quantization identity, hardware and build configuration behind the 2026-10-04/05 Strata-vs-ESE Qwen4Exp diagnostic so a future session can re-run it and compare like with like. This is an identity/configuration record, not a parity or speed claim.",
+  "scope_warning": "These numbers come from the dedicated opt-in Qwen4Exp probe build on shared, external, read-only model shards. They are NOT apples-to-apples engine parity evidence and must never be promoted through the production loader gate. The production loader still rejects general.architecture=qwen4exp.",
+
+  "workspace": {
+    "project_root": "/home/xero/Desktop/test/ESE-v0.2.1-qwen4exp-plan",
+    "note": "Existing worktree carries extensive pre-existing modified/untracked files. Never reset/clean/discard; this manifest only adds an untracked file under docs/qwen4exp/."
+  },
+
+  "ese_source_identity": {
+    "head_commit": "ee86cae61ef72309c94bae4b0fa5aa1975e37b47",
+    "diff_binary_sha256": "1403c9a8247e5760baac4ba19b911b340e6c3f44fce50171cb2131d231f276cd",
+    "git_status_porcelain_sha256": "04280d216bd65d364afa3ffc612e7fcc0b943e3b82cb7c23e02938b686f5d3e9",
+    "diff_digest_note": "git diff --binary | sha256sum ; the status digest is git status --porcelain | sha256sum. These capture the uncommitted state at capture time; re-verify before trusting any re-run.",
+    "key_source_files_sha256": {
+      "src/llama.cpp": "f077b5a8305c1cdc5e4aeb35784f70c0ecd39ab2df46b3929b779e6307a6c056",
+      "src/graphs/build_qwen4exp.cpp": "207879c592de490632f0a2397fcea417a9ad6810aa332b93e249eb679db87310",
+      "src/llama-qwen4exp-ops.cpp": "29f8758138f80bb7d0865b71ad4f51058180836b1d635a2d7ee7173a4b2c9c0d",
+      "src/llama-qwen4exp-ple.cpp": "5cf8e3fc02c81646ecdb44f9ea63f9684909661ddb0f43feaccd6e91e275e1e6",
+      "src/llama-qwen4exp-ple-storage.cpp": "0b86ee64f8220f8e31b25f67ff0d15d54f1a275bb8dc858d6466aed7f50febf7",
+      "CMakeLists.txt": "033d5aae331cff0cb87321a2f5517c7d3e85143920eaba968c1ba9268c99e92d"
+    }
+  },
+
+  "pinned_upstream_revisions": {
+    "note": "Resolved 2026-08-26; digests of the resolved files live in upstream-artifacts.json. Reproduced here for a single-file handoff.",
+    "official_model": {"repository": "Qwen/Qwen3.8-Flash-Next", "revision": "f5d08274bafd880402bd16f5e3e6c514136ec06c"},
+    "technical_report": {"repository": "QwenLM/Qwen3.8-Flash-Next", "revision": "513aa6e18a335296fc13e538232a8735b230877d"},
+    "transformers_reference": {"repository": "huggingface/transformers", "revision": "fc5c5bde8e656dad91cbf34e61940d984b1c7b91"},
+    "gguf_repository": {"repository": "unsloth/Qwen3.8-Flash-Next-GGUF", "revision": "d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249"},
+    "ese_base": "30642cdcbe4246aaddb0cbf7d079122c443ff5e2",
+    "upstream_llamacpp_master_observed": {"date": "2026-10-04", "commit": "a7fb71fab83b474a0892b9a05aaa3a8ddca2729b"},
+    "upstream_qwen4exp_pr": {"merged_pr": 27742, "merged_date": "2026-08-27", "correctness_followup_pr": 27941, "followup_commit": "36b1015", "followup_date": "2026-09-01"},
+    "evidence_file": {"path": "docs/qwen4exp/upstream-artifacts.json", "bytes": 2059, "sha256": "c3651f53d10668550b5a884764e443744d84a3b5bba2465b0c2c74e47bdde5f6"}
+  },
+
+  "shared_model_artifact": {
+    "role": "coder-pruned Qwen3.8-Flash-Next IQ1_M shared artifact; external, read-only benchmark input. Do not copy or modify.",
+    "directory": "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M",
+    "architecture": "qwen4exp",
+    "shards": [
+      {"file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf", "bytes": 29608446496, "sha256": "e11083ba855e7666b48ea3f2db6a9c3a20c18751a012cc24f948de91b7087fad"},
+      {"file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf", "bytes": 28800138432, "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"}
+    ],
+    "total_bytes": 58408454928,
+    "split_metadata": {"split.no": 0, "split.count": 2, "tensors.count": 1224},
+    "gguf_metadata_of_interest": {
+      "block_count": 48,
+      "context_length": 262144,
+      "embedding_length": 2560,
+      "attention.head_count": 24,
+      "attention.head_count_kv": 2,
+      "attention.key_length": 256,
+      "attention.value_length": 256,
+      "expert_count": 256,
+      "expert_used_count": 10,
+      "expert_feed_forward_length": 640,
+      "ssm.conv_kernel": 4,
+      "ssm.state_size": 128,
+      "ssm.group_count": 16,
+      "ssm.rank": 48,
+      "ssm.inner_size": 6144,
+      "full_attention_interval": 4,
+      "hyper_connection": 4,
+      "hyper_connection.low_rank": 320,
+      "indexer.head_count": 4,
+      "indexer.key_length": 128,
+      "indexer.top_k": 2048,
+      "ple.layers": [1],
+      "ngram": 3,
+      "heads_per_ngram": 8,
+      "conv_kernel": 4,
+      "eos_token_id": 248044,
+      "embedding_length_per_layer": 160,
+      "file_type": 31
+    },
+    "tensor_type_histogram": {
+      "BF16": 484, "F32": 292, "Q6_K": 129, "IQ4_NL": 87, "Q4_K": 47, "IQ4_XS": 45,
+      "IQ2_S": 40, "Q5_K": 35, "IQ3_XXS": 34, "IQ3_S": 20, "Q2_0": 9, "F16": 1, "Q8_0": 1
+    }
+  },
+
+  "memory_pack_and_tokenizer": {
+    "role": "Strata native pack + tokenizer used to produce the matched raw-token-ID prompt. Read-only.",
+    "pack_directory": "/home/xero/Desktop/strata/Strata-data/packs/coder-iq1_m",
+    "files": {
+      "dense.bin": {"bytes": 1475120640, "sha256": "99853263806e25450074fc9945f1e955b175bea05aa171ceeb6b5837bf6a1d9d"},
+      "index.txt": {"bytes": 93633, "sha256": "2cb3352786bcae81ea4d933eee6b2d5db45774069320c924a6dea48eb65a3cd3"},
+      "native_experts.txt": {"bytes": 3269, "sha256": "9ace1b92e1fe12595de469409e69dd52c8d5418c7981c405d9a51aa9d574dd3b"},
+      "tokenizer/chat_template.jinja": {"bytes": 9993, "sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"},
+      "tokenizer/merges.txt": {"bytes": 3353258, "sha256": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"},
+      "tokenizer/tokenizer.json": {"bytes": 541, "sha256": "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"},
+      "tokenizer/token_type.json": {"bytes": 744960, "sha256": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"},
+      "tokenizer/vocab.json": {"bytes": 5737005, "sha256": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"}
+    },
+    "tokenizer_json_summary": {
+      "model": "gpt2",
+      "pretokenizer_note": "qwen35",
+      "vocab_size": 248320,
+      "n_merges": 247587,
+      "bos_token_id": 248044,
+      "pad_token_id": 248044,
+      "eos_token_id": 248046,
+      "note": "tokenizer.json eos 248046 differs from the GGUF metadata eos_token_id 248044; record both rather than silently reconciling. The matched diagnostic passed raw token ID 12675 directly (Strata tokenizer maps \"Hi\" -> 12675), avoiding chat-template differences."
+    }
+  },
+
+  "mtp_draft_artifact": {
+    "role": "Strata MTP draft head/experts used for speculative decoding in the matched diagnostic. ESE has no matching implementation yet.",
+    "runtime_directory": "/home/xero/Desktop/strata/Strata-data/mtp/rt",
+    "files": {
+      "dense.bin": {"bytes": 116099072, "sha256": "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"},
+      "dense.txt": {"bytes": 1851, "sha256": "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"},
+      "experts.bin": {"bytes": 707788800, "sha256": "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"},
+      "draft_vocab.bin": {"bytes": 425196, "sha256": "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91"}
+    }
+  },
+
+  "strata_engine_identity": {
+    "engine_binary": {"path": "/home/xero/Desktop/test/strata/Strata-main/engine/strata", "bytes": 69056296, "sha256": "0a73f56e9842f3728165dabbbb96eba4271612b9f62532e6dfc8377a1eb42bb8"},
+    "build_json": {
+      "path": "/home/xero/Desktop/test/strata/Strata-main/engine/BUILD.json",
+      "bytes": 233,
+      "sha256": "68ec76e677479596fc4f3554d9657b84497b03c0817af5fa0a8d612f3d6ae223",
+      "contents": {"source": "local", "version": "0.1.34", "archs": [75, 86], "vision": "gpu", "cuda_dirs": ["/usr/local/cuda-13.4/bin", "/usr/local/cuda-13.4/lib64"], "src": "807f12b2eed96139", "vision_src": "4d89409b228a1daa"}
+    },
+    "source_revision": null,
+    "source_revision_limitation": "BLOCKED: /home/xero/Desktop/test/strata/Strata-main has no .git directory (confirmed 2026-10-05; `git rev-parse HEAD` -> 'fatal: not a git repository'). No source commit is recoverable, so identity is the engine binary hash + BUILD.json (version 0.1.34, src 807f12b2eed96139, vision_src 4d89409b228a1daa). Do not record a made-up revision.",
+    "launcher_config": {
+      "path": "/home/xero/Desktop/test/strata/Strata-main/strata-coder-iq1_m.json",
+      "bytes": 1622,
+      "sha256": "7ce99d8871cd9c329bea00bff6cf7e464ea759fb8f5ec9f353e208b0fe8f099b",
+      "effective_args": ["--pack <pack_dir>", "--native <shard1>", "--ple-gguf <shard2>", "--expert-profile <expert-profile-coder.bin>", "--expert-cache auto", "--prefill 1024", "--spec 4", "--mtp <mtp/rt>", "--max-context 131072", "--kv int8", "--kv-resident 32768", "--vision", "--vram-reserve-mib 700", "--spec-min-p 0.5"],
+      "gpu": [0, 2],
+      "layer_split": "auto",
+      "env": {"STRATA_SPLIT_OWN": "1"}
+    },
+    "expert_profile": {"path": "/home/xero/Desktop/test/strata/Strata-main/data/expert-profile-coder.bin", "bytes": 98328, "sha256": "a514661124d5305effe9c1bcecff7dc069af398b2b19ff9d11628a2cad0a8915"},
+    "text_probe_config": {
+      "note": "The matched text-only run used a temp copy of the launcher config with the vision block removed. That temp file lived in /tmp and is NOT preserved; its recorded hash was 8a7516a2e8045fc295fa745b0e80f8b3f5dd29219affa9f67c13f910aa0f36b9 (1353 bytes). Recreate by deleting the vision block from the launcher config; gpu [0,2] and STRATA_SPLIT_OWN=1 unchanged."
+    },
+    "surviving_strata_log": {
+      "path": "/home/xero/Desktop/test/strata/Strata-main/strata-coder-iq1_m.log",
+      "bytes": 429086,
+      "sha256": "e5d058abca1177e342159fd9333028fa3575df6de5a1821bdaf09cd41ad938dc",
+      "note": "This is the launcher profile-build/earlier-session log (long prompts, 90K+ tokens). It is NOT the matched 128-token run; it is retained only as corroborating engine-side evidence (version, layer-split/auto policy lines, expert-cache and KV-resident policy lines)."
+    }
+  },
+
+  "hardware": {
+    "cpu": {"model": "AMD Ryzen 9 5950X 16-Core Processor", "logical_cpus": 32, "threads_per_core": 2, "sockets": 1},
+    "kernel": "Linux nobara-pc 7.2.6-201.nobara.fc44.x86_64 #1 SMP PREEMPT_DYNAMIC Fri Sep 18 09:16:01 UTC 2026 x86_64",
+    "driver_version": "595.99.02",
+    "driver_note": "docs/qwen4exp/README.md records an earlier compute-capability probe at driver 595.84; the current driver is 595.99.02.",
+    "gpus": [
+      {"index": 0, "name": "NVIDIA GeForce RTX 3060 Ti", "uuid": "GPU-4235b005-5ad7-65e4-9960-4318a180a75d", "memory_total_mib": 8192, "compute_capability": "8.6"},
+      {"index": 1, "name": "NVIDIA GeForce RTX 2080 SUPER", "uuid": "GPU-55cb212f-ffba-60f1-16eb-c9ca9e88df42", "memory_total_mib": 8192, "compute_capability": "7.5"},
+      {"index": 2, "name": "NVIDIA GeForce RTX 3080", "uuid": "GPU-cf784953-0584-06fe-4686-c19ded9567f5", "memory_total_mib": 10240, "compute_capability": "8.6"}
+    ],
+    "gpu_pair_used": [0, 2]
+  },
+
+  "build_configurations": {
+    "normal_fail_closed": {
+      "dir": "build_cuda_release",
+      "cmake_build_type": "Release",
+      "generator": "Ninja",
+      "cxx_compiler": "/home/xero/micromamba/envs/vllm/bin/x86_64-conda-linux-gnu-g++",
+      "GGML_CUDA": "ON",
+      "GGML_EXPERT_CHUNKING": "ON",
+      "ESE_QWEN4EXP_PROBE_GATE": "unset (defaults OFF) -> qwen4exp load throws 'unsupported architecture: qwen4exp'",
+      "role": "production-equivalent; must keep rejecting qwen4exp"
+    },
+    "diagnostic_probe": {
+      "dir": "build_qwen4exp_probe",
+      "cmake_build_type": "Release",
+      "generator": "Unix Makefiles",
+      "cxx_compiler": "/home/xero/micromamba/envs/vllm/bin/x86_64-conda-linux-gnu-g++ (nvcc from same env)",
+      "GGML_CUDA": "ON",
+      "GGML_EXPERT_CHUNKING": "OFF",
+      "ESE_QWEN4EXP_PROBE_GATE": "BOOL=ON (compile-time); still requires per-run ESE_QWEN4EXP_PROBE_GATE=1 or it throws 'unsupported architecture: qwen4exp (probe-gate build; set ESE_QWEN4EXP_PROBE_GATE=1 to opt in)'",
+      "role": "only build able to load the artifact, and only with the runtime opt-in set; never wire the opt-in into a normal launch path"
+    },
+    "cpu_debug": {
+      "dir": "build_cpu_avx2_debug",
+      "cmake_build_type": "Debug",
+      "generator": "Ninja",
+      "cxx_compiler": "/usr/lib64/ccache/c++",
+      "GGML_CUDA": "OFF",
+      "GGML_EXPERT_CHUNKING": "ON",
+      "ESE_QWEN4EXP_PROBE_GATE": "BOOL=OFF"
+    },
+    "probe_binaries": {
+      "build_qwen4exp_probe/bin/llama-server": {"bytes": 11096216, "sha256": "f965abe81d0f665b77178bd8bb19f6f1ebed05cbb94bc83d45facf98a8088ba6"},
+      "build_qwen4exp_probe/bin/llama-cli": {"bytes": 3882384, "sha256": "8264b03113f1ba38fd6ce068fc5ce0054a357920fbc4087b3f70f597ab5ee743"},
+      "build_qwen4exp_probe/bin/test-qwen4exp-probe": {"bytes": 28048, "sha256": "2058ef4a344715fdedb79a0cab4de41810868f1941f08d3a8c6b8eb77e166cb6"},
+      "build_cuda_release/bin/test-qwen4exp-probe": {"bytes": 28048, "sha256": "2f19c2abfec87f96f42b221a3bc888c2a991997a3287c3f65486ab9fa9d9a579"},
+      "build_qwen4exp_probe/CMakeCache.txt": {"bytes": 46488, "sha256": "a5a4f49a5b4305160297c5238ed8c56b812eb255e6301419a193e1e55a2bcd65"}
+    }
+  },
+
+  "existing_evidence_fixtures": {
+    "docs/qwen4exp/operator-reference-fixture.json": {"bytes": 12136, "sha256": "020c18f90b90bf929c426a70d85b5451377a82bf5e4afe32c81c21e46ed5def8"},
+    "docs/qwen4exp/ple-reference-trace.json": {"bytes": 8359, "sha256": "3550892fb33fec77d0ab3eee9630dab32d3e542631e31663db835c355c72de14"},
+    "docs/qwen4exp/ple-iq4nl-row-fixture.json": {"bytes": 5246, "sha256": "5ab31e4a9b47371711c0a524b063ac8e5c101471ab29c6c74c6a5b3a79c42542"},
+    "docs/qwen4exp/ud-iq1-s.manifest.json": {"bytes": 316684, "sha256": "02b38f08c7608df75c5fad094b532d75282da3a0ffe2172738a06563fda9fb24"},
+    "note": "Do not overwrite these; they are prior content-addressed evidence."
+  },
+
+  "matched_diagnostic": {
+    "run_date": "2026-10-04/05",
+    "input": {"raw_prompt_token_id": 12675, "raw_text": "Hi", "generated_tokens": 128, "sampling": "greedy"},
+    "common_settings": {"context_length": 131072, "gpu_pair": [0, 2], "kv_precision": "int8 (Strata) / q8_0 (ESE)"},
+    "strata_run": {
+      "settings": {"prefill_chunk": 1024, "spec": 4, "mtp": true, "kv_resident_cells": 32768, "spec_min_p": 0.5, "vram_reserve_mib": 700, "layer_split": "auto", "expert_cache": "auto", "env": {"STRATA_SPLIT_OWN": "1"}},
+      "result": {
+        "decode_ms": 2944.2, "generated_tokens": 128, "tok_per_s": 43.5, "ms_per_token": 23.0,
+        "mtp_drafts_accepted": "82/83",
+        "suffix_drafts": "76/76 across 38 windows",
+        "expert_cache": "30833/49227 lookups (62.6%)",
+        "kv_block_reads": "2082/2114 VRAM (98.49%), 0.1 MiB read from RAM",
+        "prompt_ms": 1.5
+      }
+    },
+    "ese_run": {
+      "settings": {"ubatch": 128, "ubatch_requested": 1024, "logical_batch": 1024, "kv": "q8_0 full host-resident history", "mtp": false, "note": "no resident-window or GPU expert cache control; prompt path differed from Strata chat template"},
+      "result": {
+        "decode_ms": 22138.8, "generated_tokens": 128, "tok_per_s": 5.78, "ms_per_token": 172.96,
+        "one_token_prefill_ms": 702.18,
+        "kv_logged": "1632 MiB Q8 + 384 MiB F16 QSA-indexer cache",
+        "weight_buffers_mib": {"CUDA0": 5855, "CUDA2": 6411},
+        "compute_buffers_mib": {"CUDA0": 324, "CUDA2": 372},
+        "ple": "2048 logical rows; 1960 source reads / 176400 bytes; 88 row-cache hits; 124 input waits; zero failed reads",
+        "exit_code": 0
+      },
+      "ubatch_1024_failure": "CUDA0 could not allocate a 2285 MiB compute buffer during context allocation; no throughput produced at that ubatch."
+    },
+    "ratio": {"value": 7.5, "computed_from": "43.5 / 5.78", "interpretation": "DIAGNOSTIC ONLY. The runs differ in MTP, KV residency policy, microbatch and expert-cache features. Never present this as an engine speedup or as evidence any single feature closes the gap."}
+  },
+
+  "evidence_durability": {
+    "problem_found_2026-10-05": "The raw logs for the matched run lived in /tmp and were cleared between sessions (verified: none of the /tmp/qwen4exp_* or /tmp/strata_* files exist any more). /tmp is ephemeral and must not be the only store for benchmark evidence. This directly motivates roadmap item D8 (benchmark replay bundle written to a durable path).",
+    "lost_ephemeral_logs": [
+      {"path": "/tmp/qwen4exp_strata_match_131k_ub128_n128.log", "recorded_bytes": 31035, "recorded_sha256": "a333786e017622cd0f6bfbad1d8d6f17b69f96a545a9af6f45d902f8b4b5a43b", "present": false},
+      {"path": "/tmp/strata_profile_match_raw_hi_n128.log", "recorded_bytes": 5377, "recorded_sha256": "245de9896cc5989a66e1848fe08ef6d97ec7e73556c2bb31b53b101c07febeb5", "present": false},
+      {"path": "/tmp/codebuff-process-e09FUq/stdout.log", "recorded_bytes": 1280, "recorded_sha256": "d0c3fcc8e860078a03be0469fb88647b73d7bf654bdebbe5ec281fcb462d32a0", "present": false},
+      {"path": "/tmp/codebuff-process-e09FUq/exit.json", "recorded_sha256": "6041df3e9b345d68be886f995c452395674ea950cd3ca9992c13b64f3aa9cbd0", "recorded_contents": {"exitCode": 0}, "present": false},
+      {"path": "/tmp/qwen4exp_probe_optin_positive.log", "present": false, "note": "A1 positive-control evidence; content summarized in ROADMAP_WORKLOG.md."},
+      {"path": "/tmp/qwen4exp_strata_match_plan.log", "present": false, "note": "Contained the resource_plan JSON useful for C1."},
+      {"path": "/tmp/strata-coder-iq1_m-text-probe.json", "recorded_bytes": 1353, "recorded_sha256": "8a7516a2e8045fc295fa745b0e80f8b3f5dd29219affa9f67c13f910aa0f36b9", "present": false}
+    ],
+    "durable_records": [
+      "docs/qwen4exp/README.md (measured table + analysis; committed text)",
+      "docs/qwen4exp/benchmark-replay-20261005.json (this file)",
+      "/home/xero/Desktop/test/strata/Strata-main/strata-coder-iq1_m.log (Strata-side; different/longer session)"
+    ],
+    "hashes_of_lost_files_note": "Hashes for lost files are transcribed from the capture session and can no longer be re-verified against the original bytes; treat them as provenance notes, not verifiable digests."
+  },
+
+  "replay_procedure": {
+    "step_1_build": "Use an existing build_qwen4exp_probe (or reconfigure a fresh Release dir with -DESE_QWEN4EXP_PROBE_GATE=ON -DGGML_CUDA=ON -DGGML_EXPERT_CHUNKING=OFF). Never touch build_cuda_release's fail-closed default.",
+    "step_2_opt_in": "Set ESE_QWEN4EXP_PROBE_GATE=1 only in the environment of the single diagnostic invocation. It must not appear in any normal launch path.",
+    "step_3_ese_invocation": "Run build_qwen4exp_probe/bin/llama-cli with the shared shard paths read-only, -c 131072, q8_0 K/V, devices 0 and 2, logical batch 1024, ubatch 128, PLE async row streaming, MTP disabled (unsupported), and pass raw token ID 12675 as the prompt with 128 greedy outputs. The exact argv used in the 2026-10-04 run was not preserved verbatim; reconstruct from the settings above and record it durably this time.",
+    "step_4_strata_invocation": "Recreate the text-only Strata config by removing the vision block from strata-coder-iq1_m.json, keep gpu [0,2], STRATA_SPLIT_OWN=1, then drive GEN 128 12675 through serve/server.py or the engine line protocol.",
+    "step_5_output": "Write stdout/stderr and any plan JSON to a durable in-repo path (e.g. docs/qwen4exp/ or a bench/downloads dir), not /tmp. Hash and record them, and update this manifest with the new digests.",
+    "step_6_compare": "Compare only like-for-like fields. Do not compare prefill from a one-token prompt. Re-state that these are diagnostic, not parity-qualified numbers."
+  },
+
+  "known_non_parity_limits": [
+    "No whole-model logits/routes parity exists for the ESE Qwen graph.",
+    "ESE has no MTP/speculative path in this probe.",
+    "ESE has no bounded GPU-resident QSA KV window (Strata: 32768 cells).",
+    "ESE required ubatch 128 because ubatch 1024 failed allocation; Strata used a 1024 prefill chunk.",
+    "ESE probe did not enable Strata's per-layer GPU expert cache.",
+    "Prompt paths/templates differed; raw token ID 12675 was passed directly to sidestep the template."
+  ]
+}

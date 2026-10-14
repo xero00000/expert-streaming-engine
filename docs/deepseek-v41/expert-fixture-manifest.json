@@ -1,0 +1,34 @@
+{
+  "repository": "apetersson/DeepSeek-V4.1-Flash-MixedQ2-GGUF",
+  "revision": "af983b61ee7903f414e8152bf1ece8f6ef2a1020",
+  "records": [
+    {
+      "file": "blk.0.ffn_gate_exps.expert0.bin",
+      "tensor": "blk.0.ffn_gate_exps",
+      "expert": 0,
+      "shape": [
+        5120,
+        2304
+      ],
+      "type": "IQ2_XXS",
+      "type_id": 16,
+      "source_offset": 1763213920,
+      "bytes": 3041280,
+      "sha256": "d5f298c8879154986284608c76c3d9887eb69ee0b71060ef61adb15306b2421f"
+    },
+    {
+      "file": "blk.0.ffn_down_exps.expert0.bin",
+      "tensor": "blk.0.ffn_down_exps",
+      "expert": 0,
+      "shape": [
+        2304,
+        5120
+      ],
+      "type": "Q2_K",
+      "type_id": 10,
+      "source_offset": 253264480,
+      "bytes": 3870720,
+      "sha256": "ded1dfe34e326e6de3c3edd9afcee10c4e9e4ef140bb65865e3f2364703872a3"
+    }
+  ]
+}

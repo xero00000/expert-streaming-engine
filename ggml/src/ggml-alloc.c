@@ -1,4 +1,5 @@
 #include "ggml-alloc.h"
+#include "ggml-memory-budget.h"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -359,6 +360,9 @@ struct ggml_gallocr {
     ggml_backend_buffer_t * buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
+    struct ggml_gallocr_buffer_stats * buffer_stats;
+    ggml_memory_budget_t * ledgers;
+    uint64_t * charges;
 
     struct ggml_hash_set hash_set;
     struct hash_node * hash_values; // [hash_set.size]
@@ -400,7 +404,13 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
             galloc->buf_tallocs[i] = ggml_dyn_tallocr_new(alignment);
         }
     }
+    galloc->buffer_stats = calloc(n_bufs, sizeof(galloc->buffer_stats[0]));
+    GGML_ASSERT(galloc->buffer_stats != NULL);
+    for (int i = 0; i < n_bufs; ++i) galloc->buffer_stats[i].allocation_budget_bytes = UINT64_MAX;
     galloc->n_buffers = n_bufs;
+    galloc->ledgers = calloc(n_bufs,sizeof(galloc->ledgers[0]));
+    galloc->charges = calloc(n_bufs,sizeof(galloc->charges[0]));
+    GGML_ASSERT(galloc->ledgers && galloc->charges);
 
     return galloc;
 }
@@ -426,6 +436,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
             }
             if (!freed) {
                 ggml_backend_buffer_free(galloc->buffers[i]);
+                ggml_memory_budget_release(galloc->ledgers[i],galloc->charges[i]);
             }
         }
         if (galloc->buf_tallocs != NULL) {
@@ -443,11 +454,15 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
         }
     }
 
+    for(int i=0;i<galloc->n_buffers;++i) ggml_memory_budget_free(galloc->ledgers[i]);
+    free(galloc->ledgers);
+    free(galloc->charges);
     ggml_hash_set_free(&galloc->hash_set);
     free(galloc->hash_values);
     free(galloc->bufts);
     free(galloc->buffers);
     free(galloc->buf_tallocs);
+    free(galloc->buffer_stats);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
@@ -670,7 +685,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
-bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+static bool ggml_gallocr_reserve_n_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -749,35 +764,157 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
         }
     }
 
-    // reallocate buffers if needed
-    for (int i = 0; i < galloc->n_buffers; i++) {
-        // if the buffer type is used multiple times, we reuse the same buffer
-        for (int j = 0; j < i; j++) {
+    // Measure every requirement and check all quotas before allocating an arena.
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        const uint64_t required = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i]);
+        galloc->buffer_stats[i].required_bytes = required;
+    }
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        bool alias = false;
+        for (int j = 0; j < i; ++j) if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) alias = true;
+        if (alias) continue;
+        const uint64_t live = galloc->buffers[i] ? ggml_backend_buffer_get_size(galloc->buffers[i]) : 0;
+        const uint64_t required = galloc->buffer_stats[i].required_bytes;
+        uint64_t budget = galloc->buffer_stats[i].allocation_budget_bytes;
+        for (int j = i + 1; j < galloc->n_buffers; ++j)
+            if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i] && galloc->buffer_stats[j].allocation_budget_bytes < budget)
+                budget = galloc->buffer_stats[j].allocation_budget_bytes;
+        if (required > live && (live > budget || required > budget - live)) {
+            ++galloc->buffer_stats[i].budget_rejections;
+            return false;
+        }
+    }
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        bool alias = false;
+        for (int j = 0; j < i; ++j) {
             if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
                 galloc->buffers[i] = galloc->buffers[j];
+                alias = true;
                 break;
             }
         }
-
-        size_t cur_size = galloc->buffers[i] ? ggml_backend_buffer_get_size(galloc->buffers[i]) : 0;
-        size_t new_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i]);
-
-        // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
-        if (new_size > cur_size || galloc->buffers[i] == NULL) {
-#ifndef NDEBUG
-            fprintf(stderr, "%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
-#endif
-
-            ggml_backend_buffer_free(galloc->buffers[i]);
-            galloc->buffers[i] = ggml_backend_buft_alloc_buffer(galloc->bufts[i], new_size);
-            if (galloc->buffers[i] == NULL) {
-                fprintf(stderr, "%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+        if (alias) continue;
+        const uint64_t live = galloc->buffers[i] ? ggml_backend_buffer_get_size(galloc->buffers[i]) : 0;
+        const size_t required = (size_t) galloc->buffer_stats[i].required_bytes;
+        if (required > live || !galloc->buffers[i]) {
+            if(!ggml_memory_budget_reserve(galloc->ledgers[i],required)) {
+                ++galloc->buffer_stats[i].budget_rejections;return false;
+            }
+            ggml_backend_buffer_t candidate = ggml_backend_buft_alloc_buffer(galloc->bufts[i], required);
+            if (!candidate) {
+                ggml_memory_budget_release(galloc->ledgers[i],required);
+                ++galloc->buffer_stats[i].allocation_failures;
                 return false;
             }
-            ggml_backend_buffer_set_usage(galloc->buffers[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            // The former arena is borrowed, and must never be freed here.
+            galloc->buffers[i] = candidate;
+            galloc->charges[i] = required;
+            ggml_backend_buffer_set_usage(candidate, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            const uint64_t actual = ggml_backend_buffer_get_size(candidate);
+            if(actual>required) {
+                if(!ggml_memory_budget_reserve(galloc->ledgers[i],actual-required)) {
+                    ++galloc->buffer_stats[i].budget_rejections;return false;
+                }
+                galloc->charges[i]=actual;
+            } else if(actual<required) {
+                ggml_memory_budget_release(galloc->ledgers[i],required-actual);
+                galloc->charges[i]=actual;
+            }
+            uint64_t budget = galloc->buffer_stats[i].allocation_budget_bytes;
+            for (int j = i + 1; j < galloc->n_buffers; ++j)
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i] && galloc->buffer_stats[j].allocation_budget_bytes < budget)
+                    budget = galloc->buffer_stats[j].allocation_budget_bytes;
+            if (actual > UINT64_MAX - live) { ++galloc->buffer_stats[i].allocation_failures; return false; }
+            galloc->buffer_stats[i].peak_allocated_bytes = MAX(galloc->buffer_stats[i].peak_allocated_bytes, live + actual);
+            if (actual < required) { ++galloc->buffer_stats[i].allocation_failures; return false; }
+            if (live > budget || actual > budget - live) { ++galloc->buffer_stats[i].budget_rejections; return false; }
         }
     }
 
+    return true;
+}
+
+// Remove borrowed/reused arenas before destroying a temporary allocator.
+static void ggml_gallocr_drop_shared_buffers(ggml_gallocr_t releasing, const ggml_gallocr_t retained) {
+    for (int i = 0; i < releasing->n_buffers; ++i) {
+        for (int j = 0; j < retained->n_buffers; ++j) {
+            if (releasing->buffers[i] && releasing->buffers[i] == retained->buffers[j]) {
+                releasing->buffers[i] = NULL;
+                break;
+            }
+        }
+    }
+}
+
+bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
+        const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    ggml_gallocr_t prepared = ggml_gallocr_new_n(galloc->bufts, galloc->n_buffers);
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        prepared->buffers[i] = galloc->buffers[i];
+        prepared->buffer_stats[i] = galloc->buffer_stats[i];
+        prepared->ledgers[i] = galloc->ledgers[i];
+        ggml_memory_budget_retain(prepared->ledgers[i]);
+    }
+    if (!ggml_gallocr_reserve_n_impl(prepared, graph, node_buffer_ids, leaf_buffer_ids)) {
+        // Diagnostics describe the failed measurement; committed plans and
+        // arenas stay untouched and remain usable by the previously built graph.
+        memcpy(galloc->buffer_stats, prepared->buffer_stats, galloc->n_buffers * sizeof(galloc->buffer_stats[0]));
+        ggml_gallocr_drop_shared_buffers(prepared, galloc);
+        ggml_gallocr_free(prepared);
+        return false;
+    }
+    // Reused arenas transfer their single charge to the new committed owner.
+    for(int i=0;i<galloc->n_buffers;++i) {
+        if(prepared->buffers[i] && prepared->buffers[i]==galloc->buffers[i]) {
+            prepared->charges[i]=galloc->charges[i];
+            galloc->charges[i]=0;
+        }
+    }
+    struct ggml_gallocr previous = *galloc;
+    *galloc = *prepared;
+    *prepared = previous;
+    ggml_gallocr_drop_shared_buffers(prepared, galloc);
+    ggml_gallocr_free(prepared);
+    return true;
+}
+
+bool ggml_gallocr_set_memory_budget(ggml_gallocr_t galloc,int buffer_id,ggml_memory_budget_t ledger) {
+    if(!galloc || buffer_id<0 || buffer_id>=galloc->n_buffers) return false;
+    int owner=buffer_id;
+    for(int i=0;i<buffer_id;++i) if(galloc->buf_tallocs[i]==galloc->buf_tallocs[buffer_id]) {owner=i;break;}
+    if(galloc->ledgers[owner]==ledger) return true;
+    uint64_t live=galloc->buffers[owner]?ggml_backend_buffer_get_size(galloc->buffers[owner]):0;
+    if(!ggml_memory_budget_reserve(ledger,live)) return false;
+    ggml_memory_budget_release(galloc->ledgers[owner],galloc->charges[owner]);
+    for(int i=0;i<galloc->n_buffers;++i) if(galloc->buf_tallocs[i]==galloc->buf_tallocs[owner]) {
+        ggml_memory_budget_retain(ledger);
+        ggml_memory_budget_free(galloc->ledgers[i]);
+        galloc->ledgers[i]=ledger;
+        galloc->charges[i]=(i==owner)?live:0;
+    }
+    return true;
+}
+
+bool ggml_gallocr_set_buffer_budget(ggml_gallocr_t galloc, int buffer_id, uint64_t bytes) {
+    if (!galloc || buffer_id < 0 || buffer_id >= galloc->n_buffers) return false;
+    const uint64_t live = galloc->buffers[buffer_id] ? ggml_backend_buffer_get_size(galloc->buffers[buffer_id]) : 0;
+    if (bytes < live) return false;
+    galloc->buffer_stats[buffer_id].allocation_budget_bytes = bytes;
+    return true;
+}
+
+bool ggml_gallocr_get_buffer_stats(ggml_gallocr_t galloc, int buffer_id, struct ggml_gallocr_buffer_stats * stats) {
+    if (!galloc || !stats || buffer_id < 0 || buffer_id >= galloc->n_buffers) return false;
+    int owner = buffer_id;
+    uint64_t budget = galloc->buffer_stats[buffer_id].allocation_budget_bytes;
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        if (galloc->buf_tallocs[i] != galloc->buf_tallocs[buffer_id]) continue;
+        if (i < owner) owner = i;
+        budget = budget < galloc->buffer_stats[i].allocation_budget_bytes ? budget : galloc->buffer_stats[i].allocation_budget_bytes;
+    }
+    *stats = galloc->buffer_stats[owner];
+    stats->allocated_bytes = galloc->buffers[owner] ? ggml_backend_buffer_get_size(galloc->buffers[owner]) : 0;
+    stats->allocation_budget_bytes = budget;
     return true;
 }
 
@@ -972,6 +1109,25 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
     *buffers = realloc(*buffers, sizeof(ggml_backend_buffer_t) * (*n_buffers + 1));
     (*buffers)[(*n_buffers)++] = buffer;
 
+    return true;
+}
+
+bool ggml_backend_alloc_ctx_tensors_size(struct ggml_context * ctx,
+        ggml_backend_buffer_type_t buft, size_t * size) {
+    if (!ctx || !buft || !size || !ggml_get_no_alloc(ctx)) return false;
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    const size_t max_size = ggml_backend_buft_get_max_size(buft);
+    if (!alignment || (alignment & (alignment - 1))) return false;
+    size_t total = 0;
+    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->data != NULL || t->view_src != NULL) continue;
+        const size_t bytes = ggml_backend_buft_get_alloc_size(buft, t);
+        if (bytes > SIZE_MAX - (alignment - 1)) return false;
+        const size_t padded = GGML_PAD(bytes, alignment);
+        if (padded > max_size || padded > SIZE_MAX - total) return false;
+        total += padded;
+    }
+    *size = total;
     return true;
 }
 

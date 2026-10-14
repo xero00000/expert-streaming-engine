@@ -18,6 +18,10 @@
 extern "C" {
 #endif
 
+// Read-only GSQ format support; no lossy re-quantization of imported weights.
+void dequantize_row_q2_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_vec_dot_q2_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
 // Quantization
 void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k);
 void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t k);

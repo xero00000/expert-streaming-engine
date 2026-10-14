@@ -249,7 +249,6 @@ static void delta_net_f32_cuda(
     }
 
     CUDA_CHECK(cudaGetLastError());
-
 }
 
 // PATH D1 helper: de-interleave v from ik_llama's interleaved SSM buffer.
@@ -368,7 +367,9 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     //     port step. For now, the dispatch compiles + the binary loads but
     //     chunked is dormant.
     // Otherwise falls through to the existing sequential per-token kernel.
-    const bool kda = (src3->ne[0] == head_dim);
+    // Do not mistake [tokens, 1, heads, sequences] scalar decay for per-key
+    // KDA when tokens == head_dim. KDA also has a full token axis.
+    const bool kda = src3->ne[0] == head_dim && src3->ne[1] == n_tokens;
     // 2026-05-26: ggml_are_same_stride() checks ALL nb[i] including trivial
     // dims (size 1). After our permute alignment, g and beta have identical
     // strides EXCEPT nb[0] (which is 256 vs 128 in our shape [1,n_tokens,H_v,1])

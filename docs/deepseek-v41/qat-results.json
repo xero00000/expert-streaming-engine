@@ -1,0 +1,238 @@
+[
+  {
+    "backend": "CPU",
+    "results": [
+      {
+        "case": "qat_0_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_0_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_0_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      }
+    ]
+  },
+  {
+    "backend": "CUDA0",
+    "results": [
+      {
+        "case": "qat_0_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_0_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_0_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      }
+    ]
+  },
+  {
+    "backend": "CUDA1",
+    "results": [
+      {
+        "case": "qat_0_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_0_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_0_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      }
+    ]
+  },
+  {
+    "backend": "CUDA2",
+    "results": [
+      {
+        "case": "qat_0_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_0_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_0_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_1_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_zero",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_random",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      },
+      {
+        "case": "qat_2_ties",
+        "max_absolute_errors": {
+          "output": 0.0
+        }
+      }
+    ]
+  }
+]

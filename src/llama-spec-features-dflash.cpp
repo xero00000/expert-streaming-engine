@@ -419,12 +419,12 @@ bool llama_set_dflash_target_features_view(
     return llama_set_dflash_target_features_impl(ctx, target_features, n_floats, n_rows, target_positions, false, window_update);
 }
 
-static bool llama_dflash_parse_layer_id(const struct ggml_tensor * tensor, int32_t & layer_id) {
+static bool llama_dflash_parse_layer_id(const struct llama_context * ctx, const struct ggml_tensor * tensor, int32_t & layer_id) {
     if (tensor == nullptr) {
         return false;
     }
 
-    static constexpr const char * prefix = "l_out-";
+    const char * prefix = ctx->dsv41_runtime ? "dspark_input-" : "l_out-";
     if (std::strncmp(tensor->name, prefix, std::strlen(prefix)) != 0) {
         return false;
     }
@@ -460,7 +460,7 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
     }
 
     int32_t layer_id = -1;
-    if (!llama_dflash_parse_layer_id(tensor, layer_id)) {
+    if (!llama_dflash_parse_layer_id(ctx, tensor, layer_id)) {
         return 0;
     }
 

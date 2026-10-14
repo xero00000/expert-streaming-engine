@@ -1,0 +1,70 @@
+{
+  "forward": [
+    {
+      "aborted_step_replayed": true,
+      "backend": "CPU",
+      "failed_step_replayed": true,
+      "gpu_matmuls": 0,
+      "layer_evaluations": 96,
+      "max_absolute_error": 0.00018301606178283691
+    },
+    {
+      "aborted_step_replayed": true,
+      "backend": "CUDA0",
+      "failed_step_replayed": true,
+      "gpu_matmuls": 673,
+      "layer_evaluations": 96,
+      "max_absolute_error": 2.980232238769531e-07
+    },
+    {
+      "aborted_step_replayed": true,
+      "backend": "CUDA1",
+      "failed_step_replayed": true,
+      "gpu_matmuls": 673,
+      "layer_evaluations": 96,
+      "max_absolute_error": 2.980232238769531e-07
+    },
+    {
+      "aborted_step_replayed": true,
+      "backend": "CUDA2",
+      "failed_step_replayed": true,
+      "gpu_matmuls": 673,
+      "layer_evaluations": 96,
+      "max_absolute_error": 2.980232238769531e-07
+    }
+  ],
+  "forward-bf16": [
+    {
+      "aborted_step_replayed": true,
+      "backend": "CPU",
+      "failed_step_replayed": true,
+      "gpu_matmuls": 0,
+      "layer_evaluations": 96,
+      "max_absolute_error": 0.0
+    },
+    {
+      "aborted_step_replayed": true,
+      "backend": "CUDA0",
+      "failed_step_replayed": true,
+      "gpu_matmuls": 673,
+      "layer_evaluations": 96,
+      "max_absolute_error": 0.0
+    },
+    {
+      "aborted_step_replayed": true,
+      "backend": "CUDA1",
+      "failed_step_replayed": true,
+      "gpu_matmuls": 673,
+      "layer_evaluations": 96,
+      "max_absolute_error": 0.0
+    },
+    {
+      "aborted_step_replayed": true,
+      "backend": "CUDA2",
+      "failed_step_replayed": true,
+      "gpu_matmuls": 673,
+      "layer_evaluations": 96,
+      "max_absolute_error": 0.0
+    }
+  ]
+}

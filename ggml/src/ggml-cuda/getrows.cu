@@ -211,18 +211,26 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
             auto row_size = ggml_row_size(dst->type, dst->ne[0]);
             GGML_ASSERT(row_size % 2 == 0);
-            auto type_size = row_size % 4 == 0 ? 4 : 2;
+            // Copy stored bytes, rather than interpreting a row's scalar
+            // count as a count of uint32_t chunks. F16 rows can also have odd
+            // channel counts or padding that only permits uint16_t alignment.
+            const bool aligned_4 = uintptr_t(src0->data) % 4 == 0 && uintptr_t(dst->data) % 4 == 0 &&
+                    row_size % 4 == 0 && src0->nb[1] % 4 == 0 &&
+                    src0->nb[2] % 4 == 0 && src0->nb[3] % 4 == 0 &&
+                    dst->nb[1] % 4 == 0 && dst->nb[2] % 4 == 0 && dst->nb[3] % 4 == 0;
+            const size_t type_size = aligned_4 ? 4 : 2;
+            const int copy_units = row_size / type_size;
             dim3 grid(dst->ne[1], dst->ne[2], dst->ne[3]);
             if (type_size == 2) {
-                k_get_rows_dim1<<<grid, k_block_size, 0, ctx.stream()>>>(dst->ne[0],
+                k_get_rows_dim1<<<grid, k_block_size, 0, ctx.stream()>>>(copy_units,
                         src0->nb[1]/type_size, src0->nb[2]/type_size, src0->nb[3]/type_size,
-                        src1->nb[1]/type_size, src1->nb[2]/type_size,
+                        src1->nb[1]/sizeof(int32_t), src1->nb[2]/sizeof(int32_t),
                          dst->nb[1]/type_size,  dst->nb[2]/type_size, dst->nb[3]/type_size,
                         (const uint16_t *)src0->data, (const int *)src1->data, (uint16_t *)dst->data);
             } else {
-                k_get_rows_dim1<<<grid, k_block_size, 0, ctx.stream()>>>(dst->ne[0],
+                k_get_rows_dim1<<<grid, k_block_size, 0, ctx.stream()>>>(copy_units,
                         src0->nb[1]/type_size, src0->nb[2]/type_size, src0->nb[3]/type_size,
-                        src1->nb[1]/type_size, src1->nb[2]/type_size,
+                        src1->nb[1]/sizeof(int32_t), src1->nb[2]/sizeof(int32_t),
                          dst->nb[1]/type_size,  dst->nb[2]/type_size,  dst->nb[3]/type_size,
                         (const uint32_t *)src0->data, (const int *)src1->data, (uint32_t *)dst->data);
             }
@@ -239,6 +247,9 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int32_t * src1_i32 = (const int32_t *) src1_d;
 
     switch (src0->type) {
+        case GGML_TYPE_BF16:
+            get_rows_cuda_float(src0, src1, dst, (const nv_bfloat16 *)src0_d, src1_i32, dst_d, stream);
+            break;
         case GGML_TYPE_F16:
             get_rows_cuda_float(src0, src1, dst, (const half *)src0_d, src1_i32, dst_d, stream);
             break;

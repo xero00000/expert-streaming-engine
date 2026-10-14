@@ -1,0 +1,97 @@
+{
+  "runtime_supported": false,
+  "repository": "deepseek-ai/DeepSeek-V4.1-Flash",
+  "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+  "tensor_count": 96085,
+  "tensor_bytes": 510286023000,
+  "bytes_by_category": {
+    "vision": 970506240,
+    "other_backbone": 9846779328,
+    "routed_experts": 288777830400,
+    "dspark": 7932874632,
+    "engram_tables": 202758032400
+  },
+  "expert_count": 15360,
+  "expert_bundle_bytes_including_scales": 18800640,
+  "engram_tensors": [
+    {
+      "name": "layers.1.engram.embed.weight",
+      "shape": [
+        384006168,
+        256
+      ],
+      "dtype": "F8_E4M3",
+      "bytes": 98305579008,
+      "row_bytes": 256,
+      "shard": "model-00047-of-00048.safetensors"
+    },
+    {
+      "name": "layers.1.engram.embed.scale",
+      "shape": [
+        384006168,
+        8
+      ],
+      "dtype": "F8_E8M0",
+      "bytes": 3072049344,
+      "row_bytes": 8,
+      "shard": "model-00047-of-00048.safetensors"
+    },
+    {
+      "name": "layers.14.engram.embed.weight",
+      "shape": [
+        384016682,
+        256
+      ],
+      "dtype": "F8_E4M3",
+      "bytes": 98308270592,
+      "row_bytes": 256,
+      "shard": "model-00048-of-00048.safetensors"
+    },
+    {
+      "name": "layers.14.engram.embed.scale",
+      "shape": [
+        384016682,
+        8
+      ],
+      "dtype": "F8_E8M0",
+      "bytes": 3072133456,
+      "row_bytes": 8,
+      "shard": "model-00048-of-00048.safetensors"
+    }
+  ],
+  "decode_batch1_all_main_layers": {
+    "routed_expert_selections": 240,
+    "routed_bytes_if_all_miss": 4512153600,
+    "engram_logical_bytes": 12672,
+    "note": "Not measured throughput; ignores compute, other weights, page amplification and transfer overlap."
+  },
+  "transfer_scenarios": [
+    {
+      "expert_cache_hit_fraction": 0,
+      "routed_bytes_per_token": 4512153600
+    },
+    {
+      "expert_cache_hit_fraction": 0.25,
+      "routed_bytes_per_token": 3384115200.0
+    },
+    {
+      "expert_cache_hit_fraction": 0.5,
+      "routed_bytes_per_token": 2256076800.0
+    },
+    {
+      "expert_cache_hit_fraction": 0.75,
+      "routed_bytes_per_token": 1128038400.0
+    },
+    {
+      "expert_cache_hit_fraction": 0.9,
+      "routed_bytes_per_token": 451215359.9999999
+    }
+  ],
+  "storage": {
+    "path": "/home/xero/Desktop/test/ESE-v0.2.1-qwen4exp-plan",
+    "free_bytes": 338948411392,
+    "checkpoint_payload_fits": false,
+    "minimum_additional_bytes": 171337611608,
+    "note": "Payload only; reserve extra space for headers, conversion outputs and filesystem headroom."
+  }
+}

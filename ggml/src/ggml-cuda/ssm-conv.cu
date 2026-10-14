@@ -30,7 +30,7 @@ static __global__ void ssm_conv_single_seq_f32(
 
     [[maybe_unused]] float * y;
     if constexpr (save_steps) {
-        y = saved + t0*(nc - 1)*nr;
+        y = saved + ((size_t) t0 * nr + row) * (nc - 1);
     }
 
 #pragma unroll

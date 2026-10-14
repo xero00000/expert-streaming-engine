@@ -10,6 +10,7 @@
 #pragma once
 
 #include "llama.h"
+#include <functional>
 
 #include "sampling.h"
 
@@ -448,10 +449,14 @@ struct gpt_params {
     bool defer_experts     = false; // if true, defer expert mmap residency to speed up model loading (Linux only)
     bool prefetch_experts  = false; // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
     int  prefetch_experts_threads = 0; // number of expert prefetch workers (<=0 = auto)
+    uint32_t expert_load_workers = 0; // opt-in bounded concurrent GPU-route loads
     int64_t expert_ram_cache_mib = 0; // explicit bounded native expert RAM tier; 0 disables
     int64_t expert_ram_staging_mib = 0; // 0 = max(largest component, min(cache, 64 MiB))
     std::string expert_storage_backend = "pread";
     bool expert_sidecar_only = false;
+    std::string qwen4exp_ple_mode = "auto";
+    int64_t qwen4exp_ple_cache_mib = 256;
+    int32_t qwen4exp_ple_queue_depth = 32;
     int64_t expert_vram_cache_mib = 0; // explicit per-device capacity; 0 disables
     int64_t expert_vram_reserve_mib = 0;
     int64_t expert_prefill_staging_mib = -1; // -1 = native-policy auto, 0 disables, otherwise two-lane total

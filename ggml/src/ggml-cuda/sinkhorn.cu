@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "sinkhorn.cuh"
+#include "../ggml-hc-precise.h"
 
 // Sinkhorn normalization of T independent S x S matrices (S <= 8, so a matrix is
 // at most 64 floats). One thread per token: the whole matrix lives in a thread-local
@@ -106,23 +107,27 @@ static __global__ void k_hc_pre(const float * __restrict__ x, const float * __re
         for (int c = 0; c < S; ++c) { m[r*S + c] = expf(m[r*S + c] - mx); sum += m[r*S + c]; }
         for (int c = 0; c < S; ++c) m[r*S + c] = m[r*S + c]/sum + eps;
     }
+    // Add epsilon after the completed reduction, matching hc_split_sinkhorn.
     #pragma unroll
     for (int c = 0; c < S; ++c) {
-        float sum = eps;
+        float sum = 0.0f;
         for (int r = 0; r < S; ++r) sum += m[r*S + c];
+        sum += eps;
         for (int r = 0; r < S; ++r) m[r*S + c] /= sum;
     }
     for (int i = 0; i < iters - 1; ++i) {
         #pragma unroll
         for (int r = 0; r < S; ++r) {
-            float sum = eps;
+            float sum = 0.0f;
             for (int c = 0; c < S; ++c) sum += m[r*S + c];
+            sum += eps;
             for (int c = 0; c < S; ++c) m[r*S + c] /= sum;
         }
         #pragma unroll
         for (int c = 0; c < S; ++c) {
-            float sum = eps;
+            float sum = 0.0f;
             for (int r = 0; r < S; ++r) sum += m[r*S + c];
+            sum += eps;
             for (int r = 0; r < S; ++r) m[r*S + c] /= sum;
         }
     }
@@ -132,6 +137,7 @@ static __global__ void k_hc_pre(const float * __restrict__ x, const float * __re
 }
 
 template <int S>
+
 static __global__ void k_hc_post(int ne0, const float * __restrict__ x, const float * __restrict__ post,
         const float * __restrict__ res, const float * __restrict__ comb, float * __restrict__ dst,
         const int nelem, size_t nbx1, size_t nbp1, size_t nbc2, size_t nbr1, size_t nbr2,
@@ -255,7 +261,48 @@ void ggml_cuda_op_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 }
 
+// One block per token: compute the small FP64 matrix once, then share it
+// across hidden elements. No temporary device allocation or host fallback.
+static __global__ void k_hc_post_precise(
+        const float * x, const float * projected, const float * res,
+        const float * scale, const float * bias, float * dst,
+        int64_t H, int S, int iterations, float eps,
+        size_t nx1, size_t np1, size_t nr1, size_t nr2, size_t nd1, size_t nd2) {
+    const int64_t t = blockIdx.x;
+    __shared__ double post[8];
+    __shared__ double comb[64];
+    if (threadIdx.x == 0) {
+        ggml_hc_precise_coefficients((const float *) ((const char *) projected + t*np1),
+                scale, bias, S, iterations, eps, post, comb);
+    }
+    __syncthreads();
+    const float * value = (const float *) ((const char *) x + t*nx1);
+    for (int64_t h = threadIdx.x; h < H; h += blockDim.x) {
+        for (int d = 0; d < S; ++d) {
+            double sum = 0.0;
+            for (int r = 0; r < S; ++r) {
+                const float v = ((const float *) ((const char *) res + t*nr2 + r*nr1))[h];
+                sum = ggml_hc_add(sum, ggml_hc_mul(comb[r*S+d], v));
+            }
+            ((float *) ((char *) dst + t*nd2 + d*nd1))[h] =
+                float(ggml_hc_add(sum, ggml_hc_mul(post[d], value[h])));
+        }
+    }
+}
+
 void ggml_cuda_op_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->op_params[0] == 1) {
+        const auto * x = dst->src[0], * projected = dst->src[1], * res = dst->src[2];
+        float eps;
+        memcpy(&eps, &dst->op_params[2], sizeof(eps));
+        if (res->ne[2] == 0) return;
+        k_hc_post_precise<<<res->ne[2], 256, 0, ctx.stream()>>>(
+                (const float *) x->data, (const float *) projected->data, (const float *) res->data,
+                (const float *) dst->src[3]->data, (const float *) dst->src[4]->data, (float *) dst->data,
+                res->ne[0], int(res->ne[1]), dst->op_params[1], eps,
+                x->nb[1], projected->nb[1], res->nb[1], res->nb[2], dst->nb[1], dst->nb[2]);
+        return;
+    }
     const ggml_tensor * x    = dst->src[0];
     const ggml_tensor * post = dst->src[1];
     const ggml_tensor * res  = dst->src[2];

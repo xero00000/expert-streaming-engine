@@ -563,6 +563,15 @@ typedef struct {
 } block_iq1_m_r4;
 static_assert(sizeof(block_iq1_m_r4) == 28, "wrong iq1_m_r4 block size/padding");
 
+// GSQ Q2_0: four consecutive LSB-first codes per byte, symbols {-1,0,1,2}.
+// This GGUF encoding uses 64 elements (not the unrelated 128-element variant).
+#define QK2_0 64
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK2_0 / 4];
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == 18, "wrong q2_0 block size/padding");
+
 //
 // Bonsai
 //

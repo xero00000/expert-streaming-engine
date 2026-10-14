@@ -1,13 +1,17 @@
 #pragma once
+#include "llama-deepseek-v41-runtime.h"
 
 #include "llama-impl.h"
 #include "llama-cparams.h"
+#include "../ggml/src/ggml-memory-budget.h"
 #include "llama-sampling.h"
 
 #include "llama-spec-features.h"
 
 struct llama_model;
 struct llama_expert_prefetch_worker;
+class qwen4exp_ple_sequence_state;
+namespace qwen4exp_ple_storage { class row_store; class two_tier_store; }
 
 #include <vector>
 #include <map>
@@ -57,6 +61,7 @@ static inline llama_openpangu_swa_window_view llama_openpangu_calc_swa_window_vi
 struct llama_kv_cell {
     llama_pos pos   = -1;
     llama_pos delta = 0;
+    int64_t qwen4exp_order = -1; // token chronology, independent of rotary position
     int32_t   src   = 0; // used by recurrent state models to copy states
 
     std::set<llama_seq_id> seq_id;
@@ -81,6 +86,7 @@ struct llama_kv_cache {
     bool do_copy   = false;
     bool recurrent = false; // with recurrent state models, a cell can hold the state for more than one past token
     bool hybrid    = false;
+    bool qwen4exp_ordered = false;
     bool v_trans   = true;  // the value tensor is transposed
 
     // openPangu s_l holds position-strict MoME conv state, not per-sequence recurrent slots: qnext
@@ -135,9 +141,18 @@ struct llama_kv_cache {
 
     // GPU-resident checkpoint for recurrent/hybrid speculative decoding
     struct gpu_checkpoint {
-        std::vector<llama_kv_cell> cells_snapshot;
-        uint32_t head_snapshot = 0;
-        uint32_t used_snapshot = 0;
+        struct sequence_snapshot {
+            bool saved = false;
+            llama_pos n_past = 0;
+            // Latest chronological output may precede max rotary position
+            // after a partial shift or position compression.
+            llama_pos qwen4exp_logit_pos = -1;
+            llama_kv_cell cell;
+            std::vector<uint8_t> cpu_data;
+            size_t cpu_limit = 0;
+        };
+        // Fixed startup capacity: one row/snapshot per configured sequence.
+        std::vector<sequence_snapshot> sequences;
 
         std::vector<ggml_tensor *> s_l_shadow;
 
@@ -151,6 +166,17 @@ struct llama_kv_cache {
         // One tensor per recurrent layer, each sized [conv_dim * max_tokens].
         //std::vector<std::vector<ggml_tensor *>> per_step_qkv;
         std::vector<std::vector<ggml_tensor *>> per_step_conv;
+
+        // Experimental Qwen complete-row journals, one bounded window per sequence.
+        std::vector<ggml_tensor *> qwen4exp_prefix_state;
+        std::vector<float> qwen4exp_prefix_base_logits;
+        std::vector<float> qwen4exp_prefix_logits;
+        std::vector<int32_t> qwen4exp_prefix_tokens;
+        std::vector<uint8_t> qwen4exp_prefix_active;
+        int qwen4exp_prefix_offset(llama_seq_id seq) const {
+            return seq >= 0 && size_t(seq) < qwen4exp_prefix_active.size() && qwen4exp_prefix_active[seq]
+                ? qwen4exp_prefix_tokens[seq] : -1;
+        }
 
         int32_t per_step_n_tokens = 0;
         int32_t per_step_max_allocated = 0;
@@ -181,8 +207,6 @@ struct llama_kv_cache {
         int fixed_spec_mode = LLAMA_SPEC_CKPT_NONE;
         int32_t fixed_max_tokens = 0;
 
-        // Serialised sequence state for CPU mode
-        std::vector<uint8_t> cpu_state_data;
 
         // Private DSV4 state snapshot used by GPU/CPU fallback modes.
         std::vector<std::vector<uint8_t>> dsv4_state_data;
@@ -201,15 +225,11 @@ struct llama_kv_cache {
 
         bool allocated = false;
         bool shadow_conv_only = false;
-        bool saved     = false;
 
         void release_dsv4_per_step();
         void release_dsv4_snapshot();
 
-        void release() {
-            release_dsv4_per_step();
-            release_dsv4_snapshot();
-
+        void release_shadows() {
             for (struct ggml_context * ctx : shadow_ctxs) {
                 ggml_free(ctx);
             }
@@ -221,7 +241,13 @@ struct llama_kv_cache {
             s_l_shadow.clear();
             split_s_l_shadow.clear();
             allocated = false;
-            saved = false;
+        }
+
+        void release() {
+            release_dsv4_per_step();
+            release_dsv4_snapshot();
+            release_shadows();
+            sequences.clear();
 
             for (struct ggml_context * ctx : per_step_ctxs) {
                 ggml_free(ctx);
@@ -231,6 +257,11 @@ struct llama_kv_cache {
                 ggml_backend_buffer_free(buf);
             }
             per_step_bufs.clear();
+            qwen4exp_prefix_state.clear();
+            qwen4exp_prefix_base_logits.clear();
+            qwen4exp_prefix_logits.clear();
+            qwen4exp_prefix_tokens.clear();
+            qwen4exp_prefix_active.clear();
             per_step_ssm.clear();
             per_step_conv.clear();
             per_step_max_allocated = 0;
@@ -243,11 +274,12 @@ struct llama_kv_cache {
 
     gpu_checkpoint ckpt;
 
-    bool checkpoint_alloc_shadows(bool conv_only_shadow = false);
+    bool checkpoint_alloc_shadows(bool conv_only_shadow = false, uint32_t n_sequences = 1);
     bool checkpoint_supported() const;
-    bool checkpoint_save(ggml_backend_sched_t sched);
-    bool checkpoint_restore(ggml_backend_sched_t sched);
-    void checkpoint_delete();
+    bool checkpoint_save(ggml_backend_sched_t sched, llama_seq_id seq_id);
+    bool checkpoint_restore(ggml_backend_sched_t sched, llama_seq_id seq_id);
+    void checkpoint_delete(llama_seq_id seq_id = -1);
+    void checkpoint_invalidate(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
 
     // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
     bool per_step_alloc(const llama_model & model, int max_tokens);
@@ -303,8 +335,14 @@ struct llama_context {
     ~llama_context();
 
     const struct llama_model & model;
+    std::unique_ptr<deepseek_v41::runtime_state> dsv41_runtime;
+    uint32_t dsv41_spec_max_tokens = 0;
+    std::map<uint32_t, ggml_tensor *> dsv41_row_inputs;
 
     struct llama_cparams        cparams;
+    // CUDA-visible device order; graph arenas and all this context's pools
+    // retain their own references to each shared physical admission ledger.
+    std::vector<ggml_memory_budget_t> compute_budgets;
     // Immutable load-time ceiling. cparams.n_ctx is the active graph/KV
     // geometry and may change after a committed runtime KV transaction.
     uint32_t                    n_ctx_max = 0;
@@ -630,6 +668,33 @@ struct llama_context {
     struct ggml_tensor * inp_mtp_states = nullptr;
     struct ggml_tensor * inp_mtp_carry = nullptr; // F32 [n_embd, nextn-1] per-head hidden at the last committed position
     struct ggml_tensor * inp_dsa_sink = nullptr; // F32 [n_kv, n_tokens] per-sequence attention-sink boost for DSA indexer top-k
+    // Latest completed output for each Qwen sequence, separate from global batch outputs.
+    std::vector<float> qwen4exp_last_logits;
+    std::vector<llama_pos> qwen4exp_last_logit_pos;
+    struct ggml_tensor * inp_qwen4exp_prefix_columns = nullptr; // I32 fixed PLE prefix gather indices
+    struct ggml_tensor * inp_qwen4exp_ple = nullptr; // F32 [n_embd, n_tokens] staged 16x160 PLE rows
+    struct ggml_tensor * inp_qwen4exp_qsa_tail = nullptr; // I32 [compress_ratio-1, n_tokens]
+    struct ggml_tensor * inp_qwen4exp_qsa_tail_enabled = nullptr; // F32 [1, n_tokens]
+    struct ggml_tensor * inp_qwen4exp_qsa_block_pos = nullptr; // I32 [complete_blocks]
+    struct ggml_tensor * inp_qwen4exp_qsa_block_end = nullptr; // I32 [complete_blocks]
+    struct ggml_tensor * inp_qwen4exp_qsa_block_map = nullptr; // I32 [ratio, complete_blocks]
+
+    struct qwen4exp_attention_input {
+        llama_seq_id sequence = 0;
+        int32_t first_query = 0;
+        int32_t query_count = 0;
+        int32_t key_count = 0;
+        std::vector<int32_t> physical_rows;
+        ggml_tensor * rows = nullptr; // I32 [key_count, KV heads]
+        ggml_tensor * causal_mask = nullptr;
+        ggml_tensor * block_pos = nullptr;
+        ggml_tensor * block_end = nullptr;
+        ggml_tensor * block_map = nullptr;
+        ggml_tensor * tail = nullptr;
+        ggml_tensor * tail_enabled = nullptr;
+        std::vector<ggml_tensor *> layer_masks;
+    };
+    std::vector<qwen4exp_attention_input> qwen4exp_attention_inputs;
 
     struct openpangu_swa_window_view_state {
         bool active       = false;
@@ -674,6 +739,18 @@ struct llama_context {
     // uninitialized -> wrong block-max-pool/top-k -> degraded/NaN sparse-FA decode). Register the
     // kr_l cpy per layer here and patch its offset in update_cache_copies(), exactly like K/V.
     std::vector<CacheCopy> dsa_cache_copies;
+    // Host-side position/token history needed to reconstruct PLE bigram and
+    // trigram hashes across rollback, copy, reset, and state restoration.
+    std::unique_ptr<qwen4exp_ple_sequence_state> qwen4exp_ple_sequences;
+    std::unique_ptr<qwen4exp_ple_sequence_state> qwen4exp_ple_sequences_pending;
+    std::unique_ptr<qwen4exp_ple_storage::two_tier_store> qwen4exp_ple_store;
+    std::unique_ptr<qwen4exp_ple_storage::row_store> qwen4exp_ple_row_store;
+    uint64_t qwen4exp_ple_read_owner = 0;
+    uint64_t qwen4exp_ple_logical_rows = 0;
+    uint64_t qwen4exp_ple_logical_bytes = 0;
+    uint64_t qwen4exp_ple_input_wait_calls = 0;
+    uint64_t qwen4exp_ple_input_wait_ns = 0;
+    uint64_t qwen4exp_ple_input_wait_max_ns = 0;
     std::vector<CacheCopy> openpangu_cache_copies;
     std::vector<CacheCopy> openpangu_cache_copies_mtp;
 
@@ -698,3 +775,7 @@ struct llama_context {
 
     int max_nodes(int n_tokens, int n_kv) const;
 };
+
+std::vector<llama_context::qwen4exp_attention_input> llama_qwen4exp_attention_layout(
+        const llama_context & context, const llama_batch & batch, int32_t reservation_rows = 0);
+void llama_qwen4exp_set_attention_inputs(llama_context & context, const llama_batch & batch);

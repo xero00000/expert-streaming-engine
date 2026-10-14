@@ -26,6 +26,17 @@ mod telemetry;
 use hub::{DownloadManager, DownloadRequest, DownloadStatus, HubModel, HubModelDetails};
 use sweep::{SweepManager, SweepPlan, SweepRequest, SweepStatus};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeSupport {
+    tier: String,
+    launchable: bool,
+    text: String,
+    vision: String,
+    mtp: String,
+    note: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelProfile {
@@ -46,8 +57,14 @@ struct ModelProfile {
     ubatch_size: Option<u32>,
     #[serde(default, alias = "tensor_split")]
     tensor_split: Option<String>,
+    #[serde(default, alias = "memory_policy")]
+    memory_policy: Option<String>,
+    #[serde(default, alias = "gpu_layers")]
+    gpu_layers: Option<u32>,
     #[serde(default)]
     slots: Option<u32>,
+    #[serde(default, alias = "runtime_support")]
+    runtime_support: Option<RuntimeSupport>,
     source: String,
 }
 
@@ -410,10 +427,14 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
 }
 
 fn model_name(path: &Path) -> String {
-    path.file_stem()
+    let stem = path
+        .file_stem()
         .and_then(|name| name.to_str())
-        .unwrap_or("Unnamed model")
-        .replace(['_', '.'], " ")
+        .unwrap_or("Unnamed model");
+    let base = gguf_shard_numbers(path)
+        .and_then(|(part, total)| stem.strip_suffix(&format!("-{part:05}-of-{total:05}")))
+        .unwrap_or(stem);
+    base.replace(['_', '.'], " ")
 }
 
 fn model_id(path: &Path) -> String {
@@ -454,7 +475,46 @@ fn is_launchable_gguf(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    !name.starts_with("mmproj-") && !name.contains(".imatrix.")
+    !name.starts_with("mmproj-")
+        && !name.contains(".imatrix.")
+        && gguf_shard_numbers(path).is_none_or(|(part, _)| part == 1)
+}
+
+fn gguf_shard_numbers(path: &Path) -> Option<(u32, u32)> {
+    let stem = path.file_stem()?.to_str()?;
+    let (part_prefix, total) = stem.rsplit_once("-of-")?;
+    let (_, part) = part_prefix.rsplit_once('-')?;
+    if part.len() != 5
+        || total.len() != 5
+        || !part.bytes().all(|byte| byte.is_ascii_digit())
+        || !total.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let part = part.parse().ok()?;
+    let total = total.parse().ok()?;
+    (part >= 1 && total >= part).then_some((part, total))
+}
+
+fn runtime_support_for(architecture: Option<&str>) -> Option<RuntimeSupport> {
+    match architecture.map(str::to_ascii_lowercase).as_deref() {
+        Some("qwen4exp") => {
+            let local_test = std::env::var_os("ESE_QWEN4EXP_LOCAL_TEST").is_some();
+            Some(RuntimeSupport {
+                tier: "experimental".into(),
+                launchable: local_test,
+                text: if local_test { "experimental" } else { "validation-pending" }.into(),
+                vision: "unsupported".into(),
+                mtp: "unsupported".into(),
+                note: if local_test {
+                    "Local text-only test build; generation quality and long-context validation remain pending."
+                } else {
+                    "Text inference remains behind the v0.2.1 correctness gate; vision and MTP are not supported."
+                }.into(),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn discover_models(config: &StudioConfig) -> Vec<ModelProfile> {
@@ -508,13 +568,19 @@ fn discover_models(config: &StudioConfig) -> Vec<ModelProfile> {
                     batch_size: None,
                     ubatch_size: None,
                     tensor_split: None,
+                    memory_policy: None,
+                    gpu_layers: None,
                     slots: None,
+                    runtime_support: None,
                     source: "discovered".into(),
                 });
             }
         }
     }
     let mut models: Vec<_> = by_path.into_values().collect();
+    for model in &mut models {
+        model.runtime_support = runtime_support_for(model.architecture.as_deref());
+    }
     models.sort_by(|left, right| {
         right
             .available
@@ -1332,7 +1398,10 @@ fn promote_sweep(state: State<'_, StudioState>) -> Result<ModelProfile, String> 
         batch_size: None,
         ubatch_size: None,
         tensor_split: None,
+        memory_policy: None,
+        gpu_layers: None,
         slots: None,
+        runtime_support: None,
         source: "discovered".into(),
     });
     profile.context = Some(context);
@@ -1650,6 +1719,17 @@ mod tests {
     }
 
     #[test]
+    fn qwen4exp_runtime_support_is_explicit_and_gated() {
+        let support = runtime_support_for(Some("QWEN4EXP")).unwrap();
+        assert_eq!(support.tier, "experimental");
+        assert!(!support.launchable);
+        assert_eq!(support.text, "validation-pending");
+        assert_eq!(support.vision, "unsupported");
+        assert_eq!(support.mtp, "unsupported");
+        assert!(runtime_support_for(Some("llama")).is_none());
+    }
+
+    #[test]
     fn gpu_preflight_aggregates_large_multi_gpu_consumers() {
         let sample = "508393, /opt/comfy/python, 5124\n508393, /opt/comfy/python, 216\n4356, /usr/bin/kwin_wayland, 115\n";
         let blockers = parse_gpu_consumers(sample);
@@ -1668,6 +1748,43 @@ mod tests {
         assert!(!is_launchable_gguf(Path::new("mmproj-F16.gguf")));
         assert!(!is_launchable_gguf(Path::new("model.imatrix.gguf")));
         assert!(is_launchable_gguf(Path::new("model.Q4_K_M.gguf")));
+    }
+
+    #[test]
+    fn only_the_first_split_gguf_is_a_launchable_model() {
+        let first = Path::new("Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf");
+        let second = Path::new("Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf");
+        assert!(is_launchable_gguf(first));
+        assert!(!is_launchable_gguf(second));
+        assert_eq!(model_name(first), "Qwen3 8-Flash-Next-UD-IQ1 S");
+    }
+
+    #[test]
+    fn discovers_real_qwen4exp_as_one_gated_model_when_configured() {
+        let Ok(first_shard) = std::env::var("ESE_STUDIO_E2E_MODEL") else {
+            return;
+        };
+        let first_shard = PathBuf::from(first_shard);
+        let config = StudioConfig {
+            version: 1,
+            onboarding_complete: true,
+            help_improve_ese: false,
+            model_roots: vec![first_shard.parent().unwrap().to_path_buf()],
+            models: Vec::new(),
+            apps: Vec::new(),
+            safe_context_margin: default_safe_margin(),
+        };
+
+        let matching: Vec<_> = discover_models(&config)
+            .into_iter()
+            .filter(|model| model.architecture.as_deref() == Some("qwen4exp"))
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].path, first_shard);
+        let support = matching[0].runtime_support.as_ref().unwrap();
+        assert_eq!(support.tier, "experimental");
+        assert!(!support.launchable);
+        assert_eq!(matching[0].context, Some(262_144));
     }
 
     #[test]

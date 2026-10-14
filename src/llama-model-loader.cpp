@@ -369,6 +369,19 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         bool repack_tensors, bool use_thp, bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
+    // A throwing constructor does not run ~llama_model_loader. Keep parsed
+    // metadata and tensor contexts owned until the entire inventory succeeds.
+    struct construction_guard {
+        llama_model_loader & loader;
+        bool complete = false;
+        ~construction_guard() {
+            if (complete) return;
+            if (loader.meta) gguf_free(loader.meta);
+            loader.meta = nullptr;
+            for (auto * context : loader.contexts) ggml_free(context);
+            loader.contexts.clear();
+        }
+    } guard{*this};
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -410,6 +423,9 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     if (!meta) {
         throw std::runtime_error(format("%s: failed to load model from %s\n", __func__, fname.c_str()));
     }
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> first_context(ctx, ggml_free);
+    contexts.push_back(first_context.get());
+    first_context.release();
 
     get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
     // Use the spelling stored in the GGUF when expanding architecture-prefixed
@@ -418,7 +434,6 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     llm_kv = LLM_KV(llm_arch_from_string(arch_name), nullptr, arch_name.c_str());
 
     files.emplace_back(new llama_file(fname.c_str(), "rb"));
-    contexts.emplace_back(ctx);
 
     // Save tensors data offset of the main file.
     // For subsidiary files, `meta` tensor data offset must not be used,
@@ -445,11 +460,13 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         if (trace > 0) {
             LLAMA_LOG_INFO("%s: loading additional %d GGUFs\n", __func__, n_split);
         }
+        get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors);
 
         char split_path[PATH_MAX] = {0};
         for (idx = 1; idx < n_split; idx++) {
             llama_split_path(split_path, sizeof(split_path), split_prefix, idx, n_split);
 
+            ctx = nullptr;
             struct gguf_init_params split_params = {
                 /*.no_alloc = */ true,
                 /*.ctx      = */ &ctx,
@@ -458,19 +475,44 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
             if (!ctx_gguf) {
                 throw std::runtime_error(format("%s: failed to load GGUF split from %s\n", __func__, split_path));
             }
+            std::unique_ptr<gguf_context, decltype(&gguf_free)> split_metadata(ctx_gguf, gguf_free);
+            std::unique_ptr<ggml_context, decltype(&ggml_free)> split_context(ctx, ggml_free);
+            const auto require_split_value = [&](enum llm_kv field, gguf_type type, int64_t expected) {
+                const auto key = llm_kv(field);
+                const int key_id = gguf_find_key(ctx_gguf, key.c_str());
+                if (key_id < 0 || gguf_get_kv_type(ctx_gguf, key_id) != type) {
+                    throw std::runtime_error(format("invalid split '%s': missing or wrongly typed %s",
+                            split_path, key.c_str()));
+                }
+                const int64_t value = type == GGUF_TYPE_UINT16
+                    ? int64_t(gguf_get_val_u16(ctx_gguf, key_id))
+                    : int64_t(gguf_get_val_i32(ctx_gguf, key_id));
+                if (value != expected) {
+                    throw std::runtime_error(format("invalid split '%s': %s=%lld, expected %lld",
+                            split_path, key.c_str(), (long long) value, (long long) expected));
+                }
+            };
+            require_split_value(LLM_KV_SPLIT_NO, GGUF_TYPE_UINT16, idx);
+            require_split_value(LLM_KV_SPLIT_COUNT, GGUF_TYPE_UINT16, n_split);
+            require_split_value(LLM_KV_SPLIT_TENSORS_COUNT, GGUF_TYPE_INT32, n_tensors);
+            // The standard splitter stores architecture metadata only in the
+            // first file. A repeated declaration must still agree with it.
+            const int arch_id = gguf_find_key(ctx_gguf, "general.architecture");
+            if (arch_id >= 0 && (gguf_get_kv_type(ctx_gguf, arch_id) != GGUF_TYPE_STRING ||
+                    arch_name != gguf_get_val_str(ctx_gguf, arch_id))) {
+                throw std::runtime_error(format("invalid split '%s': inconsistent architecture", split_path));
+            }
 
             files.emplace_back(new llama_file(split_path, "rb"));
-            contexts.emplace_back(ctx);
+            contexts.push_back(split_context.get());
+            split_context.release();
 
             // Save tensors data offset info of the shard.
             for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
                 weights.emplace_back(files.back().get(), idx, cur->name, ctx_gguf, cur);
             }
 
-            gguf_free(ctx_gguf);
         }
-
-        get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors);
 
         // sanity check
         {
@@ -665,6 +707,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     this->merge_qkv = merge_qkv;
     this->merge_up_gate_exps = merge_up_gate_exps;
     this->defer_experts = defer_experts;
+    guard.complete = true;
 }
 
 llama_model_loader::~llama_model_loader() {
@@ -880,11 +923,15 @@ bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & resul
 
     switch (arr_info.gt) {
         case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T, float>::value)); break;
+        case GGUF_TYPE_UINT64:  GGML_ASSERT((std::is_same_v<T, uint64_t>)); break;
+        case GGUF_TYPE_INT64:   GGML_ASSERT((std::is_same_v<T,  int64_t>)); break;
         case GGUF_TYPE_UINT32:
         case GGUF_TYPE_BOOL:
         case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same_v<T,  int32_t>) || (std::is_same_v<T, uint32_t>));  break;
         default:
-            throw std::runtime_error(format("%s is not a float32, int32, uint32 or bool array", key.c_str()));
+            throw std::runtime_error(format(
+                    "%s has unsupported array element type %s",
+                    key.c_str(), gguf_type_name(arr_info.gt)));
     }
 
     result.resize(arr_info.length);
@@ -1554,5 +1601,6 @@ template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum ll
 template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama_model_loader::get_arr_n<unsigned int>(const std::string &, unsigned int &, bool);
 template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama_model_loader::get_arr_n<unsigned int>(enum llm_kv, unsigned int&, bool);
 template bool llama_model_loader::get_arr<uint32_t>(const std::string &, std::vector<uint32_t> &, bool);
+template bool llama_model_loader::get_arr<uint64_t>(const std::string &, std::vector<uint64_t> &, bool);
 template bool llama_model_loader::get_arr<int32_t, 8>(const std::string &, std::array<int32_t, 8> &, bool);
 template bool llama_model_loader::get_arr<uint32_t, 8>(const std::string &, std::array<uint32_t, 8> &, bool);

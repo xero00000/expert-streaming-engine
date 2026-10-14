@@ -1,0 +1,115 @@
+{
+  "repository": "deepseek-ai/DeepSeek-V4.1-Flash",
+  "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+  "scope": "layer 0 expert 0 only; three 32-row samples per projection",
+  "results": [
+    {
+      "source": "layers.0.ffn.experts.0.w1",
+      "native": "blk.0.ffn_gate_exps",
+      "row": 0,
+      "rows": 32,
+      "type": "IQ2_XXS",
+      "cosine": 0.9402926564216614,
+      "relative_rms": 0.3536797761917114,
+      "source_sha256": "8f355321e4e2c6d8e37312b0169af60dfcd8f224307b571b3c3fa826fa558684",
+      "scales_sha256": "5c163081ccbc04320231f03ef7d1cd31c11e9090ef9fd8d20a688580b31f2714",
+      "native_sha256": "2d84f381a93c6ac56fcdd00f8c778b294fa1217f51c477506d5380a744b40a59"
+    },
+    {
+      "source": "layers.0.ffn.experts.0.w1",
+      "native": "blk.0.ffn_gate_exps",
+      "row": 1152,
+      "rows": 32,
+      "type": "IQ2_XXS",
+      "cosine": 0.9406213164329529,
+      "relative_rms": 0.35269439220428467,
+      "source_sha256": "890669c378b4ceca27e2a57b45f2d60647e2903ba91d8cfbeaf75103ee96dd00",
+      "scales_sha256": "e3d7081fa880ba16772cce15a7e4cfa4e3736eec55a07b9dd2431f9eeecc916c",
+      "native_sha256": "f2334a7ed066cce2b5ebb26c7de7ef5066aefd1ba9760bcc31aef5f4877a9d66"
+    },
+    {
+      "source": "layers.0.ffn.experts.0.w1",
+      "native": "blk.0.ffn_gate_exps",
+      "row": 2272,
+      "rows": 32,
+      "type": "IQ2_XXS",
+      "cosine": 0.940346896648407,
+      "relative_rms": 0.35363438725471497,
+      "source_sha256": "2d46f69787e283e690206db1e71a0c707023ded9f1a15f01f8d8034ac66800ba",
+      "scales_sha256": "6fb2cbf4df4e093b68157d2515d6a52a086077d4b5e6ad2dc1a72d7631e1d87c",
+      "native_sha256": "93eabd1cc5e3fdd9298e1fc5d5ec36f33b2b9ec432cafc5a81f6c51918872253"
+    },
+    {
+      "source": "layers.0.ffn.experts.0.w3",
+      "native": "blk.0.ffn_up_exps",
+      "row": 0,
+      "rows": 32,
+      "type": "IQ2_XXS",
+      "cosine": 0.9408470392227173,
+      "relative_rms": 0.3521742820739746,
+      "source_sha256": "c27333441141bc5753f5cb66633dfcad7a3618b05616995fc138c830824eaf2d",
+      "scales_sha256": "f77c33f887a3f20e9d2f4750890dc79ae3ae205a3b6d2d812413e6624a7cc65c",
+      "native_sha256": "d0e104de8d3ff689955dcb27658113093ff20d00af598015da5b063a8ace0e07"
+    },
+    {
+      "source": "layers.0.ffn.experts.0.w3",
+      "native": "blk.0.ffn_up_exps",
+      "row": 1152,
+      "rows": 32,
+      "type": "IQ2_XXS",
+      "cosine": 0.9403544068336487,
+      "relative_rms": 0.35343194007873535,
+      "source_sha256": "c07567a396472467398bd7efdd71b6625f9ef1b7993b766f99bd28d2adaf68b5",
+      "scales_sha256": "a60bf89e653dac8118776124ebde279bff33f05272f35ee14a31694d50031b77",
+      "native_sha256": "11b80ce8b4f0a46a3a07f197f46f25f1dfca545b2bb584f848ae457795b859a8"
+    },
+    {
+      "source": "layers.0.ffn.experts.0.w3",
+      "native": "blk.0.ffn_up_exps",
+      "row": 2272,
+      "rows": 32,
+      "type": "IQ2_XXS",
+      "cosine": 0.9407238960266113,
+      "relative_rms": 0.3524934947490692,
+      "source_sha256": "fb5e5985e4a194e55c42ce9c24a2221d7510c4c02fc01d1753527aa771891e0d",
+      "scales_sha256": "e90b3b21cc714c19da9bef677ccbf8ac7f49eef1605f08addd100d01c28281ad",
+      "native_sha256": "b5a55082f04c8f5ce88dd19998eba7e143971bc9a91dd488897677b4116453d2"
+    },
+    {
+      "source": "layers.0.ffn.experts.0.w2",
+      "native": "blk.0.ffn_down_exps",
+      "row": 0,
+      "rows": 32,
+      "type": "Q2_K",
+      "cosine": 0.9630522727966309,
+      "relative_rms": 0.27104562520980835,
+      "source_sha256": "184364b23cf058589b1cc53e9e32c747699b59ad93952ec74325e71fa3205c9e",
+      "scales_sha256": "233ca133631f5ffade1805016449036e137bd15f612ab4ef959f6fe7c539ec92",
+      "native_sha256": "2418e1b4695e3a3ca871380cabdc6cc098160dcdbedd92c3de1af6ca8992942a"
+    },
+    {
+      "source": "layers.0.ffn.experts.0.w2",
+      "native": "blk.0.ffn_down_exps",
+      "row": 2560,
+      "rows": 32,
+      "type": "Q2_K",
+      "cosine": 0.9632454514503479,
+      "relative_rms": 0.2703556418418884,
+      "source_sha256": "f7c0b2e40b96232169a053cc79457ec152c1bbf68c5e194de03d43e3c0d9effc",
+      "scales_sha256": "e7f2c48ccaa298ad9d17c3eca6113c2d59970d339e4a888a8db9d56fcf5d2815",
+      "native_sha256": "754c02aca026fc933ea4ad4e0e27f272c064644869725329b7be99d22c2d47fc"
+    },
+    {
+      "source": "layers.0.ffn.experts.0.w2",
+      "native": "blk.0.ffn_down_exps",
+      "row": 5088,
+      "rows": 32,
+      "type": "Q2_K",
+      "cosine": 0.9632912874221802,
+      "relative_rms": 0.2702277600765228,
+      "source_sha256": "3bc45afabdbf59f6a1a1cbf90cbcb43680dc707f540b392f8546527828bf1015",
+      "scales_sha256": "48a365b8308655152c0c9658678ea31a617ba587140c1eb3dbce452b565c9a2a",
+      "native_sha256": "413426eba4b6d021efbd6f7b82e5fccab2492b9f903592c4b78b5972b883f6b0"
+    }
+  ]
+}

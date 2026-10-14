@@ -34,9 +34,11 @@ want CUDA acceleration on Linux.
 
 Download `ese-studio_0.2.0_x64-setup.exe` (recommended) or the MSI, compare its
 SHA-256 value with `SHA256SUMS-windows.txt`, and run it. The package includes a
-CUDA-enabled runtime for supported NVIDIA GPUs and retains CPU fallback. Python,
-CMake, Visual Studio, and the CUDA toolkit are not required to run the installed
-application.
+CUDA-enabled runtime for supported NVIDIA GPUs. Its bundled native runtime
+requires an installed NVIDIA driver, including for CPU execution. CPU-only
+Windows machines can build the CPU runtime from source with
+`./ese.cmd build --backend cpu`. Python, CMake, Visual Studio, and the CUDA toolkit
+are not required to run the installed application.
 
 The NSIS installation supports signed update checks from **Settings → Updates**.
 

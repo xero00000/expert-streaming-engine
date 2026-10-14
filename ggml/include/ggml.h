@@ -428,6 +428,7 @@ extern "C" {
         GGML_TYPE_I2_S      = 36,  // So we are able to consume MS BitNet I2_S quants
         GGML_TYPE_MXFP4     = 39,  // so we are compatible with mainline
         GGML_TYPE_Q1_0_G128 = 41,  // Bonsai 1-bit quants
+        GGML_TYPE_Q2_0      = 42,  // 64-element, 18-byte GSQ blocks
         //
         //
         GGML_TYPE_TURBO3_0 = 43,  // internal Phase 1 CPU reference; not a public KV-cache option
@@ -2671,6 +2672,8 @@ extern "C" {
             bool                  lower,
             bool                  uni);
 
+    // Q/K must already be normalized by the caller. The op preserves those
+    // values (including additive-epsilon small-vector norms) on every backend.
     GGML_API struct ggml_tensor * ggml_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

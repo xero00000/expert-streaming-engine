@@ -64,6 +64,9 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
         case GGML_TYPE_Q8_0:
             mul_mat_vec_q8_0_q8_1_cuda(args, stream);
             break;
+        case GGML_TYPE_Q2_0:
+            mul_mat_vec_q_cuda<GGML_TYPE_Q2_0>(args, stream);
+            break;
         case GGML_TYPE_TQ2_0:
             mul_mat_vec_tq2_0_q8_1_cuda(args, stream);
             break;
@@ -281,7 +284,13 @@ void ggml_cuda_op_fused_mul_mat_vec_q_id(ggml_backend_cuda_context & ctx,
     const int64_t ne10 = src1->ne[0];
     GGML_ASSERT(ne10 % QK8_1 == 0);
     GGML_ASSERT(src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1);
-    GGML_ASSERT(src1->ne[1] == 1 && src1->ne[2] == 1);
+    // Dense verification vectors share weights while each token retains the
+    // scalar fused reduction. Indexed expert launches keep their existing shape.
+    const bool dense_batch = !ids && src1->ne[1] > 1;
+    GGML_ASSERT(src1->ne[2] == 1 && (src1->ne[1] == 1 ||
+                (dense_batch && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE)));
+    GGML_ASSERT(!dense_batch || (src0->ne[2] == 1 && dst->ne[2] == 1 &&
+                !bias_u && !bias_g && src1_ncols == src1->ne[1]));
     //if (ids && ids->ne[0] != dst->ne[2]) {
     //    printf("%s(%s->%s): unexpected situation\n", __func__, src0->name, dst->name);
     //    printf("  src0 = %ld x %ld x %ld x %ld\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
@@ -294,11 +303,14 @@ void ggml_cuda_op_fused_mul_mat_vec_q_id(ggml_backend_cuda_context & ctx,
     const int64_t ne0 = dst->ne[0];
 
     ggml_cuda_op_mul_mat_vec_q_impl(ctx, src0->type,
-        ne00, ne0, dst->ne[2],
-        src0->nb[2], src1->nb[2], dst->nb[2], ids ? ids->nb[0] : 0, bias_u ? bias_u->nb[1] : 0,
+        ne00, ne0, dense_batch ? src1->ne[1] : dst->ne[2],
+        dense_batch ? 0 : src0->nb[2],
+        dense_batch ? ggml_row_size(GGML_TYPE_Q8_1, src1_padded_row_size) : src1->nb[2],
+        dense_batch ? dst->nb[1] : dst->nb[2],
+        ids ? ids->nb[0] : 0, bias_u ? bias_u->nb[1] : 0,
         src0_dd_u, src0_dd_g, src1_ddq_i, dst_dd_i, ids ? (const char *)ids->data : nullptr,
         bias_u ? bias_u->data : nullptr, bias_g ? bias_g->data : nullptr,
-        row_low, row_high, src1_ncols,
+        row_low, row_high, dense_batch ? 1 : src1_ncols,
         src1_padded_row_size, unary_op, limit, stream);
 
     GGML_UNUSED(src1_ddf_i);
@@ -313,6 +325,7 @@ bool ggml_cuda_mmvq_type_supported(ggml_type src0_type) {
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q6_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:

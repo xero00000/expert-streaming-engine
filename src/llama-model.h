@@ -6,6 +6,7 @@
 #include "llama-expert-io.h"
 #include "llama-vocab.h"
 #include "llama-hparams.h"
+#include "llama-deepseek-v41-model.h"
 
 #include "ggml-backend.h"
 
@@ -384,6 +385,24 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_wgate = nullptr;
     struct ggml_tensor * indexer_comp_ape   = nullptr;
     struct ggml_tensor * indexer_comp_norm  = nullptr;
+    struct ggml_tensor * qwen4exp_indexer_q_proj = nullptr;
+    struct ggml_tensor * qwen4exp_indexer_k_proj = nullptr;
+    struct ggml_tensor * qwen4exp_indexer_q_norm = nullptr;
+    struct ggml_tensor * qwen4exp_indexer_k_norm = nullptr;
+    struct ggml_tensor * qwen4exp_ple_conv = nullptr;
+    struct ggml_tensor * qwen4exp_ple_key = nullptr;
+    struct ggml_tensor * qwen4exp_ple_value = nullptr;
+    struct ggml_tensor * qwen4exp_ple_norm_query = nullptr;
+    struct ggml_tensor * qwen4exp_ple_norm_key = nullptr;
+    struct ggml_tensor * qwen4exp_ple_norm_conv = nullptr;
+    struct ggml_tensor * qwen4exp_hc_attn_down = nullptr;
+    struct ggml_tensor * qwen4exp_hc_attn_norm = nullptr;
+    struct ggml_tensor * qwen4exp_hc_attn_up = nullptr;
+    struct ggml_tensor * qwen4exp_hc_attn_inject = nullptr;
+    struct ggml_tensor * qwen4exp_hc_ffn_down = nullptr;
+    struct ggml_tensor * qwen4exp_hc_ffn_norm = nullptr;
+    struct ggml_tensor * qwen4exp_hc_ffn_up = nullptr;
+    struct ggml_tensor * qwen4exp_hc_ffn_inject = nullptr;
     struct ggml_tensor * attn_kv_norm       = nullptr;
     struct ggml_tensor * hc_attn_base     = nullptr;
     struct ggml_tensor * hc_attn_fn       = nullptr;
@@ -450,6 +469,21 @@ struct llama_layer {
 
 struct llama_lora_adapter;
 
+// Authoritative location of the skipped Qwen4-Exp PLE tensor. The temporary
+// GGUF loader validates this extent; contexts reopen the same shard through a
+// bounded storage backend instead of allocating the 26.8 GiB tensor.
+struct qwen4exp_ple_source_info {
+    bool valid = false;
+    uint32_t id = 0;
+    llama_expert_cache::source_identity identity;
+    uint64_t file_size = 0;
+    uint64_t tensor_offset = 0;
+    uint64_t tensor_bytes = 0;
+    uint64_t row_size = 0;
+    uint64_t row_count = 0;
+    std::string path;
+};
+
 struct rpc_device {
     std::string endpoint;
     uint32_t device;
@@ -458,6 +492,10 @@ struct rpc_device {
 struct llama_cparams;
 
 struct llama_model {
+    deepseek_v41::model_config dsv41_config;
+    std::string dsv41_assets_json;
+    std::string dsv41_directory;
+    std::map<std::string, ggml_tensor *> dsv41_tensors;
     e_model     type  = MODEL_UNKNOWN;
     llm_arch    arch  = LLM_ARCH_UNKNOWN;
     llama_ftype ftype = LLAMA_FTYPE_ALL_F32;
@@ -495,6 +533,9 @@ struct llama_model {
     struct ggml_tensor * hc_head_base = nullptr;
     struct ggml_tensor * hc_head_fn = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
+    struct ggml_tensor * qwen4exp_hc_output_down = nullptr;
+    struct ggml_tensor * qwen4exp_hc_output_norm = nullptr;
+    struct ggml_tensor * qwen4exp_hc_output_up = nullptr;
 
     // openPangu-2.0: global mHC stream-merge module (non-block)
     struct ggml_tensor * mhc_merge_phi   = nullptr;
@@ -556,7 +597,15 @@ struct llama_model {
     // loader, and the bounded RAM tier owns all file-source handles it uses.
     llama_expert_tensor_index expert_index;
     std::unique_ptr<llama_expert_cache::ram_cache> expert_ram_cache;
+    std::unique_ptr<llama_expert_cache::load_queue> expert_load_queue;
+    std::unique_ptr<llama_expert_cache::read_ahead_queue> expert_read_ahead;
+    std::mutex expert_load_queue_mutex;
     bool expert_sidecar_only = false;
+
+    qwen4exp_ple_source_info qwen4exp_ple_source;
+    uint64_t qwen4exp_ple_cache_bytes = 256ULL*1024ULL*1024ULL;
+    uint32_t qwen4exp_ple_queue_depth = 32;
+    llama_qwen4exp_ple_mode qwen4exp_ple_mode = LLAMA_QWEN4EXP_PLE_AUTO;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -629,6 +678,13 @@ struct llama_model {
     std::unique_ptr<reload_info> reload;
 };
 
+struct llama_kv_size_profile {
+    llm_arch arch;
+    llama_hparams hparams;
+    size_t cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_type idx_type_k,
+            uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const;
+};
+
 // Recompute the load-time-derived combined wkv_b (computed_wkv_b) of layer il
 // from the current wk_b/wv_b tensor data (hot-swap support). Defined in
 // llama.cpp next to llm_prepare_mla.
@@ -687,7 +743,9 @@ struct llama_lora_adapter {
 //   std::string name = tn(LLM_TENSOR_ATTN_NORM, "weight", 3);     -> "blk.3.attn_norm.weight"
 //
 struct LLM_TN {
-    LLM_TN(llm_arch arch) : arch(arch) {}
+    // V4.1 shares these backbone tensor spellings, but has a separate loader
+    // contract and graph. This alias is only for common tensor-name helpers.
+    LLM_TN(llm_arch arch) : arch(arch == LLM_ARCH_DEEPSEEK41 ? LLM_ARCH_DEEPSEEK4 : arch) {}
 
     llm_arch arch;
 

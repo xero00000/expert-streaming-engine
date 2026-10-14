@@ -2,6 +2,7 @@
 #include <iostream>
 #include <random>
 #include <cstdlib>
+#include <limits>
 
 #include <nlohmann/json.hpp>
 #include <sheredom/subprocess.h>
@@ -34,6 +35,7 @@ static void test_object_methods(testing & t);
 static void test_hasher(testing & t);
 static void test_stats(testing & t);
 static void test_fuzzing(testing & t);
+static void test_numeric_boundaries(testing & t);
 
 static bool g_python_mode = false;
 
@@ -73,9 +75,55 @@ int main(int argc, char *argv[]) {
         t.test("hasher", test_hasher);
         t.test("stats", test_stats);
         t.test("fuzzing", test_fuzzing);
+        t.test("numeric boundaries", test_numeric_boundaries);
     }
 
     return t.summary();
+}
+
+static void test_numeric_boundaries(testing & t) {
+    const auto low = std::numeric_limits<int64_t>::min();
+    const auto high = std::numeric_limits<int64_t>::max();
+    test_template(t, "maximum integer", "{{ a + b }}", {{"a", high}, {"b", 0}}, std::to_string(high));
+    test_template(t, "minimum integer", "{{ a + b }}", {{"a", low}, {"b", 0}}, std::to_string(low));
+    test_template(t, "integer beyond exact double", "{{ a + b }}", {{"a", int64_t(9007199254740993LL)}, {"b", 2}}, "9007199254740995");
+    test_template(t, "boundary subtraction", "{{ a - b }}", {{"a", low}, {"b", low}}, "0");
+    test_template(t, "boundary product", "{{ a * b }}", {{"a", low/2}, {"b", 2}}, std::to_string(low));
+    test_template(t, "minimum modulo minus one", "{{ a % b }}", {{"a", low}, {"b", -1}}, "0");
+    for (const auto & item : std::vector<std::pair<std::string, json>>{
+            {"{{ a % b }}", {{"a", 1}, {"b", 0}}},
+            {"{{ a + b }}", {{"a", high}, {"b", 1}}},
+            {"{{ a + b }}", {{"a", low}, {"b", -1}}},
+            {"{{ a - b }}", {{"a", low}, {"b", 1}}},
+            {"{{ a - b }}", {{"a", high}, {"b", -1}}},
+            {"{{ a * b }}", {{"a", high}, {"b", 2}}},
+            {"{{ a * b }}", {{"a", low}, {"b", -1}}},
+            {"{{ a * b }}", {{"a", -1}, {"b", low}}},
+            {"{{ a * b }}", {{"a", low}, {"b", 2}}}}) {
+        bool rejected = false;
+        try {
+            jinja::lexer lexer;
+            auto program = jinja::parse_from_tokens(lexer.tokenize(item.first));
+            jinja::context ctx(item.first);
+            jinja::global_from_json(ctx, item.second, true);
+            jinja::runtime runtime(ctx);
+            runtime.execute(program);
+        } catch (const std::exception & error) {
+            const std::string message = error.what();
+            rejected = message.find("Modulo by zero") != std::string::npos ||
+                message.find("signed 64-bit range") != std::string::npos;
+        }
+        t.assert_true("numeric fault rejected: " + item.first + item.second.dump(), rejected);
+    }
+    for (double value : {0x1p63, -0x1p64, 1e100, -1e100}) {
+        auto number = jinja::mk_val<jinja::value_float>(value);
+        t.assert_true("large float construction preserves value", number->as_float() == value);
+        bool rejected = false;
+        try { number->as_int(); } catch (const std::runtime_error &) { rejected = true; }
+        t.assert_true("out-of-range float integer conversion rejected", rejected);
+    }
+    t.assert_true("minimum float integer conversion", jinja::mk_val<jinja::value_float>(-0x1p63)->as_int() == low);
+    t.assert_true("fitting float integer conversion", jinja::mk_val<jinja::value_float>(123.75)->as_int() == 123);
 }
 
 static void test_whitespace_control(testing & t) {

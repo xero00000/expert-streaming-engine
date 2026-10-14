@@ -2,13 +2,18 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <exception>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace llama_expert_cache {
@@ -120,12 +125,21 @@ private:
 
 class source {
 public:
+    struct read_request {
+        uint64_t offset = 0;
+        void * destination = nullptr;
+        size_t length = 0;
+    };
+
     virtual ~source() = default;
     virtual uint32_t id() const = 0;
     virtual source_identity identity() const = 0;
     virtual uint64_t size() const = 0;
     virtual read_backend backend() const = 0;
     virtual void read(uint64_t offset, void * destination, size_t length) const = 0;
+    virtual void read_many(const std::vector<read_request> & requests) const;
+    // Best-effort storage advice, with no payload allocation or cache admission.
+    virtual bool advise_will_need(uint64_t, uint64_t) const { return false; }
 };
 
 // An exact storage backend is selected at construction. Unsupported io_uring
@@ -143,6 +157,11 @@ public:
     uint64_t size() const override;
     read_backend backend() const override;
     void read(uint64_t offset, void * destination, size_t length) const override;
+    void read_many(const std::vector<read_request> & requests) const override;
+    bool advise_will_need(uint64_t offset, uint64_t length) const override;
+    // Best-effort Linux page-cache control for reproducible cold benchmarks.
+    // Throws if the requested range is invalid or the kernel rejects the hint.
+    void evict_range_from_os_cache(uint64_t offset, uint64_t length) const;
     const std::string & path() const;
 
 private:
@@ -153,6 +172,7 @@ private:
 struct cache_config {
     uint64_t capacity_bytes = 0;
     uint64_t staging_bytes = 0;
+    bool frequency_retention = false;
 };
 
 struct cache_stats {
@@ -168,6 +188,17 @@ struct cache_stats {
     uint64_t staging_waits = 0;
     uint64_t staging_wait_ns = 0;
     uint64_t storage_read_ns = 0;
+    uint64_t lock_wait_ns = 0;
+    uint64_t coalesced_loads = 0;
+    uint64_t failed_loads = 0;
+    uint64_t active_loads = 0;
+    uint64_t peak_active_loads = 0;
+    uint64_t staging_capacity_bytes = 0;
+    uint64_t staging_used_bytes = 0;
+    uint64_t peak_staging_used_bytes = 0;
+    // Reservations overlap still-readable eviction candidates. They are not
+    // additional physical allocations beyond the fixed resident arena.
+    uint64_t reserved_bytes = 0;
     std::array<uint64_t, size_t(read_backend::count)> bytes_read = {{ 0, 0, 0 }};
 };
 
@@ -179,6 +210,7 @@ public:
 class ram_cache {
 private:
     struct entry;
+    struct pending_load;
 
 public:
     class lease {
@@ -201,11 +233,19 @@ public:
         std::shared_ptr<entry> entry_;
     };
 
-    ram_cache(cache_config config, std::vector<std::shared_ptr<const source>> sources);
+    // Optional caller-allocated arena (at least capacity_bytes, aligned to 64
+    // bytes). Shared ownership retains its allocator until the cache is freed.
+    ram_cache(cache_config config, std::vector<std::shared_ptr<const source>> sources,
+            std::shared_ptr<uint8_t> resident_arena = {});
     ram_cache(const ram_cache &) = delete;
     ram_cache & operator=(const ram_cache &) = delete;
 
     lease acquire(std::shared_ptr<const descriptor> value);
+    // Return an empty lease on a miss without starting storage work.
+    lease try_acquire(std::shared_ptr<const descriptor> value);
+    // Advise absent exact ranges without changing retention, pins or demand
+    // counters. Already resident/in-flight components need no extra advice.
+    uint64_t advise_will_need(std::shared_ptr<const descriptor> value) const;
     bool erase(const expert_key & key);
     cache_stats stats() const;
     void clear();
@@ -218,13 +258,40 @@ private:
         std::atomic<uint64_t> pins{0};
         uint64_t last_used = 0;
         uint64_t insertion_order = 0;
+        uint32_t frequency = 0;
+        bool ready = true;
+        const pending_load * reserved_by = nullptr;
     };
+
+    struct pending_load {
+        enum class phase { loading, copying, ready, failed };
+        phase state = phase::loading;
+        std::shared_ptr<entry> result;
+        std::vector<std::shared_ptr<entry>> victims;
+        uint64_t staging_offset = 0;
+        uint64_t arena_offset = 0;
+        std::exception_ptr error;
+        // Successful completion holds one pin until all coalesced callers
+        // have obtained their own leases, even if the initiating caller exits.
+        ~pending_load();
+    };
+
+    struct lru_less {
+        bool operator()(const std::shared_ptr<entry> & a, const std::shared_ptr<entry> & b) const noexcept;
+    };
+    using offset_index = std::map<uint64_t, entry *>;
+    using lru_index = std::set<std::shared_ptr<entry>, lru_less>;
+    void touch(const std::shared_ptr<entry> & value, bool inserted = false);
+    void observe(const expert_key & key);
 
     static bool checked_add(uint64_t a, uint64_t b, uint64_t & result);
     bool allocation_plan(
             uint64_t bytes,
             uint64_t & arena_offset,
-            std::vector<std::shared_ptr<entry>> & victims) const;
+            std::vector<std::shared_ptr<entry>> & victims,
+            const pending_load * own_reservation = nullptr) const;
+    bool staging_plan(uint64_t bytes, uint64_t & offset) const;
+    void release_reservation(const std::shared_ptr<pending_load> & load);
 
     struct aligned_free {
         void operator()(uint8_t * pointer) const noexcept;
@@ -233,19 +300,119 @@ private:
     const cache_config config_;
     std::map<uint32_t, std::shared_ptr<const source>> sources_;
     mutable std::mutex mutex_;
+    std::condition_variable changed_;
     // Descriptor identity remains canonical even after its payload is evicted
     // or clear() drops all resident entries.
     std::map<expert_key, std::shared_ptr<const descriptor>> canonical_descriptors_;
+    std::map<expert_key, uint32_t> observations_;
     std::map<expert_key, std::shared_ptr<entry>> entries_;
-    // Single reusable fill arena. Misses are serialized by mutex_, so this
-    // buffer never scales with request concurrency.
+    offset_index by_offset_;
+    lru_index by_recency_;
+    std::map<expert_key, std::shared_ptr<pending_load>> pending_;
+    // Concurrent fills own disjoint regions of this one bounded staging arena.
+    // Storage reads and payload copies run without the metadata mutex.
     std::vector<uint8_t> staging_;
     // One fixed aligned arena makes the resident byte bound physical, not just
     // a telemetry counter. Entry pointers remain stable while leases are held.
-    std::unique_ptr<uint8_t, aligned_free> resident_arena_;
+    std::shared_ptr<uint8_t> resident_arena_;
     uint64_t clock_ = 0;
     uint64_t insertion_clock_ = 0;
+    uint64_t frequency_clock_ = 0;
     cache_stats stats_;
+};
+
+// A small persistent worker pool with fixed request slots. Completion is
+// consumed independently of submission order. Payloads still belong to the
+// cache's fixed arenas; the queue never allocates another loading buffer.
+// The cache must outlive the queue and all leases returned by it. Destruction
+// discards queued requests, joins running reads, and releases untaken results.
+// As with the cache, callers must stop using the object before destroying it.
+class load_queue {
+public:
+    struct completion {
+        uint64_t id = 0;
+        ram_cache::lease payload;
+        std::exception_ptr error;
+    };
+    struct queue_stats {
+        uint64_t submitted = 0;
+        uint64_t ready_hits = 0;
+        uint64_t outstanding = 0;
+        uint64_t outstanding_bytes = 0;
+        uint64_t peak_outstanding_bytes = 0;
+        uint64_t byte_limit = 0;
+    };
+
+    load_queue(ram_cache & cache, size_t workers, size_t requests, uint64_t byte_limit);
+    ~load_queue();
+    load_queue(const load_queue &) = delete;
+    load_queue & operator=(const load_queue &) = delete;
+
+    // Nonblocking admission. An ID must be unique until its result is taken.
+    // False means request slots/bytes are unavailable (including oversized
+    // requests). The caller can consume results or use the synchronous path.
+    bool try_submit(uint64_t id, std::shared_ptr<const descriptor> value);
+    // Wait only if requested and there are outstanding requests. A completed
+    // storage error is returned in error, with an empty payload.
+    bool next(completion & result, bool wait);
+    queue_stats stats() const;
+
+private:
+    enum class phase { free, queued, running, ready };
+    struct slot {
+        phase state = phase::free;
+        uint64_t id = 0;
+        std::shared_ptr<const descriptor> desc;
+        ram_cache::lease payload;
+        std::exception_ptr error;
+    };
+    void worker();
+    void stop();
+
+    ram_cache & cache_;
+    mutable std::mutex mutex_;
+    std::condition_variable work_changed_;
+    std::condition_variable completion_changed_;
+    std::vector<slot> slots_;
+    std::vector<std::thread> workers_;
+    queue_stats stats_;
+    bool stopping_ = false;
+};
+
+// Bounded speculative storage advice. New demand routes expire stale queued
+// hints; the worker yields while the demand pool has outstanding work. Advice
+// already accepted by the OS cannot be cancelled, so bytes are also bounded
+// across each complete graph pass, not just across the software queue.
+class read_ahead_queue {
+public:
+    struct queue_stats {
+        uint64_t submitted = 0, advised_bytes = 0, skipped = 0, expired = 0, rejected = 0, failed = 0;
+        uint64_t outstanding_bytes = 0, peak_outstanding_bytes = 0;
+    };
+    read_ahead_queue(ram_cache & cache, load_queue * demand, uint64_t pass_byte_limit);
+    ~read_ahead_queue();
+    read_ahead_queue(const read_ahead_queue &) = delete;
+    read_ahead_queue & operator=(const read_ahead_queue &) = delete;
+    void advance(uintptr_t owner, uint64_t pass, uint32_t layer);
+    bool submit(std::shared_ptr<const descriptor> value);
+    queue_stats stats() const;
+    // Stop producers first; then cancel queued hints and join the advice call.
+    void stop();
+private:
+    void worker();
+    ram_cache & cache_;
+    load_queue * demand_;
+    const uint64_t pass_byte_limit_;
+    mutable std::mutex mutex_;
+    std::condition_variable changed_;
+    std::deque<std::shared_ptr<const descriptor>> pending_;
+    std::set<expert_key> seen_;
+    uintptr_t owner_ = 0;
+    uint64_t pass_ = 0, admitted_bytes_ = 0;
+    uint32_t layer_ = 0;
+    bool stopping_ = false;
+    queue_stats stats_;
+    std::thread worker_;
 };
 
 } // namespace llama_expert_cache

@@ -19,6 +19,7 @@
 #include <regex>
 #include <exception>
 #include <cstdlib>
+#include <map>
 #include <set>
 #include <string_view>
 
@@ -37,11 +38,99 @@ static bool server_resource_rebalance_fail_at(std::string_view boundary) noexcep
             expected, true, std::memory_order_relaxed);
 }
 
+// The HTTP calculation precedes task dispatch. Recheck its tracked fixed
+// allocation floors on the owner thread before any replacement is prepared.
+static bool server_resource_memory_within_limits(
+        const llama_context * ctx, const json & limits, const json & host_limits) {
+    std::map<int32_t, common_resource_device_memory> observed;
+    common_resource_host_memory host;
+    for (const auto & limit : limits) {
+        const int32_t id = limit.at("id").get<int32_t>();
+        if (id < 0 || !observed.emplace(id, common_resource_device_memory{id, 0, 0}).second) return false;
+    }
+    uint32_t count = 0;
+    if (!llama_resource_get_memory_pools(ctx, nullptr, 0, &count)) return false;
+    std::vector<llama_resource_memory_pool> pools(count);
+    if (!llama_resource_get_memory_pools(ctx, pools.data(), count, &count)) return false;
+    for (const auto & pool : pools) {
+        int32_t id = -2;
+        if (!llama_resource_backend_device_id(ctx, pool.backend_id, &id)) return false;
+        if (id < 0) {
+            uint64_t * total = nullptr;
+            switch (pool.category) {
+                case LLAMA_RESOURCE_MEMORY_WEIGHTS: total = &host.weights_bytes; break;
+                case LLAMA_RESOURCE_MEMORY_PLE_CACHE: total = &host.ple_cache_bytes; break;
+                case LLAMA_RESOURCE_MEMORY_GRAPH:
+                case LLAMA_RESOURCE_MEMORY_CHECKPOINT:
+                case LLAMA_RESOURCE_MEMORY_OUTPUT:
+                case LLAMA_RESOURCE_MEMORY_HOST_METADATA:
+                case LLAMA_RESOURCE_MEMORY_HOST_JOURNAL:
+                case LLAMA_RESOURCE_MEMORY_HANDOFF:
+                case LLAMA_RESOURCE_MEMORY_PLE_STAGING: total = &host.fixed_bytes; break;
+                default: break;
+            }
+            if (total && pool.bytes > UINT64_MAX - *total) return false;
+            if (total) *total += pool.bytes;
+            continue;
+        }
+        const auto device = observed.find(id);
+        if (device == observed.end()) return false;
+        uint64_t * total = nullptr;
+        switch (pool.category) {
+            case LLAMA_RESOURCE_MEMORY_WEIGHTS: total = &device->second.weights_bytes; break;
+            case LLAMA_RESOURCE_MEMORY_GRAPH:
+            case LLAMA_RESOURCE_MEMORY_CUDA_POOL:
+            case LLAMA_RESOURCE_MEMORY_CHECKPOINT:
+            case LLAMA_RESOURCE_MEMORY_OUTPUT:
+            case LLAMA_RESOURCE_MEMORY_HANDOFF: total = &device->second.fixed_bytes; break;
+            default: break;
+        }
+        if (total && pool.bytes > UINT64_MAX - *total) return false;
+        if (total) *total += pool.bytes;
+    }
+    for (const auto & limit : limits) {
+        const auto & actual = observed.at(limit.at("id").get<int32_t>());
+        if (actual.weights_bytes > limit.at("weights_bytes").get<uint64_t>() ||
+            actual.fixed_bytes > limit.at("fixed_bytes").get<uint64_t>()) return false;
+    }
+    return host.weights_bytes <= host_limits.at("weights_bytes").get<uint64_t>() &&
+        host.fixed_bytes <= host_limits.at("fixed_bytes").get<uint64_t>() &&
+        host.ple_cache_bytes <= host_limits.at("ple_cache_bytes").get<uint64_t>();
+}
+
 struct server_mmproj_residency_transaction {
     mtmd_context * offside = nullptr;
     bool published = false;
     bool finalized = false;
 };
+
+static json server_kv_preparation_memory(const llama_context * ctx, uint32_t target) {
+    llama_kv_preparation_memory memory = {};
+    if (!llama_kv_cache_resize_memory(ctx, target, &memory, nullptr, 0)) return nullptr;
+    std::vector<llama_kv_preparation_device> devices(memory.device_count);
+    if (!llama_kv_cache_resize_memory(ctx, target, &memory, devices.data(), devices.size())) return nullptr;
+    json rows = json::array();
+    for (const auto & device : devices) rows.push_back({{"id", device.device_id}, {"kv_bytes", device.kv_bytes}});
+    return {{"context", target}, {"host_metadata_bytes", memory.host_metadata_bytes},
+            {"host_staging_bytes", memory.host_staging_bytes}, {"devices", std::move(rows)}};
+}
+
+static json server_kv_current_memory(const llama_context * ctx) {
+    uint32_t count = 0;
+    if (!llama_resource_get_memory_pools(ctx, nullptr, 0, &count)) return nullptr;
+    std::vector<llama_resource_memory_pool> pools(count);
+    if (!llama_resource_get_memory_pools(ctx, pools.data(), count, &count)) return nullptr;
+    std::map<int32_t, uint64_t> bytes;
+    for (const auto & pool : pools) {
+        if (pool.category != LLAMA_RESOURCE_MEMORY_KV) continue;
+        int32_t id = -2;
+        if (!llama_resource_backend_device_id(ctx, pool.backend_id, &id) || pool.bytes > UINT64_MAX-bytes[id]) return nullptr;
+        bytes[id] += pool.bytes;
+    }
+    json rows = json::array();
+    for (const auto & item : bytes) rows.push_back({{"id", item.first}, {"kv_bytes", item.second}});
+    return rows;
+}
 
 struct server_mtp_residency_transaction {
     std::vector<common_speculative_mtp_transaction_t> slots;
@@ -2060,6 +2149,11 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     }
 
     {  // apply logit bias
+        for (const auto & saved : slot.ignore_eos_biases) {
+            if (saved.present) slot.sparams.logit_bias[saved.token] = saved.bias;
+            else slot.sparams.logit_bias.erase(saved.token);
+        }
+        slot.ignore_eos_biases.clear();
         const auto& logit_bias = data.find("logit_bias");
         if (logit_bias != data.end() && (logit_bias->is_object() || logit_bias->is_array())) {
             slot.sparams.logit_bias.clear(); // only clear if user sets it
@@ -2127,7 +2221,15 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
             }
         }
         if (json_value(data, "ignore_eos", false) && has_eos_token) {
-            slot.sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
+            // A model can have several terminal tokens. Ban each of them for
+            // this request, then restore explicit biases at the next request.
+            for (llama_token token = 0; token < llama_vocab_n_tokens(vocab); ++token) {
+                if (!llama_vocab_is_eog(vocab, token)) continue;
+                const auto prior = slot.sparams.logit_bias.find(token);
+                const bool present = prior != slot.sparams.logit_bias.end();
+                slot.ignore_eos_biases.push_back({token, present, present ? prior->second : 0.0f});
+                slot.sparams.logit_bias[token] = -INFINITY;
+            }
         }
 
     }
@@ -2592,6 +2694,46 @@ static inline int server_decode(llama_context * ctx, const llama_batch & batch) 
 #endif
 }
 
+void server_context::invalidate_failed_decode_context() {
+    // A failed graph can write part of the decode or shared KV maintenance.
+    // Clearing only the current batch's sequence is therefore insufficient.
+    llama_synchronize(ctx);
+    llama_kv_cache_clear(ctx);
+    for (auto & slot : slots) {
+        if (slot.ctx != ctx) continue;
+        common_speculative_clear_sequence(slot.spec, slot.id, true);
+        slot.cache_tokens.clear();
+        slot.n_past = 0;
+        slot.n_past_prompt = 0;
+        slot.n_past_offset = 0;
+        slot.n_past_se = 0;
+        slot.n_discarded_prompt = 0;
+        slot.n_kept_prompt = 0;
+        slot.n_prompt_tokens_cache = 0;
+        slot.ga_i = 0;
+        slot.server_cached_prompt = server_prompt{};
+        slot.checkpoint_pos = -1;
+        slot.do_checkpoint = false;
+        slot.sampled = LLAMA_TOKEN_NULL;
+        slot.drafted.clear();
+        slot.i_batch_dft.clear();
+        slot.i_batch = -1;
+        slot.prompt_batch_i0 = -1;
+        slot.prompt_batch_i1 = -1;
+        slot.token_buffer.clear();
+        slot.rewind_count = 0;
+        slot.n_buffer = 0;
+        slot.rewind_status = false;
+        if (slot.ctx_sampling != nullptr) common_sampler_reset(slot.ctx_sampling);
+    }
+    // A system-prefix replay clears KV again. Do not let prompt admission
+    // restore a saved prefix before that replay and then reuse stale tokens.
+    if (prompt_cache && prompt_cache->ctx == ctx) prompt_cache->states.clear();
+    clean_kv_cache = false;
+    // The shared system prefix was also removed and must be decoded again.
+    system_need_update = !system_tokens.empty();
+}
+
 void server_context::system_prompt_update() {
     LOG_VERBOSE("system prompt update", {
         {"system_prompt", system_prompt},
@@ -2615,8 +2757,17 @@ void server_context::system_prompt_update() {
                 common_batch_add(batch, system_tokens[i + j], i + j, { 0 }, false);
             }
 
-            if (server_decode(ctx, batch) != 0) {
-                LOG_ERROR("llama_decode() failed", {});
+            const int ret = server_decode(ctx, batch);
+            if (ret != 0) {
+                LOG_ERROR("system prompt decode failed", {{"ret", ret}});
+                invalidate_failed_decode_context();
+                for (auto & slot : slots) {
+                    if (slot.ctx != ctx || !slot.is_processing()) continue;
+                    slot.state = SLOT_STATE_PROCESSING;
+                    slot.command = SLOT_COMMAND_NONE;
+                    slot.release();
+                    send_error(slot, "Failed to decode the system prompt. Please retry the request.");
+                }
                 return;
             }
         }
@@ -2916,6 +3067,20 @@ json server_context::get_formatted_generation(const server_slot& slot) const {
 }
 
 void server_context::send_error(const server_task& task, const std::string& error, const enum error_type type) {
+    // Slot action handlers consume value results through the legacy receiver.
+    // A polymorphic completion error would stay in the other response queue.
+    if (task.type == SERVER_TASK_TYPE_SLOT_SAVE ||
+        task.type == SERVER_TASK_TYPE_SLOT_RESTORE ||
+        task.type == SERVER_TASK_TYPE_SLOT_ERASE) {
+        LOG_ERROR("task error", {{"id_multi", task.id_multi}, {"id_task", task.id}, {"error", error}});
+        server_task_result result;
+        result.id = task.id;
+        result.id_multi = task.id_multi;
+        result.error = true;
+        result.data = format_error_response(error, type);
+        queue_results.send(std::move(result));
+        return;
+    }
     send_error(task.id, task.id_multi, error, type);
 }
 
@@ -3655,6 +3820,27 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
         json devices = json::array();
+        uint32_t pool_count = 0;
+        if (!llama_resource_get_memory_pools(ctx, nullptr, 0, &pool_count)) {
+            send_error(task, "failed to query tracked resource memory", ERROR_TYPE_SERVER);
+            break;
+        }
+        std::vector<llama_resource_memory_pool> pools(pool_count);
+        if (!llama_resource_get_memory_pools(ctx, pools.data(), pool_count, &pool_count)) {
+            send_error(task, "failed to collect tracked resource memory", ERROR_TYPE_SERVER);
+            break;
+        }
+        json memory_pools = json::array();
+        for (const auto & pool : pools) {
+            int32_t device_id = -2;
+            const bool located = llama_resource_backend_device_id(ctx, pool.backend_id, &device_id);
+            memory_pools.push_back({
+                {"backend_id", pool.backend_id},
+                {"device_id", located ? json(device_id) : json(nullptr)},
+                {"category", int(pool.category)},
+                {"bytes", pool.bytes},
+            });
+        }
         for (const auto & device : resource_devices) {
             devices.push_back({
                 {"id", device.device_id},
@@ -3707,6 +3893,11 @@ void server_context::process_single_task(server_task&& task) {
                 {"active_leases", resource.expert_ram_active_leases},
             }},
             {"devices", std::move(devices)},
+            {"memory_inventory", {
+                {"scope", "tracked-native-capacities"},
+                {"mapped_weights", "virtual-span-not-resident-ram"},
+                {"pools", std::move(memory_pools)},
+            }},
             {"runtime_rebalance", {
                 {"mutation_enabled", true},
                 {"mode", "idle-atomic-multi-pool"},
@@ -3718,6 +3909,10 @@ void server_context::process_single_task(server_task&& task) {
         const std::string plan_json = resource_plan_json();
         if (!plan_json.empty()) {
             res.data["resources"]["plan"] = json::parse(plan_json);
+        }
+        const uint32_t requested_context = json_value(task.data, "kv_preparation_context", uint32_t(0));
+        if (requested_context != 0) {
+            res.data["resources"]["kv_preparation"] = server_kv_preparation_memory(ctx, requested_context);
         }
 
         if (has_transient) {
@@ -3820,6 +4015,18 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
 
+        if (!server_resource_memory_within_limits(ctx, task.data.at("device_memory_limits"),
+                task.data.at("host_memory_limits"))) {
+            fail("tracked resource memory changed before preparation; retry from a fresh snapshot",
+                 ERROR_TYPE_UNAVAILABLE);
+            break;
+        }
+        const json live_kv = server_kv_current_memory(ctx);
+        if (live_kv.is_null() || live_kv != task.data.at("current_kv_storage")) {
+            fail("live KV storage changed before preparation; retry from a fresh snapshot", ERROR_TYPE_UNAVAILABLE);
+            break;
+        }
+
         const std::string scope = task.data.at("scope").get<std::string>();
         static const std::set<std::string> supported_scopes = {
             "kv-only", "expert-cache-only", "transient-only",
@@ -3836,6 +4043,13 @@ void server_context::process_single_task(server_task&& task) {
         if (!replace_kv && !replace_expert && !replace_transient) {
             fail("runtime rebalance task has no physical operation", ERROR_TYPE_INVALID_REQUEST);
             break;
+        }
+        if (replace_kv) {
+            const json actual = server_kv_preparation_memory(ctx, task.data.at("target_context").get<uint32_t>());
+            if (actual.is_null() || actual != task.data.at("kv_preparation")) {
+                fail("KV preparation sizing changed before allocation; retry from a fresh snapshot", ERROR_TYPE_UNAVAILABLE);
+                break;
+            }
         }
         const uint32_t target_context = task.data.at("target_context").get<uint32_t>();
         if (target_context == 0 || slots.empty() || target_context % slots.size() != 0) {
@@ -4002,6 +4216,25 @@ void server_context::process_single_task(server_task&& task) {
             if (transaction.kv == nullptr) {
                 abort_transaction(
                     "KV preparation failed; the original resources remain active");
+                break;
+            }
+            llama_kv_preparation_memory actual = {};
+            const auto & expected = task.data.at("kv_preparation");
+            if (!llama_kv_cache_transaction_memory(transaction.kv, &actual, nullptr, 0)) {
+                abort_transaction("failed to audit prepared KV memory; original resources remain active");
+                break;
+            }
+            std::vector<llama_kv_preparation_device> allocated(actual.device_count);
+            if (!llama_kv_cache_transaction_memory(transaction.kv, &actual, allocated.data(), allocated.size())) {
+                abort_transaction("failed to audit prepared KV placement; original resources remain active");
+                break;
+            }
+            json actual_rows = json::array();
+            for (const auto & row : allocated) actual_rows.push_back({{"id", row.device_id}, {"kv_bytes", row.kv_bytes}});
+            if (actual.host_metadata_bytes > expected.at("host_metadata_bytes").get<uint64_t>() ||
+                    actual.host_staging_bytes > expected.at("host_staging_bytes").get<uint64_t>() ||
+                    actual_rows != expected.at("devices")) {
+                abort_transaction("prepared KV memory exceeded native sizing; original resources remain active");
                 break;
             }
             if (server_resource_rebalance_fail_at("after-kv-prepare")) {
@@ -5857,21 +6090,30 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
         const int ret = server_decode(ctx, batch_view);
         if (ret != 0) {
-            if (n_batch == 1 || ret < 0) {
-                int user_cancel = -3;
+            if (n_batch == 1 || ret != 1) {
+                const int user_cancel = -3;
+                std::string decode_error;
                 if (ret == user_cancel) {
                     LLAMA_LOG_INFO("Decode process is cancelled by user.\n");
                 }
                 else {
-                    // if you get here, it means the KV cache is full - try increasing it via the context size
-                    LOG_ERROR("failed to decode the batch: KV cache is full - try increasing it via the context size", {
+                    if (ret == 1) decode_error = "KV cache is full. Please try increasing the context size.";
+                    else if (ret == LLAMA_DECODE_ERROR_ABORTED) decode_error = "Decode graph was aborted. Please retry the request.";
+                    else if (ret == -2) decode_error = "Failed to allocate working memory for decoding.";
+                    else decode_error = "Failed to decode the batch.";
+                    LOG_ERROR("failed to decode the batch", {
                         {"i",   i},
-                        {"n_batch",  ret},
+                        {"n_batch",  n_batch},
                         {"ret",   ret},
+                        {"error", decode_error},
                         });
+                    if (ret != 1) invalidate_failed_decode_context();
                 }
 
                 for (auto& slot : slots) {
+                    // Do not manufacture failures for idle slots or contexts
+                    // that did not participate in this decode.
+                    if (slot.ctx != ctx || !slot.is_processing()) continue;
                     slot.state = SLOT_STATE_PROCESSING;
                     slot.command = SLOT_COMMAND_NONE;
                     if (ret == user_cancel) {
@@ -5881,9 +6123,15 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                         slot.release();
                     }
                     else {
+                        if (ret == 1) {
+                            // Slot exhaustion happens before the graph runs;
+                            // retain only its already completed prefix.
+                            const llama_pos cur_pos = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
+                            slot.n_past = slot.cache_tokens.size_up_to_pos(cur_pos + 1);
+                            slot.cache_tokens.keep_first(slot.n_past);
+                        }
                         slot.release();
-                        LLAMA_LOG_INFO("n_past = %d\n", (int)slot.cache_tokens.size());
-                        send_error(slot, "Input prompt is too big compared to KV size. Please try increasing KV size.");
+                        send_error(slot, decode_error);
                     }
                 }
                 break; // break loop of n_batch
@@ -6051,6 +6299,10 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 void server_context::update_slots() {
     if (system_need_update) {
         system_prompt_update();
+        if (system_need_update) {
+            release_slots();
+            return;
+        }
     }
     // release slots
     release_slots();

@@ -103,7 +103,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build DEB and RPM packages
-        run: pnpm tauri build --bundles deb,rpm --config src-tauri/tauri.unsigned.conf.json
+        run: pnpm package:linux --bundles deb,rpm --config src-tauri/tauri.unsigned.conf.json
 
       - name: Install and smoke-test DEB package
         run: |
@@ -137,12 +137,15 @@ jobs:
     runs-on: windows-2022
     # A cold CUDA 12.4 build takes just under two hours on the hosted runner.
     # Leave enough time to verify and preserve it for later PR updates.
-    timeout-minutes: 180
+    timeout-minutes: 240
     defaults:
       run:
         working-directory: studio
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Restored build markers must resolve before ancestry checks.
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -160,12 +163,19 @@ jobs:
         with:
           components: clippy,rustfmt
 
+      - name: Capture Windows CUDA build cache key
+        id: windows-cuda-key
+        shell: pwsh
+        env:
+          ESE_NATIVE_CACHE_KEY: ese-windows-cuda-v2-${{ runner.os }}-cuda12.4-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'include/**', 'src/**', 'common/**', 'examples/CMakeLists.txt', 'examples/server/**', 'vendor/**', '.github/scripts/setup-cuda-windows.ps1', '.github/scripts/prepare-restored-build.py') }}
+        run: Add-Content -Path $env:GITHUB_OUTPUT -Value "key=$env:ESE_NATIVE_CACHE_KEY"
+
       - name: Restore exact Windows CUDA runtime build
         id: windows-cuda-cache
         uses: actions/cache@v4
         with:
           path: build-package
-          key: ese-windows-cuda-v2-${{ runner.os }}-cuda12.4-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'include/**', 'src/**', 'common/**', 'examples/CMakeLists.txt', 'examples/server/**', 'vendor/**', '.github/scripts/setup-cuda-windows.ps1', '.github/scripts/prepare-restored-build.py') }}
+          key: ${{ steps.windows-cuda-key.outputs.key }}
           restore-keys: |
             ese-windows-cuda-v2-${{ runner.os }}-cuda12.4-
             ese-windows-cuda-v1-${{ runner.os }}-cuda12.4-
@@ -195,7 +205,7 @@ jobs:
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build bundled ESE CPU + CUDA runtime
+      - name: Build bundled ESE CUDA runtime
         if: steps.windows-cuda-cache.outputs.cache-hit != 'true'
         working-directory: .
         shell: cmd
@@ -205,6 +215,14 @@ jobs:
           cmake --build build-package --config Release --target llama-server -j 2
           python .github\scripts\prepare-restored-build.py --build-root build-package --record
 
+      - name: Build separate driver-independent Windows CPU runtime
+        working-directory: .
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build-package-cpu -G "Visual Studio 17 2022" -A x64 -DGGML_CUDA=OFF -DGGML_NATIVE=OFF -DESE_QWEN4EXP_PROBE_GATE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON
+          cmake --build build-package-cpu --config Release --target llama-server --parallel 2
+
       - name: Build standalone Windows ESE launcher
         working-directory: .
         shell: pwsh
@@ -212,6 +230,10 @@ jobs:
           python -m pip install --disable-pip-version-check "pyinstaller==6.16.0"
           python -m PyInstaller --noconfirm --clean --onefile --name ese --paths . --hidden-import tools.ese --distpath dist --workpath build-pyinstaller --specpath build-pyinstaller ese
           .\dist\ese.exe --version
+
+      - name: Check Windows CPU fallback selection and verification controls
+        working-directory: .
+        run: python -m unittest tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_before_cuda_binary_load tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_preserves_explicit_binary_overrides tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_rejects_cuda_payload_in_cpu_directory tests.test_windows_runtime_verify
 
       - name: Check installer PowerShell syntax
         shell: pwsh
@@ -232,7 +254,7 @@ jobs:
         working-directory: .
         shell: pwsh
         run: |
-          python .\.github\scripts\verify-windows-runtime.py --runtime-root .\studio\runtime\ese --build-root .\build-package
+          python .\.github\scripts\verify-windows-runtime.py --runtime-root .\studio\runtime\ese --build-root .\build-package --cpu-build-root .\build-package-cpu
           if ($LASTEXITCODE -ne 0) { throw "Staged Windows runtime verification failed" }
           .\studio\runtime\ese\ese.exe doctor --json
           if ($LASTEXITCODE -ne 0) { throw "ESE runtime doctor failed" }
@@ -251,7 +273,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: build-package
-          key: ese-windows-cuda-v2-${{ runner.os }}-cuda12.4-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'include/**', 'src/**', 'common/**', 'examples/CMakeLists.txt', 'examples/server/**', 'vendor/**', '.github/scripts/setup-cuda-windows.ps1', '.github/scripts/prepare-restored-build.py') }}
+          key: ${{ steps.windows-cuda-key.outputs.key }}
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check

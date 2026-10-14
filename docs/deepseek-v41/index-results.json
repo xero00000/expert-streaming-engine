@@ -1,0 +1,70 @@
+[
+  {
+    "backend": "CPU",
+    "results": [
+      {
+        "case": "index-d32-t1",
+        "max_absolute_errors": {
+          "scores": 3.5762786865234375e-07
+        }
+      },
+      {
+        "case": "index-d128-t7",
+        "max_absolute_errors": {
+          "scores": 9.5367431640625e-07
+        }
+      }
+    ]
+  },
+  {
+    "backend": "CUDA0",
+    "results": [
+      {
+        "case": "index-d32-t1",
+        "max_absolute_errors": {
+          "scores": 3.5762786865234375e-07
+        }
+      },
+      {
+        "case": "index-d128-t7",
+        "max_absolute_errors": {
+          "scores": 1.1920928955078125e-06
+        }
+      }
+    ]
+  },
+  {
+    "backend": "CUDA1",
+    "results": [
+      {
+        "case": "index-d32-t1",
+        "max_absolute_errors": {
+          "scores": 3.5762786865234375e-07
+        }
+      },
+      {
+        "case": "index-d128-t7",
+        "max_absolute_errors": {
+          "scores": 1.1920928955078125e-06
+        }
+      }
+    ]
+  },
+  {
+    "backend": "CUDA2",
+    "results": [
+      {
+        "case": "index-d32-t1",
+        "max_absolute_errors": {
+          "scores": 3.5762786865234375e-07
+        }
+      },
+      {
+        "case": "index-d128-t7",
+        "max_absolute_errors": {
+          "scores": 1.1920928955078125e-06
+        }
+      }
+    ]
+  }
+]

@@ -56,6 +56,32 @@ test("runtime staging includes the complete Python launcher package", () => {
   assert.match(studioWorkflow, /"tools\/hardware_profile\.py"/);
 });
 
+test("Linux package metadata declares launcher and OpenMP dependencies", () => {
+  assert.ok(tauriConfig.bundle.linux.deb.depends.includes("python3 (>= 3.10)"));
+  assert.ok(tauriConfig.bundle.linux.deb.depends.includes("libgomp1"));
+  assert.ok(tauriConfig.bundle.linux.rpm.depends.includes("python3"));
+  assert.ok(tauriConfig.bundle.linux.rpm.depends.includes("libgomp"));
+  // Tauri CLI 2.11.4 uses rpm 0.16.0: compressed short writes corrupt
+  // the raw payload digest and repeatedly hash the unconsumed input.
+  assert.deepEqual(tauriConfig.bundle.linux.rpm.compression, { type: "none" });
+});
+
+test("Linux CUDA packages carry the pinned CUDA, NCCL, and NVTX licenses", () => {
+  const expected = {
+    "NVIDIA-CUDA-12.8-LICENSE.txt": "e2c71babfd18a8e69542dd7e9ca018f9caa438094001a58e6bc4d8c999bf0d07",
+    "NVIDIA-NCCL-LICENSE.txt": "0f0174a6b4e0b33ac26375bf729533075b32f4c51a5b6802a3d742d7dcdc9a76",
+    "NVIDIA-NVTX-LICENSE.txt": "abdfd8a6738b27cd1504e091f77b682dbae928339f040b8a6f59a548245991a0",
+  };
+  for (const [name, hash] of Object.entries(expected)) {
+    assert.equal(tauriConfig.bundle.resources[`../licenses/${name}`], `licenses/${name}`);
+    assert.equal(createHash("sha256").update(readFileSync(join(studioRoot, "licenses", name))).digest("hex"), hash);
+  }
+  const notices = readFileSync(join(repoRoot, "THIRD_PARTY_NOTICES.txt"), "utf8").replace(/\s+/g, " ");
+  for (const text of ["cuda_cudart 12.8.57", "libcublas 12.8.3.14", "NVIDIA NCCL 2.25.1", "libcuda.so.1 is not bundled"]) {
+    assert.ok(notices.includes(text), text);
+  }
+});
+
 test("NSIS packages the large CUDA runtime without solid compression", () => {
   assert.equal(tauriConfig.bundle.windows.nsis.template, "installer.nsi");
   const template = readFileSync(join(studioRoot, "src-tauri", "installer.nsi"), "utf8");
@@ -78,7 +104,7 @@ test("WiX splits the CUDA runtime across bounded embedded cabinets", () => {
 test("cached Windows builds still stage and enforce CUDA redistributables", () => {
   assert.match(
     studioWorkflow,
-    /name: Studio frontend, Rust, and Windows installers[\s\S]*?timeout-minutes: 180/,
+    /name: Studio frontend, Rust, and Windows installers[\s\S]*?timeout-minutes: 240/,
   );
   const cudaInstall = studioWorkflow.match(
     /- name: Install CUDA toolkit\n(?<body>(?: {8,}.*\n){1,5})/,
@@ -107,6 +133,16 @@ test("cached Windows builds still stage and enforce CUDA redistributables", () =
   for (const pattern of ["cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll"]) {
     assert.ok(studioWorkflow.split(pattern).length >= 3, `${pattern} is not gated in both installer jobs`);
   }
+});
+
+test("AppImage release packaging preserves modern ELF relocation sections", () => {
+  assert.match(releaseWorkflow, /- name: Build packages[\s\S]*?NO_STRIP: "1"/);
+});
+
+test("release package jobs require the complete native regression suite", () => {
+  assert.match(releaseWorkflow, /native-regressions:[\s\S]*?ctest --test-dir build-release-checks --output-on-failure/);
+  assert.match(releaseWorkflow, /linux-studio:\n\s+name: Build Linux Studio packages\n\s+needs: native-regressions/);
+  assert.match(releaseWorkflow, /windows-studio:\n\s+name: Build Windows Studio installers\n\s+needs: native-regressions/);
 });
 
 test("repository forms use ESE links, branding, and available labels", () => {
@@ -138,9 +174,14 @@ test("Studio presents reasoning and runtime actions from measured state", () => 
   assert.match(app, /chatStatus\.ready \? "Model connected" : chatStatus\.active \? "Model starting"/);
   assert.match(app, /chatStatus\.active \? "Stop model & run" : "Run sweep"/);
   assert.match(app, /chatStatus\.modelPath === selected\.path \? "Restart model" : "Switch model"/);
-  assert.match(app, /selected\.available \? "Selected" : "Missing"/);
+  assert.match(app, /selectedLaunchable \? "Selected" : selected\.available \? "Validation gated" : "Missing"/);
   assert.match(app, />Included<\/span>/);
+  assert.match(app, /Qwen 3\.8 · Flash Next/);
+  assert.match(app, /support-badge">Experimental/);
+  assert.match(app, /Text \$\{capabilityLabel\(selected\.runtimeSupport\.text\)\} · Vision/);
+  assert.match(app, /!selectedLaunchable \? "Validation gated"/);
   assert.match(types, /ready: boolean;/);
   assert.match(types, /modelPath\?: string;/);
+  assert.match(types, /runtimeSupport\?: RuntimeSupport;/);
   assert.doesNotMatch(app, />Scanning<\/span>/);
 });
