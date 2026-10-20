@@ -1,8 +1,9 @@
 # ESE source consolidation review — 20 October 2026
 
 The release candidate, experimental inference work and Android draft now have
-separate local review branches. No source worktree was reset, deleted or
-overwritten, and nothing was pushed or published. `ESE-current` still points to
+separate local review branches. Initial consolidation preserved every original
+worktree; the subsequent authorized cleanup below removed redundant copies.
+Nothing was pushed or published. `ESE-current` still points to
 `ESE-v0.2.1-qwen4exp-plan` so existing launcher/build paths continue to work.
 
 This review covers source provenance, preservation, integration boundaries,
@@ -143,3 +144,43 @@ artifacts; installers have not been rebuilt with the new launcher option.
 The next release task is to reconcile and validate the package matrix. The
 research and Android branches can be reviewed independently without changing
 the candidate or the working launcher symlink.
+
+## Subsequent authorized cleanup
+
+After consolidation, the user requested removal of unneeded old branches and
+worktrees. The following 11 redundant checkouts and their disposable build
+outputs were removed:
+
+- `ESE-combined-peak`, `ESE-combined-txn`, `ESE-compact-parity-gate`;
+- `ESE-expert-cache-diag`, `ESE-expert-txn-api`, `ESE-kv-txn-api`;
+- `ESE-main-winfix`, `ESE-mtp-owner-txn`, `ESE-transient-txn`;
+- `ESE-v0.2.0-public`;
+- `results/ese-v0.2.1-release-preparation-20261014/source`.
+
+Their recorded HEADs and source-archive checksum were verified first. Fresh
+status checks found only disposable generated files and no new source edits.
+The model-file inventory found no untracked model weights beyond CMake
+compiler-probe binaries. A process/file-descriptor check found no use of the
+removed paths, and launcher/configuration searches found only historical
+archive references to them.
+
+Eleven obsolete local branch names were deleted, including the unmounted
+`v2/concurrent-local-sessions` and `v2/transient-resource-transaction` branches.
+Their exact heads remain recoverable under
+`refs/archive/ese-cleanup-20261020/…`; the earlier review archive refs and
+source payload archive also remain. No remote branch was deleted.
+
+The cleanup freed 5,588,590,592 bytes (about 5.2 GiB) on the home filesystem,
+plus the separate prepared-source checkout on the external results disk. Git
+connectivity checks passed afterward. The two launcher-selected CUDA servers
+and the consolidated CPU server still produce valid help and resolve their
+shared-library dependencies.
+
+`ESE-glm5-next` and `ESE-v0.2.1-qwen4exp-plan` remain because `model_slots.sh`
+uses their CUDA builds. The primary `ESE` directory owns the shared Git
+database and retains the original Android build workspace. The three new
+review worktrees, `main`, and `llama-kimi-reference` remain available. The
+launcher symlink was not changed.
+
+Exact deletion records and recovery references are in `cleanup-result.json`
+alongside the source archive and inventories.
