@@ -16,6 +16,18 @@ from urllib.request import urlopen
 LOCK = Path(__file__).with_name("cuda-linux-12.8.lock.json")
 
 
+def configure_library_layout(root: Path) -> None:
+    # NVIDIA redistributables use lib/, but nvcc's default Linux link search
+    # uses lib64/. Without this alias the host compiler can pick up an older
+    # CUDA runtime from its own search paths instead of this pinned SDK.
+    libraries = root / "lib64"
+    if libraries.is_symlink() and libraries.readlink() == Path("lib"):
+        return
+    if libraries.exists() or libraries.is_symlink():
+        raise ValueError("CUDA lib64 must be an alias of the pinned lib directory")
+    libraries.symlink_to("lib", target_is_directory=True)
+
+
 def install_archive(archive: Path, root: Path, expected_hash: str, expected_bytes: int) -> None:
     with archive.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -49,6 +61,7 @@ def main() -> None:
     for relative in ["bin/nvcc", "include/cuda_runtime.h", "include/nccl.h", "lib/libnccl.so", "lib/libcublas.so"]:
         if not (root / relative).is_file():
             raise ValueError(f"Incomplete CUDA/NCCL toolchain: {relative}")
+    configure_library_layout(root)
     # These release builds link cuBLAS/NCCL dynamically; discard unused static
     # copies to leave room for Rust builds and all three package formats in CI.
     for pattern in ["lib/libcublas*_static.a", "lib/libnccl_static.a"]:

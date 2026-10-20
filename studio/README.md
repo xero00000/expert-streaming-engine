@@ -181,12 +181,18 @@ to the model server started by Studio.
 
 ## Release validation
 
+Use Node.js 22.22.2 (`../.node-version`), pnpm 11.19.0 (the
+`packageManager` field) and Rust 1.96.0 (`../rust-toolchain.toml`). CI uses
+the same versions. Keep `node_modules` local to this checkout; replacing a
+symlinked dependency tree can modify another worktree. Corepack users can
+run `corepack pnpm` in place of `pnpm`.
+
 ```bash
 pnpm install --frozen-lockfile
 pnpm build
 cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
+cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+cargo test --locked --manifest-path src-tauri/Cargo.toml
 pnpm package:linux --bundles appimage,deb,rpm --config src-tauri/tauri.unsigned.conf.json # Linux source packages
 pnpm tauri build --bundles nsis,msi --config src-tauri/tauri.unsigned.conf.json      # Windows source package
 ```

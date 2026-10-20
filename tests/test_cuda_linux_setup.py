@@ -15,6 +15,26 @@ SPEC.loader.exec_module(MODULE)
 
 
 class CudaLinuxSetupTests(unittest.TestCase):
+    def test_nvcc_library_search_resolves_the_pinned_runtime_and_is_repeatable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lib").mkdir()
+            (root / "lib/libcudart_static.a").write_bytes(b"pinned runtime")
+            MODULE.configure_library_layout(root)
+            MODULE.configure_library_layout(root)
+            self.assertEqual((root / "lib64/libcudart_static.a").read_bytes(), b"pinned runtime")
+
+    def test_existing_lib64_cannot_silently_select_another_runtime(self):
+        for symlink in [False, True]:
+            with self.subTest(symlink=symlink), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                if symlink:
+                    (root / "lib64").symlink_to("other-toolkit")
+                else:
+                    (root / "lib64").mkdir()
+                with self.assertRaisesRegex(ValueError, "pinned lib"):
+                    MODULE.configure_library_layout(root)
+
     def fixture(self, entries):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

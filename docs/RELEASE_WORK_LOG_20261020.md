@@ -49,7 +49,7 @@ claimed: no new eight-package production build or installed-update trial has
 been run. Continue with task 2's clean-source validation, retaining the full
 package acceptance check for tasks 6 and 7.
 
-### 2. Finish validation of the consolidated source — PENDING
+### 2. Finish validation of the consolidated source — IN PROGRESS
 
 - Pin the package-manager toolchain and prove a frozen-lockfile build without
   modifying dependencies in another worktree.
@@ -168,3 +168,19 @@ recorded and no outstanding supported-scope release blockers.
   `task1-nvidia-lock-validation.json`.
 - No remote dispatch, push, tag, new production installer build, installed-update
   trial or publication occurred. Those checks remain explicitly pending.
+
+### Task 2 — toolchain isolation and validation in progress
+
+- Pinned Node.js 22.22.2, pnpm 11.19.0 and Rust 1.96.0 in source and
+  the Studio/release workflows. Rust CI tests and Clippy now use `--locked`.
+- Removed only the consolidated checkout's `node_modules` symlink. Its old
+  target was preserved; a new local frozen-lockfile installation and the full
+  `pnpm build` passed without changing the frontend lockfile.
+- Installed the checksum-pinned CUDA 12.8/NCCL 2.25.1 SDK locally. The first
+  compiler ABI probe exposed nvcc's `lib64` search picking up an older Conda
+  CUDA runtime, because the redistributables use `lib`. Added a repeatable
+  `lib64 -> lib` alias and regression checks; the fresh ABI probe now passes.
+  The interrupted first build/configure logs are retained as failed-attempt
+  evidence. The corrected full native CUDA build is in progress.
+- Rust tests passed (27 tests, zero ignored). Clippy and GPU qualification are
+  still pending; task 2 remains in progress.

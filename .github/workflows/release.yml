@@ -96,13 +96,16 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .node-version
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 10
+          package_json_file: studio/package.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -181,7 +184,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .node-version
 
       - uses: actions/setup-python@v5
         with:
@@ -189,9 +192,12 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 10
+          package_json_file: studio/package.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy, rustfmt
 
       - name: Capture Windows CUDA build cache key
         id: windows-cuda-key
