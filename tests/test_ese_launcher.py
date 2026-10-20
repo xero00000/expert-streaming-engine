@@ -1037,6 +1037,57 @@ class LauncherTests(unittest.TestCase):
                 prefetch_tail=1,
             )
 
+    def test_expert_load_workers_preserve_bounded_cache_plan(self) -> None:
+        for policy in ("cache", "stream"):
+            for workers in (0, 1, 4, 8):
+                with self.subTest(policy=policy, workers=workers):
+                    plan = build_launch_plan(
+                        model=moe_model(), hardware=hardware(20),
+                        binary=Path("/server"), policy=policy,
+                        expert_load_workers=workers,
+                        expert_ram_cache=768 * 1024**2,
+                        expert_ram_staging=32 * 1024**2,
+                    )
+                    for flag, value in (("--expert-ram-cache-mib", "768"),
+                                        ("--expert-ram-staging-mib", "32")):
+                        self.assertEqual(plan.arguments[plan.arguments.index(flag) + 1], value)
+                    if workers:
+                        self.assertEqual(plan.arguments.count("--expert-load-workers"), 1)
+                        self.assertEqual(
+                            plan.arguments[plan.arguments.index("--expert-load-workers") + 1],
+                            str(workers),
+                        )
+                    else:
+                        self.assertNotIn("--expert-load-workers", plan.arguments)
+                    self.assertEqual("--defer-experts" in plan.arguments, policy == "stream")
+
+    def test_expert_load_workers_reject_unavailable_policies_and_counts(self) -> None:
+        for policy, workers in (("resident", 1), ("hybrid", 4), ("cache", -1), ("stream", 9)):
+            with self.subTest(policy=policy, workers=workers), self.assertRaisesRegex(
+                ESEError, "--expert-load-workers"
+            ):
+                build_launch_plan(
+                    model=moe_model(), hardware=hardware(20),
+                    binary=Path("/server"), policy=policy, expert_load_workers=workers,
+                )
+
+    def test_expert_load_worker_cli_option_reaches_native_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "model.gguf"
+            write_minimal_gguf(path, {
+                "general.architecture": "gpt-oss", "gpt-oss.expert_count": 128,
+                "gpt-oss.expert_used_count": 4, "gpt-oss.block_count": 36,
+            })
+            args = _make_parser().parse_args([
+                "plan", str(path), "--policy", "stream", "--expert-load-workers", "4",
+                "--no-auto-hybrid",
+            ])
+            args.extra = ()
+            with mock.patch("tools.ese._hardware_for_server", return_value=hardware(20)), \
+                    mock.patch("tools.ese._resolve_binary", return_value=Path("/server")):
+                plan = _plan_from_args(args)
+            self.assertEqual(plan.arguments[plan.arguments.index("--expert-load-workers") + 1], "4")
+
     def test_parallel_slots_are_enabled_for_resident_models(self) -> None:
         plan = build_launch_plan(
             model=dense_model(),

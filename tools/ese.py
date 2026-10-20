@@ -1316,6 +1316,7 @@ def build_launch_plan(
     expert_vram_cache: int | None = None,
     expert_prefill_staging: int | None = None,
     expert_storage_backend: str | None = None,
+    expert_load_workers: int = 0,
     expert_cache_min_observations: int = 2,
     hybrid_gpu_experts: int = 0,
     hybrid_cpu_ns_per_expert: int = 0,
@@ -1357,6 +1358,10 @@ def build_launch_plan(
     )
     if expert_storage_backend not in (None, "mmap", "pread", "io_uring"):
         raise ESEError("--expert-storage-backend must be mmap, pread, or io_uring")
+    if not 0 <= expert_load_workers <= 8:
+        raise ESEError("--expert-load-workers must be between 0 and 8")
+    if expert_load_workers and selected_policy not in ("cache", "stream"):
+        raise ESEError("--expert-load-workers requires cache or stream policy")
     if expert_cache_min_observations < 1:
         raise ESEError("--expert-cache-min-observations must be at least 1")
     if expert_prefill_staging is not None and expert_prefill_staging < 0:
@@ -1504,6 +1509,8 @@ def build_launch_plan(
                     _mib_ceil(expert_ram_staging, "--expert-ram-staging"),
                 )
             )
+        if expert_load_workers:
+            args.extend(("--expert-load-workers", str(expert_load_workers)))
         if vram_cache:
             args.extend(
                 (
@@ -2467,6 +2474,13 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
         help="exact expert source backend (default: mmap for cache, pread for stream)",
     )
     parser.add_argument(
+        "--expert-load-workers",
+        type=int,
+        choices=range(9),
+        default=0,
+        help="parallel GPU-route expert reads sharing the RAM staging budget (0..8; default: synchronous)",
+    )
+    parser.add_argument(
         "--expert-cache-min-observations",
         type=int,
         default=2,
@@ -2660,6 +2674,7 @@ def _plan_from_args(
         expert_vram_cache=args.expert_vram_cache,
         expert_prefill_staging=getattr(args, "expert_prefill_staging", None),
         expert_storage_backend=args.expert_storage_backend,
+        expert_load_workers=getattr(args, "expert_load_workers", 0),
         expert_cache_min_observations=args.expert_cache_min_observations,
         hybrid_gpu_experts=hybrid_gpu_experts,
         hybrid_cpu_ns_per_expert=hybrid_cpu_ns_per_expert,
