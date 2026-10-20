@@ -5,10 +5,29 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { gtkPluginWithRuntimeExclusions, packagingEnvironment } from "../scripts/package-linux.mjs";
+import { gtkPluginWithRuntimeExclusions, packagingEnvironment, linuxPackageConfiguration } from "../scripts/package-linux.mjs";
 import { protectsNvidiaLibrary } from "../scripts/patchelf-runtime.mjs";
 
 const studioRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+test("Linux package configuration preserves the installed runtime variant in its update feed", () => {
+  const root = mkdtempSync(join(tmpdir(), "ese-package-variant-"));
+  try {
+    for (const [setting, variant] of [["OFF", "cpu"], ["ON", "cuda"]]) {
+      writeFileSync(join(root, "CMakeCache.txt"), `GGML_CUDA:BOOL=${setting}\n`);
+      const selected = linuxPackageConfiguration(root, variant);
+      assert.equal(selected.variant, variant);
+      const config = JSON.parse(readFileSync(selected.config, "utf8"));
+      assert.deepEqual(config.plugins.updater.endpoints,
+        [`https://github.com/xero00000/expert-streaming-engine/releases/latest/download/latest-${variant}.json`]);
+      assert.throws(() => linuxPackageConfiguration(root, variant === "cpu" ? "cuda" : "cpu"), /does not match/);
+    }
+    writeFileSync(join(root, "CMakeCache.txt"), "# unknown configuration\n");
+    assert.throws(() => linuxPackageConfiguration(root), /explicit GGML_CUDA/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("Linux package environment preserves signing configuration and prevents stripping", () => {
   const env = packagingEnvironment("/fixture/cache", "/fixture/linuxdeploy", "/fixture/patchelf", {

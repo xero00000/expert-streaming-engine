@@ -12,6 +12,17 @@ const linuxdeployUrl = `https://github.com/tauri-apps/binary-releases/releases/d
 // cleared in the same way as Tauri's prepare_tools().
 const linuxdeploySha256 = "20eebde3c18ae2e44279bd624fc72482503aece216d5d77f10932235342f71c1";
 
+export function linuxPackageConfiguration(buildRoot, requestedVariant) {
+  const cache = readFileSync(join(buildRoot, "CMakeCache.txt"), "utf8");
+  const configured = cache.match(/^GGML_CUDA:BOOL=(ON|OFF)\s*$/m);
+  if (!configured) throw new Error("Linux packaging requires an explicit GGML_CUDA build configuration.");
+  const variant = configured[1] === "ON" ? "cuda" : "cpu";
+  if (requestedVariant && requestedVariant !== variant) {
+    throw new Error(`Requested ${requestedVariant} package does not match the ${variant} runtime build.`);
+  }
+  return { variant, config: join(studioRoot, "src-tauri", `tauri.linux-${variant}.conf.json`) };
+}
+
 function executable(name) {
   for (const directory of (process.env.PATH || "").split(delimiter)) {
     const path = resolve(directory, name);
@@ -43,6 +54,13 @@ async function main() {
   if (process.platform !== "linux" || process.arch !== "x64") {
     throw new Error("Linux release packaging tools are pinned for x86_64.");
   }
+  const buildRoot = process.env.ESE_RUNTIME_BUILD_DIR
+    ? resolve(process.env.ESE_RUNTIME_BUILD_DIR)
+    : ["build-package", "build-release-runtime", "build-ci", "build"]
+      .map((name) => resolve(studioRoot, "..", name))
+      .find((root) => existsSync(join(root, "bin", "llama-server")));
+  if (!buildRoot) throw new Error("Build the Linux ESE runtime before packaging.");
+  const packageConfig = linuxPackageConfiguration(buildRoot, process.env.ESE_PACKAGE_VARIANT);
   const realPatchelf = process.env.ESE_REAL_PATCHELF || process.env.PATCHELF || executable("patchelf");
   const parentCache = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
   const cacheRoot = mkdtempSync(join(tmpdir(), "ese-linux-package-"));
@@ -75,10 +93,12 @@ async function main() {
     if (compiled.error) throw compiled.error;
     if (compiled.status !== 0) throw new Error("Could not build the linuxdeploy launcher.");
     chmodSync(join(studioRoot, "scripts", "patchelf-runtime.mjs"), 0o755);
-    const result = spawnSync("pnpm", ["tauri", "build", ...process.argv.slice(2)], {
+    const result = spawnSync("pnpm", ["tauri", "build", "--config", packageConfig.config, ...process.argv.slice(2)], {
       cwd: studioRoot,
       stdio: "inherit",
-      env: packagingEnvironment(cacheRoot, realLinuxdeploy, realPatchelf),
+      env: packagingEnvironment(cacheRoot, realLinuxdeploy, realPatchelf, {
+        ...process.env, ESE_RUNTIME_BUILD_DIR: buildRoot, ESE_PACKAGE_VARIANT: packageConfig.variant,
+      }),
     });
     if (result.error) throw result.error;
     process.exitCode = result.status ?? 1;

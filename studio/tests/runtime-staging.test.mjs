@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 const studioRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const script = process.env.ESE_STAGE_TEST_SOURCE || join(studioRoot, "scripts", "stage-runtime.mjs");
 
-function stageFixture(cuda, { missingVendor = false, missingPatcher = false } = {}) {
+function stageFixture(cuda, { missingVendor = false, missingPatcher = false, requestedVariant, missingBuild = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), "ese-runtime-stage-"));
   try {
     const repo = join(root, "repo");
@@ -18,6 +18,9 @@ function stageFixture(cuda, { missingVendor = false, missingPatcher = false } = 
     const bin = join(root, "test-bin");
     const log = join(root, "patchelf.jsonl");
     for (const directory of [scripts, join(repo, "tools"), join(build, "bin"), bin]) mkdirSync(directory, { recursive: true });
+    const retained = join(repo, "studio", "runtime", "ese", "retained");
+    mkdirSync(dirname(retained), { recursive: true });
+    writeFileSync(retained, "previous runtime must survive rejected staging");
     cpSync(script, join(scripts, "stage-runtime.mjs"));
     cpSync(join(dirname(script), "windows-cpu-runtime.mjs"), join(scripts, "windows-cpu-runtime.mjs"));
     for (const name of ["ese", "ese.cmd"]) writeFileSync(join(repo, name), "fixture launcher\n");
@@ -42,8 +45,16 @@ function stageFixture(cuda, { missingVendor = false, missingPatcher = false } = 
     chmodSync(ldd, 0o755);
     const result = spawnSync(process.execPath, [join(scripts, "stage-runtime.mjs")], {
       encoding: "utf8",
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, ESE_RUNTIME_BUILD_DIR: build },
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`,
+        ESE_RUNTIME_BUILD_DIR: missingBuild ? join(root, "missing-build") : build,
+        ESE_PACKAGE_VARIANT: requestedVariant || "" },
     });
+    if (missingBuild || (requestedVariant && requestedVariant !== (cuda ? "cuda" : "cpu"))) {
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, missingBuild ? /runtime is not built/ : /does not match/);
+      assert.equal(readFileSync(retained, "utf8"), "previous runtime must survive rejected staging");
+      return;
+    }
     if (missingVendor || missingPatcher) {
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, missingPatcher ? /requires patchelf/ : /Required CUDA redistributable libnccl\.so\.2 could not be resolved/);
@@ -52,6 +63,7 @@ function stageFixture(cuda, { missingVendor = false, missingPatcher = false } = 
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const metadata = JSON.parse(readFileSync(join(repo, "studio", "runtime", "ese", "build", "bin", "ese-runtime.json"), "utf8"));
     assert.equal(metadata.cuda, cuda);
+    assert.equal(metadata.package_variant, cuda ? "cuda" : "cpu");
     const calls = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(calls.length, 2);
     assert.deepEqual(calls.map((args) => args[2].split("/").at(-1)).sort(), ["libggml.so", "llama-server"]);
@@ -83,4 +95,13 @@ test("CUDA runtime staging rejects an unresolved redistributable", { skip: proce
 
 test("Linux runtime staging requires patchelf", { skip: process.platform !== "linux" }, () => {
   stageFixture(false, { missingPatcher: true });
+});
+
+test("Variant mismatch rejects staging before replacing the existing runtime", { skip: process.platform !== "linux" }, () => {
+  stageFixture(false, { requestedVariant: "cuda" });
+  stageFixture(true, { requestedVariant: "cpu" });
+});
+
+test("An explicit missing runtime build fails without replacing existing staging", { skip: process.platform !== "linux" }, () => {
+  stageFixture(false, { missingBuild: true });
 });

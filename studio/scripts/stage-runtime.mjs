@@ -13,8 +13,8 @@ function within(path, root) {
   return value === "" || (value !== ".." && !value.startsWith(`..${sep}`) && !isAbsolute(value));
 }
 const buildRoots = [
-  ...(process.env.ESE_RUNTIME_BUILD_DIR ? [resolve(process.env.ESE_RUNTIME_BUILD_DIR)] : []),
-  ...["build-package", "build-release-runtime", "build-ci", "build"].map((name) => join(repoRoot, name)),
+  ...(process.env.ESE_RUNTIME_BUILD_DIR ? [resolve(process.env.ESE_RUNTIME_BUILD_DIR)]
+    : ["build-package", "build-release-runtime", "build-ci", "build"].map((name) => join(repoRoot, name))),
 ];
 
 const serverCandidates = buildRoots.flatMap((root) => [
@@ -26,6 +26,16 @@ if (!server) {
   throw new Error(
     `ESE runtime is not built. Run ${process.platform === "win32" ? "py -3" : "python3"} ../ese build --backend cpu --build-dir ../build-package first.`,
   );
+}
+
+const serverBuildRoot = buildRoots.find((root) => within(server, root));
+const cache = join(serverBuildRoot, "CMakeCache.txt");
+const configuredCuda = existsSync(cache) && readFileSync(cache, "utf8").match(/^GGML_CUDA:BOOL=(ON|OFF)\s*$/m);
+if (!configuredCuda) throw new Error("Runtime staging requires an explicit GGML_CUDA build configuration.");
+const runtimeCuda = configuredCuda[1] === "ON";
+const packageVariant = runtimeCuda ? "cuda" : "cpu";
+if (process.env.ESE_PACKAGE_VARIANT && process.env.ESE_PACKAGE_VARIANT !== packageVariant) {
+  throw new Error(`Requested ${process.env.ESE_PACKAGE_VARIANT} package does not match the ${packageVariant} runtime build.`);
 }
 
 rmSync(destination, { recursive: true, force: true });
@@ -50,8 +60,6 @@ if (process.platform !== "win32") {
 }
 
 const runtimeExtensions = process.platform === "win32" ? [".dll"] : [".so"];
-const serverBuildRoot = buildRoots.find((root) => within(server, root));
-let runtimeCuda = false;
 if (serverBuildRoot) {
   const pending = [serverBuildRoot];
   while (pending.length) {
@@ -66,11 +74,9 @@ if (serverBuildRoot) {
     }
   }
 
-  const cache = join(serverBuildRoot, "CMakeCache.txt");
-  runtimeCuda = existsSync(cache) && /^GGML_CUDA:BOOL=ON\s*$/m.test(readFileSync(cache, "utf8"));
   writeFileSync(
     join(destination, "build", "bin", "ese-runtime.json"),
-    `${JSON.stringify({ cuda: runtimeCuda }, null, 2)}\n`,
+    `${JSON.stringify({ cuda: runtimeCuda, package_variant: packageVariant }, null, 2)}\n`,
   );
 }
 

@@ -193,8 +193,24 @@ pnpm tauri build --bundles nsis,msi --config src-tauri/tauri.unsigned.conf.json 
 
 GitHub Actions repeats these checks on Ubuntu and Windows and publishes the DEB,
 RPM, NSIS, and MSI packages as CI artifacts. The protected tagged-release
-workflow additionally builds the Linux AppImage, signs updater artifacts with
-`TAURI_SIGNING_PRIVATE_KEY`, generates `latest.json`, and attaches all packages,
-signatures, and platform checksum files to the GitHub release. The maintainer's
+workflow has separate Linux CPU/CUDA jobs, builds all six Linux packages and
+both Windows installers, and signs updater artifacts with
+`TAURI_SIGNING_PRIVATE_KEY`. Collection uses explicit platform/runtime names
+and records each package set's source commit, SHA-256 and byte count. Release
+preparation requires all eight packages from the tagged source commit before
+generating checksums or updater metadata.
+
+`pnpm package:linux` selects `latest-cpu.json` or `latest-cuda.json` from the
+native build's CMake configuration; an explicit mismatched
+`ESE_PACKAGE_VARIANT` is rejected before staging replaces an existing runtime.
+`ESE_RUNTIME_BUILD_DIR` selects exactly that build directory, without falling
+back to a different runtime. These feeds preserve the installed Linux variant.
+The legacy `latest.json` uses the CPU AppImage for older CPU installations and
+the dual-runtime Windows installer. AppImage automatic updates require signed
+artifacts; DEB/RPM users install the matching variant manually.
+
+The workflow attaches packages, signatures, provenance and checksum files to
+the GitHub release. Its implementation/local checks do not establish that new
+installers have been built, signed or qualified. The maintainer's
 recoverable private-key backup is stored outside the repository with mode
 `0600`; only the public key is committed.

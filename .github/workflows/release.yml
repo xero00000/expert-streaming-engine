@@ -23,6 +23,11 @@ jobs:
       - name: Install template reference dependency
         run: python -m pip install "Jinja2==3.1.6"
 
+      - name: Check release asset contract and CUDA installer controls
+        run: |
+          python -m unittest discover -s tests -p test_release_assets.py -v
+          python -m unittest discover -s tests -p test_cuda_linux_setup.py -v
+
       - name: Configure native regression build
         run: >-
           cmake -S . -B build-release-checks
@@ -43,9 +48,27 @@ jobs:
     name: Build Linux Studio packages
     needs: native-regressions
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            cuda: "OFF"
+          - variant: cuda
+            cuda: "ON"
+    env:
+      CC: gcc-12
+      CXX: g++-12
+      CUDAHOSTCXX: g++-12
+      ESE_RUNTIME_BUILD_DIR: ${{ github.workspace }}/build-release-runtime
+      ESE_PACKAGE_VARIANT: ${{ matrix.variant }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Verify tag matches Studio version
         env:
@@ -57,6 +80,7 @@ jobs:
       - name: Install Linux desktop build dependencies
         run: >-
           sudo apt-get update && sudo apt-get install -y
+          gcc-12 g++-12 ninja-build
           libwebkit2gtk-4.1-dev
           libayatana-appindicator3-dev
           librsvg2-dev
@@ -65,6 +89,10 @@ jobs:
           file
           xdg-utils
           rpm
+
+      - name: Install pinned Linux CUDA and NCCL build components
+        if: matrix.variant == 'cuda'
+        run: python3 .github/scripts/setup-cuda-linux.py --root "$RUNNER_TEMP/ese-cuda-12.8"
 
       - uses: actions/setup-node@v4
         with:
@@ -79,15 +107,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: studio/src-tauri
+          shared-key: release-linux-${{ matrix.variant }}
 
-      - name: Build bundled ESE CPU runtime
-        run: >-
-          cmake -S . -B build-release-runtime
-          -DCMAKE_BUILD_TYPE=Release
-          -DGGML_CUDA=OFF
-          -DLLAMA_BUILD_TESTS=OFF
-          -DLLAMA_BUILD_SERVER=ON
-          && cmake --build build-release-runtime --target llama-server -j2
+      - name: Restore Linux native build cache
+        uses: actions/cache@v4
+        with:
+          path: build-release-runtime
+          key: ese-linux-${{ matrix.variant }}-cuda12.8-v1-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'include/**', 'src/**', 'common/**', 'examples/CMakeLists.txt', 'examples/server/**', 'vendor/**', '.github/scripts/setup-cuda-linux.py', '.github/scripts/cuda-linux-12.8.lock.json') }}
+
+      - name: Build bundled ESE runtime
+        env:
+          CUDA_ENABLED: ${{ matrix.cuda }}
+        run: |
+          cuda_args=()
+          if [ "$ESE_PACKAGE_VARIANT" = cuda ]; then
+            cuda_args+=("-DCMAKE_CUDA_ARCHITECTURES=75-real;86-real;86-virtual")
+          fi
+          cmake -S . -B "$ESE_RUNTIME_BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
+            -DGGML_CUDA="$CUDA_ENABLED" -DESE_QWEN4EXP_PROBE_GATE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON "${cuda_args[@]}"
+          if [ "$ESE_PACKAGE_VARIANT" = cuda ]; then
+            grep -q '^NCCL_LIBRARIES:FILEPATH=.*libnccl' "$ESE_RUNTIME_BUILD_DIR/CMakeCache.txt"
+          fi
+          cmake --build "$ESE_RUNTIME_BUILD_DIR" --target llama-server --parallel 2
 
       - name: Build packages
         working-directory: studio
@@ -97,6 +140,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
           pnpm install --frozen-lockfile
           pnpm package:linux --bundles appimage,deb,rpm
 
@@ -104,13 +148,14 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           python3 .github/scripts/collect-release-assets.py \
-            --platform linux --version "$version" \
+            --platform linux --variant "$ESE_PACKAGE_VARIANT" --version "$version" \
+            --source-commit "$GITHUB_SHA" --runtime-root studio/runtime/ese \
             --bundle-root studio/src-tauri/target/release/bundle \
             --output release-assets
 
       - uses: actions/upload-artifact@v4
         with:
-          name: release-linux
+          name: release-linux-${{ matrix.variant }}
           path: release-assets/*
           if-no-files-found: error
 
@@ -190,7 +235,7 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -S . -B build-package -G "Ninja Multi-Config" -DGGML_CUDA=ON -DGGML_NATIVE=OFF "-DCMAKE_CUDA_ARCHITECTURES=75-real;86-real;86-virtual" "-DCMAKE_CUDA_FLAGS=--threads=2" -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON
+          cmake -S . -B build-package -G "Ninja Multi-Config" -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DESE_QWEN4EXP_PROBE_GATE=OFF "-DCMAKE_CUDA_ARCHITECTURES=75-real;86-real;86-virtual" "-DCMAKE_CUDA_FLAGS=--threads=2" -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON
           cmake --build build-package --config Release --target llama-server -j 2
           python .github\scripts\prepare-restored-build.py --build-root build-package --record
 
@@ -244,7 +289,7 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:GITHUB_REF_NAME.Substring(1)
-          python .\.github\scripts\collect-release-assets.py --platform windows --version $version --bundle-root .\studio\src-tauri\target\release\bundle --output release-assets
+          python .\.github\scripts\collect-release-assets.py --platform windows --version $version --source-commit $env:GITHUB_SHA --runtime-root .\studio\runtime\ese --bundle-root .\studio\src-tauri\target\release\bundle --output release-assets
           if ($LASTEXITCODE -ne 0) { throw "Release asset collection failed" }
 
       - uses: actions/upload-artifact@v4
@@ -266,30 +311,15 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Generate checksums
-        working-directory: release-assets
-        run: |
-          sha256sum -- *.AppImage *.deb *.rpm *.exe *.msi > SHA256SUMS
-          sha256sum -- *.exe *.msi > SHA256SUMS-windows.txt
-
-      - name: Generate signed updater manifest
+      - name: Validate complete package matrix and generate release metadata
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           REPOSITORY: ${{ github.repository }}
         run: |
           version="${RELEASE_TAG#v}"
-          linux_signature="$(cat "release-assets/ese-studio_${version}_amd64.AppImage.sig")"
-          windows_signature="$(cat "release-assets/ese-studio_${version}_x64-setup.exe.sig")"
-          jq -n \
-            --arg version "$version" \
-            --arg notes "Expert Streaming Engine ${RELEASE_TAG}" \
-            --arg pub_date "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg linux_url "https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}/ese-studio_${version}_amd64.AppImage" \
-            --arg linux_signature "$linux_signature" \
-            --arg windows_url "https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}/ese-studio_${version}_x64-setup.exe" \
-            --arg windows_signature "$windows_signature" \
-            '{version: $version, notes: $notes, pub_date: $pub_date, platforms: {"linux-x86_64": {url: $linux_url, signature: $linux_signature}, "windows-x86_64": {url: $windows_url, signature: $windows_signature}}}' \
-            > release-assets/latest.json
+          python3 .github/scripts/prepare-release-assets.py \
+            --version "$version" --repository "$REPOSITORY" \
+            --source-commit "$GITHUB_SHA" --assets release-assets
 
       - name: Publish GitHub release
         env:

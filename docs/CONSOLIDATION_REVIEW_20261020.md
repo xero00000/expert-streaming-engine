@@ -118,13 +118,13 @@ artifacts; installers have not been rebuilt with the new launcher option.
 
 ## Findings still requiring work
 
-1. **Release automation does not reproduce the documented candidate set.**
-   `.github/workflows/release.yml` builds one Linux CPU variant; the prepared
-   candidates include separate CPU and CUDA variants. Its collector and updater
-   manifest still use `ese-studio_<version>_amd64…` names, whereas the prepared
-   artifacts use `ESE-Studio_<version>_linux-x86_64_cpu/cuda…` and
-   `ESE-Studio_<version>_windows-x64…`. Resolve the build matrix, naming,
-   signatures and updater targets together before tagging.
+1. **The corrected release workflow still needs end-to-end qualification.**
+   The initial review found a CPU-only Linux workflow and mismatched package
+   names. Local source now has separate CPU/CUDA jobs, explicit variant names,
+   provenance/checksum validation and separate update feeds. The
+   [release work log](RELEASE_WORK_LOG_20261020.md) records implementation and
+   local checks. Actual package builds, installed updates and signing remain
+   pending; no hosted release workflow has been run for these changes.
 2. **Research remains a separate qualification effort.** GLM/dense streaming,
    new expert dispatch and placement paths have not been promoted into the
    candidate. Several native research targets are intentionally manual rather
@@ -141,9 +141,10 @@ artifacts; installers have not been rebuilt with the new launcher option.
    GPU/installer execution are still incomplete. Public Qwen admission remains
    disabled. The source cleanup does not establish release readiness.
 
-The next release task is to reconcile and validate the package matrix. The
-research and Android branches can be reviewed independently without changing
-the candidate or the working launcher symlink.
+The remaining ordered release tasks are tracked in the
+[release work log](RELEASE_WORK_LOG_20261020.md). The research and Android
+branches can be reviewed independently without changing the candidate or the
+working launcher symlink.
 
 ## Subsequent authorized cleanup
 
