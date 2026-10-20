@@ -6,6 +6,21 @@ authoritative historical record for each tag.
 
 ## [Unreleased]
 
+## [0.2.1] - Unreleased
+
+- Preserve expert-cache payloads across layer-layout changes and overlap
+  independent bounded RAM-cache reads.
+- Expose optional parallel expert loading through the launcher while keeping
+  synchronous loading as the default.
+- Improve allocation accounting, failed-decode recovery and Windows CPU
+  runtime selection.
+- Prepare separate Linux CPU/CUDA packages and Windows dual-runtime installers.
+  Signing, Windows GPU/installer execution and filled-64K qualification remain
+  incomplete. Experimental Qwen inference stays disabled in production.
+
+See [the candidate release notes](docs/releases/v0.2.1.md) and
+[validation scope](docs/RELEASE_NOTES_V0_2_1.md).
+
 ## [0.2.0] - 2026-08-25
 
 ### Added

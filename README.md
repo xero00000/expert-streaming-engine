@@ -57,16 +57,17 @@ builds; vision and MTP on that path are unsupported.
 
 ## Install ESE Studio + ESE
 
-The v0.2.1 desktop installers provide ESE Studio, the `ese` launcher and a
-matching native runtime. Windows packages include CUDA acceleration and a
+The v0.2.1 desktop installers are prepared candidates containing ESE Studio,
+the `ese` launcher and a matching native runtime. Windows packages include CUDA acceleration and a
 separate CPU runtime selected when NVIDIA GPUs are unavailable. Linux downloads
 provide separate `cpu` and `cuda` variants; CUDA requires an NVIDIA driver.
 Windows installers are unsigned; this release does not provide signed in-app
 updates. See [release notes](docs/releases/v0.2.1.md) for verified scope.
 
-Download the package and checksum file from the
-[latest release](https://github.com/xero00000/expert-streaming-engine/releases/latest),
-then verify and install it.
+Publication is pending. Check the version on the
+[release page](https://github.com/xero00000/expert-streaming-engine/releases)
+before downloading; the latest published version may be earlier than this
+candidate. Use the package and checksum file for the same version.
 
 ### Linux
 

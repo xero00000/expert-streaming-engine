@@ -128,15 +128,15 @@ def check_versions(errors: list[str]) -> None:
         "README.md",
         [
             f"v{version} desktop installers",
-            f"ese-studio_{version}_amd64.AppImage",
-            f"ese-studio_{version}_x64-setup.exe",
+            f"ESE-Studio_{version}_linux-x86_64_cpu.AppImage",
+            f"ESE-Studio_{version}_windows-x64-setup.exe",
         ],
     )
-    require_text(errors, "studio/README.md", [f"v{version} AppImage"])
+    require_text(errors, "studio/README.md", [f"v{version} candidate"])
     require_text(
         errors,
         "docs/install.md",
-        [f"examples below use `{version}`", f"ese-studio_{version}_amd64.deb"],
+        [f"v{version} candidate", f"ESE-Studio_{version}_linux-x86_64_cpu.deb"],
     )
     require_text(errors, "CHANGELOG.md", [f"## [{version}] -"])
     if not (ROOT / f"docs/releases/v{version}.md").is_file():

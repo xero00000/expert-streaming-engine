@@ -848,8 +848,8 @@ compare cold and warm states and disclose regressions elsewhere. The end-to-end
 target is to exceed Strata's 43.5 tok/s on this exact 128-token diagnostic
 *after* matched feature settings and parity; it is not a promised result.
 
-The existing release and parity gates in
-[`../V0_2_1_QWEN4EXP_PLAN.md`](../V0_2_1_QWEN4EXP_PLAN.md) remain authoritative.
+The existing release and parity gates recorded in the
+[candidate validation notes](../RELEASE_NOTES_V0_2_1.md) remain authoritative.
 All designs above are proposals; none opens the production architecture gate.
 
 ### Launcher integration target (the Strata slot)
