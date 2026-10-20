@@ -61,6 +61,13 @@ lcov-report/
 /common/build-info.cpp
 /studio/runtime/
 
+# Local build trees, scratch probes and retained research captures
+/.*-build/
+/.baseline-cpu-tests*/
+/.scratch/
+/tmp-scratch-*.cpp
+/docs/qwen4exp/native-recurrence-*/
+
 # Deprecated
 
 /main
