@@ -512,6 +512,10 @@ if (GGML_CUDA)
     set_tests_properties(test-explicit-projection PROPERTIES ENVIRONMENT "ESE_CUDA_EXPLICIT_AUTOTUNE=1;CUDA_DEVICE_ORDER=PCI_BUS_ID")
 endif()
 
+llama_build(test-iq4-xs-cpu.cpp)
+target_include_directories(test-iq4-xs-cpu PRIVATE ../ggml/src)
+llama_test(test-iq4-xs-cpu)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
