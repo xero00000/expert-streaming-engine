@@ -12,6 +12,14 @@ sustained decode medians (ESE / Strata at least 1.0). Record every sample and
 cold/repeated behavior; retain startup, prefill and first-response separately.
 This does not lift the publication hold or qualify other models/context sizes.
 
+On 21 October the user clarified that qualification should depend on the model
+and requested the existing Strata launcher profile. The following 35B results
+remain scoped to that model. The Flash-Next launcher reference and its current
+ESE model-support blocker are recorded at the end of this document.
+The selected reference is **Flash-Next IQ2_XS, 1M experimental**, with all three
+GPUs and the saved launcher settings. Its repeated-request reference is
+52.3 tok/s (51.5 overall); ESE cannot yet load that model in the release build.
+
 Record the following before collecting qualification measurements:
 
 - Exact model and quantization, local path and SHA-256; any conversion or
@@ -257,8 +265,8 @@ context, zero-temperature sampler and no prompt reuse are unchanged.
 The three-GPU profile is 1.78x Strata's single-GPU decode rate on this workload.
 This meets an absolute-speed target using the available machine; it does not
 establish parity with equal GPU allocation. Single-3080 parity remains unmet.
-The user has been asked which allocation should guide the remaining work;
-the existing same-GPU acceptance contract is not silently replaced.
+Those results remain scoped to this 35B model; the subsequent launcher profile
+selection below now defines the active performance reference.
 
 Both nine-request runs independently repeat their output exactly and preserve
 full counts with normal shutdown. Each engine uses different arithmetic, so
@@ -297,3 +305,98 @@ A 4.375 GiB packed-cache pilot keeps the 1 GiB reserve and completes three
 requests with exact stable-mode replay, clean lease drain and normal exit.
 Its repeated requests reach 33.37/33.47 tok/s, still below the single-3080
 target. See `ese-iq4-3080-nvme-packed-4375g-pilot/`; it remains tuning evidence.
+
+### Launcher reference requested — 21 October
+
+The launcher has three Strata profiles. Its documented daily profile is
+`strata-iq2-xs-ablit`, backed by `strata/Strata-main/strata-iq2_xs.json`.
+The user was asked to distinguish it from Coder IQ1_M 128K and the experimental
+IQ2_XS 1M entry, then explicitly selected **Flash-Next IQ2_XS, 1M experimental**.
+The saved Coder configuration references two missing GGUF files. Both daily
+IQ2_XS shards are present. Their metadata names `Qwen3.8-Flash-Next GSQ-RCO`
+and architecture `qwen4exp` (48 layers, 512 experts, top ten).
+
+The daily profile selects physical GPUs `1,0,2`, explicit layer boundaries
+`6,14`, 262,144 context cells, K8V4 KV, resident experts, two pipeline windows,
+MTP depth four with the installed draft head, vision, and its installed runtime
+control vector. The daily run retains those settings. An isolated
+HTTP service changes only the port and log destination; it does not switch or
+rewrite the user's launcher. Actual prompt lengths and conversation reuse must
+be taken from this model's receipts rather than assumed from the 35B tokenizer.
+
+The current release ESE binary fails a direct load of the same IQ2_XS model
+with `unsupported architecture: qwen4exp`, exit 1, before inference. Its
+configure-time probe gate is OFF and has not been opened. Therefore there is
+no valid ESE speed result for this model and no eligible same-model comparison.
+Strata's selected launcher baseline is recorded separately; a measured Strata
+rate cannot close ESE's model-support gap. Earlier 35B three-GPU throughput
+does not satisfy this model's target.
+
+Raw profile snapshots, file inventory, ESE binary identity and rejection log
+are in `task4/launcher-profile-comparison/`. Task 4 remains in progress and
+publication remains on hold.
+
+The selected `strata-iq2_xs-1m.json` uses the same models, GPUs, layer split,
+MTP, control vector and vision as the daily profile, with 1,048,576 context
+cells, Q4 KV, 32,768 resident KV cells and YaRN scaling of four. The selected
+baseline uses this complete configuration. It completes three starts with three
+short maintenance requests each; actual token counts, prompt reuse and full
+128-token generations are recorded from receipts. Configured 1M capacity
+does not establish a filled-1M context qualification.
+
+The initial daily-profile run is retained separately and superseded by the
+explicit choice: three requests completed on its first process, then the
+second startup was interrupted. `selection.json` records the user steering.
+Full model hashes are shared because the two profiles use the same unchanged
+files; the selected run rechecks their stat identities before using those hashes.
+
+Selected-profile measurements (Strata 0.1.45):
+
+| Fresh start | Startup to ready | First request | Repeat 1 | Repeat 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 121.92 s | 45.5 tok/s | 52.9 tok/s | 50.6 tok/s |
+| 2 | 119.80 s | 45.2 tok/s | 51.5 tok/s | 52.1 tok/s |
+| 3 | 107.06 s | 45.4 tok/s | 56.4 tok/s | 52.5 tok/s |
+
+Median decode is **51.5 tok/s overall**, **52.3 on the six repeats**, and
+**45.4 on the three first requests**. First-request TTFT median is 2.46 s;
+repeat TTFT median is 0.148 s. Each request generates the full 128 tokens,
+including reasoning, and reports 552 total prompt tokens. First requests read
+all 552; repeats reuse 547 and read five. Prefill work is not conflated.
+This is short-request measurement under the saved 1M allocation, not a filled
+million-token run, completed-answer quality, or long-context acceptance.
+
+All three services return zero on graceful shutdown with no owned processes
+remaining. Largest monitored-process HWM is 33.52 GiB; largest sampled process
+swap is 1.42 GiB. Sampled driver-memory peaks, including the desktop, are
+7,329 MiB on the 3060 Ti, 7,121 MiB on the 2080 SUPER, and 9,620 MiB on the
+3080. Strata is not constrained by ESE's 32 GiB tracked-capacity setting.
+The engine reports 15 pool workers, Q4 KV, 32,768 resident KV cells,
+three prefill stages, installed control-vector projection on layers 4–44,
+and MTP maximum four. These profile-specific allocations/features remain
+part of the reference, unlike the earlier eight-thread/no-MTP 35B comparison.
+
+Nine distinct output sequences are retained despite requested temperature
+zero and seed 4242. Their cause is not established. This supplies an observed
+speed reference, not deterministic replay or numerical acceptance. Shared
+desktop load, sequential process order, retained OS caches and Strata's
+internal file-cache trimming remain limits on the timing evidence.
+
+ESE is retested with the selected 1,048,576 context request and rejects the
+model before KV, YaRN or speculation admission. Its probe gate remains OFF.
+No ESE speed or eligible ratio exists for this model. Existing upstream
+short-prompt numerical evidence uses the pruned 256-expert Coder artifact;
+it does not qualify this selected 512-expert artifact or its 1M profile.
+Model references and the remaining admission gates must be resolved before
+an ESE performance comparison can satisfy task 4.
+
+`launcher-profile-comparison/selected-profile-summary.json` records the
+selected configuration, both complete model hashes, medians, resources,
+output variation and ESE rejection. Its summarizer independently checks all
+counts, timing arithmetic, unchanged original profile hashes, current model
+file identities and clean process drain. Raw responses and metrics are in
+`launcher-profile-comparison/strata-iq2-xs-1m/`. The interrupted daily run is
+preserved separately. No production launcher or engine source was changed.
+`auxiliary-inputs.json` records post-run hashes for pack/tokenizer files,
+MTP, routing profile, control vector, vision and service code; the complete
+GGUF hashes were obtained before timing.

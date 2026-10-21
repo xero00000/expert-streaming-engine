@@ -76,6 +76,17 @@ The [performance qualification protocol](PERFORMANCE_QUALIFICATION_20261020.md)
 is prepared. The user has set the speed target: **match Strata**. Establish a
 same-machine, same-model reference before applying that target.
 
+On 21 October the user clarified that qualification depends on the model and
+requested testing **the Strata profile in the existing launcher**. That profile
+is now the next reference; the earlier 35B comparison does not qualify a
+Flash-Next launcher model. See the continuation entry below for profile selection
+and compatibility evidence.
+
+Selected reference: **Flash-Next IQ2_XS, 1M experimental**, using the saved
+`strata-iq2_xs-1m.json` profile across all three GPUs. Its measured short-request
+decode medians are 51.5 tok/s overall and 52.3 on repeats. ESE currently rejects
+this model architecture, so task 4's active dependency is model qualification.
+
 - Define the exact model, prompt, resource budget, policies and speed target.
   Use Strata's measured sustained decode rate as the reference; retain startup,
   prefill and first-response timings separately.
@@ -555,10 +566,10 @@ The fully resident **three-GPU** profile completes three fresh starts with
 three requests each: 81.03 tok/s median (81.24 on repeats), exact independent
 output replay, full 512/128 counts and normal shutdown. It exceeds Strata's
 single-GPU rate by 1.78x using a different allocation. It does not close the
-same-GPU gap. The user has been asked whether to qualify this practical fast
-profile or continue requiring single-3080 parity; the existing contract remains
-open pending that choice. Detailed resource/latency limits and every pilot are
-recorded in the performance qualification document and the results root.
+same-GPU gap. These results did not settle acceptance. The subsequent launcher
+profile selection below defines the active reference. Resource/latency limits
+and every pilot are recorded in the performance qualification document and
+the results root.
 Studio staging, later work-log tasks and the publication hold remain unchanged.
 
 The 4.375 GiB packed-cache pilot retains the 1 GiB reserve and completes all
@@ -566,3 +577,79 @@ three requests with stable-mode exact replay and normal drain/shutdown, but
 repeated decode is only 33.37/33.47 tok/s. Single-3080 acceptance remains open.
 The corrected nine-run resident median is 81.02568 tok/s; the earlier 81.46
 figure was an individual sample and has been corrected in user-facing status.
+
+### Task 4 continuation — existing Strata launcher profile
+
+The user requested the launcher profile rather than choosing an allocation for
+the 35B comparison. `model_slots.sh` maps three Strata entries: Coder IQ1_M
+128K, Flash-Next IQ2_XS 256K daily, and Flash-Next IQ2_XS 1M experimental.
+The daily 256K profile was the initial working assumption while the user's
+specific profile choice was pending. Its config is `strata-iq2_xs.json`: GPUs
+`1,0,2`, layer boundaries `6,14`, K8V4 KV, resident experts, two pipeline
+windows, speculative MTP depth four, vision reservation and the existing
+runtime control vector. These differ materially from the earlier 35B test.
+
+Both IQ2_XS GGUF shards are present (39,225,954,592 and 28,800,138,432 bytes).
+Metadata identifies `Qwen3.8-Flash-Next GSQ-RCO`, architecture `qwen4exp`,
+48 layers and 512 experts with ten selected per token. The Coder profile's
+configured GGUF paths are missing; that profile cannot currently start as saved.
+All three original configurations and their file inventory are retained in
+`task4/launcher-profile-comparison/` without editing the launcher.
+
+The current release CUDA binary is tested directly against the IQ2_XS model
+and rejects it with `unsupported architecture: qwen4exp` (exit 1). Its compiled
+probe gate remains OFF. This is an actual model-support blocker, so no ESE
+speed or Strata parity can be claimed for this profile. The initial Strata
+baseline used an isolated copy of the daily profile,
+changing only the local service port and engine-log destination. Original
+models, settings, production services and publication hold are preserved.
+The standalone upload microbenchmark was deferred when the user changed the
+reference; no transfer-buffer implementation was added.
+
+The user subsequently selected **Flash-Next IQ2_XS, 1M experimental** explicitly.
+The partial daily run is preserved: its first process completed three full
+552/128 requests; the second startup was interrupted on selection. It is not
+the selected acceptance baseline. `selection.json` records this change.
+The selected `strata-iq2_xs-1m.json` retains the same models, GPU order,
+layer boundaries, control vector, MTP and vision, but requests 1,048,576
+context cells, Q4 KV with 32,768 resident cells, and YaRN scaling of four.
+Three fresh starts with three short requests each have completed.
+This tests short-request speed under the saved 1M allocation, not a filled
+million-token prompt. Both full shard hashes were obtained before the daily
+run; their file identities are rechecked for the selected run.
+
+The selected profile completes all nine full 552/128 requests and three clean
+service shutdowns with no remaining owned processes. Decode medians are
+**51.5 tok/s overall, 52.3 on repeats, and 45.4 on first requests**. Fresh
+startup takes 107.06–121.92 s. Repeats reuse 547 of the 552 prompt tokens;
+their speed and prefill are not represented as full fresh-prompt work.
+The 128 generated tokens include reasoning. This is short-request speed under
+the 1M configuration, not filled-context or answer-quality qualification.
+All nine output sequences differ despite the requested zero temperature and
+fixed seed; the cause is not established, and deterministic replay is not
+accepted. Largest monitored-process HWM is 33.52 GiB and sampled process swap
+reaches 1.42 GiB. These resource conditions remain part of the reference.
+
+The ESE load is also repeated with the selected 1,048,576 context request:
+the same architecture rejection occurs before KV, YaRN or speculation
+admission. The probe gate remains OFF. Config hashes verify that all three
+original launcher profiles are unchanged. Summary, strict count/timing checks,
+raw SSE, process/GPU samples and failure records are retained in
+`task4/launcher-profile-comparison/selected-profile-summary.json` and its
+referenced runs. No ESE/Strata speed ratio is eligible for this model.
+`auxiliary-inputs.json` retains post-run hashes for pack/tokenizer files,
+MTP artifacts, routing profile, control vector, vision and service code.
+
+Required work for this selected model, in order:
+
+1. Establish independent numerical references for the selected 512-expert
+   IQ2_XS artifact. Existing short upstream evidence uses the pruned
+   256-expert Coder artifact and does not qualify this model.
+2. Resolve the remaining model/cache/speculation numerical gates and qualify
+   its selected control-vector, YaRN and KV behavior before release admission.
+   Existing gated research remains separate; simply opening the gate is not a fix.
+3. Run ESE under the agreed model/profile workload and resource conditions,
+   then compare fresh and repeated rates against this saved Strata reference.
+
+Task 4 and the publication hold remain open. No engine source, launcher,
+installed Studio runtime or package was changed by this profile test.
