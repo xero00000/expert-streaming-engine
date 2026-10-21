@@ -122,7 +122,7 @@ separate. The speed acceptance does not lift the publication hold.
 Acceptance: sustained runs without corruption, silent truncation or progressive
 memory growth, with exact commands and failed trials preserved.
 
-### 6. Rebuild and install the final packages — PENDING
+### 6. Rebuild and install the final packages — IN PROGRESS (SIX LINUX PACKAGES BUILT)
 
 - Rebuild all eight packages from the recorded final source.
 - Test Linux CPU/CUDA installation, dependencies, startup and inference.
@@ -1701,3 +1701,55 @@ its response. Larger lengths/longer budgets require explicit arguments; do not
 launch multi-hour passes as routine follow-up. Continue only the available
 short release-readiness checks. No publication authorization or production
 Qwen admission is implied by the reduced validation scope.
+
+
+### Task 6 — six real Linux packages from a frozen source snapshot
+
+Frozen package source: `e4b5739fc9380f401be3c548200a499a7f84ba34` in an
+independent shared clone. Original source/build caches remain unchanged;
+borrowed Git objects are mounted read-only. Source status is clean after the
+frozen-lockfile frontend install and both package builds. Qualification-only
+log updates after this point do not change that recorded package source.
+
+The host CPU binary requires GLIBC 2.43 / GLIBCXX 3.4.35, so it is unsuitable
+for the Ubuntu release baseline. Rebuilt the CPU runtime under cached Ubuntu
+24.04 (GLIBC 2.39, GCC 13.3), with `GGML_NATIVE=OFF`, production Qwen admission
+OFF and Release optimization: 134.64 seconds. The refreshed consolidated CUDA
+runtime uses GCC 12.4, the selected 75/86 CUDA targets and lower symbol versions;
+it loads and reports the frozen source/version inside Ubuntu 24.04. No full
+CUDA recompilation is needed. An attempted `--list-devices` preflight is retained
+as a rejected command: this fork does not expose that option. It is not counted
+as a GPU inference check; packaged inference remains pending.
+
+Built **six actual 0.2.1 installers**: CPU and CUDA AppImage/DEB/RPM. The CPU
+package pass takes 113.49 seconds and CUDA 129.07 seconds; collection takes
+1.01 / 22.43 seconds. Both variant collectors pass against the same frozen
+source, runtime markers and separate updater overlays. Artifacts and indices:
+`task6/ubuntu-build/assets-cpu/` and `task6/ubuntu-build/assets-cuda/`.
+`task6/task6-progress.json` records exact names, sizes, commands and evidence.
+Windows MSI/NSIS and the complete eight-package acceptance remain pending.
+
+The initial offline dependency attempt stops at its 30-second budget because
+pnpm's supply-chain validation requests uncached metadata. Retain that failed
+attempt; the corrected network-enabled **frozen-lockfile** install passes its
+policies in 29.15 seconds, without a lockfile/source change. Rust builds remain
+offline against the existing registry cache. No remote CI or publication occurs.
+
+The existing updater private key is present with mode 0600, matches the compiled
+public key and successfully signs a local preflight payload. Verification uses
+the updater's `minisign-verify 0.2.5` implementation: the valid payload passes,
+while altered payload bytes and an altered trusted comment fail. Both real
+collected AppImage signatures also verify against that configured public key.
+No private key contents are logged or placed in container configuration. These
+checks establish signing configuration and actual AppImage signatures, not an
+installed-update acceptance pass. Native DEB/RPM package-manager signing and
+Windows Authenticode are not claimed.
+
+The system hypervisor has an ESE Windows test VM (`win10`, stopped, no physical
+host-device passthrough) and a separate stopped VR VM with USB/GPU passthrough.
+Only their configuration was inspected; neither VM nor its disk was changed.
+The ESE bootstrap ISO's authorized key matches an available local key. The
+original Win10 qcow2 is not directly user-readable but is managed through the
+active `images` libvirt pool. If used, test an isolated overlay rather than
+modifying the original VM/disk. Do not start the VR VM or detach the desktop
+RTX 3080. All remaining inference checks keep short explicit time budgets.
