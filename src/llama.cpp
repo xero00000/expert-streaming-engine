@@ -2298,6 +2298,16 @@ static bool llama_kv_cache_init(
     const bool is_dsv4_k_only = model.arch == LLM_ARCH_DEEPSEEK4;
     bool is_mla_attn = model.is_mla_model();
 
+    const char * host_attention_flag = std::getenv("ESE_QWEN4EXP_HOST_ATTENTION_KV");
+    const bool host_attention = offload && model.arch == LLM_ARCH_QWEN4EXP &&
+            host_attention_flag && std::strcmp(host_attention_flag, "1") == 0;
+    if (host_attention && (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN)) {
+        LLAMA_LOG_ERROR("%s: Qwen4Exp host attention KV requires layer or single-device splitting\n", __func__);
+        return false;
+    }
+    if (host_attention && !metadata_only) {
+        LLAMA_LOG_INFO("%s: Qwen4Exp attention/indexer KV on host; recurrent state follows layer devices\n", __func__);
+    }
     bool split_cache   = false;
     bool replicate_mla = false;
     if ((model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && !is_mla_attn && offload && !is_dsv4_k_only) {
@@ -2321,6 +2331,10 @@ static bool llama_kv_cache_init(
                              model.arch == LLM_ARCH_QWEN35MOE) && hparams.nextn_predict_layers > 0;
         const int64_t n_mtp_first = hparams.n_layer - hparams.nextn_predict_layers;
         for (int64_t i = 0; i < n_layer; ++i) {
+            if (host_attention && !hparams.is_recurrent(i)) {
+                buft_layer_count[llama_default_buffer_type_cpu(true)]++;
+                continue;
+            }
             const bool is_mtp_tail = is_mtp && i >= n_mtp_first;
             if ((split_cache || replicate_mla) && !is_mtp_tail) {
                 buft_layer_count[model.buft_layer[i].buft_matrix]++;
@@ -2432,7 +2446,9 @@ static bool llama_kv_cache_init(
                                         model.arch == LLM_ARCH_GLM_DSA) &&
                 hparams.nextn_predict_layers > 0 && i >= n_mtp_first_layer;
         //struct ggml_context * ctx = split_cache && !qnext_recurrent ? ctx_map.at(model.buft_layer[i].buft_matrix) : offload ? ctx_map.at(model.buft_layer[i].buft) : cache.ctxs.front();
-        struct ggml_context * ctx = ((split_cache || replicate_mla) && !is_mtp_tail_layer) ? ctx_map.at(model.buft_layer[i].buft_matrix) : offload ? ctx_map.at(model.buft_layer[i].buft) : cache.ctxs.front();
+        struct ggml_context * ctx = host_attention && !qnext_recurrent ? ctx_map.at(llama_default_buffer_type_cpu(true)) :
+                ((split_cache || replicate_mla) && !is_mtp_tail_layer) ? ctx_map.at(model.buft_layer[i].buft_matrix) :
+                offload ? ctx_map.at(model.buft_layer[i].buft) : cache.ctxs.front();
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
         ggml_tensor * s = nullptr;

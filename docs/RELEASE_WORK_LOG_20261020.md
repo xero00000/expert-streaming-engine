@@ -827,3 +827,26 @@ available, and proves that clearing an external private file mapping overwrites
 its contents while preserving its underlying file and ownership. Evidence:
 `host-kv-residency-before/`, `host-kv-residency-after/`, `lazy-host-prefill33/`
 and `lazy-host-kv-tests.log` under the selected-model restoration directory.
+
+
+#### Mixed host attention / GPU recurrent-state allocation
+
+The private Qwen4Exp path can retain recurrent state on its layer GPU while
+placing attention and indexer KV in host buffers (`ESE_QWEN4EXP_HOST_ATTENTION_KV=1`,
+with KV offload otherwise enabled). The opt-in applies only to this architecture
+and rejects graph/attention splitting. At 1M allocation, host payload is 13,056 MiB
+and GPU recurrent payload totals 112.57 MiB. The 33-token sequential replay matches
+the prior GPU-placement control byte-for-byte for every logit and ordered route.
+Enabling a 4 GiB expert cache preserves that exact result. Focused fixture and
+cache-sizing tests pass. Commands and artifacts are in `hybrid-kv-prefill33/`,
+`hybrid-kv-cache33/` and `hybrid-kv-focused-tests.log`.
+
+Changing GPU layer placement, or batching prefill, introduces small early
+arithmetic differences which cross a Q4 rounding boundary at token 24 and then
+fail the existing full-logit/route comparison. Those runs are retained as failed
+controls (`hybrid-kv-placement33/`, `hybrid-kv-actual-batched33/`); the folder named
+`hybrid-kv-launcher-batched33/` actually used sequential decoding because the
+probe checks environment-variable presence. Its recorded config states this.
+The first complete 552-token / 128-generation diagnostic therefore uses the
+validated placement and serial prefill. It is a manual-budget measurement with
+launcher feature differences, not speed acceptance.
