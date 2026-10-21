@@ -59,7 +59,7 @@ package acceptance check for tasks 6 and 7.
 
 Acceptance: required clean builds/checks pass against one recorded source state.
 
-### 3. Verify inference correctness and recovery — IN PROGRESS (RAM PLANNING DEFECT OPEN)
+### 3. Verify inference correctness and recovery — COMPLETE (LOCAL FIXTURE ACCEPTANCE)
 
 - Compare supported resident/cache/stream paths against pinned references.
 - Exercise forced eviction, cancellation, allocation failure and session
@@ -70,7 +70,11 @@ Acceptance: required clean builds/checks pass against one recorded source state.
 Acceptance: reproducible correctness and recovery evidence for every claimed
 supported execution path.
 
-### 4. Resolve the performance hold — PENDING
+### 4. Resolve the performance hold — IN PROGRESS (ACCEPTANCE CONTRACT PENDING)
+
+The [performance qualification protocol](PERFORMANCE_QUALIFICATION_20261020.md)
+is prepared. The model, resource budget and passing speed target await the
+user's answer to the question submitted while task 3 was finishing.
 
 - Define the exact model, prompt, resource budget, policies and speed target.
   A target has not yet been agreed; do not invent a passing threshold.
@@ -372,3 +376,42 @@ The follow-up measures the allocator's actual native arena layout without
 allocating buffers or altering committed layouts, reserves host arena peaks
 separately from fixed metadata, and reconciles optional cache capacity during
 startup. No arbitrary margin or relaxed memory admission is introduced.
+
+
+### Task 3 completed — native host planning and final regression qualification
+
+Native source `9e55c492525def32759f53aee73798ad2d1f7f7d` completes the
+context-storage and measured host-graph reservation repair. Optional prompt
+cache capacity is finalized in whole MiB before application cache allocation;
+startup reconciles native KV/output metadata, measured arena replacement peaks
+and final tracked storage. Host admission and the immutable RAM ceiling remain
+strict. The internal measurement hook preserves committed layouts and allocates
+no backend buffers; boundary, overflow, rejection and old-output regressions pass.
+
+The original RTX 2080 SUPER automatic `--max-ram 4GiB` case now starts, generates
+twice with exact cold probability replay, and exits normally. Its finalized plan
+reserves 461,928 bytes beyond graph metadata and 3,414,016 bytes of host graph
+backing, with 4,202,692,608 bytes of optional prompt cache. The tracked admission
+total after inference is 4,294,099,912 bytes, below the 4,294,967,296-byte ceiling.
+Eight automatic-budget controls pass: CPU with/without warmup, each GPU,
+three GPUs, GPU warmup and the staged runtime without library-path overrides.
+
+Final-source checks pass: 94 CPU tests; 99 CUDA passes and one expected NCCL
+skip on each of three GPUs; four strict ASAN/UBSAN/leak targets; 152 Python
+unittests; exact route/logit and forced-eviction matrices; 24 sustained worker
+trials; bounded prefill on one/two/three GPUs; CPU/three-GPU rebalance faults;
+21 real disconnect/retry trials; and seven HTTP decode-failure controls.
+Ada/newer GPUs, real driver exhaustion and upstream full-model numerical
+qualification are not claimed by these fixture results.
+
+Current evidence entry point:
+`/home/xero/Desktop/test/results/ese-release-work-20261020/task3/host-plan-qualified/summary.json`.
+It retains source/binary/compiler/device identities, raw outputs, commands,
+responses, receipts, failure trials and checksums. Earlier evidence and failed
+trials remain intact. Task 3's local fixture acceptance is complete; release
+readiness still requires the remaining work-log tasks. No push, remote workflow,
+tag or publication occurred.
+
+Task 4 has begun with a concrete measurement protocol and local model/hardware
+inventory. Its acceptance contract remains open pending the selected model,
+prompt/resource budget and required speed target; no threshold was invented.

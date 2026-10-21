@@ -123,10 +123,13 @@ installers have not been rebuilt with the new launcher option.
 
 Task 3 subsequently repaired CPU router softmax and implicit BOS warmup defects.
 The [inference/recovery validation](INFERENCE_RECOVERY_VALIDATION_20261020.md)
-records rebuilt source `9e0d3b037`, fixture logits/routes, three-GPU suites,
-worker/prefill/transaction checks, sanitizers and real HTTP disconnects. An
-automatic GPU RAM-plan headroom defect remains open, so task 3 and release
-readiness are not complete. The next repair is recorded in the work log.
+records final native source `9e55c4925`, fixture logits/routes, three-GPU suites,
+worker/prefill/transaction checks, four sanitizer targets and real HTTP
+disconnects. Automatic host context and graph-workspace RAM planning is also
+repaired and qualified at the original 4 GiB ceiling. Task 3's local fixture
+acceptance is complete. Task 4's performance contract is prepared and awaits
+the user's model, resource budget and passing speed target. Release readiness
+and the publication hold still depend on the remaining work-log tasks.
 
 ## Findings still requiring work
 

@@ -1,18 +1,19 @@
 # Consolidated inference correctness and recovery — 20 October 2026
 
-Task 3 remains in progress. This evidence validates the bounded fixture paths
-listed below. It does not establish release readiness or upstream full-model
-acceptance. The strict automatic RAM-planning headroom failure remains open.
+Task 3's local fixture acceptance is complete. The automatic host RAM-planning
+failure is repaired and the final source passes the bounded correctness and
+recovery matrix below. Release readiness and upstream full-model acceptance
+still require the remaining work-log tasks.
 
 ## Candidate and retained references
 
-Native source: `9e0d3b0379d187ac643c4fc94019bc4e2ef694aa`.
-The native-receipt validator and its six regressions are committed at
-`60ab8fdf2`; they change no native executable source.
+Final native source: `9e55c492525def32759f53aee73798ad2d1f7f7d`.
+Earlier native repairs were recorded at `9e0d3b037`; the receipt-verifier repair
+is `60ab8fdf2`. The final candidate includes both plus native host context and
+graph-workspace planning. Earlier source evidence remains archived.
 The production Qwen gate is OFF in CPU, CUDA and sanitizer builds.
-The candidate CLI/server report this commit. See `source.json` and
-`runtime-versions.json` in
-`/home/xero/Desktop/test/results/ese-release-work-20261020/task3/` for source,
+The candidate CLI/server report this commit. See
+`/home/xero/Desktop/test/results/ese-release-work-20261020/task3/host-plan-qualified/source.json` for source,
 binary/library hashes, compilers, device UUIDs and gate settings.
 
 The retained TinyMoE F16 fixture has SHA-256
@@ -63,8 +64,9 @@ and without startup warmup also matches content and all returned probabilities.
   native topology, byte counts and peak/headroom arithmetic. The prior verifier
   rejects the valid native-receipt regression. Documentation and whitespace
   checks passed.
-- Both targeted Clang 22 Debug ASAN/UBSAN/leak suites passed: expert cache and
-  server decode recovery. Sanitizers use strict halt-on-error and leak detection.
+- All four targeted Clang 22 Debug ASAN/UBSAN/leak suites passed: expert cache,
+  server decode recovery, resource planner and graph arena budgets. Sanitizers
+  use strict halt-on-error and leak detection.
   These are CPU sanitizer checks, with no claimed GPU memory-checker run.
 - Exact forced-token parity covers **512,000 logits and 320 route IDs per
   configuration** over 16 steps. The CUDA-enabled runner has eleven records:
@@ -87,8 +89,8 @@ and without startup warmup also matches content and all returned probabilities.
   The three-GPU launcher trial uses `--tensor-split 1,1,8` so MoE layers occupy
   all three cards; the equal-share trial used only two expert devices and is
   retained as a failed placement-coverage trial. No speed threshold is claimed.
-- CPU KV shrink/grow, injected KV rollback and continuation pass. The RTX 2080
-  SUPER and three-GPU runs also pass expert-cache reconciliation, combined
+- CPU KV shrink/grow, injected KV rollback and continuation pass. The final
+  three-GPU run also passes expert-cache reconciliation, combined
   1024/512-token KV and 64/32 MiB cache changes, busy rejection, exact output
   and publication/rollback checks. Multi-device controls include failure after
   one device prepares and after the first device publishes. The verifier now
@@ -109,7 +111,9 @@ and without startup warmup also matches content and all returned probabilities.
   `LD_PRELOAD`; its three real disconnect/inference trials also pass in that
   environment. This is a staged runtime, not an installed release package.
 
-Start with `task3-summary.json` in the evidence directory. Raw model outputs,
+Start with `host-plan-qualified/summary.json` in the evidence directory.
+The top-level `task3-summary.json` points to this final source; earlier summaries
+and failure trials remain archived. Raw model outputs,
 route/logit values, command/environment records, HTTP responses, allocator
 snapshots, JUnit files and per-file checksums are retained. Earlier failed
 runs remain visible and are not included in the passing counts.
@@ -122,13 +126,17 @@ intermediates and can change graph submission; retain uninstrumented CLI and
 HTTP controls alongside them. The probe executable's historical Qwen name and
 capture environment names do not enable or qualify the Qwen architecture.
 
-Strict automatic `--memory-policy auto --max-ram 4GiB` selected cache capacity
-that left insufficient tracked context metadata/output headroom. Startup
-rejected `4,295,429,216` required bytes against `4,294,967,296` usable bytes.
-Preserve the rejection and repair the planning forecast; do not weaken host
-admission or treat an explicit smaller-cache configuration as proof that the
-automatic plan is fixed. Transaction tests can use bounded explicit caches
-independently.
+The strict automatic `--memory-policy auto --max-ram 4GiB` failure is repaired.
+The original required/usable rejection (`4,295,429,216` / `4,294,967,296` bytes)
+and the intermediate missing-host-graph failure remain archived. Startup now
+reconciles the native context receipt, measures host arena requirements without
+allocating backend buffers, reserves replacement peaks, and finalizes fitting
+whole-MiB prompt-cache capacity before that application cache is allocated.
+Context metadata and graph backing remain distinct immutable reservations.
+Eight automatic startup/inference/replay controls pass across CPU, every GPU,
+three GPUs, warmup and staged serving. The 2080 SUPER admitted tracked total is
+`4,294,099,912` bytes within the original ceiling; admission was not weakened.
+Ada/newer GPU hardware remains unavailable and unqualified.
 
 Physical driver allocation exhaustion, larger original-model numerical
 acceptance, research Qwen/MTP/multimodal serving, filled 64K context,
