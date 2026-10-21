@@ -1324,6 +1324,11 @@ struct ggml_active_expert_cache_component_state {
     size_t buffer_bytes = 0;
 };
 
+struct ggml_active_expert_cache_observation {
+    uint32_t count = 0;
+    int resident_slot = -1;
+};
+
 struct ggml_active_expert_cache_device {
     ggml_active_expert_cache_device() = default;
     ggml_active_expert_cache_device(const ggml_active_expert_cache_device &) = delete;
@@ -1361,7 +1366,9 @@ struct ggml_active_expert_cache_device {
     bool compute_event_recorded = false;
     bool used_this_pass = false;
     std::vector<void *> lease_handles;
-    std::unordered_map<uint64_t, uint32_t> observations;
+    // Residency shares the existing observation nodes; hits need not scan
+    // every physical slot. Replacement caches rebuild these physical indices.
+    std::unordered_map<uint64_t, ggml_active_expert_cache_observation> observations;
     std::unordered_map<uint64_t, uint64_t> admission_thresholds;
     std::unordered_set<uint64_t> observed_this_pass;
     std::unordered_map<uint64_t, uint64_t> last_observed_route;
@@ -2573,6 +2580,7 @@ static void ggml_active_expert_cache_release(ggml_active_expert_cache_device & c
         cache.ctx = nullptr;
     }
     cache.entries.clear();
+    for (auto & observation : cache.observations) observation.second.resident_slot = -1;
     cache.pools.clear();
     cache.layer_pools.clear();
     cache.logical_experts = 0;
@@ -3118,6 +3126,20 @@ static bool ggml_active_expert_cache_init_component(
             max_expert_bytes);
 }
 
+static uint64_t ggml_active_expert_cache_key(int layer, int expert) {
+    return (uint64_t(uint32_t(layer)) << 32) | uint32_t(expert);
+}
+
+static int ggml_active_expert_cache_resident_slot(
+        const ggml_active_expert_cache_device & cache, int layer, int expert) {
+    const auto found = cache.observations.find(ggml_active_expert_cache_key(layer, expert));
+    if (found == cache.observations.end() || found->second.resident_slot < 0) return -1;
+    const int slot = found->second.resident_slot;
+    GGML_ASSERT(size_t(slot) < cache.entries.size());
+    GGML_ASSERT(cache.entries[size_t(slot)].layer == layer && cache.entries[size_t(slot)].expert == expert);
+    return slot;
+}
+
 static int ggml_active_expert_cache_slot(
         ggml_active_expert_cache_device & cache,
         int layer,
@@ -3131,13 +3153,12 @@ static int ggml_active_expert_cache_slot(
     const int end = pool ? pool->begin + pool->slots : cache.slots;
     *evicted = false;
     *eviction_cost = 0;
-    for (int slot = begin; slot < end; ++slot) {
-        auto & entry = cache.entries[slot];
-        if (entry.layer == layer && entry.expert == expert) {
-            entry.last_used = ++cache.clock;
-            *hit = true;
-            return slot;
-        }
+    const int resident = ggml_active_expert_cache_resident_slot(cache, layer, expert);
+    if (resident >= 0) {
+        GGML_ASSERT(resident >= begin && resident < end);
+        cache.entries[size_t(resident)].last_used = ++cache.clock;
+        *hit = true;
+        return resident;
     }
 
     auto entry_cost = [&](int slot) {
@@ -3161,7 +3182,7 @@ static int ggml_active_expert_cache_slot(
         const uint64_t age = cache.route_clock - last->second;
         // Bound historical popularity and decay stale entries as the topic
         // changes. The units are layer routes, not wall-clock time.
-        return (uint64_t(std::min<uint32_t>(found->second, 32)) << 10) >> std::min<uint64_t>(31, age/256);
+        return (uint64_t(std::min<uint32_t>(found->second.count, 32)) << 10) >> std::min<uint64_t>(31, age/256);
     };
     auto retained_score = [&](int slot) -> uint64_t {
         return cache.entries[slot].transient ? 0 : frequency(cache.entries[slot]);
@@ -3217,9 +3238,13 @@ static int ggml_active_expert_cache_slot(
     *evicted = entry.layer >= 0;
     if (*evicted) {
         *eviction_cost = entry_cost(selected);
+        auto old = cache.observations.find(ggml_active_expert_cache_key(entry.layer, entry.expert));
+        GGML_ASSERT(old != cache.observations.end() && old->second.resident_slot == selected);
+        old->second.resident_slot = -1;
     }
     entry.layer = layer;
     entry.expert = expert;
+    cache.observations[ggml_active_expert_cache_key(layer, expert)].resident_slot = selected;
     // Equal-frequency misses stream through reusable scratch slots instead
     // of evicting the whole resident set during an oversized layer sweep.
     entry.transient = cache.frequency_retention && *evicted &&
@@ -3748,6 +3773,7 @@ static ggml_backend_sched_expert_cache_txn_t ggml_backend_sched_expert_cache_pre
                     building.preflight_generation = transaction->catalog_generation;
                     building.clock = current.clock;
                     building.observations = current.observations;
+                    for (auto & observation : building.observations) observation.second.resident_slot = -1;
                     building.admission_thresholds = current.admission_thresholds;
                     building.last_observed_route = current.last_observed_route;
                     building.previous_route = current.previous_route;
@@ -3788,6 +3814,8 @@ static ggml_backend_sched_expert_cache_txn_t ggml_backend_sched_expert_cache_pre
                         auto & destination_entry = building.entries[destination_slot];
                         destination_entry = source_entry;
                         destination_entry.ready_mask = 0;
+                        building.observations[ggml_active_expert_cache_key(
+                                source_entry.layer, source_entry.expert)].resident_slot = int(destination_slot);
                         for (int component = 0;
                                 component < GGML_ACTIVE_EXPERT_CACHE_COMPONENT_COUNT;
                                 ++component) {
@@ -4176,7 +4204,7 @@ static bool ggml_active_expert_cache_prepare_route(
         const uint64_t observation_key = (uint64_t(uint32_t(layer)) << 32) | uint32_t(expert);
         if (cache.observed_this_pass.insert(observation_key).second) {
             ++sched->active_expert_cache_route_observations;
-            auto & count = cache.observations[observation_key];
+            auto & count = cache.observations[observation_key].count;
             if (count != UINT32_MAX) ++count;
             const auto last = cache.last_observed_route.find(observation_key);
             uint64_t reuse_distance = UINT64_MAX;
@@ -4203,7 +4231,7 @@ static bool ggml_active_expert_cache_prepare_route(
         }
         const auto threshold = cache.admission_thresholds.find(observation_key);
         if (threshold == cache.admission_thresholds.end() ||
-                uint64_t(cache.observations[observation_key]) < threshold->second) {
+                uint64_t(cache.observations[observation_key].count) < threshold->second) {
             admission_ready = false;
         }
     }
@@ -4238,12 +4266,11 @@ static bool ggml_active_expert_cache_prepare_route(
     // later position and force an unnecessary upload in the same route.
     std::vector<int> protected_slots;
     protected_slots.reserve(active_experts.size());
-    for (int slot = 0; slot < cache.slots; ++slot) {
-        const auto & entry = cache.entries[size_t(slot)];
-        if (entry.layer == layer && active_experts.count(entry.expert)) {
-            protected_slots.push_back(slot);
-        }
+    for (const int expert : active_experts) {
+        const int slot = ggml_active_expert_cache_resident_slot(cache, layer, expert);
+        if (slot >= 0) protected_slots.push_back(slot);
     }
+    std::sort(protected_slots.begin(), protected_slots.end());
     std::unordered_map<int32_t, int> unique_slots;
     for (size_t i = 0; i < expert_ids.size(); ++i) {
         const int32_t expert = expert_ids[i];
@@ -4693,16 +4720,17 @@ static bool ggml_expert_prefill_find_resident(
     auto & component = cache.components[component_index];
     if (!component.tensor || !logical_source) return false;
     const uint8_t mask = uint8_t(1u << component_index);
-    for (size_t slot = 0; slot < cache.entries.size(); ++slot) {
-        const auto & entry = cache.entries[slot];
-        if (entry.layer != layer || entry.expert != expert || (entry.ready_mask & mask) == 0) continue;
+    const int slot = ggml_active_expert_cache_resident_slot(cache, layer, expert);
+    if (slot >= 0) {
+        const auto & entry = cache.entries[size_t(slot)];
+        if ((entry.ready_mask & mask) == 0) return false;
         if (entry.layout_ids[size_t(component_index)] >= component.layouts.size()) return false;
         const auto & layout = component.layouts[entry.layout_ids[size_t(component_index)]];
         if (!ggml_active_expert_cache_layout_matches(layout, logical_source)) return false;
         *source_view = *layout.tensor;
         source_view->ne[2] = 1;
         source_view->nb[2] = source_view->nb[3] = layout.expert_bytes;
-        source_view->data = (uint8_t *) layout.tensor->data + (slot - size_t(layout.slot_begin))*layout.tensor->nb[2];
+        source_view->data = (uint8_t *) layout.tensor->data + size_t(slot - layout.slot_begin)*layout.tensor->nb[2];
         return true;
     }
     return false;
