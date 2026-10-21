@@ -221,6 +221,14 @@ llama_build(test-speculative-sequence-isolation.cpp speculative-common-discard.c
 llama_build(test-bf16-stable-batch.cpp)
 if (GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
+    llama_build(test-bf16-convert.cu)
+    target_include_directories(test-bf16-convert PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-bf16-convert PRIVATE
+        GGML_CUDA_FUSION=${GGML_CUDA_FUSION}
+        GGML_CUDA_MIN_BATCH_OFFLOAD=${GGML_CUDA_MIN_BATCH_OFFLOAD})
+    target_link_libraries(test-bf16-convert PRIVATE CUDA::cudart CUDA::cuda_driver)
+    llama_test(test-bf16-convert)
+    set_tests_properties(test-bf16-convert PROPERTIES SKIP_RETURN_CODE 77)
     target_link_libraries(test-speculative-sequence-isolation PRIVATE CUDA::cuda_driver)
     target_link_libraries(test-bf16-stable-batch PRIVATE CUDA::cuda_driver)
     llama_build(test-cuda-nccl-lifecycle.cpp)

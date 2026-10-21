@@ -1416,3 +1416,43 @@ numerical acceptance is made. Keep the native CPU option off in the selected
 profile and retain the prior 18.408 tok/s GPU diagnostic as the best tested
 repeat. CPU dot acceleration alone does not establish useful overlap or
 full-model qualification. Task 4 and the release gate remain open.
+
+
+A further cache-routing experiment keeps every complete cached expert on
+its actual output GPU, beyond the configured fixed-position minimum. Mask
+fixtures pass for complete hits, missing gate components, wrong layouts,
+wrong devices, padding and exclusive/exhaustive CPU/GPU routes. The full
+`workload-1m-all-resident-hits-hybrid8-active4` nevertheless revokes on the
+unchanged CPU-drift guard after 70 CPU layer calls (85.996 ms versus the
+calibrated 4x limit of 82.653 ms). Its 13.636 / 17.146 tok/s and differing
+hashes do not qualify. The patch/test/runtime are archived outside the repo;
+the working source is restored to the committed fixed-budget implementation.
+This policy needs more useful CPU/GPU overlap before adoption. The selected
+runtime links return to the preceding best Q4 launch implementation.
+
+
+### Task 4 — aligned BF16-to-F32 conversion
+
+The CUDA trace identifies repeated BF16-to-F32 weight expansion as a large
+summed kernel cost. The aligned F32 destination path now moves four adjacent
+BF16 values per thread with uint2/float4 loads/stores. Each value still uses
+the original `__bfloat162float` instruction. Unaligned inputs/destinations,
+other destination types and other CUDA-compatible vendors retain the scalar
+path; short tails use the scalar instruction without reading past the end.
+
+`test-bf16-convert` passes on all three cards: eleven shapes, all four
+source/destination alignment combinations, three changed-input graph
+replays, output guards, every BF16 bit pattern (including NaNs), exact scalar
+CUDA comparison and an independent finite-value bit oracle. A 3,276,800-value
+component diagnostic reports scalar/selected 49.158/49.257 us on the 2080,
+52.274/50.053 us on the 3060 Ti, and 40.396/30.884 us on the 3080. These are
+component timings, not end-to-end speed evidence. The separate ubatch-128 /
+1M strict model control matches all 8,194,560 logits, routes and IDs bitwise.
+
+The unchanged GPU-only 552/128 workload completes at 13.941 / 18.417 tok/s,
+with both preceding native output hashes unchanged. This is effectively
+neutral versus 13.630 / 18.408 for the preceding run; no end-to-end speedup
+is claimed. CPU Q2/hybrid/all-hit options remain off. Evidence is retained as
+`bf16-vector-*` and `workload-1m-bf16-vector-passive4`. The 41.2 / 41.84 tok/s
+thresholds remain unmet. GPU conversion optimization alone does not remove
+the host scheduling/transfer boundaries identified in the trace.
