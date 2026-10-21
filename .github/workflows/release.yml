@@ -262,7 +262,7 @@ jobs:
 
       - name: Check Windows CPU fallback selection and verification controls
         working-directory: .
-        run: python -m unittest tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_before_cuda_binary_load tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_preserves_explicit_binary_overrides tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_rejects_cuda_payload_in_cpu_directory tests.test_windows_runtime_verify
+        run: python -m unittest tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_before_cuda_binary_load tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_preserves_explicit_binary_overrides tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_rejects_cuda_payload_in_cpu_directory tests.test_windows_runtime_verify tests.test_windows_msvc
 
       - name: Build installers
         working-directory: studio
@@ -277,7 +277,7 @@ jobs:
       - name: Verify CUDA runtime in installer staging
         shell: pwsh
         run: |
-          python .\.github\scripts\verify-windows-runtime.py --runtime-root .\studio\runtime\ese --build-root .\build-package --cpu-build-root .\build-package-cpu
+          python .\.github\scripts\verify-windows-runtime.py --runtime-root .\studio\runtime\ese --build-root .\build-package --cpu-build-root .\build-package-cpu --studio-exe .\studio\src-tauri\target\release\ese-studio.exe --gui-msvc-directory .\studio\runtime\msvc
           if ($LASTEXITCODE -ne 0) { throw "Staged Windows runtime verification failed" }
           .\studio\runtime\ese\ese.exe doctor --json
           if ($LASTEXITCODE -ne 0) { throw "ESE runtime doctor failed" }

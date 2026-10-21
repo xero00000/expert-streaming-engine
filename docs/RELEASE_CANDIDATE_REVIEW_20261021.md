@@ -3,9 +3,11 @@
 Unpublished local candidate. The eight-package release contract is incomplete.
 Push, hosted CI, tag creation and publication remain on hold.
 
-Frozen binary/package source: `e4b5739fc9380f401be3c548200a499a7f84ba34` on `review/ese-consolidated-20261020`.
-Later review commits update documentation; the retained Linux artifacts still
-identify that frozen source. Windows assets from older commits do not count.
+Retained initial Linux package source:
+`e4b5739fc9380f401be3c548200a499a7f84ba34` on `review/ese-consolidated-20261020`.
+The working branch now also repairs missing Windows Microsoft runtime staging.
+The final eight-package set must include that repair; earlier Linux artifacts
+and older Windows assets are not relabelled as the final source.
 
 ## Current results
 
@@ -16,7 +18,8 @@ identify that frozen source. Windows assets from older commits do not count.
 | Filled context | Two 2K/256 retrieval/replay requests and one 8K/256 request pass; longer passes deferred by user |
 | Linux packages | Six actual CPU/CUDA AppImage/DEB/RPM; Ubuntu DEB/Fedora RPM installs; 24 exact relocated native payloads; 25 short inference cases; six GUI startups |
 | AppImage signing/update | Configured key matches; two real signatures verify; eight updater API integration cases and both updated GUI startups pass |
-| Windows | Isolated VM boots and accepts the existing test key; older CPU cache only; no CUDA toolkit/cache; current MSI/NSIS and physical Windows GPU acceptance pending |
+| Windows | Current CPU native build, standalone launcher, frontend and Studio Rust build pass; CUDA 12.4 tools are installed and the CUDA build is partial; actual MSI/NSIS and physical GPU acceptance pending |
+| Windows runtime dependencies | Missing app-local MSVC/OpenMP imports reproduced and repaired; six native DLL dependencies load from staging; exact top-32 output and normal shutdown pass; Studio CRT import closure passes |
 
 Inference package controls compare one generated token and top-32 probabilities
 against the corresponding unpackaged build with the same pinned model. They do
@@ -34,7 +37,7 @@ version migration trial. All six compiled app configurations contain only
 their own CPU/CUDA feed plus the configured public key. Windows Authenticode
 and native DEB/RPM package-manager signing are not claimed.
 
-## Artifact hashes
+## Retained initial Linux artifact hashes
 
 The private checksum file is
 `task6/ubuntu-build/LINUX-CANDIDATE-SHA256SUMS.txt`; it includes the six Linux

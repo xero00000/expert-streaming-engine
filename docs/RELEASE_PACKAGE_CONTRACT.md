@@ -15,6 +15,23 @@ components and NCCL 2.25.1 from NVIDIA, including the runtime versions retained
 in the existing Linux packaging notices. The Windows job retains its CUDA 12.4
 toolchain and separately builds the driver-independent CPU runtime.
 
+Windows staging also resolves the native binaries' transitive Microsoft C++
+and OpenMP imports from the installed Visual Studio desktop x64 release redist.
+It bundles those unmodified files beside each native server and places Studio's
+CRT resources beside its executable through `tauri.windows.conf.json`. Each
+directory has an `ese-msvc-runtime.json` size/hash inventory. Missing imports
+or altered inventory files fail verification; System32, debug and OneCore
+directories are not redistribution sources. The build uses Python/pefile
+(provided by the pinned PyInstaller dependency) to inspect PE files; the
+installed launcher does not require a separate Python installation.
+
+`ESE_MSVC_REDIST_DIR` can select a release redist version directory or its `x64`
+subdirectory. Otherwise staging uses the developer-prompt redist directory or
+the latest installed Visual Studio C++ toolchain. App-local Microsoft runtime
+updates must be shipped with an ESE package update. See Microsoft's
+[deployment methods](https://learn.microsoft.com/en-us/cpp/windows/choosing-a-deployment-method)
+and [redistribution documentation](https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files).
+
 ## Collection and release preparation
 
 `collect-release-assets.py` selects only the requested version from each

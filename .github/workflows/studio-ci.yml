@@ -235,7 +235,7 @@ jobs:
 
       - name: Check Windows CPU fallback selection and verification controls
         working-directory: .
-        run: python -m unittest tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_before_cuda_binary_load tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_preserves_explicit_binary_overrides tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_rejects_cuda_payload_in_cpu_directory tests.test_windows_runtime_verify
+        run: python -m unittest tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_before_cuda_binary_load tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_preserves_explicit_binary_overrides tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_rejects_cuda_payload_in_cpu_directory tests.test_windows_runtime_verify tests.test_windows_msvc
 
       - name: Check installer PowerShell syntax
         shell: pwsh
@@ -290,7 +290,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ese-windows-runtime-${{ github.sha }}
-          path: studio/runtime/ese
+          path: |
+            studio/runtime/ese
+            studio/runtime/msvc
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -309,6 +311,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - uses: pnpm/action-setup@v4
         with:
@@ -330,13 +336,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ese-windows-runtime-${{ github.sha }}
-          path: studio/runtime/ese
+          path: studio/runtime
 
       - name: Verify restored runtime payload
         shell: pwsh
         working-directory: .
         run: |
           $required = @(
+            '.\studio\runtime\msvc\ese-msvc-runtime.json',
             '.\studio\runtime\ese\ese.exe',
             '.\studio\runtime\ese\build\bin\llama-server.exe',
             '.\studio\runtime\ese\build\bin\ese-runtime.json'
@@ -372,6 +379,15 @@ jobs:
         shell: pwsh
         run: throw 'MSI packaging failed; inspect the uploaded WiX diagnostics artifact.'
 
+      - name: Verify Studio app-local MSVC resources
+        working-directory: .
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check "pefile==2023.2.7"
+          if ($LASTEXITCODE -ne 0) { throw "PE parser installation failed" }
+          python -c "from pathlib import Path; from tools.windows_msvc import verify; verify(Path('studio/runtime/msvc'), extra_images=[Path('studio/src-tauri/target/release/ese-studio.exe')])"
+          if ($LASTEXITCODE -ne 0) { throw "Studio MSVC runtime verification failed" }
+
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
@@ -394,6 +410,10 @@ jobs:
         with:
           node-version-file: .node-version
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: studio/package.json
@@ -414,13 +434,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ese-windows-runtime-${{ github.sha }}
-          path: studio/runtime/ese
+          path: studio/runtime
 
       - name: Verify restored runtime payload
         shell: pwsh
         working-directory: .
         run: |
           $required = @(
+            './studio/runtime/msvc/ese-msvc-runtime.json',
             './studio/runtime/ese/ese.exe',
             './studio/runtime/ese/build/bin/llama-server.exe',
             './studio/runtime/ese/build/bin/ese-runtime.json'
@@ -437,6 +458,15 @@ jobs:
 
       - name: Build NSIS installer
         run: pnpm tauri build --bundles nsis --config src-tauri/tauri.ci-bundle.conf.json
+
+      - name: Verify Studio app-local MSVC resources
+        working-directory: .
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check "pefile==2023.2.7"
+          if ($LASTEXITCODE -ne 0) { throw "PE parser installation failed" }
+          python -c "from pathlib import Path; from tools.windows_msvc import verify; verify(Path('studio/runtime/msvc'), extra_images=[Path('studio/src-tauri/target/release/ese-studio.exe')])"
+          if ($LASTEXITCODE -ne 0) { throw "Studio MSVC runtime verification failed" }
 
       - name: Upload Windows NSIS installer
         uses: actions/upload-artifact@v4

@@ -8,9 +8,13 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pefile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.windows_msvc import verify as verify_msvc
 
 
 def require_file(path: Path) -> Path:
@@ -63,6 +67,7 @@ def verify_cpu_runtime(runtime_root: Path, build_root: Path, launcher: Path) -> 
                           if re.match(r"(?:nvcuda|cudart|cublas|ggml-cuda)", dep))
             if cuda:
                 raise SystemExit(f"CPU fallback {path.name} imports CUDA dependencies: {cuda}")
+    verify_msvc(cpu_bin, reader=pe_imports)
     environment = os.environ.copy()
     for name in ("ESE_SERVER", "ESE_SERVER_BACKEND"):
         environment.pop(name, None)
@@ -90,6 +95,8 @@ def main() -> None:
     parser.add_argument("--build-root", required=True, type=Path)
     parser.add_argument("--cpu-build-root", type=Path,
                         help="Also require, execute and verify the separately staged CPU fallback")
+    parser.add_argument("--studio-exe", type=Path, help="Verify Studio's app-local CRT resources too")
+    parser.add_argument("--gui-msvc-directory", type=Path)
     args = parser.parse_args()
 
     runtime_root = args.runtime_root.resolve()
@@ -126,6 +133,13 @@ def main() -> None:
     require_import(llama, "ggml.dll")
     for dependency in ("cudart64_12.dll", "cublas64_12.dll", "nvcuda.dll"):
         require_import(ggml, dependency)
+
+    verify_msvc(runtime_bin, reader=pe_imports)
+    if args.studio_exe:
+        if not args.gui_msvc_directory:
+            raise SystemExit("--studio-exe requires --gui-msvc-directory")
+        verify_msvc(args.gui_msvc_directory, reader=pe_imports,
+                    extra_images=[require_file(args.studio_exe)])
 
     print(f"Verified staged CUDA runtime and PE dependency chain from {launcher}")
     if args.cpu_build_root is not None:

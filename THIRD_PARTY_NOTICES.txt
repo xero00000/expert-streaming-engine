@@ -16,6 +16,26 @@ ik_llama.cpp are distributed under the MIT License. The complete MIT License
 and upstream copyright notices are in LICENSE at the repository root and are
 bundled with ESE Studio as licenses/ESE-MIT-LICENSE.txt.
 
+Microsoft Visual C++ runtime components (Windows packages only)
+---------------------------------------------------------------
+
+Windows packages include unmodified release x64 Microsoft Visual C++ CRT and
+OpenMP DLLs from the build toolchain's Microsoft.VC143.CRT and
+Microsoft.VC143.OpenMP redistributable folders. These Microsoft components are
+not covered by ESE's MIT License. Their redistribution is governed by the
+Microsoft Software License Terms for the Visual Studio installation.
+
+The native server and separate CPU fallback include their required transitive
+MSVC imports. Studio's CRT files are installed beside its executable. Each
+directory retains an ese-msvc-runtime.json inventory with exact sizes and
+SHA-256 hashes. Debug runtimes, developer tools and System32 copies are not
+redistribution sources. Updates to these app-local libraries are delivered in
+ESE package updates.
+
+Microsoft redistribution and deployment references:
+https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files
+https://learn.microsoft.com/en-us/cpp/windows/choosing-a-deployment-method
+
 NVIDIA CUDA runtime components (Windows packages only)
 -------------------------------------------------------
 

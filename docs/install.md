@@ -3,8 +3,8 @@
 ESE Studio gives you a model library, local chat and measured configuration
 sweeps. Each package includes the matching ESE launcher and native server.
 
-These instructions describe the unpublished **v0.2.1 candidate**. Six current
-Linux packages are built and checked; current Windows installers remain pending.
+These instructions describe the unpublished **v0.2.1 candidate**. Six Linux
+candidate packages are checked; the complete final package set remains in progress.
 Linux AppImage updater signatures verify, and publication remains on hold.
 The latest public release may still be an earlier
 version. Check the version on the [GitHub release page](https://github.com/xero00000/expert-streaming-engine/releases)

@@ -80,7 +80,7 @@ if (serverBuildRoot) {
   );
 }
 
-if (process.platform === "win32" && process.env.CUDA_PATH) {
+if (process.platform === "win32" && runtimeCuda && process.env.CUDA_PATH) {
   const cudaBin = join(process.env.CUDA_PATH, "bin");
   if (existsSync(cudaBin)) {
     for (const entry of readdirSync(cudaBin)) {
@@ -97,6 +97,20 @@ if (process.platform === "win32" && runtimeCuda) {
     destination,
     buildDirectory: process.env.ESE_RUNTIME_CPU_BUILD_DIR,
   });
+}
+
+if (process.platform === "win32") {
+  const nativeBins = [join(destination, "build", "bin")];
+  const cpuBin = join(destination, "build", "cpu", "bin");
+  if (existsSync(cpuBin)) nativeBins.push(cpuBin);
+  const args = [
+    join(repoRoot, ".github", "scripts", "stage-windows-msvc-runtime.py"),
+    ...nativeBins.flatMap((bin) => ["--runtime-bin", bin]),
+    "--gui-directory", join(studioRoot, "runtime", "msvc"),
+  ];
+  const staged = spawnSync(process.env.ESE_BUILD_PYTHON || "python", args, { encoding: "utf8" });
+  if (staged.status !== 0) throw new Error(`MSVC redistributable staging failed: ${staged.stderr || staged.error || staged.stdout}`);
+  console.log(staged.stdout.trim());
 }
 
 if (process.platform === "linux") {

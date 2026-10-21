@@ -1888,3 +1888,69 @@ Documentation/link invariants, all version fields and Git whitespace checks
 pass. All five owned Linux build/test containers are stopped after their probes
 finish; the Windows clone and both original VMs are shut off. The publication
 hold and the active remaining Windows/full-matrix work remain unchanged.
+
+
+### Task 6 — current Windows builds and Microsoft runtime staging repair
+
+Staged the exact `e4b5739fc...` source archive in the isolated VM and verified
+its SHA-256 on both hosts. Downloaded six Windows CUDA 12.4.1 component archives
+(563,232,009 bytes total), verified every size/SHA-256 against NVIDIA's official
+manifest on Linux and again in Windows, and extracted them into a private SDK
+directory. NVCC 12.4.131 and its MSVC 19.44 compiler probe pass with the required
+75-real/86-real/86-virtual targets and production Qwen admission OFF.
+
+Pinned portable Node 22.22.2 and pnpm 11.19.0, installed Rust 1.96.0 and
+PyInstaller 6.16.0, and passed the frozen-lockfile supply-chain checks. TypeScript,
+Vite and the standalone `ese.exe --version` pass. The full Studio Release Rust
+build passes in 269.07 seconds. Build commands have explicit limits; these are
+builds, not new sustained inference/performance passes.
+
+The inherited VM topology exposed eight sockets, but Windows reported only two
+one-core processors. Reconfigured only the clone to one eight-core socket and
+24 GiB RAM; Windows then sees eight processors. A new empty 32 GiB scratch
+volume, identified by its unique serial, was initialized as S: for Cargo output.
+Live SATA attachment was rejected without changing the VM; an emulated USB disk
+was used instead. No physical host USB or GPU device was assigned. The original
+VMs/disks remain unchanged and the base disk is opened read-only by QEMU.
+
+The CPU native build completes after retaining two budget-limited attempts and
+reusing their completed objects. The matching c559... fixture serves the exact
+12-token input and one generated token. An initial shutdown harness inherited
+OpenSSH's Ctrl+C-ignore setting; a separate Python console control proves this.
+Clearing that inherited flag yields a normal server exit 0 without changing
+product code. This single-token check does not qualify throughput.
+
+Actual PE inspection exposed a packaging gap: MSVCP, VCRUNTIME and VCOMP imports
+were satisfied by the build VM's system DLLs but were missing from the staged
+native runtime. Added transitive release-x64 MSVC redistributable staging from
+Visual Studio's desktop CRT/OpenMP folders, per-directory size/hash inventories,
+and strict verification. Debug, OneCore, missing, altered and unlisted runtime
+payloads are rejected. Studio's CRT files are mapped beside the application via
+a Windows-only Tauri overlay. CI carries both runtime resource directories into
+the separate MSI/NSIS jobs and verifies Studio's imports after those builds;
+release verification checks the native and Studio closures together.
+
+The real unfixed Windows stage fails the new dependency check. After repair,
+the native and Studio import closures pass. The CPU server loads all six MSVC/
+OpenMP DLLs from its staging directory, preserves exact text/top-32 probabilities
+against the unpackaged Windows build and exits normally. The four native
+project files remain byte-identical. Eleven focused Python controls pass on
+Linux and Windows; all 35 Studio checks, workflow actionlint 1.7.7, documentation
+invariants and whitespace checks pass. Microsoft runtime notices now describe
+the app-local deployment and servicing scope.
+
+The initial PyInstaller pin incorrectly forced a pefile version excluded by
+PyInstaller; retain that resolver rejection. The corrected pinned PyInstaller
+install resolves pefile 2023.2.7 successfully. A PowerShell process-wrapper exit
+code observation bug also remains recorded; SDK/tool installation itself passes,
+and subsequent .NET/Python process supervisors capture actual exit codes and
+terminate only their owned process trees on budget exhaustion.
+
+The first CUDA build reaches 91/416 steps before its 600-second build limit;
+retain completed objects and the terminal budget record. No current dual-runtime
+MSI/NSIS or Windows GPU acceptance is claimed. Evidence is under
+`task6/windows-isolated/`, including `cpu-staged-msvc-proof.json`,
+`msvc-staging-qualification.json`, `studio-rust-build-job.json`, SDK/source
+identities and all failure/control logs. The Windows staging/notice changes
+require a new final eight-package set; the earlier signed Linux candidates stay
+identified by their original frozen source. Publication remains on hold.
