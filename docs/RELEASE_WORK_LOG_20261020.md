@@ -122,14 +122,17 @@ separate. The speed acceptance does not lift the publication hold.
 Acceptance: sustained runs without corruption, silent truncation or progressive
 memory growth, with exact commands and failed trials preserved.
 
-### 6. Rebuild and install the final packages — SOFTWARE CHECKS PASS; WINDOWS GPU GATE OPEN
+### 6. Rebuild and install the final packages — COMPLETE FOR AGREED SCOPE; WINDOWS GPU DEFERRED
 
 - Rebuild all eight packages from the recorded final source.
 - Test Linux CPU/CUDA installation, dependencies, startup and inference.
-- Test actual Windows MSI/NSIS installation, CPU fallback and NVIDIA inference.
+- Test actual Windows MSI/NSIS installation and CPU fallback. Physical NVIDIA
+  inference is deferred by the user for this candidate and remains unqualified.
 
 Acceptance: installed packages reproduce the validated behavior; hosted PE
-checks do not substitute for physical Windows GPU evidence.
+checks do not substitute for physical Windows GPU evidence. On 21 October the
+user explicitly requested skipping that test for now; its deferral closes the
+current work item without qualifying Windows GPU inference.
 
 ### 7. Finish signing and update handling — COMPLETE (LOCAL SIGNED-UPDATE ACCEPTANCE)
 
@@ -140,14 +143,16 @@ checks do not substitute for physical Windows GPU evidence.
 Acceptance: an update selects the correct runtime and verifies successfully;
 unsigned installer limitations are explicit where applicable.
 
-### 8. Prepare the release — LOCAL CANDIDATE PREPARED; WINDOWS GPU GATE OPEN
+### 8. Prepare the release — COMPLETE LOCALLY; PAUSE BEFORE RELEASE
 
 - Freeze source and artifact hashes; finish release notes and evidence links.
 - Complete available final checks and prepare the PR/tag content locally.
 - Keep push, hosted CI and publication pending while the user's hold applies.
 
 Acceptance: a concrete, reviewable release candidate with all claimed checks
-recorded and no outstanding supported-scope release blockers.
+recorded and no outstanding blockers within the agreed local qualification
+scope. Physical Windows GPU inference and long passes remain explicitly deferred.
+Pause here before release, as requested; the publication hold remains active.
 
 ## Activity
 
@@ -2221,3 +2226,26 @@ the 28,180,480-byte Windows evidence archive with SHA-256
 The clone receives a normal shutdown request after its process check and
 evidence transfer. Original VMs remain stopped. Guest wall-clock UTC is about
 three hours ahead of host UTC; job durations use monotonic time.
+
+
+### Final scope decision — Windows GPU test deferred; pause before release
+
+The user instructed **“Lets skip that test for now”** in response to the
+physical Windows NVIDIA inference question. This explicitly defers that test
+for the current candidate. Windows GPU inference remains **unqualified**; no
+hardware test is recorded as passed, no NVIDIA driver is installed and no
+host device is detached. Earlier entries describing an unanswered scope question
+and an open physical-GPU gate are historical and superseded by this decision.
+
+Tasks 1–8 are complete for the agreed local scope, including the accepted
+approximately 19 tok/s experimental baseline, bounded workload checks, eight
+actual packages and signed-update checks. Long context/concurrency passes and
+Windows GPU qualification remain deferred; production Qwen admission stays OFF.
+The final [candidate review](RELEASE_CANDIDATE_REVIEW_20261021.md) records the
+unchanged product freeze, package hashes, evidence and local PR/tag drafts.
+
+Only qualification documentation changes after product freeze
+`2ff6389928fb701ad9331275682529cf5896645b`; existing packages need no rebuild.
+The final documentation/link and version checks pass. Work pauses before release
+as requested. No push, hosted CI dispatch, PR, tag, asset upload or publication
+has occurred. The publication hold remains active until explicitly lifted.

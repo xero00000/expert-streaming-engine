@@ -2,8 +2,9 @@
 
 Unpublished local candidate. Push, hosted CI, PR/tag creation and publication
 remain on hold. All eight packages, their source indices, checksums and updater
-feeds are prepared and pass local software qualification. Physical Windows
-NVIDIA inference remains an open release gate.
+feeds are prepared and pass local software qualification. The user explicitly
+deferred physical Windows NVIDIA inference: it remains unqualified. The agreed
+local work list is complete, and work pauses here before release.
 
 Product/package source freeze:
 `2ff6389928fb701ad9331275682529cf5896645b` on
@@ -28,7 +29,7 @@ Earlier candidates retain their original source indices and evidence.
 | Windows GUI | Actual MSI application opens Settings in the clone's interactive session with community sharing off and its bundled launcher selected; UI Automation confirms the update action. Its first screenshot is occluded by a Windows upgrade prompt; the final post-update NSIS Settings view is visually verified after declining that prompt only in the owned clone |
 | Windows NSIS | Real 654,163,835-byte installer completes in 808.71 seconds; actual install returns 0 in 66.80 seconds; 33 exact runtime files, CPU fallback and exact top-32 inference pass |
 | Windows signed update | Seven download/format controls plus real signed passive-mode reinstall pass; installer exit 0, deliberate license-file repair, all 33 runtime identities, CPU inference and post-update Settings startup verified |
-| Windows physical NVIDIA | Blocked by the host IOMMU group; no GPU is detached and no Windows NVIDIA driver is installed |
+| Windows physical NVIDIA | Deferred by the user for this candidate; inference remains unqualified. The host IOMMU constraint is unchanged; no GPU is detached or Windows NVIDIA driver installed |
 
 Inference controls use the pinned TinyMoE fixture, twelve prompt IDs, one
 prediction and top-32 probabilities against the matching unpackaged runtime.
@@ -68,17 +69,20 @@ The complete `SHA256SUMS` covers eight packages and three signature files.
 checksums are in `final-2ff638992-release-assets/`. All three artifact-set indices
 identify the same full source freeze. The directory is private and unpublished.
 
-## Remaining work before release approval
+## Release hold and deferred qualification
 
-1. Resolve physical Windows NVIDIA qualification or obtain an explicit change
-   to the intended supported scope. The spare GPUs share IOMMU group 15 with
-   the mounted-storage SATA controller, USB and Ethernet. Assigning that group
-   would disrupt host devices; the active desktop GPU remains untouched. The
-   user has been asked whether to retain the gate or defer this qualification;
-   no answer or waiver is assumed.
-2. Review the final local candidate while retaining the publication hold.
-   Push, hosted CI, PR/tag creation and release publication require the hold
-   to be lifted. No such action has occurred.
+The user explicitly instructed **“Lets skip that test for now”** in response
+to the physical Windows NVIDIA test question. It is deferred for this candidate
+and remains unqualified. The spare GPUs still share IOMMU group 15 with mounted
+storage, USB and Ethernet; no passthrough or host device change was attempted.
+This decision supersedes the earlier unresolved scope question.
+
+All agreed local tasks are complete. Work pauses before release as requested.
+Push, hosted CI, PR/tag creation and release publication remain on hold until
+the user explicitly lifts that hold. No such action has occurred. Hosted
+workflow execution remains future release work and is not claimed as passed.
+Long context/concurrency runs remain deferred and production Qwen admission
+stays OFF.
 
 ## Evidence
 
@@ -119,8 +123,35 @@ Paths are relative to the private evidence root
 
 See the [work log](RELEASE_WORK_LOG_20261020.md) for retained failures and the
 [package contract](RELEASE_PACKAGE_CONTRACT.md) for the required deliverable.
-Local PR summary: consolidate ESE, repair cache/recovery correctness, preserve
-CPU/CUDA update variants, bundle Windows Microsoft runtimes, and document the
-accepted experimental performance and unresolved physical GPU gate. Prepared tag content identifies `v0.2.1` and this source freeze; the physical
-Windows GPU gate and publication hold must be resolved before creating it.
-No PR or tag has been created.
+
+## Local PR and tag drafts
+
+Prepared PR title: **Prepare ESE 0.2.1 consolidated runtime and package release**
+
+Prepared PR body:
+
+> Consolidate the reviewed ESE changes, repair cache and recovery correctness,
+> and produce Linux CPU/CUDA packages plus Windows installers with app-local
+> Microsoft runtimes. DEB/RPM updates use the package manager; signed automatic
+> updates preserve the AppImage runtime variant and update Windows NSIS installs.
+>
+> Local source, scoped inference/recovery, all eight packages and signed-update
+> checks pass as documented above. The user accepts approximately 19 tok/s for
+> the experimental Flash-Next profile. Long passes and physical Windows NVIDIA
+> inference are deferred; Windows GPU inference remains unqualified and
+> production Qwen admission stays OFF. Hosted release CI has not run.
+
+Prepared tag name: `v0.2.1`. Product/package source freeze:
+`2ff6389928fb701ad9331275682529cf5896645b`. Later commits contain qualification
+documentation only. The final tag target must be the reviewed integration commit
+that retains this product freeze and the final scope documentation.
+
+Prepared tag message:
+
+> ESE 0.2.1: consolidated runtime, CPU/CUDA Linux packages and dual-runtime
+> Windows installers. Local installation and signed-update checks pass. Physical
+> Windows NVIDIA inference and extended workload qualification are deferred;
+> experimental Qwen admission remains disabled in production builds.
+
+These are local drafts only. No PR or tag has been created; the user's
+publication hold remains active.

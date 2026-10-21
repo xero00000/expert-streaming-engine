@@ -142,3 +142,18 @@ passes are deferred, and production Qwen admission stays OFF. Windows installers
 lack Authenticode signatures; the NSIS updater signature is verified separately.
 See the [current review](RELEASE_CANDIDATE_REVIEW_20261021.md) and
 [work log](RELEASE_WORK_LOG_20261020.md) for source, scope, failures and evidence.
+
+
+### v0.2.1 scope decision — Windows GPU test deferred
+
+The user subsequently instructed **“Lets skip that test for now”** in response
+to the physical Windows NVIDIA inference question. The unchecked hardware test
+above remains unperformed and **Windows GPU inference remains unqualified**;
+it is explicitly deferred for this candidate rather than a current release gate.
+This decision supersedes the preceding “no waiver is assumed” status.
+
+All agreed local preparation is complete. Work pauses before release as
+requested. The publication hold is unchanged: no push, hosted CI dispatch,
+PR/tag creation or upload/publication. Hosted workflow execution has not run.
+See the [candidate review](RELEASE_CANDIDATE_REVIEW_20261021.md) for the final
+local PR/tag drafts, unchanged product source freeze and evidence.

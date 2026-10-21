@@ -6,8 +6,9 @@ to one recorded source. Local install/CPU fallback, scoped Linux inference,
 AppImage/NSIS signature verification and installed-update checks pass. Windows
 packages include app-local Microsoft C++ and OpenMP runtimes. DEB/RPM updates
 use their package manager; AppImage and Windows retain signed automatic updates.
-Physical Windows NVIDIA inference remains an open qualification gate. Earlier
-CI and candidate records below retain their original scope. See the
+Physical Windows NVIDIA inference is deferred by the user for this candidate
+and remains unqualified. Earlier CI and candidate records below retain their
+original scope. Work pauses before release. See the
 [current candidate review](RELEASE_CANDIDATE_REVIEW_20261021.md) for the source
 freeze, hashes, evidence and publication hold.
 
