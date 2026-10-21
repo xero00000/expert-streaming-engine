@@ -3,8 +3,10 @@
 ESE Studio gives you a model library, local chat and measured configuration
 sweeps. Each package includes the matching ESE launcher and native server.
 
-These instructions describe the prepared **v0.2.1 candidate**. Publication and
-signing remain pending; the latest public release may still be an earlier
+These instructions describe the unpublished **v0.2.1 candidate**. Six current
+Linux packages are built and checked; current Windows installers remain pending.
+Linux AppImage updater signatures verify, and publication remains on hold.
+The latest public release may still be an earlier
 version. Check the version on the [GitHub release page](https://github.com/xero00000/expert-streaming-engine/releases)
 before choosing a file.
 
@@ -22,8 +24,11 @@ are not required to run the installed Windows application.
 ## Verify and install
 
 Download `SHA256SUMS` with your package. Check its SHA-256 before installation.
-The current candidate has no verified publisher/updater signatures; apply
-updates by installing the next package manually.
+Both Linux AppImages have verified updater signatures. Their separate CPU/CUDA
+update feeds and installation/recovery paths pass local integration checks;
+the public update channel has not been enabled for this candidate. Apply manual
+package updates until publication. Native DEB/RPM package-manager signing and
+Windows Authenticode are not established by an AppImage updater signature.
 
 ### Linux
 
@@ -56,10 +61,10 @@ In PowerShell, compare the hash with the matching line in `SHA256SUMS`:
 Get-FileHash .\ESE-Studio_0.2.1_windows-x64-setup.exe -Algorithm SHA256
 ```
 
-Run the setup EXE (or MSI), open ESE Studio and add your model folder. Current
-installers are unsigned. CPU executable and launcher selection checks passed in
-CI; actual installer execution and Windows GPU model inference remain
-unverified by that hosted run.
+These are the planned Windows filenames. Current-source MSI/NSIS builds,
+installation and Windows GPU inference remain pending. Earlier unsigned CI
+installers and their CPU selection checks describe older source; use the
+published release's own validation record when choosing an available installer.
 
 ## Check your PC and first model
 

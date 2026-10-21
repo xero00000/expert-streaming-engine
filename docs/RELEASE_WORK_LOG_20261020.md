@@ -131,7 +131,7 @@ memory growth, with exact commands and failed trials preserved.
 Acceptance: installed packages reproduce the validated behavior; hosted PE
 checks do not substitute for physical Windows GPU evidence.
 
-### 7. Finish signing and update handling — PENDING
+### 7. Finish signing and update handling — LINUX CHECKS PASS; WINDOWS PENDING
 
 - Verify signing-key configuration without exposing key contents.
 - Check signature verification, variant selection, installation and update
@@ -140,7 +140,7 @@ checks do not substitute for physical Windows GPU evidence.
 Acceptance: an update selects the correct runtime and verifies successfully;
 unsigned installer limitations are explicit where applicable.
 
-### 8. Prepare the release — PENDING
+### 8. Prepare the release — LOCAL REVIEW DRAFT PREPARED; FULL MATRIX PENDING
 
 - Freeze source and artifact hashes; finish release notes and evidence links.
 - Complete available final checks and prepare the PR/tag content locally.
@@ -1804,3 +1804,87 @@ this short-check scope. Windows MSI/NSIS builds and installation, installed-upda
 and failure/recovery trials, and final release preparation remain pending.
 The accepted approximately 19 tok/s scope and production Qwen gate remain as
 previously recorded. No push, tag, hosted CI or publication has occurred.
+
+
+### Task 6 — isolated Windows preflight
+
+Created a new qcow2 backing overlay through libvirt and an independent test VM
+(`ese-review-win-20261021`) with its own UUID, MAC, NVRAM and virtual TPM. No
+physical device passthrough is assigned. The original `win10` configuration
+matches the saved preflight XML exactly; the original disk remains the read-only
+backing image. The VR VM and desktop GPU are untouched.
+
+The clone boots Windows 10 Pro 19045 and accepts the already-authorized test SSH
+key for its existing `ok` account. No key or account is changed. Node, pnpm, Rust,
+MSVC, CMake/Ninja and installer tooling are present, but only an older CPU native
+build is cached (`GGML_NATIVE=ON`). No CUDA toolkit or CUDA build cache is
+present. Those older runtimes/installers are not current-source package evidence.
+Current dual-runtime MSI/NSIS, physical Windows NVIDIA inference and Windows
+update qualification remain pending; do not replace them with PE inspection.
+
+The clone completes a normal guest shutdown. A managed-save request races with
+that completion and reports that the domain is not running; final `domstate`
+confirms **shut off**. No forced power-off or GPU detachment occurs. Retain the
+overlay and inventory for further work at
+`task6/windows-isolated/preflight-summary.json`.
+
+
+### Task 7 — signed Linux update installation and recovery pass
+
+Linked a local integration probe against the **same unmodified production
+`tauri-plugin-updater 2.10.1`** library retained by the candidate build. It uses
+the configured public key and the actual signed CPU/CUDA AppImages. Only the
+test context uses a loopback HTTP feed. Production HTTPS endpoints/configuration
+are unchanged. All six packaged Studio executables contain their corresponding
+`latest-cpu.json` or `latest-cuda.json` URL and the expected public key, without
+the opposite variant URL.
+
+Eight bounded cases pass: default version comparison rejects the same-version
+offer; HTTP 503, truncated transfer, corrupted signature and corrupted payload
+are rejected; a forced file-size-limit write failure rolls back to the original
+bytes; valid CPU and CUDA retries install their exact signed candidate hashes.
+Tests run as UID 1000 on temporary files in the container filesystem and retain
+0755 permissions. Installation starts from archived distinct 0.2.1 AppImage
+builds; a **test-only comparator permits same-version replacement**. This is
+not a previous-public-version migration or public-channel test. The forced
+write error is `EFBIG`; rollback preserves the original bytes and executable
+mode. Real valid payloads then replace the temporary installed files.
+
+Both updated AppImages also render ESE Studio for at least 12 seconds as the
+unprivileged user; the updated CUDA capture is visually checked. The complete
+integration run has a hard 110-second budget; valid CPU/CUDA install cases take
+1.15 / 14.08 seconds, plus separate short post-install GUI checks. All owned
+probe processes stop. Evidence, raw failures, requests, exact before/after
+hashes and helper identities are retained in
+`task7/linux-update-qualification.json` and
+`task6/ubuntu-build/update-checks/`.
+
+Linux signing and local updater integration are now checked. Native DEB/RPM
+package-manager signatures, Windows Authenticode and actual Windows update/
+failure-recovery acceptance are not established by those results. Publication
+and the public updater channel remain on hold.
+
+
+### Task 8 — current local review draft and Linux hashes
+
+Prepared [the current candidate review](RELEASE_CANDIDATE_REVIEW_20261021.md)
+with the frozen package source, all six Linux payload hashes, evidence links,
+accepted speed scope and explicit Windows/full-matrix gaps. The private
+`task6/ubuntu-build/LINUX-CANDIDATE-SHA256SUMS.txt` includes six Linux packages
+and their two collected AppImage signatures. It is not the complete release
+`SHA256SUMS` or an eight-package acceptance pass.
+
+Corrected stale statements that the current Linux AppImages are unsigned or
+that old eight-package builds describe the current source. Installation notes,
+Studio documentation and draft release notes now distinguish checked Linux
+signatures from the pending Windows builds and public channel. No binary or
+product configuration changes follow the frozen package source; later commits
+record documentation and qualification. Complete release metadata generation
+and final approval remain pending the actual current Windows artifacts and
+their required qualification. No push, remote CI dispatch, PR, tag or release
+is created.
+
+Documentation/link invariants, all version fields and Git whitespace checks
+pass. All five owned Linux build/test containers are stopped after their probes
+finish; the Windows clone and both original VMs are shut off. The publication
+hold and the active remaining Windows/full-matrix work remain unchanged.

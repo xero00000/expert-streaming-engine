@@ -1,10 +1,18 @@
 # ESE v0.2.1 release notes
 
-**Working draft — unpublished.** This document describes the current candidate.
-Eight unsigned installer/package candidates have completed their recorded
-packaging checks. Signing, the new filled-64K flagship demonstration and broader
-release qualification remain incomplete. Experimental capabilities below are
-not a declaration of production support.
+**Working draft — unpublished, updated 21 October 2026.** Six current-source
+Linux CPU/CUDA DEB/RPM/AppImage packages pass installation, startup and bounded
+inference checks. Both AppImage updater signatures and local installation/
+failure-recovery integration checks pass. Current-source Windows installers
+remain pending. Earlier eight-package and Windows CI records below describe
+older candidates. See the [current candidate review](RELEASE_CANDIDATE_REVIEW_20261021.md)
+for frozen source, hashes, evidence and remaining gates.
+
+The user accepted approximately 19 tok/s for the selected experimental
+Flash-Next profile and deferred further speed optimization and multi-hour
+passes. Larger-context/concurrency qualification remains incomplete; production
+Qwen admission stays OFF. Experimental capabilities below are not a declaration
+of production support.
 
 ## More dependable local AI on the hardware you own
 
@@ -443,7 +451,7 @@ build or Conda paths. Release asset collection requires the requested version
 and its matching signature, preventing stale cached installers from being
 renamed as the current release.
 
-Current unsigned Linux CPU and CUDA DEB/RPM/AppImage candidates pass loader,
+The October 13–14 unsigned Linux CPU and CUDA DEB/RPM/AppImage candidates pass loader,
 launcher, small-model API/cache and desktop startup checks. CUDA candidates
 bundle byte-identical cudart, cuBLAS and NCCL runtime libraries with their
 notices; they require a host NVIDIA driver. CPU candidates work without that
@@ -625,6 +633,13 @@ Known limitations of this candidate include:
 - No new Qwen serving-slot, readiness or dual-protocol API qualification.
 
 ## Performance reporting
+
+The October 21 selected Flash-Next IQ2_XS, 1M experimental launcher diagnostic
+records 13.968 / 19.841 / 19.664 tok/s across one start and three requests. The
+user accepted approximately 19 tok/s for this version, superseding the earlier
+80%-of-Strata requirement. This observation is scoped to that recorded short
+workload, not a speed floor at a filled 1M context. Further speed work and
+multi-hour context passes are deferred. See the [release work log](RELEASE_WORK_LOG_20261020.md).
 
 The launch presentation now leads with using the PC you already own. Its
 [PC guide](WHAT_CAN_MY_PC_RUN.md) separates estimates from tested configurations,

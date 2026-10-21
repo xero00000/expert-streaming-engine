@@ -59,8 +59,9 @@ are recognized rather than overwritten. Use `HF_TOKEN` or
 ## Linux install
 
 The AppImage, DEB and RPM packages contain both Studio and ESE, with separate
-CPU and CUDA variants. The current v0.2.1 candidate is unsigned and uses manual
-package updates. See the [installation guide](../docs/install.md) for exact
+CPU and CUDA variants. Both current v0.2.1 candidate AppImage signatures and local
+installation/recovery checks pass. The candidate remains unpublished; use manual
+package updates until its public channel is enabled. See the [installation guide](../docs/install.md) for exact
 filenames and verification limits.
 
 The Linux ESE launcher requires Python 3.10 or newer and the system OpenMP
