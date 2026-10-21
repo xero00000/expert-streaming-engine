@@ -1,7 +1,14 @@
 """The context probe must preserve document records and reject false retrieval."""
 import importlib.util
+import json
 from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 spec = importlib.util.spec_from_file_location(
     "native_context", Path(__file__).parents[1] / "scripts/qualify-native-context.py")
@@ -10,6 +17,35 @@ spec.loader.exec_module(context)
 
 
 class ContextQualificationTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(signal, "setitimer"), "POSIX wall-time budget")
+    def test_wall_time_budget_interrupts_a_server_that_never_responds(self):
+        release = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                release.wait(5)
+
+            def log_message(self, *args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server, tempfile.TemporaryDirectory() as tmp:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
+            thread.start()
+            try:
+                output = Path(tmp) / "evidence"
+                result = subprocess.run([sys.executable, str(Path(context.__file__)),
+                    "--url", f"http://127.0.0.1:{server.server_port}", "--output", str(output),
+                    "--context", "4096", "--max-seconds", "0.1"],
+                    capture_output=True, timeout=3)
+                self.assertNotEqual(result.returncode, 0)
+                report = json.loads((output / "report.json").read_text())
+                self.assertEqual(report["status"], "time_budget_exceeded")
+                self.assertEqual(report["samples"], [])
+            finally:
+                release.set()
+                server.shutdown()
+                thread.join(timeout=2)
+
     def test_exact_64k_fixture_keeps_records_and_generation_suffix(self):
         fixture = context.build_fixture(
             lambda text: list(text.encode()),

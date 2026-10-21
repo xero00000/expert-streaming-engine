@@ -112,7 +112,7 @@ Acceptance: the user accepts the observed approximately 19 tok/s for this
 version. Record the selected configuration and keep correctness/resource gates
 separate. The speed acceptance does not lift the publication hold.
 
-### 5. Qualify realistic workloads — IN PROGRESS
+### 5. Qualify realistic workloads — SHORT CHECKS PASS; LONG PASSES DEFERRED BY USER
 
 - Fill at least 65,536 actual prompt tokens with generation headroom and no
   silent truncation; check retrieval near the start, middle and end.
@@ -1678,3 +1678,26 @@ sampled in this retry and will be reported with the completed resource audit;
 no zero-swap claim applies. Both shards' exact size/mtime seals match the
 previously completed SHA-256 identities. No filled-64K, concurrency, native
 arithmetic or release acceptance is claimed by these intermediate results.
+
+
+### Task 5 — bounded verification; multi-hour passes deferred
+
+The user stated **“we dont have time for multi hour passes.”** The active
+context runner was interrupted immediately and its owned server shut down
+normally (server exit 0). No 65,536-token pass started. Preserve the two complete
+2,048/256 requests with exact replay and the first complete 8,192/256 retrieval
+pass; the second 8K request is interrupted, not a pass or an inference failure.
+Final evidence and sampled resource peaks are in
+`task5/flash-next-context-256/qualification-summary.json`, with the original
+report, user-stop record, raw streams, identities and logs retained. Larger
+filled-context/concurrency/native-arithmetic claims remain unqualified.
+
+The probe now defaults to 2K only and a hard 120-second total wall-time budget.
+Its POSIX interval timer interrupts even a server that never sends HTTP headers;
+operator cancellation and budget exhaustion have distinct report states.
+Four context regressions plus the existing benchmark/surface checks pass
+(**20 total**), including a real local HTTP server that deliberately withholds
+its response. Larger lengths/longer budgets require explicit arguments; do not
+launch multi-hour passes as routine follow-up. Continue only the available
+short release-readiness checks. No publication authorization or production
+Qwen admission is implied by the reduced validation scope.

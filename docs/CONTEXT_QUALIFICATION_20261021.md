@@ -17,8 +17,8 @@ Example for a server with 1,048,576 context cells per slot:
 python3 scripts/qualify-native-context.py \
   --url http://127.0.0.1:8080 \
   --context 1048576 \
-  --lengths 2048 8192 65536 \
-  --predict 256 --repeats 2 \
+  --lengths 2048 \
+  --predict 256 --repeats 2 --max-seconds 120 \
   --output /absolute/path/to/new-evidence-directory
 ```
 
@@ -37,10 +37,18 @@ must preserve the generated text exactly. Raw streams and final responses are
 saved before validation; a failed check marks the report failed and stops the
 run. Existing evidence directories are never replaced.
 
-Begin with the 2K pilot before the 8K/65,536-token runs. Long prefill can take
-substantially longer than decode; the default per-request socket timeout is two
-hours. Keep the server's own resource/cancellation limits active. Record failed
-or aborted trials separately. Two successful retrieval responses do not prove
-arbitrary concurrency, full-history numerical parity, memory bounds or a 1M
-filled-context claim. Interleaved-session and resource acceptance need their
-own evidence. Do not open public model admission based on this probe alone.
+The default is a 2K pilot with a hard **120-second total wall-time budget**.
+This POSIX probe interrupts even a server that has not sent its first HTTP
+response. A time-budget stop is recorded separately from an inference failure;
+operator interruption is also recorded separately. Larger lengths and longer
+budgets must be explicitly supplied. The user has deferred multi-hour passes:
+do not launch those checks as routine release preparation.
+
+The completed selected-model evidence contains two exact 2K replays and one
+successful 8K retrieval/count check. The 8K repeat was interrupted at the user's
+request; 65,536 tokens were not attempted. These are partial checks, not full
+long-context acceptance. Keep the server's own resource/cancellation limits
+active and retain failed or interrupted trials separately. The default socket
+timeout is subordinate to the total wall-time budget. Retrieval checks do not
+prove arbitrary concurrency, full-history numerical parity, memory bounds or a
+1M filled-context claim. Do not open public model admission based on them alone.
