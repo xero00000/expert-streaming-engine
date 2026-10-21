@@ -258,6 +258,37 @@ void test_exact_reads_hits_and_backend_telemetry() {
     }
 }
 
+void test_dense_arena_fill_and_earlier_hole() {
+    constexpr uint32_t count = 1024;
+    const source_identity identity = {0xabcd, 0x1234};
+    std::vector<uint8_t> bytes((count+1)*64);
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = uint8_t(i * 13 + i / 64);
+    auto storage = std::make_shared<memory_source>(1, identity, read_backend::pread, bytes);
+    ram_cache cache({(count+16)*64, 128}, {storage});
+    std::vector<std::shared_ptr<const descriptor>> descriptors;
+    const uint8_t * base = nullptr;
+    for (uint32_t i = 0; i <= count; ++i) {
+        auto spec = make_spec({0, i, component::up}, 1, identity, i*64);
+        spec.dimensions = {{8, 8, 0, 0}};
+        spec.extents = {{1, identity, i*64, 64}};
+        descriptors.push_back(descriptor::make(spec, {{1, bytes.size()}}));
+        if (i == count) break;
+        auto value = cache.acquire(descriptors.back());
+        if (i == 0) base = value.data();
+        REQUIRE(value.data() == base + i*64);
+        REQUIRE(std::equal(bytes.begin()+i*64, bytes.begin()+(i+1)*64, value.data()));
+    }
+    REQUIRE(cache.stats().evictions == 0);
+    REQUIRE(cache.stats().resident_bytes == count*64);
+    // There is still ample tail capacity. First-fit must fill the earlier
+    // erased hole, rather than change policy to unconditional append.
+    REQUIRE(cache.erase(descriptors[7]->key()));
+    auto replacement = cache.acquire(descriptors.back());
+    REQUIRE(replacement.data() == base + 7*64);
+    REQUIRE(cache.stats().evictions == 0);
+    REQUIRE(std::equal(bytes.begin()+count*64, bytes.end(), replacement.data()));
+}
+
 void test_deterministic_eviction_and_lease_lifetime(bool frequency = false) {
     const source_identity identity = { 0xaaaa, 0xbbbb };
     std::vector<uint8_t> bytes(256);
@@ -2784,6 +2815,7 @@ int main(int argc, char ** argv) {
         test_cpu_router_softmax_replay();
         test_descriptor_validation();
         test_exact_reads_hits_and_backend_telemetry();
+        test_dense_arena_fill_and_earlier_hole();
         test_deterministic_eviction_and_lease_lifetime();
         test_deterministic_eviction_and_lease_lifetime(true);
         test_ram_frequency_retention();

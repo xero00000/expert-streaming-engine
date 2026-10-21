@@ -765,6 +765,44 @@ bool ram_cache::allocation_plan(
         std::vector<std::shared_ptr<entry>> & victims,
         const pending_load * own_reservation) const {
     using interval = std::pair<uint64_t, uint64_t>;
+    // A fully occupied prefix has no earlier free fit. Initial population of
+    // a large resident arena can therefore append without walking every
+    // existing entry twice per load. Pending reservations are bounded by the
+    // loader concurrency; a gap or an incompletely published entry retains
+    // the original first-fit/eviction planner below.
+    uint64_t tail = 0;
+    bool dense = by_offset_.empty() || checked_add_u64(by_offset_.rbegin()->first,
+            by_offset_.rbegin()->second->desc->bytes(), tail);
+    dense = dense && stats_.resident_bytes == tail && tail <= config_.capacity_bytes;
+    if (dense) {
+        std::vector<interval> reservations;
+        reservations.reserve(pending_.size());
+        for (const auto & item : pending_) {
+            const auto & load = item.second;
+            if (load.get() == own_reservation) continue;
+            reservations.emplace_back(load->arena_offset,
+                    load->arena_offset + load->result->desc->bytes());
+        }
+        std::sort(reservations.begin(), reservations.end());
+        for (const auto & region : reservations) {
+            uint64_t aligned;
+            if (region.first > region.second || region.second > config_.capacity_bytes ||
+                    !checked_add_u64(tail, 63, aligned) || region.first > (aligned & ~uint64_t(63))) {
+                dense = false;
+                break;
+            }
+            tail = std::max(tail, region.second);
+        }
+        uint64_t aligned;
+        if (dense && checked_add_u64(tail, 63, aligned)) {
+            aligned &= ~uint64_t(63);
+            if (aligned <= config_.capacity_bytes && bytes <= config_.capacity_bytes - aligned) {
+                arena_offset = aligned;
+                victims.clear();
+                return true;
+            }
+        }
+    }
     std::vector<interval> occupied;
     occupied.reserve(entries_.size() + pending_.size());
     for (const auto & item : by_offset_) {
