@@ -4,11 +4,13 @@ Task 4 starts after the local inference/recovery checks in task 3. The user's
 publication hold remains in force. A benchmark result does not authorize a
 push, hosted workflow, tag or publication.
 
-## Acceptance contract to finalize
+## Acceptance contract
 
-The model, prompt, hardware/memory budget and speed threshold require the
-user's selection. An asynchronous question was submitted while task 3's
-validation continued. No passing threshold or production workload is assumed.
+The user selected **match Strata in speed**. For the first direct comparison,
+freeze one common supported model and prompt on this machine; compare repeated
+sustained decode medians (ESE / Strata at least 1.0). Record every sample and
+cold/repeated behavior; retain startup, prefill and first-response separately.
+This does not lift the publication hold or qualify other models/context sizes.
 
 Record the following before collecting qualification measurements:
 
@@ -54,10 +56,35 @@ to define the contract.
    Report individual samples and median/range, including failed trials.
 6. Profile the measured bottleneck, make one change, and rerun the affected
    correctness/recovery checks before repeating the same timing protocol.
-7. Apply the agreed threshold without changing it after seeing results. Record
+7. Apply the Strata reference without changing it after seeing results. Record
    task 4's outcome and proceed to task 5's filled-64K/concurrency qualification.
 
 Existing tools include `llama-bench`, `scripts/compare-llama-bench.py`, the
 phase-2 cache runner and the retained HTTP/resource evidence wrappers. Select
 the runner that records the agreed workload; the present fixture timings have
 no production acceptance threshold.
+
+## Direct comparison preparation
+
+The saved 5 October Strata benchmark failed before readiness and has no speed
+metrics. Its gated Qwen4Exp workload is different from the supported qwen35moe
+35B model used in the preliminary resident/cache smoke tests. Those smoke
+timings cannot establish Strata parity.
+
+The installed Strata 0.1.45 also supports qwen35moe, using a single GPU for this
+family. The common comparison therefore selects the RTX 3080, 8 CPU threads,
+8,192 context cells, a frozen 512-token prompt, 128 greedy generated tokens and
+no MTP. The Q4_K_M candidate is rejected by Strata's F32 projection loader.
+The existing Qwen3.6-35B-A3B-UD-IQ4_XS model has suitable tensor formats but
+omits the explicit zero-MTP metadata that Strata requires. A separate benchmark
+copy adds only `qwen35moe.nextn_predict_layers = 0`; all original metadata and
+every tensor's type, shape and SHA-256 must verify unchanged. Both engines use
+that identical copy. Original files and running-service configs are preserved.
+
+The prompt includes reasoning output; rates are generated-token rates, not
+answer-only rates. Initial measurements retain the shared desktop's ambient
+GPU load, so quiet-system qualification remains distinct. Engine-protocol
+Strata first-token latency excludes HTTP; compare it separately from ESE HTTP
+latency. Both runners reject missing/invalid timing receipts, prompt reuse,
+wrong actual token counts, early stops and truncation. They retain raw logs,
+commands, model/binary/runner identities and sampled process/driver memory.

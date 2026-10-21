@@ -70,14 +70,15 @@ Acceptance: required clean builds/checks pass against one recorded source state.
 Acceptance: reproducible correctness and recovery evidence for every claimed
 supported execution path.
 
-### 4. Resolve the performance hold — IN PROGRESS (ACCEPTANCE CONTRACT PENDING)
+### 4. Resolve the performance hold — IN PROGRESS (TARGET: MATCH STRATA)
 
 The [performance qualification protocol](PERFORMANCE_QUALIFICATION_20261020.md)
-is prepared. The model, resource budget and passing speed target await the
-user's answer to the question submitted while task 3 was finishing.
+is prepared. The user has set the speed target: **match Strata**. Establish a
+same-machine, same-model reference before applying that target.
 
 - Define the exact model, prompt, resource budget, policies and speed target.
-  A target has not yet been agreed; do not invent a passing threshold.
+  Use Strata's measured sustained decode rate as the reference; retain startup,
+  prefill and first-response timings separately.
 - Collect matched cold/warm startup, prefill, first-response and sustained
   decode timings; compare like-for-like ESE/Strata conditions where possible.
 - Profile and improve measured bottlenecks, preserving correctness and limits.
