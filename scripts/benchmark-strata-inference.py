@@ -70,6 +70,8 @@ def main():
         environment={k:v for k,v in environment.items() if k.startswith(('CUDA_','LD_','STRATA_'))},
         starts=[],samples=[])
     identity=(model.stat().st_size, model.stat().st_mtime_ns)
+    libraries=subprocess.run(['ldd',str(engine)],text=True,capture_output=True,env=environment)
+    (out/'linked-libraries.txt').write_text(libraries.stdout+libraries.stderr)
     def save(): (out/'report.json').write_text(json.dumps(report,indent=2)+'\n')
     try:
         for iteration in range(args.starts):

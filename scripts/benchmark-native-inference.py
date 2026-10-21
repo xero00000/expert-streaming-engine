@@ -155,6 +155,8 @@ def main():
     environment = dict(os.environ, CUDA_VISIBLE_DEVICES=args.gpus)
     environment.pop('LD_PRELOAD', None)
     report['environment'] = {k:v for k,v in environment.items() if k.startswith(('CUDA_', 'LD_', 'ESE_', 'GGML_'))}
+    libraries = subprocess.run(['ldd', str(server)], text=True, capture_output=True, env=environment)
+    (out/'linked-libraries.txt').write_text(libraries.stdout+libraries.stderr)
     signature = None
     def save(): (out/'report.json').write_text(json.dumps(report,indent=2)+'\n')
     save()
@@ -206,6 +208,7 @@ def main():
                             if time.monotonic()-started>300:raise RuntimeError('startup timeout')
                             time.sleep(.1)
                     entry['startup_to_ready_seconds']=time.monotonic()-started
+                    request('/detokenize', dict(tokens=prompt), name='prompt-decoded')
                     request('/v1/ese/resources',name='resources-before')
                     for trial in range(args.requests):
                         payload=dict(prompt=prompt,n_predict=args.predict,n_probs=0,temperature=0,seed=4242,
