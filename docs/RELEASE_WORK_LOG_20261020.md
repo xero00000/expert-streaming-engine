@@ -2018,3 +2018,60 @@ requires container SIGKILL after a two-second stop timeout. All caches, disks,
 artifacts and failure evidence remain intact. Actual Windows installers,
 Windows install/update/GPU checks, refreshed CUDA collection and final full-set
 metadata remain pending. No push, hosted CI, PR, tag or publication occurs.
+
+
+### Task 7 continuation — cached Linux bundles and package-format update policy
+
+The user authorizes continuing the Windows build in the background while other
+work proceeds. Resume the cached CUDA build with eight jobs and a 2,700-second
+limit; do not resume long inference qualification. The original VMs/disks and
+desktop GPU remain untouched.
+
+Finish the missing Linux CUDA DEB/RPM bundles through Tauri's bundle-only
+command. The interrupted prior run left the build executable's Tauri bundle
+initializer set to DEB. A first bundle-only attempt warns and would retain that
+wrong initializer in RPM; do not accept those bundles. Inspection of the pinned
+upstream bundler confirms its normal behavior: replace the UNK initializer for
+each format, then restore the unpatched binary after successful bundling.
+Preserve the interrupted executable, resolve its actual mutable initializer
+through the ELF symbol and relocation, and reverse exactly the three changed
+marker bytes. Bundle-only then completes DEB/RPM without warnings in 55.55
+seconds and retains their correct per-format initializer. No application or
+native compilation occurs. A signing CLI environment/path argument conflict is
+retained; using the existing key environment signs the unchanged prior AppImage
+in 2.44 seconds. Collection completes in 36.93 seconds.
+
+All six `1888775e9` Linux packages now pass static inspection, all 24 native
+payload identities, current notices, dependency/version checks, exact compiled
+CPU/CUDA feeds, public keys and actual ELF bundle-type initializers. Both real
+AppImage signatures verify. Extracting CUDA packages directly onto the evidence
+archive first hits a 65-second bound; using local container scratch completes
+the DEB/RPM/AppImage checks in 16.89/29.96/22.70 seconds. Preserve the slow attempt.
+Eight real updater API cases also pass against these new signed payloads,
+including default same-version rejection, corrupt/truncated downloads,
+write-failure rollback and valid CPU/CUDA replacement with exact bytes/mode/UID.
+This remains local integration with a test-only reinstall comparator, not a
+public-version upgrade. A prior absolute-host-path test symlink is corrected to
+a relative sibling link visible inside the build container; retain that failed
+test setup separately.
+
+Review then exposes a remaining supported-flow defect: the GUI offers its
+AppImage automatic-update action inside DEB/RPM installations even though the
+package contract specifies manual package-manager updates. Add a bundle-type
+guard using the already-pinned Tauri API and its default core permission.
+DEB/RPM show manual update instructions and make no updater request. Unidentified
+formats also avoid guessing a download type; AppImage, MSI and NSIS preserve
+automatic signed-update checks. Five focused behavior tests cover zero network
+requests for manual/failed detection, the three automatic formats and preserved
+no-update/error results. This frontend change requires final packages from a
+new recorded source; the checked `1888775e9` artifacts stay identified as such.
+
+Read-only host preflight also establishes a physical Windows GPU limitation:
+both spare GPUs belong to IOMMU group 15 alongside the mounted-storage SATA
+controller, USB and Ethernet. The Linux VFIO ownership rules prohibit sharing
+that group between native host drivers and the guest. No device is detached,
+driver downloaded, host rebooted or original VM changed. Continue Windows
+build/install/update qualification independently; physical Windows NVIDIA
+inference remains blocked by the current host isolation. Evidence is
+`task6/windows-isolated/physical-gpu-iommu-preflight.json`, with the kernel
+documentation reference and actual group membership. Publication stays on hold.

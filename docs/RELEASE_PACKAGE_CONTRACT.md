@@ -68,6 +68,11 @@ automatic migration path. DEB/RPM updates remain package-manager/manual
 installations of the matching variant. Signing and actual installed-update
 tests remain required before enabling a release channel.
 
+Studio reads Tauri's actual bundle type before checking for an automatic
+update. DEB/RPM installations show package-manager instructions and do not
+contact the AppImage feed. An unidentified format also uses manual updates;
+AppImage and both Windows installer formats retain signed automatic updates.
+
 Tauri documents [static updater metadata](https://v2.tauri.app/plugin/updater/#static-json-file)
 and [configuration overlays](https://v2.tauri.app/develop/configuration-files/#extending-the-configuration).
 The toolchain component lock records its authoritative NVIDIA manifest; the

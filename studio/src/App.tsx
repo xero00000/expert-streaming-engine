@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getVersion } from "@tauri-apps/api/app";
+import { getBundleType, getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { Activity, AppWindow, Bot, Box, Bug, ChevronDown, ChevronRight, ChevronUp, CloudDownload, Download, Gauge, HardDrive, Heart, Library, MessageSquare, Play, Plus, RefreshCw, RotateCcw, Search, Send, Settings, ShieldCheck, SlidersHorizontal, Sparkles, SquareTerminal, StopCircle, Trash2, User, X } from "lucide-react";
 import { TerminalPane } from "./components/TerminalPane";
 import { privacySafeError } from "./privacy";
+import { checkPackageUpdate, manualUpdateInstructions } from "./update-policy";
 import type { AppProfile, ChatStatus, DownloadStatus, HubModel, HubModelDetails, ModelProfile, StudioSnapshot, SweepPlan, SweepStatus, TerminalTab, View } from "./types";
 import "./App.css";
 
@@ -44,7 +45,7 @@ interface ChatEntry {
   reasoning?: string;
 }
 
-type UpdateState = "idle" | "checking" | "available" | "downloading" | "current" | "error";
+type UpdateState = "idle" | "checking" | "available" | "downloading" | "current" | "manual" | "error";
 
 function storedChat(): ChatEntry[] {
   try {
@@ -275,6 +276,13 @@ function App() {
     void refresh();
     if (!("__TAURI_INTERNALS__" in window)) return;
     void getVersion().then(setAppVersion).catch(() => undefined);
+    void getBundleType().then((bundleType) => {
+      const instructions = manualUpdateInstructions(bundleType);
+      if (instructions) {
+        setUpdateState("manual");
+        setUpdateDetail(instructions);
+      }
+    }).catch(() => undefined);
     const cleanups: Array<() => void> = [];
     let disposed = false;
     const register = (listener: Promise<() => void>) => void listener.then((cleanup) => {
@@ -321,7 +329,14 @@ function App() {
     setUpdateDetail("Contacting the signed GitHub release channel…");
     setUpdateProgress(0);
     try {
-      const availableUpdate = await check({ timeout: 30_000 });
+      const result = await checkPackageUpdate(getBundleType, () => check({ timeout: 30_000 }));
+      if (result.kind === "manual") {
+        setPendingUpdate(undefined);
+        setUpdateState("manual");
+        setUpdateDetail(result.instructions);
+        return;
+      }
+      const availableUpdate = result.update;
       setPendingUpdate(availableUpdate ?? undefined);
       if (availableUpdate) {
         setUpdateState("available");
@@ -731,11 +746,11 @@ function App() {
                 <div className="privacy-note" id="telemetry-settings-detail"><ShieldCheck size={17} /><span><strong>{snapshot.helpImproveEse ? "Community sharing is on" : "Community sharing is off"}</strong>Raw results stay in the private collector. Public GitHub data is grouped and never includes prompts, responses, usernames, hostnames, local paths, or logs.</span></div>
               </section>
               <section className="panel settings-updates">
-                <div className="panel-heading"><div><h2>Updates</h2><p>Signed updates replace Studio and the bundled ESE runtime together.</p></div><span className="version-badge">v{appVersion}</span></div>
-                <div className={`update-state ${updateState}`} aria-live="polite"><Sparkles size={17} /><span><strong>{updateState === "available" ? `ESE Studio ${pendingUpdate?.version}` : updateState === "downloading" ? "Installing update" : updateState === "current" ? "You’re up to date" : updateState === "error" ? "Couldn’t update" : updateState === "checking" ? "Checking for updates" : "Stable release channel"}</strong>{updateDetail}</span></div>
+                <div className="panel-heading"><div><h2>Updates</h2><p>{updateState === "manual" ? "Install a matching release package to update Studio and its bundled runtime." : "Signed updates replace Studio and the bundled ESE runtime together."}</p></div><span className="version-badge">v{appVersion}</span></div>
+                <div className={`update-state ${updateState}`} aria-live="polite"><Sparkles size={17} /><span><strong>{updateState === "available" ? `ESE Studio ${pendingUpdate?.version}` : updateState === "downloading" ? "Installing update" : updateState === "current" ? "You’re up to date" : updateState === "manual" ? "Manual updates" : updateState === "error" ? "Couldn’t update" : updateState === "checking" ? "Checking for updates" : "Stable release channel"}</strong>{updateDetail}</span></div>
                 {updateState === "error" && <button className="report-error error-card-action" onClick={() => void reportError("updater", updateDetail)}><Bug size={13} />Report error</button>}
                 {updateState === "downloading" && <><div className="progress-track" role="progressbar" aria-label="Update download" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(updateProgress)}><span style={{ width: `${Math.max(3, updateProgress)}%` }} /></div><div className="progress-meta"><span>Downloading and verifying</span><span>{updateProgress ? `${Math.round(updateProgress)}%` : "Preparing…"}</span></div></>}
-                <button className={updateState === "available" ? "primary wide update-action" : "wide update-action"} onClick={() => void (updateState === "available" ? installUpdate() : checkForUpdate())} disabled={!native || updateState === "checking" || updateState === "downloading"}>{updateState === "available" ? <><Download size={14} />Download, install & restart</> : <><RefreshCw size={14} className={updateState === "checking" ? "spin" : ""} />{updateState === "checking" ? "Checking…" : "Check for updates"}</>}</button>
+                <button className={updateState === "available" ? "primary wide update-action" : "wide update-action"} onClick={() => void (updateState === "available" ? installUpdate() : checkForUpdate())} disabled={!native || updateState === "checking" || updateState === "downloading" || updateState === "manual"}>{updateState === "manual" ? "Use your package installer" : updateState === "available" ? <><Download size={14} />Download, install & restart</> : <><RefreshCw size={14} className={updateState === "checking" ? "spin" : ""} />{updateState === "checking" ? "Checking…" : "Check for updates"}</>}</button>
               </section>
               <section className="panel settings-about">
                 <div className="panel-heading"><div><h2>About ESE Studio</h2><p>{snapshot.platform === "windows" ? "Windows" : snapshot.platform === "linux" ? "Linux" : snapshot.platform} control center for Expert Streaming Engine · v{appVersion}</p></div></div>
