@@ -4555,9 +4555,6 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
             fprintf(stderr, "%s: error: resource planning failed: %s\n", __func__, error.c_str());
             return iparams;
         }
-        const std::string json_plan = common_resource_plan_json(resource_plan);
-        params.resolved_resource_plan_json = json_plan;
-        fprintf(stderr, "resource_plan: %s\n", json_plan.c_str());
     }
 
     auto mparams = common_model_params_to_llama(params);
@@ -4589,12 +4586,37 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         if (unweighted > resource_plan.ram_planned_bytes) { llama_free_model(model); return iparams; }
         host_limits.weights_reservation_bytes = resource_plan.ram_planned_bytes-unweighted;
     }
-    llama_context * lctx = llama_init_from_model_with_host_limits(model, cparams,
-            host_limits.capacity_bytes ? &host_limits : nullptr);
+    struct host_plan_state {
+        common_resource_plan & plan;
+        gpt_params & params;
+        std::string error;
+    } host_plan = {resource_plan, params, {}};
+    const auto finalize_host_plan = [](const llama_context_host_requirements * required,
+            llama_context_host_limits * limits, void * data) -> bool {
+        auto & state = *static_cast<host_plan_state *>(data);
+        if (!common_resource_plan_reserve_host_context(state.plan, *required, state.error)) return false;
+        const auto & plan = state.plan;
+        limits->fixed_reservation_bytes = plan.host_graph_metadata_bytes + plan.host_context_metadata_bytes;
+        limits->ple_cache_reservation_bytes = plan.qwen4exp_ple_ram_bytes;
+        limits->other_reservation_bytes = plan.expert_ram_bytes + plan.aux_ram_bytes + plan.io_staging_bytes;
+        limits->weights_reservation_bytes = plan.ram_planned_bytes-limits->fixed_reservation_bytes-
+            limits->ple_cache_reservation_bytes-limits->other_reservation_bytes;
+        state.params.cache_ram_mib = int32_t(plan.aux_ram_bytes/(1024ULL*1024ULL));
+        return true;
+    };
+    llama_context * lctx = host_limits.capacity_bytes
+        ? llama_init_from_model_with_host_planner(model, cparams, &host_limits, finalize_host_plan, &host_plan)
+        : llama_init_from_model(model, cparams);
     if (lctx == NULL) {
+        if (!host_plan.error.empty()) fprintf(stderr, "resource planning failed: %s\n", host_plan.error.c_str());
         fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, params.model.c_str());
         llama_free_model(model);
         return iparams;
+    }
+
+    if (!params.memory_policy.empty()) {
+        params.resolved_resource_plan_json = common_resource_plan_json(resource_plan);
+        fprintf(stderr, "resource_plan: %s\n", params.resolved_resource_plan_json.c_str());
     }
 
     for (auto [op, on_off] : params.offload_policy) {

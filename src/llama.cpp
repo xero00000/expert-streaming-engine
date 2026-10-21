@@ -1541,7 +1541,8 @@ static bool llama_resource_get_memory_pools_impl(const llama_context * ctx,
         llama_resource_memory_pool * pools, uint32_t capacity, uint32_t * count);
 static bool llama_kv_tracked_metadata(const llama_kv_cache & cache, uint64_t cells, uint64_t & bytes);
 static bool llama_host_preflight_context(llama_context & ctx, const llama_context_params & params,
-        ggml_type type_k, ggml_type type_v, uint32_t kv_size);
+        ggml_type type_k, ggml_type type_v, uint32_t kv_size,
+        llama_context_host_planner planner, void * planner_data);
 
 static bool llama_host_control(const llama_context & ctx, llama_host_memory_control & result) {
     std::lock_guard<std::mutex> lock(llama_host_memory_mutex);
@@ -9665,7 +9666,8 @@ static void llama_repack_up_gate_exps(llama_context & lctx) {
 static struct llama_context * llama_init_from_model(
                  struct llama_model * model,
         struct llama_context_params   params,
-        const llama_context_host_limits * host_limits) {
+        const llama_context_host_limits * host_limits,
+        llama_context_host_planner planner, void * planner_data) {
 
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
@@ -10290,7 +10292,7 @@ static struct llama_context * llama_init_from_model(
         }
         ctx->backends.push_back(ctx->backend_cpu);
 
-        if (!llama_host_preflight_context(*ctx, params, type_k, type_v, kv_size)) {
+        if (!llama_host_preflight_context(*ctx, params, type_k, type_v, kv_size, planner, planner_data)) {
             LLAMA_LOG_ERROR("%s: tracked host context preparation exceeds its budget\n", __func__);
             return nullptr;
         }
@@ -10651,6 +10653,12 @@ struct llama_context * llama_init_from_model(llama_model * model, llama_context_
 }
 struct llama_context * llama_init_from_model_with_host_limits(llama_model * model,
         llama_context_params params, const llama_context_host_limits * limits) {
+    return llama_init_from_model_with_host_planner(model, params, limits, nullptr, nullptr);
+}
+struct llama_context * llama_init_from_model_with_host_planner(llama_model * model,
+        llama_context_params params, const llama_context_host_limits * limits,
+        llama_context_host_planner planner, void * planner_data) {
+    if (planner && (!limits || !limits->capacity_bytes)) return nullptr;
     if (limits && limits->capacity_bytes) {
         uint64_t reserved = 0;
         for (uint64_t value : {limits->weights_reservation_bytes, limits->ple_cache_reservation_bytes,
@@ -10660,7 +10668,7 @@ struct llama_context * llama_init_from_model_with_host_limits(llama_model * mode
         }
         if (reserved > limits->capacity_bytes) return nullptr;
     }
-    try { return llama_init_from_model(model, params, limits); }
+    try { return llama_init_from_model(model, params, limits, planner, planner_data); }
     catch (const std::exception & error) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
     } catch (...) { LLAMA_LOG_ERROR("%s: context initialization failed\n", __func__); }
@@ -12394,7 +12402,8 @@ static bool llama_kv_tracked_metadata(const llama_kv_cache & cache, uint64_t cel
 }
 
 static bool llama_host_preflight_context(llama_context & ctx, const llama_context_params & params,
-        ggml_type type_k, ggml_type type_v, uint32_t kv_size) {
+        ggml_type type_k, ggml_type type_v, uint32_t kv_size,
+        llama_context_host_planner planner, void * planner_data) {
     llama_host_memory_control control;
     if (!llama_host_control(ctx, control)) return true;
     try {
@@ -12427,6 +12436,37 @@ static bool llama_host_preflight_context(llama_context & ctx, const llama_contex
         const uint64_t output = (logits+embeddings)*outputs*sizeof(float);
         const uint64_t ids = uint64_t(normalized.n_batch)*sizeof(int32_t);
         if (ids > UINT64_MAX-metadata || output > UINT64_MAX-(metadata+ids)) return false;
+        if (planner) {
+            // Use the same native preparation and tracked inventory as admission,
+            // after placement and context normalization are known. No optional
+            // application cache has been allocated at this point.
+            llama_context_host_requirements required = {0, 0, metadata+ids+output, kv};
+            uint32_t count = 0;
+            if (!llama_resource_get_memory_pools_impl(&ctx, nullptr, 0, &count)) return false;
+            std::vector<llama_resource_memory_pool> pools(count);
+            if (!llama_resource_get_memory_pools_impl(&ctx, pools.data(), count, &count)) return false;
+            for (const auto & pool : pools) {
+                if (pool.backend_id != -1 || pool.category == LLAMA_RESOURCE_MEMORY_MAPPED_WEIGHTS) continue;
+                uint64_t * value = &required.fixed_bytes;
+                if (pool.category == LLAMA_RESOURCE_MEMORY_WEIGHTS) value = &required.weights_bytes;
+                else if (pool.category == LLAMA_RESOURCE_MEMORY_PLE_CACHE) value = &required.ple_cache_bytes;
+                else if (pool.category == LLAMA_RESOURCE_MEMORY_KV || pool.category == LLAMA_RESOURCE_MEMORY_KV_TRANSACTION)
+                    value = &required.kv_bytes;
+                if (pool.bytes > UINT64_MAX-*value) return false;
+                *value += pool.bytes;
+            }
+            auto revised = control.limits;
+            if (!planner(&required, &revised, planner_data) || revised.capacity_bytes != control.limits.capacity_bytes) return false;
+            uint64_t reserved = 0;
+            for (uint64_t value : {revised.weights_reservation_bytes, revised.ple_cache_reservation_bytes,
+                    revised.other_reservation_bytes, revised.fixed_reservation_bytes}) {
+                if (value > UINT64_MAX-reserved) return false;
+                reserved += value;
+            }
+            if (reserved > revised.capacity_bytes) return false;
+            std::lock_guard<std::mutex> lock(llama_host_memory_mutex);
+            llama_host_memory_controls.at(&ctx).limits = revised;
+        }
         uint64_t total = 0;
         return llama_host_projected_memory(ctx, kv, metadata+ids+output, false, total);
     } catch (...) { return false; }

@@ -139,7 +139,14 @@ struct common_resource_plan {
     bool kv_native_sizing = false;
     std::function<uint64_t(uint32_t)> kv_bytes_for_context;
     uint64_t host_graph_metadata_bytes = 0;
+    // Native model/context/KV bookkeeping and initial output storage beyond graph metadata.
+    uint64_t host_context_metadata_bytes = 0;
 };
+
+// Finalize optional host cache capacity from native startup requirements.
+// Failure leaves the plan unchanged; auxiliary cache capacity uses whole MiB.
+bool common_resource_plan_reserve_host_context(common_resource_plan & plan,
+        const llama_context_host_requirements & required, std::string & error);
 
 struct common_resource_transition_stats {
     uint64_t attempts = 0;

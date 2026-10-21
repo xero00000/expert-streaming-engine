@@ -676,6 +676,24 @@ extern "C" {
             struct llama_context_params params,
             const struct llama_context_host_limits * limits);
 
+    // Called once with native startup requirements, before allocating KV,
+    // outputs or computation graphs. May resize application reservations;
+    // the original capacity remains an immutable ceiling. Returning false
+    // rejects initialization. The ordinary admission checks still apply.
+    struct llama_context_host_requirements {
+        uint64_t weights_bytes;
+        uint64_t ple_cache_bytes;
+        uint64_t fixed_bytes;
+        uint64_t kv_bytes;
+    };
+    typedef bool (*llama_context_host_planner)(
+            const struct llama_context_host_requirements * requirements,
+            struct llama_context_host_limits * limits, void * user_data);
+    LLAMA_API struct llama_context * llama_init_from_model_with_host_planner(
+            struct llama_model * model, struct llama_context_params params,
+            const struct llama_context_host_limits * limits,
+            llama_context_host_planner planner, void * user_data);
+
     LLAMA_API void llama_set_offload_policy(struct llama_context * lctx, int op, bool on_or_off);
 
     // Frees all allocated memory

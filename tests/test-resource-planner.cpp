@@ -1203,6 +1203,41 @@ void test_gpu_cache_preparation_preserves_host_ram_budget() {
     REQUIRE(error.find("combined RAM")!=std::string::npos);
 }
 
+void test_native_host_context_reservation() {
+    common_resource_plan original;
+    original.ram_capacity_bytes = 16*MiB;
+    original.ram_planned_bytes = 16*MiB;
+    original.host_graph_metadata_bytes = 2*MiB;
+    original.aux_ram_bytes = 10*MiB;
+    original.devices.push_back({0});
+    llama_context_host_requirements required = {4*MiB, 0, 3*MiB+123, 0};
+    std::string error;
+    auto plan = original;
+    REQUIRE(common_resource_plan_reserve_host_context(plan, required, error));
+    REQUIRE(plan.host_context_metadata_bytes == MiB+123);
+    REQUIRE(plan.aux_ram_bytes == 8*MiB);
+    REQUIRE(plan.ram_planned_bytes == 15*MiB+123);
+    REQUIRE(nlohmann::json::parse(common_resource_plan_json(plan)).at("host_context_metadata_bytes") == MiB+123);
+    // Admission must account for host KV even when the plan has only GPU rows.
+    required.kv_bytes = MiB;
+    REQUIRE(common_resource_plan_reserve_host_context(plan, required, error));
+    REQUIRE(plan.aux_ram_bytes == 7*MiB);
+    for (int delta : {-1, 0, 1}) {
+        plan = original;
+        plan.ram_capacity_bytes = 8*MiB+123+delta;
+        const auto before = common_resource_plan_json(plan);
+        const bool accepted = common_resource_plan_reserve_host_context(plan, required, error);
+        REQUIRE(accepted == (delta >= 0));
+        if (accepted) REQUIRE(plan.aux_ram_bytes == 0 && plan.ram_planned_bytes == 7*MiB+123);
+        else REQUIRE(common_resource_plan_json(plan) == before);
+    }
+    plan = original;
+    required.fixed_bytes = UINT64_MAX;
+    REQUIRE(!common_resource_plan_reserve_host_context(plan, required, error));
+    REQUIRE(common_resource_plan_json(plan) == common_resource_plan_json(original));
+    std::puts("PASS: native context reservations, whole-MiB auxiliary capacity, host KV, exact boundaries and atomic rejection");
+}
+
 void test_host_graph_metadata_reservation() {
     common_resource_plan_input input;
     input.requested_policy = COMMON_MEMORY_POLICY_CACHE;
@@ -1241,6 +1276,10 @@ void test_host_graph_metadata_reservation() {
     auto changed = plan;
     changed.host_graph_metadata_bytes++;
     const auto previous = common_resource_preparation_peak_json(report);
+    REQUIRE(!common_resource_rebalance_preparation_peak(plan, changed, report, error, false, false, &host));
+    REQUIRE(common_resource_preparation_peak_json(report) == previous);
+    changed = plan;
+    changed.host_context_metadata_bytes++;
     REQUIRE(!common_resource_rebalance_preparation_peak(plan, changed, report, error, false, false, &host));
     REQUIRE(common_resource_preparation_peak_json(report) == previous);
     input.host_graph_metadata_bytes = UINT64_MAX;
@@ -1305,6 +1344,7 @@ int main(int argc, char ** argv) {
     test_tracked_host_memory_preparation();
     test_native_kv_preparation_receipt();
     test_host_graph_metadata_reservation();
+    test_native_host_context_reservation();
     std::puts("PASS: resource planning including fixed/stepped native cache forecasts");
     return 0;
     } catch (const std::exception & error) {

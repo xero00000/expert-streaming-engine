@@ -574,6 +574,40 @@ static void run_host_admission(const fixture & file) {
     std::printf("host quota: steady=%llu byte boundaries, reservation faults, retained output rejection and fitting growth pass\n", (unsigned long long)steady);
 }
 
+static void run_host_planner(const fixture & file) {
+    auto mp = llama_model_default_params();
+    mp.devices = ""; mp.n_gpu_layers = 0; mp.split_mode = LLAMA_SPLIT_MODE_NONE; mp.use_mmap = false;
+    std::unique_ptr<llama_model, decltype(&llama_free_model)> model(llama_model_load_from_file(file.path.string().c_str(), mp), llama_free_model);
+    check(bool(model), "host planner model load");
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 512; cp.n_batch = cp.n_ubatch = 16; cp.n_seq_max = 1;
+    cp.n_threads = cp.n_threads_batch = 1; cp.flash_attn = true; cp.type_k = cp.type_v = GGML_TYPE_F16;
+    struct state { int calls = 0; int mode = 0; llama_context_host_requirements required = {}; } data;
+    const auto planner = [](const llama_context_host_requirements * required, llama_context_host_limits * limits, void * opaque) {
+        auto & data = *static_cast<state *>(opaque);
+        ++data.calls; data.required = *required;
+        // Leave the ordinary admission path to reject a one-byte overcommit.
+        limits->weights_reservation_bytes = required->weights_bytes;
+        limits->fixed_reservation_bytes = required->fixed_bytes;
+        limits->other_reservation_bytes = limits->capacity_bytes-required->weights_bytes-limits->fixed_reservation_bytes-required->kv_bytes-(8ULL<<20);
+        if (data.mode == 1) limits->other_reservation_bytes += (8ULL<<20)+1;
+        if (data.mode == 2) ++limits->capacity_bytes;
+        return data.mode != 3;
+    };
+    const llama_context_host_limits limits = {1ULL<<30, 0, 0, (1ULL<<30)-1, 0};
+    for (int mode : {0, 1, 2, 3}) {
+        data = {}; data.mode = mode;
+        std::unique_ptr<llama_context, decltype(&llama_free)> ctx(
+            llama_init_from_model_with_host_planner(model.get(), cp, &limits, planner, &data), llama_free);
+        check(data.calls == 1, "host planner was not called exactly once");
+        check(data.required.fixed_bytes > 0 && data.required.weights_bytes > 0 && data.required.kv_bytes > 0,
+            "host planner omitted native requirements");
+        check(bool(ctx) == (mode == 0), "host planner admission/capacity/rejection boundary changed");
+        if (ctx) check(!decode(ctx.get(), {3}, 0, 0).empty(), "host planner fitting inference failed");
+    }
+    std::puts("host planner: native receipt, fitting inference, one-byte excess, immutable capacity and explicit rejection pass");
+}
+
 static void run_host_kv_admission(const fixture & file) {
     auto mp = llama_model_default_params();
     mp.devices = ""; mp.n_gpu_layers = 0; mp.split_mode = LLAMA_SPLIT_MODE_NONE; mp.use_mmap = false;
@@ -649,6 +683,7 @@ int main(int argc, char ** argv) {
         run(file, 1, true, true);
         run_memory_recheck(file);
         run_host_admission(file);
+        run_host_planner(file);
         run_host_kv_admission(file);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "SERVER RECOVERY ERROR: %s\n", error.what());

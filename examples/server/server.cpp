@@ -612,6 +612,7 @@ static bool server_parse_resource_plan(
         plan.ram_capacity_bytes = value.at("ram_capacity_bytes").get<uint64_t>();
         plan.ram_planned_bytes = value.at("ram_planned_bytes").get<uint64_t>();
         plan.host_graph_metadata_bytes = value.value("host_graph_metadata_bytes", uint64_t(0));
+        plan.host_context_metadata_bytes = value.value("host_context_metadata_bytes", uint64_t(0));
         plan.expert_ram_bytes = value.at("expert_ram_bytes").get<uint64_t>();
         plan.qwen4exp_ple_ram_bytes = value.value("qwen4exp_ple_ram_bytes", uint64_t(0));
         plan.aux_ram_bytes = value.at("aux_ram_bytes").get<uint64_t>();

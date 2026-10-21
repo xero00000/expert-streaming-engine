@@ -347,3 +347,19 @@ actual capacity/rounding contracts; add a reproducing startup/boundary check;
 then repeat the strict-budget GPU startup and affected recovery checks. Do not
 weaken native host admission. Full-model, physical driver OOM and task 4 onward
 remain unqualified. The performance/publication hold is unchanged.
+
+
+### Task 3 continuation — native host startup reservation repair
+
+The automatic GPU failure is being repaired by reconciling the provisional
+plan with the native preflight receipt after model placement/context
+normalization, before KV/output/graph payload allocation. The finalized plan
+reserves model/context/KV bookkeeping and initial outputs separately from
+graph metadata, reduces optional prompt-cache capacity to fitting whole MiB,
+and retains the reservation in immutable runtime rebalance accounting.
+The RAM ceiling and ordinary native admission checks remain enforced.
+
+Focused CPU planner/recovery regressions and automatic 4 GiB CPU startup,
+two cold inference requests and exact probability replay pass in a working
+build. Final committed-source CPU/CUDA/sanitizer checks and the original GPU
+reproducer are next; task 3 remains open until those results are recorded.
