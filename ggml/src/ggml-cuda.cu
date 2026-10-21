@@ -5581,10 +5581,12 @@ static ggml_cuda_graph_tensor_layout cuda_graph_tensor_layout(const ggml_tensor 
     return layout;
 }
 
-static bool cuda_graph_same_layout(const ggml_cuda_graph_tensor_layout & a, const ggml_cuda_graph_tensor_layout & b) {
-    if (a.present != b.present || a.type != b.type || a.buffer_type != b.buffer_type) return false;
+static bool cuda_graph_matches_layout(const ggml_cuda_graph_tensor_layout & old, const ggml_tensor * tensor) {
+    if (!tensor) return !old.present;
+    const auto buffer = tensor->buffer ? tensor->buffer : tensor->view_src ? tensor->view_src->buffer : nullptr;
+    if (!old.present || old.type != tensor->type || old.buffer_type != (buffer ? buffer->buft : nullptr)) return false;
     for (int i = 0; i < GGML_MAX_DIMS; ++i)
-        if (a.ne[i] != b.ne[i] || a.nb[i] != b.nb[i]) return false;
+        if (old.ne[i] != tensor->ne[i] || old.nb[i] != tensor->nb[i]) return false;
     return true;
 }
 
@@ -5596,7 +5598,10 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
         cuda_graph_update_required = true;
     }
 
-    std::vector<uint64_t> bindings;
+    // Reuse temporary capacity across graphs on this host thread. Allocation
+    // identities are still collected and checked in full on every call.
+    static thread_local std::vector<uint64_t> bindings;
+    bindings.clear();
     const auto remember_buffer = [&](const ggml_tensor * tensor) {
         if (!tensor || !tensor->buffer || !ggml_backend_buffer_is_cuda(tensor->buffer)) return;
         const auto * context = static_cast<const ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
@@ -5615,7 +5620,7 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
         std::lock_guard<std::mutex> lock(ggml_cuda_graph_binding_mutex);
         auto & previous = ggml_cuda_graph_bindings[graph];
         bindings_changed = previous != bindings;
-        previous = std::move(bindings);
+        if (bindings_changed) previous = bindings;
         auto & layouts = ggml_cuda_graph_layouts[graph];
         if (layouts.size() != size_t(cgraph->n_nodes)) {
             layout_changed = true;
@@ -5624,13 +5629,15 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const auto * node = cgraph->nodes[i];
             auto & old = layouts[i];
-            const auto output = cuda_graph_tensor_layout(node);
-            layout_changed |= !cuda_graph_same_layout(old.output, output);
-            old.output = output;
+            if (!cuda_graph_matches_layout(old.output, node)) {
+                layout_changed = true;
+                old.output = cuda_graph_tensor_layout(node);
+            }
             for (int j = 0; j < GGML_MAX_SRC; ++j) {
-                const auto source = cuda_graph_tensor_layout(node->src[j]);
-                layout_changed |= !cuda_graph_same_layout(old.sources[j], source);
-                old.sources[j] = source;
+                if (!cuda_graph_matches_layout(old.sources[j], node->src[j])) {
+                    layout_changed = true;
+                    old.sources[j] = cuda_graph_tensor_layout(node->src[j]);
+                }
             }
             if (i < int(graph->ggml_graph_properties.size()) &&
                     node->op != graph->ggml_graph_properties[i].node_op) layout_changed = true;
@@ -5703,7 +5710,10 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
             }
             cuda_graph_update_required = true;
         }
-        set_ggml_graph_node_properties(cgraph->nodes[i], &graph->ggml_graph_properties[i]);
+        // Matching properties need no rewrite. Copy/view destination pointer
+        // changes retain their existing per-replay indirection above.
+        if (cuda_graph_update_required)
+            set_ggml_graph_node_properties(cgraph->nodes[i], &graph->ggml_graph_properties[i]);
     }
 
     return cuda_graph_update_required;

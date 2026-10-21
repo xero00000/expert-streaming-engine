@@ -1456,3 +1456,70 @@ is claimed. CPU Q2/hybrid/all-hit options remain off. Evidence is retained as
 `bf16-vector-*` and `workload-1m-bf16-vector-passive4`. The 41.2 / 41.84 tok/s
 thresholds remain unmet. GPU conversion optimization alone does not remove
 the host scheduling/transfer boundaries identified in the trace.
+
+
+### Task 4 — existing autotuner and launcher layer-boundary diagnostics
+
+The existing `ESE_CUDA_EXPLICIT_AUTOTUNE=1` option chooses 1/2/4 warps for
+small explicit BF16 projections after its unchanged exactness checks.
+`workload-1m-bf16-vector-autotune-passive4` completes at 13.435 / 18.694 tok/s
+with both original native hashes unchanged. This is only a 1.5% repeat gain
+in one start/two requests, not qualification or a resolved bottleneck. A
+separate strict model control is still required before adopting the option
+in a selected profile.
+
+`workload-1m-resident14-bf16-vector-passive4` tests ratios 6,8,35 with the CPU
+expert override beginning at layer 14, approaching the selected Strata
+6/14 boundaries. CUDA1 model storage increases from 5,117.28 to 5,812.25 MiB
+and CUDA2 decreases from 2,430.37 to 2,310.41 MiB; startup and both requests
+finish without exhausting the existing reserves. It reaches 14.319 /
+18.241 tok/s, below the preceding 13-resident-layer diagnostic. Its two
+hashes agree with each other but differ from the 13-layer native output.
+It is not promoted: neither a speed benefit nor native arithmetic parity
+for the changed placement is established. No launcher file is changed.
+
+`workload-1m-bf16-vector-passive1` retains 16 prompt threads but uses one
+decode CPU thread, after packed host KV/gathers reduce host work. It completes
+at 14.340 / 18.901 tok/s with both original native hashes unchanged. The
+repeat is 2.6% above the four-thread vector diagnostic; this is one start/two
+requests, not qualification. A short read-only SQLite summary of an older
+trace ran during this diagnostic's first prompt; first-prompt latency is
+therefore not a clean comparison. It did not overlap either timed decode
+window or the repeat prompt. Further tracing uses a separate run.
+
+
+### Task 4 — fresh CPU/GPU trace and graph-validation allocation work
+
+`nsight-bf16-vector-fullprompt-cpu` traces three frozen 552-token requests
+with 32 generated tokens, one decode CPU thread and the latest packed-Q4 /
+vector-BF16 runtime. PLE uses mmap to avoid the previously observed sampler /
+io_uring allocation failure; this is not the async benchmark profile. The
+approximate final decode window is 2,077 ms and contains 31 GPU decode steps.
+API and GPU times overlap and must not be added as elapsed time. The window
+has 9,145 stream synchronizations, 3,782 graph launches, 17,922 H2D copies
+(5.838 GB), and 2,416 D2H copies (65 MB). Summed GPU BF16 conversion is
+234 ms; small explicit BF16 projections 152 ms; Q2 down projections 96 ms.
+The main CUDA host thread has 1,857 CPU samples; graph validation owns 61
+self samples and route preparation 29. Full SQL summaries, raw trace and
+CPU samples are retained. Traced throughput is excluded from qualification.
+
+Graph validation now compares saved layouts directly with current tensor
+metadata and refreshes snapshots only when they change. Temporary allocation
+ID vector capacity is reused per host thread, and the saved binding vector
+is copied only on changes. Every allocation ID, source presence/type/buffer,
+shape/stride, pointer, precision and operation parameter check remains in
+place. Stable copy/view destination updates retain their existing indirection.
+No graph-validity or eviction guard is disabled.
+
+Graph leaf layout/type/stride and pointer mutation tests, packed Q4 copy /
+gather replay, and actual IQ2_XXS/IQ1_M plus Q2 precision-mode switch fixtures
+pass on each of the three cards (12 commands). The full expert-cache suite
+also passes. A separate ubatch-128 / 1M 33-token model control includes the
+existing projection autotuner and one decode thread and matches all
+8,194,560 strict-reference logits, routes and IDs bitwise. As before, this
+F32 control does not qualify native quantized expert arithmetic.
+
+The isolated GPU-only `workload-1m-graph-guard-passive1` completes at 14.398 /
+18.755 tok/s with both original native output hashes unchanged, versus the
+preceding 14.340 / 18.901. Treat the full-workload timing as neutral: no
+end-to-end speedup is claimed. Task 4 and the 80% speed gate remain open.
