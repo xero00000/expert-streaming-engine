@@ -122,7 +122,7 @@ separate. The speed acceptance does not lift the publication hold.
 Acceptance: sustained runs without corruption, silent truncation or progressive
 memory growth, with exact commands and failed trials preserved.
 
-### 6. Rebuild and install the final packages — IN PROGRESS (SIX LINUX PACKAGES BUILT)
+### 6. Rebuild and install the final packages — LINUX CHECKS PASS; WINDOWS PENDING
 
 - Rebuild all eight packages from the recorded final source.
 - Test Linux CPU/CUDA installation, dependencies, startup and inference.
@@ -1753,3 +1753,54 @@ original Win10 qcow2 is not directly user-readable but is managed through the
 active `images` libvirt pool. If used, test an isolated overlay rather than
 modifying the original VM/disk. Do not start the VR VM or detach the desktop
 RTX 3080. All remaining inference checks keep short explicit time budgets.
+
+
+### Task 6 — bounded Linux installation and packaged inference pass
+
+All six frozen-source Linux candidates pass extraction, version/dependency,
+license, desktop-entry and ELF dependency checks. CPU packages require no NVIDIA
+devices or CUDA libraries. CUDA packages contain the four pinned vendor payloads
+with their original hashes and exclude NVIDIA driver libraries. All **24 project
+native payloads** match the corresponding frozen unpackaged builds after the
+declared `$ORIGIN` RPATH relocation.
+
+Actually installed both DEBs in separate Ubuntu 24.04 test containers and both
+RPMs in separate Fedora 44 test containers. Package-manager verification, native
+payload hashes, runtime variant markers, launcher doctor and native version all
+pass. The Fedora base already contains a different candidate with version
+0.2.1; the initial refusal is retained. Reinstalling with `--replacepkgs` installs
+the current artifact, and its payload hashes and `rpm -V` then pass. An initial
+DEB supervisor PATH omission also remains recorded; restoring the standard sbin
+paths resolves it without changing the package.
+
+**25 short inference cases pass** across extracted DEB/RPM/AppImage and installed
+DEB/RPM runtimes: CPU builds without NVIDIA devices; CUDA builds with devices
+hidden and with each of the RTX 3060 Ti, RTX 2080 SUPER and RTX 3080 selected
+individually by UUID. Each case checks the 12-token prompt receipt, one generated
+token, exact text and top-32 probabilities against its corresponding unpackaged
+build, native/vendor library paths, owned GPU identity, resource enumeration,
+unsupported resident rebalance rejection and normal server shutdown. These are
+package-preservation checks, not full-vocabulary numerical or speed qualification.
+
+The first inference attempt referenced an archived 32-vocabulary toy while
+loading the current 32,000-vocabulary TinyMoE fixture. Preserve that failed
+harness attempt. Corrected references use the exact current model SHA-256
+`c559eaabd8a56589b8abe09d678fbb56c673a3dcc28907e193d27b25ecd60684`,
+the frozen source and the matching CPU/CUDA unpackaged runtime. Exact output
+assertions remain unchanged; no numerical tolerance is introduced.
+
+All **six GUI startups** pass as an unprivileged user with isolated XDG data and
+Xvfb displays: actual installed DEB/RPM and actual AppImage for both variants.
+Each renders an ESE Studio window for at least 12 seconds; screenshots are
+retained and representative installed-DEB/AppImage captures visually checked.
+No model server or GUI probe remains running. Inference and GUI probes have
+internal 90/100-second budgets plus outer timeouts below two minutes. No large
+context or sustained throughput run is added.
+
+Evidence: `task6/linux-inspection/linux-acceptance-summary.json`, with per-case
+responses, exact fixture/reference identities, installation logs, GUI captures,
+native hashes and helper provenance. Linux packaging acceptance is complete for
+this short-check scope. Windows MSI/NSIS builds and installation, installed-update
+and failure/recovery trials, and final release preparation remain pending.
+The accepted approximately 19 tok/s scope and production Qwen gate remain as
+previously recorded. No push, tag, hosted CI or publication has occurred.
