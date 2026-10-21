@@ -335,12 +335,37 @@ def main() -> int:
             raise RuntimeError(f"{count}-GPU legacy slot cache did not complete compact staging")
         vram_policy = [
             "--expert-storage-backend", "pread",
-            # TinyMoE uses top-2 routing; 4 MiB yields two full expert slots,
-            # exercising same-route slot protection as well as forced churn.
-            "--expert-vram-cache-mib", "4",
+            # TinyMoE uses top-2 routing. Allow two active triplets plus the
+            # scheduler's complete-triplet padding headroom and route arena.
+            # 4 MiB now leaves only one usable slot and retains CPU placement.
+            "--expert-vram-cache-mib", "6",
             "--expert-vram-reserve-mib", "256",
             "--expert-cache-min-observations", "2",
         ]
+        undersized_policy = vram_policy.copy()
+        undersized_policy[undersized_policy.index("--expert-vram-cache-mib") + 1] = "4"
+        undersized = run_cli(args.cli, args.model, [
+            *common_cache, *undersized_policy, *gpu_common,
+        ], env)
+        require_success(undersized, f"{count}-GPU undersized-cache CPU placement")
+        undersized_total = next(
+            (item for item in undersized["stats"] if item.get("level") == "vram-total"), None
+        )
+        undersized_ram = next(
+            (item for item in undersized["stats"] if item.get("level") == "ram"), None
+        )
+        if (
+            undersized["generated"] != gpu_baseline["generated"]
+            or not undersized_total
+            or any(undersized_total[key] for key in ("admissions", "uploads", "forced_fallbacks"))
+            or not undersized_ram
+            or undersized_ram["peak_resident_bytes"] > undersized_ram["capacity_bytes"]
+            or undersized_ram["peak_staging_used_bytes"] > undersized_ram["staging_capacity_bytes"]
+            or any(undersized_ram[key] for key in (
+                "active_leases", "active_loads", "reserved_bytes", "staging_used_bytes", "failed_loads"
+            ))
+        ):
+            raise RuntimeError(f"{count}-GPU undersized cache did not retain bounded CPU execution")
         non_asserted_cache = [item for item in common_cache if item != "--expert-sidecar-only"]
         compact_safety = run_cli(args.cli, args.model, [
             *non_asserted_cache,
@@ -434,6 +459,12 @@ def main() -> int:
             "gpu_resident_matches_cpu_reference":
                 gpu_resident["generated"] == baseline["generated"],
             "host_active_copy_reference_output": gpu_baseline["generated"],
+            "undersized_cache_cpu_placement": {
+                "capacity_bytes_per_gpu": 4 * 1024 * 1024,
+                "output": undersized["generated"],
+                "total": undersized_total,
+                "ram": undersized_ram,
+            },
             "legacy_slot_cache": {
                 "slots": 4,
                 "output": legacy["generated"],

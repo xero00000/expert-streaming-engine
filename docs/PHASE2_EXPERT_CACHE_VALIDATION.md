@@ -143,6 +143,14 @@ evidence is not ambiguous under CUDA device reordering. It also records the
 Git commit and SHA-256 hashes of the CLI and model. GPU acceptance refuses a
 dirty source tree, so the result identifies the exact candidate under test.
 
+The current TinyMoE churn lane uses 6 MiB per GPU: two usable expert triplets,
+one triplet of allocation headroom and the route arena. The older 4 MiB setting
+leaves only one usable slot after padding headroom and therefore retains the
+CPU expert path for top-2 routing. The runner checks that case separately
+against the CPU-expert placement reference, requiring no GPU admissions or
+uploads and fully drained, bounded RAM leases. It does not compare that CPU
+path's rounding against the fully resident CUDA reference.
+
 The cache uses one dedicated CUDA transfer stream per participating device.
 Upload events make new slots visible to compute; compute-completion events make
 prior slot reads visible to the transfer stream before reuse. Neither edge
