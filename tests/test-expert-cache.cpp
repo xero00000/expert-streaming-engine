@@ -1755,6 +1755,26 @@ void test_cuda_stable_expert_reduction() {
 #endif
 }
 
+void test_cuda_model_quantized_cache_geometry() {
+#ifdef GGML_USE_CUDA
+    if (ggml_backend_cuda_get_device_count() == 0) return;
+    auto * backend = ggml_backend_cuda_init(0, nullptr, nullptr);
+    REQUIRE(backend != nullptr);
+    struct cleanup { ggml_backend_t backend; ~cleanup() { ggml_backend_free(backend); } } free_backend{backend};
+    for (const auto type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K}) {
+        for (const int tokens : {1, 2, 5, 8}) {
+            const auto reference = compute_cuda_padded_experts(backend, type, false, 0, tokens);
+            for (const int count : {17, 64, 97}) {
+                std::cout << "Model quantized cache geometry: type=" << ggml_type_name(type)
+                          << " tokens=" << tokens << " slots=" << count << std::endl;
+                REQUIRE(compute_cuda_padded_experts(backend, type, false, 4096, tokens,
+                        false, false, count, count - 4) == reference);
+            }
+        }
+    }
+#endif
+}
+
 void test_cuda_sparse_quantized_routes() {
 #ifdef GGML_USE_CUDA
     if (ggml_backend_cuda_get_device_count() == 0) return;
@@ -2629,6 +2649,11 @@ int main(int argc, char ** argv) {
             compute_cuda_cache_preflight(true, false, false, false, GGML_TYPE_F16,
                     false, nullptr, 4, false, false, false, false, false, true);
             std::cout << "PASS: strict prefill reserve rejection and exact retry\n";
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--model-quant-geometry-only") == 0) {
+            test_cuda_model_quantized_cache_geometry();
+            std::cout << "PASS: model quantized cache geometry\n";
             return 0;
         }
         test_cpu_router_softmax_replay();

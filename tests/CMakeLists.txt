@@ -391,6 +391,11 @@ if (GGML_EXPERT_CHUNKING AND GGML_IQK_MUL_MAT)
     target_compile_definitions(test-expert-cache PRIVATE ESE_TEST_EXPERT_LEASE_CHUNKING)
 endif()
 llama_test(test-expert-cache)
+if (GGML_CUDA)
+    add_test(NAME test-model-quantized-cache-geometry COMMAND test-expert-cache --model-quant-geometry-only)
+    set_tests_properties(test-model-quantized-cache-geometry PROPERTIES
+        ENVIRONMENT "ESE_CUDA_STABLE_EXPERT_REDUCTION=1" RUN_SERIAL TRUE TIMEOUT 120)
+endif()
 llama_build(test-expert-cache-transaction.cpp)
 
 # Phase 3 transient residency: bounded, failure-atomic module transactions.
