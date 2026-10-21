@@ -108,6 +108,20 @@ struct llama_kv_cache {
 
     std::vector<llama_kv_cell> cells;
 
+    // Ordered Qwen caches count occupied physical cells in used. Stop after
+    // visiting all of them; allocation capacity can be a million cells even
+    // for a short request. Holes and wrapped/restored rows remain visible.
+    uint32_t occupied_end() const {
+        if (!qwen4exp_ordered) return size;
+        uint32_t remaining = used;
+        uint32_t end = 0;
+        while (end < size && remaining > 0) {
+            const auto & cell = cells[end++];
+            if (cell.pos >= 0 && !cell.is_empty()) --remaining;
+        }
+        return end;
+    }
+
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
     std::vector<struct ggml_tensor *> s_l; // per layer recurrent state storage (Qwen3Next)

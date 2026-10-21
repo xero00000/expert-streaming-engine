@@ -515,3 +515,14 @@ The associated commands, failures, raw receipts, library identities and
 checks are under `task4/qwen4exp-iq2-restore/`; the work log records each
 intermediate result. The next full workload is measured separately without
 concurrent compilation or tracing. Publication remains on hold.
+
+
+A subsequent full request with active caches reaches 5.585 tok/s, but repeat
+prefill fails the physical reserve guard after workspace growth; its failed
+report is retained. Reserving additional headroom and fully placing the first
+13 expert layers on the two slower PCIe cards completes both 552/128 requests
+at 7.535 / 8.000 tok/s (23.57 / 25.17 prompt tok/s, 23.44 / 21.94 s TTFT),
+without forced expert fallbacks or sampled process swap. These use opt-in native
+activation arithmetic and remain diagnostics below the unchanged 80% target.
+A separate strict F32-cache placement control is byte identical across all
+8,194,560 logits and 1,584 routes; it does not qualify the native arithmetic.

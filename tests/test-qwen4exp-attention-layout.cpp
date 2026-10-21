@@ -11,6 +11,32 @@ static void require(bool ok, const char * message) {
 
 int main() {
     try {
+        // A physical occupancy bound must retain distant restored/wrapped
+        // rows and shared ownership, while skipping an empty capacity tail.
+        llama_kv_cache occupancy;
+        occupancy.size = 1024;
+        occupancy.cells.resize(occupancy.size);
+        require(occupancy.occupied_end() == 1024, "ordinary cache extent changed");
+        occupancy.qwen4exp_ordered = true;
+        require(occupancy.occupied_end() == 0, "empty ordered extent");
+        occupancy.cells[2].pos = 10;
+        occupancy.cells[2].seq_id.insert(0);
+        occupancy.cells[2].seq_id.insert(1);
+        occupancy.used = 1;
+        require(occupancy.occupied_end() == 3, "shared cell counted twice");
+        occupancy.cells[1023].pos = 4;
+        occupancy.cells[1023].seq_id.insert(0);
+        occupancy.used = 2;
+        require(occupancy.occupied_end() == 1024, "distant restored row omitted");
+        occupancy.cells[2].pos = -1;
+        occupancy.cells[2].seq_id.clear();
+        occupancy.used = 1;
+        require(occupancy.occupied_end() == 1024, "hole hid wrapped row");
+        occupancy.cells[1023].pos = -1;
+        occupancy.cells[1023].seq_id.clear();
+        occupancy.used = 0;
+        require(occupancy.occupied_end() == 0, "cleared ordered extent");
+
         llama_model model{};
         model.arch = LLM_ARCH_LLAMA;
         model.hparams.n_layer = 0;

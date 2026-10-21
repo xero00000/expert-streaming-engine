@@ -70,11 +70,11 @@ Acceptance: required clean builds/checks pass against one recorded source state.
 Acceptance: reproducible correctness and recovery evidence for every claimed
 supported execution path.
 
-### 4. Resolve the performance hold — IN PROGRESS (TARGET: MATCH STRATA)
+### 4. Resolve the performance hold — IN PROGRESS (TARGET: AT LEAST 80% OF STRATA)
 
 The [performance qualification protocol](PERFORMANCE_QUALIFICATION_20261020.md)
-is prepared. The user has set the speed target: **match Strata**. Establish a
-same-machine, same-model reference before applying that target.
+is prepared. The initial speed target was to match Strata; the user later
+set a model-specific minimum of **80% of Strata**, as recorded below.
 
 On 21 October the user clarified that qualification depends on the model and
 requested testing **the Strata profile in the existing launcher**. That profile
@@ -950,3 +950,97 @@ and drains leases at exit. Evidence: `cache-preflight-diagnostic-hi/`,
 `cache-physical-retry-tests-*.log`, `cache-physical-retry-reference33/` and
 private library/source identities. The full-workload retry is a separate
 measurement; the 80% speed requirement remains open.
+
+
+### Task 4 — active caches, repeat reserve failure, and resident placement
+
+- `workload-1m-cache-fixed128` activates all three GPU caches and completes its
+  first 552/128 request at 5.585 tok/s. The second request fails the physical
+  reserve guard (1,459,159,040 bytes free versus 1,468,006,400 required).
+  Subsequent workspace growth consumes headroom beyond initial preflight.
+  Its failed report and first receipt are retained; this is not acceptance.
+- Strata's saved H2D probes identify especially slow first and second GPU
+  links. A diagnostic places all expert weights for layers 0–5 on the 2080
+  SUPER and 6–12 on the 3060 Ti, then stages/caches the remaining 35 layers
+  on the 3080 (`-ts 6,7,36`). A strict F32-cache 33-token placement control
+  matches the all-CPU-expert control bit for bit across 8,194,560 logits,
+  1,584 route records and input IDs. This validates placement for that
+  arithmetic/control only, not native quantized arithmetic or full context.
+- `workload-1m-resident13` uses native quantized expert/projection experiments,
+  bounded initial graph reservation, mixed host attention/GPU recurrent KV,
+  1M Q4 allocation, 128-token microbatches, 1 GiB pinned RAM cache, 2.5 GiB
+  device cache, 1.5 GiB prefill staging and a 1,400 MiB physical reserve.
+  Both 552/128 requests finish cleanly at 7.535 / 8.000 tok/s with exact
+  self replay, zero forced expert fallbacks and zero sampled process swap.
+  Prompt rates are 23.57 / 25.17 tok/s; TTFT is 23.44 / 21.94 seconds.
+  This remains below 41.2 overall / 41.84 repeat tok/s. Routing uses original
+  weights; the opt-in native activation arithmetic remains unqualified
+  against the original-input numerical reference.
+- Runtime counters show 32.32 GB of decode expert uploads across two requests
+  and 9.20 seconds of RAM-cache storage reads overall, motivating direct
+  mapped-source and grouped CPU/GPU execution diagnostics. The first direct
+  mapped-source attempt rejects startup because load workers require a RAM
+  cache. It is preserved separately and rerun with workers explicitly zero.
+
+Commands, immutable library identities, strict placement comparisons, raw SSE,
+resources and failed trials are retained beneath
+`task4/qwen4exp-iq2-restore/`. Original launcher/model files and publication hold
+remain unchanged. No current result meets the speed requirement.
+
+
+### Task 4 — mapped sources, CPU waits and recurrent projection policy
+
+- Direct mapped expert sources, without the additional bounded RAM-cache copy,
+  complete the same resident-13 552/128 diagnostic at 9.942 / 10.146 tok/s and
+  17.59 / 15.67 seconds TTFT. The harness `resident` label here suppresses its
+  RAM-lease defaults only: the final 35 layers still use a 2.5 GiB GPU cache
+  and mapped host tensors, so this is not full model residency.
+- A separate short-request Nsight trace and CPU sampling run identify CPU
+  OpenMP barrier spinning, CPU matrix operations and full-capacity KV metadata
+  scans. Profiling is excluded from performance results. CPU sampling with
+  explicit io_uring PLE initially fails source allocation; a retained second
+  diagnostic uses PLE mmap and succeeds. This I/O change is diagnostic only.
+- Native packed projection policy was being overwritten after construction
+  in recurrent Q/K/V, gate and output projections. The opt-in policy now
+  survives those overrides; BF16/F16/F32 weights and default strict arithmetic
+  keep their previous precision. The strict 4K/F32 placement control remains
+  bit identical across 8,194,560 logits, 1,584 routes and all input IDs.
+- With that correction, one decode worker completes 552/128 twice at 7.917 /
+  8.087 tok/s (20.79 / 9.40 seconds TTFT). Four decode workers, 16 batch
+  workers, `OMP_WAIT_POLICY=PASSIVE` and `GOMP_SPINCOUNT=0` measure 10.664 /
+  10.737 tok/s (11.27 / 9.50 seconds TTFT). These combined changes are
+  configuration diagnostics; no isolated causal speedup is claimed for the
+  recurrent arithmetic change. Both remain below the agreed thresholds.
+- New ordered-Qwen metadata bounds stop after visiting all occupied physical
+  cells, retaining holes, shared owners and distant/wrapped/restored rows.
+  Slot chronology, maximum extent, sequence position queries and token counts
+  avoid scanning the empty tail of a 1M allocation for each short decode.
+  Ordinary architectures keep their existing scan extent. Three focused
+  schema/cache-sizing/attention-layout CTests pass, including new occupancy
+  cases. The strict Q4/1M 33-token replay also remains bit identical across all
+  8,194,560 logits, 1,584 routes and IDs; full workload and lifecycle checks
+  follow before this change is considered complete.
+
+`native-delta-runtime-identity.json` and `occupied-kv-runtime-identity.json`
+record immutable private libraries and source diffs; each workload preserves
+its exact argv/environment and raw receipts. The native arithmetic and bounded
+initial graph reservation remain explicit experiments. Neither 1M allocation
+nor a short exact replay qualifies filled-1M context. Publication remains held.
+
+
+The occupied-cell workload completes at 11.799 / 11.787 tok/s with exactly the
+same 128-token output hashes as the preceding passive-four-worker runtime.
+Repeat TTFT is 9.10 seconds. The additional strict lifecycle control passes
+shift, divide and partial-shift full snapshots and sequence migration exactly.
+Its shared-prefix transform check fails because the other sequence snapshot
+changes. The identical command on the immutable pre-optimization runtime
+fails at the same check, establishing an existing experimental-Qwen lifecycle
+blocker rather than a regression introduced by occupied-cell scans. Both
+failures are retained (`occupied-kv-position-lifecycle` and
+`pre-occupied-kv-position-lifecycle`); shared-prefix isolation is not qualified.
+
+A one-token scheduler dump identifies host K/V gathers pulling ordinary
+KQ/softmax/VQ attention onto the CPU. The next opt-in experiment explicitly
+places those computations on each layer GPU while retaining bounded host row
+gathers. It has not yet been built or qualified in this entry. All speed and
+publication holds remain active.

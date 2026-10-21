@@ -2958,7 +2958,9 @@ static bool llama_kv_cache_find_slot(
             if (batch.n_seq_id[i] != 1) return false;
             next_order.emplace(batch.seq_id[i][0], -1);
         }
-        for (const auto & cell : cache.cells) {
+        const uint32_t occupied_end = cache.occupied_end();
+        for (uint32_t row = 0; row < occupied_end; ++row) {
+            const auto & cell = cache.cells[row];
             if (cell.pos < 0) continue;
             for (auto seq : cell.seq_id) {
                 auto found = next_order.find(seq);
@@ -2989,7 +2991,7 @@ static bool llama_kv_cache_find_slot(
 
 // find how many cells are currently in use
 static uint32_t llama_kv_cache_cell_max(const struct llama_kv_cache & cache) {
-    for (uint32_t i = cache.size; i > 0; --i) {
+    for (uint32_t i = cache.occupied_end(); i > 0; --i) {
         const llama_kv_cell & cell = cache.cells[i - 1];
 
         if (cell.pos >= 0 && !cell.is_empty()) {
@@ -3001,6 +3003,7 @@ static uint32_t llama_kv_cache_cell_max(const struct llama_kv_cache & cache) {
 }
 
 static uint32_t llama_kv_cache_cell_max(const struct llama_kv_cache & cache, uint32_t pad) {
+    if (cache.qwen4exp_ordered) return llama_kv_cache_cell_max(cache);
     uint32_t last = cache.size;
     for (uint32_t i = cache.size; i > 0; i -= pad) {
         const llama_kv_cell & cell = cache.cells[i - 1];
@@ -3755,7 +3758,8 @@ static void llama_kv_cache_seq_div(
 static llama_pos llama_kv_cache_seq_pos_max(struct llama_kv_cache & cache, llama_seq_id seq_id) {
     llama_pos result = 0;
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    const uint32_t occupied_end = cache.occupied_end();
+    for (uint32_t i = 0; i < occupied_end; ++i) {
         if (cache.cells[i].has_seq_id(seq_id)) {
             result = std::max(result, cache.cells[i].pos);
         }
@@ -3767,7 +3771,8 @@ static llama_pos llama_kv_cache_seq_pos_max(struct llama_kv_cache & cache, llama
 static llama_pos llama_kv_cache_seq_pos_min(struct llama_kv_cache & cache, llama_seq_id seq_id) {
     llama_pos result = -1;
 
-    for (uint32_t i = 0; i < cache.size; ++i) {
+    const uint32_t occupied_end = cache.occupied_end();
+    for (uint32_t i = 0; i < occupied_end; ++i) {
         if (cache.cells[i].has_seq_id(seq_id)) {
             result = cache.cells[i].pos;
             break;
@@ -11391,7 +11396,8 @@ void llama_kv_cache_view_update(const struct llama_context * ctx, struct llama_k
 int32_t llama_get_kv_cache_token_count(const struct llama_context * ctx) {
     int result = 0;
 
-    for (uint32_t i = 0; i < ctx->kv_self.size; i++) {
+    const uint32_t occupied_end = ctx->kv_self.occupied_end();
+    for (uint32_t i = 0; i < occupied_end; i++) {
         result += ctx->kv_self.cells[i].seq_id.size();
     }
 
