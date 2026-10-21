@@ -5,9 +5,13 @@ Push, hosted CI, tag creation and publication remain on hold.
 
 Retained initial Linux package source:
 `e4b5739fc9380f401be3c548200a499a7f84ba34` on `review/ese-consolidated-20261020`.
-The working branch now also repairs missing Windows Microsoft runtime staging.
-The final eight-package set must include that repair; earlier Linux artifacts
-and older Windows assets are not relabelled as the final source.
+Current product/package source freeze:
+`1888775e987ba48465e4b48479d0dd1692d081ab`, including the Windows Microsoft
+runtime staging repair. Three refreshed Linux CPU packages are collected from
+that source; the refreshed CUDA packaging attempt reached its 180-second limit
+and was not collected. The final eight-package set is still incomplete;
+earlier Linux artifacts and older Windows assets are not relabelled as the
+current source. Later qualification documentation does not change this freeze.
 
 ## Current results
 
@@ -20,6 +24,17 @@ and older Windows assets are not relabelled as the final source.
 | AppImage signing/update | Configured key matches; two real signatures verify; eight updater API integration cases and both updated GUI startups pass |
 | Windows | Current CPU native build, standalone launcher, frontend and Studio Rust build pass; CUDA 12.4 tools are installed and the CUDA build is partial; actual MSI/NSIS and physical GPU acceptance pending |
 | Windows runtime dependencies | Missing app-local MSVC/OpenMP imports reproduced and repaired; six native DLL dependencies load from staging; exact top-32 output and normal shutdown pass; Studio CRT import closure passes |
+| Refreshed Linux CPU packages | Current-source AppImage/DEB/RPM collected; all 12 relocated native payload identities, current notices, dependency checks and AppImage signature pass |
+
+The Windows source seal checks all 3,333 tracked files, treating symbolic links
+as links. The resumed CUDA build preserves another 38/325 completed steps before
+being stopped after 289.75 seconds for the user's time constraint. The separate
+Tauri CLI/custom-protocol prebuild reaches its 300-second limit; the earlier raw
+Cargo build remains a distinct passing result. Neither attempt establishes a
+current Windows installer. No NVIDIA display driver is installed in the clone.
+Completed objects remain cached; further cold build attempts are deferred,
+without automatically chaining additional build windows. All owned build/test
+processes stop and the isolated clone is shut off. No physical GPU was detached.
 
 Inference package controls compare one generated token and top-32 probabilities
 against the corresponding unpackaged build with the same pinned model. They do
@@ -65,6 +80,10 @@ metadata generation remains pending Windows. Package SHA-256 values:
 4. Present the complete local candidate for review; retain the user's publication
    hold until explicit approval. No publication command has been executed.
 
+The accepted approximately 19 tok/s baseline and deferred long-context work
+remain unchanged. Short checks do not waive the unfinished installer/metadata
+requirements or qualify a multi-hour workload.
+
 ## Evidence
 
 All paths below are relative to the private evidence root
@@ -75,6 +94,13 @@ All paths below are relative to the private evidence root
 - `task6/windows-isolated/preflight-summary.json`: isolated Windows inventory and stopped VM.
 - `task7/linux-update-qualification.json`: signing, updater and post-install startup proofs.
 - `task6/ubuntu-build/update-checks/`: raw updater requests, responses, failures, hashes and helpers.
+- `task6/ubuntu-build/final-1888775e9-assets-cpu/`: refreshed CPU packages,
+  source index and four-file `CPU-CANDIDATE-SHA256SUMS.txt`.
+- `task6/linux-inspection/final-1888775e9/banner-stderr-control/summary.json`:
+  refreshed CPU package and exact native identity checks.
+- `task6/final-1888775e9-cpu-signature.json`: actual refreshed AppImage verification.
+- `task6/windows-isolated/bounded-build-evidence-1888775e9/`: source seal,
+  bounded attempts and explicit CUDA checkpoint record.
 
 The [release work log](RELEASE_WORK_LOG_20261020.md) retains failures and earlier
 results in order; the [package contract](RELEASE_PACKAGE_CONTRACT.md) defines the

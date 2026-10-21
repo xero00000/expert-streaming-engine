@@ -1954,3 +1954,67 @@ MSI/NSIS or Windows GPU acceptance is claimed. Evidence is under
 identities and all failure/control logs. The Windows staging/notice changes
 require a new final eight-package set; the earlier signed Linux candidates stay
 identified by their original frozen source. Publication remains on hold.
+
+
+### Time-bounded checkpoint — current source repair and refreshed CPU packages
+
+Committed the Windows runtime repair as product/package source freeze
+`1888775e987ba48465e4b48479d0dd1692d081ab`. Eleven focused Python controls,
+workflow actionlint, version/documentation invariants and whitespace checks
+pass. CPU staging with a valid CUDA SDK present also passes: unused CUDA DLLs
+are excluded and the actual MSVC native/GUI import closures remain complete.
+
+Applied only the changed tracked files to the Windows source tree, preserving
+unchanged native input timestamps and compiled objects. Verified all 3,333
+tracked source files against Git blob hashes. The first source-seal harness
+incorrectly hashed five symbolic-link targets as regular file contents; retain
+that failure. The corrected check validates link text separately. No native
+source changes occurred since the earlier frozen archive.
+
+Only the isolated clone was changed to one 16-core socket and 32 GiB RAM, and
+Windows reports 16 CPUs. The resumed eight-job CUDA build adds 38/325 completed
+steps. It is deliberately stopped after 289.75 seconds because the remaining
+cold compilation exceeds a short step; it does not pass or exhaust its planned
+600-second limit. The explicit checkpoint record distinguishes this stop from
+a compiler failure. A separate Tauri CLI/custom-protocol prebuild reaches its
+300-second budget after staging/frontend compilation and rebuilding the Tauri
+feature-dependent crates. It does not pass; the earlier 269.07-second raw Cargo
+build remains a separate passing result. All completed objects are preserved.
+Do not automatically chain further cold build windows under the user's time
+constraint. The clone has no NVIDIA display driver; no driver setup or physical
+GPU passthrough was attempted in this step.
+
+Reused the Linux native caches; refreshing Git build identifiers needs only
+four incremental build steps per variant. The initial host CUDA relink lacks
+its build-time vendor library search path and fails; the explicit cached CUDA/
+compiler library path resolves that relink without changing source or flags.
+Three real current-source Linux CPU packages build in 110.06 seconds and collect
+in 1.53 seconds under `task6/ubuntu-build/final-1888775e9-assets-cpu/`.
+Their four-file checksum list includes the three packages and AppImage signature,
+not the complete release checksum set. The actual AppImage signature verifies.
+
+The CPU DEB, RPM and AppImage inspections pass in 0.79, 0.98 and 2.47 seconds.
+All 12 relocated native files match the refreshed unpackaged build exactly;
+versions, ELF closure, driver exclusion, desktop files and current notices pass.
+Retain two inspection harness failures: the clean image's inherited Python
+wrapper references an unavailable old mount, and native `--version` writes its
+banner to stderr. Explicit system-Python PATH and checking the captured banner
+stream resolve both without modifying the packages. Successful evidence is
+`task6/linux-inspection/final-1888775e9/banner-stderr-control/summary.json`.
+
+The refreshed Linux CUDA packaging attempt hits its 180-second limit during DEB
+bundling, after producing a partial AppImage build. It is not collected or
+treated as a completed package set. The earlier six-package Linux qualification
+remains tied to `e4b5739fc...`; do not mix it with the refreshed CPU source index.
+No new inference throughput or extended-context pass runs. Approximately 19
+tok/s remains the user-accepted experimental baseline.
+
+Copied and hash-verified the terminal Windows source/build/checkpoint archive
+(`09912027dd191298c1a4815611b093a5c9c12e612e301859a4bfafb0a7e6294f`).
+Windows process inspection confirms no compiler/linker/build children remain.
+The clone shuts down normally; both original VMs remain shut off. The owned
+Linux build container is stopped after its bounded command; its sleeping PID 1
+requires container SIGKILL after a two-second stop timeout. All caches, disks,
+artifacts and failure evidence remain intact. Actual Windows installers,
+Windows install/update/GPU checks, refreshed CUDA collection and final full-set
+metadata remain pending. No push, hosted CI, PR, tag or publication occurs.
