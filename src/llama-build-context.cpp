@@ -7,6 +7,9 @@
 #include "llama-kv-padding.h"
 
 #include "ggml.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 #include "ggml-ese.h"
 #include "../ggml/src/ggml-qat.h"
 #include "../ggml/src/ggml-expert-loader.h"
@@ -921,6 +924,40 @@ static ggml_tensor * qwen4exp_encode_host_q4(
         }
     }
     return value;
+}
+
+static ggml_tensor * qwen4exp_gather_attention_rows(
+        llama_context & lctx, ggml_context * ctx, ggml_cgraph * graph, ggml_tensor * cache,
+        ggml_tensor * ids, bool host, int64_t layer) {
+#ifdef GGML_USE_CUDA
+    const char * flag = std::getenv("ESE_QWEN4EXP_PACKED_HOST_KV");
+    if (host && flag && std::strcmp(flag, "1") == 0 && lctx.cparams.offload_kqv &&
+            qwen4exp_explicit_arithmetic(lctx) && cache->type == GGML_TYPE_Q4_0) {
+        // Copy selected packed rows verbatim on CPU, rather than expanding
+        // them before the handoff. The ordinary F32 attention path receives
+        // the same rows after device dequantization. Full history and physical
+        // row ownership stay in the existing host cache.
+        auto * packed = ggml_get_rows_ext(ctx, cache, ids, true, false);
+        auto * expanded = ggml_cast(ctx, packed, GGML_TYPE_F32);
+        for (auto * backend : lctx.backends) {
+            if (ggml_backend_is_cuda(backend) &&
+                    ggml_backend_supports_buft(backend, lctx.model.buft_layer[layer].buft) &&
+                    ggml_backend_supports_op(backend, expanded)) {
+                ggml_backend_sched_set_tensor_backend(lctx.sched, packed, lctx.backend_cpu);
+                ggml_backend_sched_set_tensor_backend(lctx.sched, expanded, backend);
+                // Gather K and V before expanding either on the device. During
+                // compact batched prefill this also groups host gathers ahead
+                // of the per-query attention graphs, avoiding one extra backend
+                // split for each cast while keeping F32 scratch per query.
+                ggml_build_forward_expand(graph, packed);
+                return expanded;
+            }
+        }
+    }
+#endif
+    auto * rows = qwen4exp_build_cache_rows(ctx, cache, ids);
+    if (host) ggml_backend_sched_set_tensor_backend(lctx.sched, rows, lctx.backend_cpu);
+    return rows;
 }
 
 void llm_build_context::llm_build_kv_store(
@@ -2221,12 +2258,10 @@ static ggml_tensor * llm_build_kqv(
                 auto * row_map = ggml_view_2d(ctx, input.rows, input.key_count, n_head_kv, input.rows->nb[1], 0);
                 for (int64_t query = 0; query < input.query_count; ++query) {
                     const auto compact = qwen4exp_build_compact_attention_rows(ctx, row_map, mask, selected, query);
-                    auto * compact_k = qwen4exp_build_cache_rows(ctx, physical_k, compact.rows);
-                    auto * compact_v = qwen4exp_build_cache_rows(ctx, physical_v, compact.rows);
-                    if (ggml_backend_buffer_is_host(k_cache->buffer))
-                        ggml_backend_sched_set_tensor_backend(lctx.sched, compact_k, lctx.backend_cpu);
-                    if (ggml_backend_buffer_is_host(v_cache->buffer))
-                        ggml_backend_sched_set_tensor_backend(lctx.sched, compact_v, lctx.backend_cpu);
+                    auto * compact_k = qwen4exp_gather_attention_rows(lctx, ctx, graph, physical_k, compact.rows,
+                            ggml_backend_buffer_is_host(k_cache->buffer), il);
+                    auto * compact_v = qwen4exp_gather_attention_rows(lctx, ctx, graph, physical_v, compact.rows,
+                            ggml_backend_buffer_is_host(v_cache->buffer), il);
                     const bool f32_rows = compact_k->type == GGML_TYPE_F32 && compact_v->type == GGML_TYPE_F32;
                     if (f32_rows) compact_v = ggml_cont(ctx, ggml_transpose(ctx, compact_v));
                     auto * queries = ggml_view_3d(ctx, q_cur, q_cur->ne[0], q_cur->ne[1], 1,
@@ -2239,15 +2274,12 @@ static ggml_tensor * llm_build_kqv(
                 continue;
             }
             auto * ids = ggml_view_2d(ctx, input.rows, input.key_count, n_head_kv, input.rows->nb[1], 0);
-            auto * ordered_k = qwen4exp_build_cache_rows(ctx, physical_k, ids);
-            auto * ordered_v = qwen4exp_build_cache_rows(ctx, physical_v, ids);
-            // Gather host KV before the backend handoff. Moving the complete
-            // persistent cache to CUDA first copies the entire configured
-            // context on every decode, including unused cells.
-            if (ggml_backend_buffer_is_host(k_cache->buffer))
-                ggml_backend_sched_set_tensor_backend(lctx.sched, ordered_k, lctx.backend_cpu);
-            if (ggml_backend_buffer_is_host(v_cache->buffer))
-                ggml_backend_sched_set_tensor_backend(lctx.sched, ordered_v, lctx.backend_cpu);
+            // Gather only selected rows before the backend handoff. Never
+            // transfer the complete persistent allocation during decode.
+            auto * ordered_k = qwen4exp_gather_attention_rows(lctx, ctx, graph, physical_k, ids,
+                    ggml_backend_buffer_is_host(k_cache->buffer), il);
+            auto * ordered_v = qwen4exp_gather_attention_rows(lctx, ctx, graph, physical_v, ids,
+                    ggml_backend_buffer_is_host(v_cache->buffer), il);
             // The CUDA FA implementations for gathered F32 rows can convert
             // them to half despite GGML_PREC_F32. Preserve explicit arithmetic
             // through the ordinary F32 KQ/softmax/VQ path for these rows.

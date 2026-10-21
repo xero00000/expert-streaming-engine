@@ -29,6 +29,63 @@ template<class T> static std::vector<T> read(const std::string & path, size_t co
     return data;
 }
 
+static void packed_host_gather_case(ggml_backend_t compute, ggml_backend_t cpu, int width, int heads, int rows) {
+    auto * leaves = ggml_init({2*1024*1024, nullptr, true});
+    auto * ctx = ggml_init({2*1024*1024, nullptr, true});
+    require(leaves && ctx, "packed host contexts");
+    const int physical = rows*2+5;
+    auto * storage = ggml_new_tensor_3d(leaves, GGML_TYPE_Q4_0, width+32, heads+1, physical+2);
+    const size_t offset = storage->nb[2] + ggml_type_size(GGML_TYPE_Q4_0);
+    auto * cache = ggml_view_3d(ctx, storage, width, physical, heads, storage->nb[2], storage->nb[1], offset);
+    auto * id_storage = ggml_new_tensor_2d(leaves, GGML_TYPE_I32, rows+7, heads);
+    auto * ids = ggml_view_2d(ctx, id_storage, rows, heads, id_storage->nb[1], 0);
+    auto * packed = ggml_get_rows_ext(ctx, cache, ids, true, false);
+    auto * reference = qwen4exp_build_cache_rows(ctx, cache, ids);
+    auto * expanded = ggml_cast(ctx, packed, GGML_TYPE_F32);
+    ggml_set_output(packed); ggml_set_output(reference); ggml_set_output(expanded);
+    require(ggml_backend_supports_op(cpu, packed) && ggml_backend_supports_op(compute, expanded), "packed gather support");
+    auto * graph = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(graph, reference); ggml_build_forward_expand(graph, expanded);
+    auto * input_buffer = ggml_backend_alloc_ctx_tensors(leaves, cpu);
+    require(input_buffer, "packed host inputs");
+    ggml_backend_t backends[] = {compute, cpu};
+    auto * sched = ggml_backend_sched_new(backends, nullptr, compute == cpu ? 1 : 2, 64, false);
+    require(sched, "packed scheduler");
+    ggml_backend_sched_set_tensor_backend(sched, packed, cpu);
+    ggml_backend_sched_set_tensor_backend(sched, reference, cpu);
+    ggml_backend_sched_set_tensor_backend(sched, expanded, compute);
+    require(ggml_backend_sched_alloc_graph(sched, graph), "packed graph allocation");
+    require(ggml_backend_sched_get_tensor_backend(sched, packed) == cpu &&
+            ggml_backend_sched_get_tensor_backend(sched, expanded) == compute, "packed transfer placement");
+    std::vector<float> values(ggml_nelements(storage)), actual(ggml_nelements(expanded)), expected(actual.size());
+    std::vector<uint8_t> payload(ggml_nbytes(storage)), raw(ggml_nbytes(packed));
+    std::vector<int32_t> order(ggml_nelements(id_storage));
+    for (int round = 0; round < 3; ++round) {
+        for (size_t i = 0; i < values.size(); ++i) values[i] = i % 97 < 32 ? 0.f : std::sin(float(i)*.031f + round)*3.f;
+        ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), payload.data(), 0,
+                storage->ne[1]*storage->ne[2], storage->ne[0], nullptr, nullptr);
+        for (int head = 0; head < heads; ++head) for (int row = 0; row < rows+7; ++row)
+            order[head*(rows+7)+row] = (physical-1-row*2+head+round*7+physical*2) % physical;
+        if (rows > 1) for (int head = 0; head < heads; ++head) order[head*(rows+7)+rows-1] = order[head*(rows+7)];
+        ggml_backend_tensor_set(storage, payload.data(), 0, payload.size());
+        ggml_backend_tensor_set(id_storage, order.data(), 0, order.size()*sizeof(int32_t));
+        require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "packed replay compute");
+        ggml_backend_tensor_get(reference, expected.data(), 0, expected.size()*sizeof(float));
+        ggml_backend_tensor_get(expanded, actual.data(), 0, actual.size()*sizeof(float));
+        require(std::memcmp(actual.data(), expected.data(), actual.size()*sizeof(float)) == 0, "packed handoff changed dequantized row bits");
+        ggml_backend_tensor_get(packed, raw.data(), 0, raw.size());
+        const size_t row_bytes = ggml_row_size(GGML_TYPE_Q4_0, width);
+        for (int head = 0; head < heads; ++head) for (int row = 0; row < rows; ++row) {
+            const size_t source_offset = offset + order[head*(rows+7)+row]*cache->nb[1]+head*cache->nb[2];
+            require(std::memcmp(raw.data()+(head*rows+row)*row_bytes, payload.data()+source_offset, row_bytes) == 0,
+                    "packed handoff changed stored Q4 bytes");
+        }
+    }
+    std::printf("packed_host_gather: width=%d heads=%d rows=%d three replays bitwise exact packed=%zu expanded=%zu\n",
+            width, heads, rows, raw.size(), actual.size()*sizeof(float));
+    ggml_backend_sched_free(sched); ggml_backend_buffer_free(input_buffer); ggml_free(ctx); ggml_free(leaves);
+}
+
 static void gather_case(ggml_backend_t backend, ggml_type type, int width, int heads, int rows) {
     auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
     require(ctx, "context");
@@ -288,6 +345,11 @@ int main(int argc, char ** argv) {
 #endif
         if (!backend) backend = ggml_backend_cpu_init();
         require(backend, "backend");
+        auto * host_backend = ggml_backend_is_cpu(backend) ? backend : ggml_backend_cpu_init();
+        require(host_backend, "packed gather CPU backend");
+        for (int width : {32, 256}) for (int heads : {1, 2}) for (int rows : {1, 17, 256, 2304})
+            packed_host_gather_case(backend, host_backend, width, heads, rows);
+        if (host_backend != backend) ggml_backend_free(host_backend);
         validate_formats();
         for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32}) for (int width : {63, 64, 256})
             for (int heads : {1, 2, 4}) for (int rows : {1, 17, 256})

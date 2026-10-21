@@ -1263,3 +1263,48 @@ attention/indexer KV on the host. GPU attention alone still requires host
 cache encoding/gathers and transfer boundaries. Further work must preserve
 full logical history and lifecycle correctness when introducing any resident
 window; reducing the logical cache to 32K would not qualify the 1M profile.
+
+
+### Task 4 — packed host attention-cache handoff (in qualification)
+
+A new opt-in `ESE_QWEN4EXP_PACKED_HOST_KV=1` path gathers selected Q4_0
+rows byte-for-byte on CPU, transfers the packed result, and expands to F32 on
+the layer's CUDA backend. It requires the existing explicit arithmetic and
+KQV offload policy. Unsupported types/backends retain the preceding gather.
+Persistent storage, logical context, chronological selection and cache
+ownership are unchanged. Both ordered and selection-limited attention paths
+use the helper. Packed rows occupy 18 bytes per 32 values versus 128 bytes
+for F32, reducing this handoff's data volume by 7.11 times.
+
+`test-qwen4exp-cache-order` now covers 16 packed host-handoff geometries x
+three replays on each of the three cards and CPU. It checks stored Q4 bytes
+and expanded F32 bits against the existing CPU F32 gather, including padded
+and interleaved heads/rows, nonzero block offsets, strided IDs, changed data
+and IDs, repeated rows and 2304-row compaction geometry. All pass, as do
+existing gather fixtures. The initial CPU fixture incorrectly created two
+CPU backend contexts and failed its placement assertion; the corrected CPU
+fixture aliases one backend. Failure and corrected logs are retained, and
+`packed-host-gather-tests.json` identifies the valid evidence explicitly.
+
+`packed-host-strict-reference33` matches all logits/routes/IDs bitwise at
+ubatch 16. The first full ubatch-128 workload fails at constructor reservation
+with the existing `GGML_SCHED_MAX_SPLITS` assertion, before requests run.
+`workload-1m-packed-host-passive4` preserves that failure. The implementation
+is revised to expand the packed CPU gathers into the graph ahead of device
+conversion/attention, so K and V gathers can share a handoff. This keeps the
+scheduler limit fixed and F32 scratch per query. The revised ubatch-128
+strict control constructs 43,666 nodes and 3,246 splits successfully;
+its final numerical check and full workload follow.
+
+
+The revised `packed-host-grouped-strict-reference33` uses ubatch 128 and
+matches all 8,194,560 logits, routes and input IDs bitwise. The matching full
+`workload-1m-packed-host-grouped-passive4` then completes 552/128 twice at
+12.491 / 16.364 tok/s (TTFT 44.31 / 6.88 seconds), with the preceding native
+output hash unchanged. Startup is 16.95 seconds. The repeat is 7.6% above the
+preceding 15.213 tok/s diagnostic, but this remains one start/two requests,
+not the three-start qualification. The full model prompt has fewer than
+2304 keys: larger selection-limited model execution and long-context
+lifecycle remain unqualified, despite the 2304-row operator fixtures and
+successful worst-case constructor reservation. Keep the path opt-in and the
+release gate closed. The 41.2 / 41.84 tok/s thresholds are still unmet.
