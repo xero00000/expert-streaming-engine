@@ -850,3 +850,54 @@ probe checks environment-variable presence. Its recorded config states this.
 The first complete 552-token / 128-generation diagnostic therefore uses the
 validated placement and serial prefill. It is a manual-budget measurement with
 launcher feature differences, not speed acceptance.
+
+
+#### Strata source comparison and draft ablation
+
+The complete ESE serial diagnostic finishes both 552/128 requests and exits
+cleanly: 3.39 then 4.67 tok/s, first-token times 370.47 and 327.75 seconds.
+Its GPU expert cache is active; these results do not meet the speed requirement.
+The fixture/memory success must not be reported as performance readiness.
+
+Read-only inspection of the local Strata source and frozen engine logs finds:
+quantized Q8 activation dot products; grouped CPU/GPU expert computation; a
+profile-filled/adaptive GPU cache and a resident RAM complement; 32K resident
+KV streaming; and overlapping speculative windows. The saved baseline's PCIe
+probes are 0.7, 2.8 and 20.6 GB/s in selected device order, making its 6/14
+layer split material. ESE's balanced placement spreads uploads across slow links.
+Strata retains 24.24 GiB of complementary expert weights in pinned RAM and
+reports zero expert blob file reads during these requests.
+
+An isolated copy disables MTP, suffix/lookup drafts and pipelined windows.
+A first attempt with `--spec 1` is rejected by the native-pack admission rule;
+`--spec 2` without a drafter is the valid serial path. The three completed
+requests have zero proposed/accepted drafts and measure 35.9 / 42.1 / 43.6 tok/s.
+The original launcher profile is unchanged. Disabling MTP also frees its buffers
+and changes cache capacity, and outputs vary; this is a diagnostic ablation,
+not a pure fixed-memory causal estimate or replacement qualification baseline.
+Evidence: `strata-no-spec-ablation/`, `strata-no-mtp-ablation/` and their copied
+profiles/commands under the restoration directory.
+
+Next, exercise native quantized experts behind an opt-in while retaining
+explicit dense/router/indexer precision. Compare against the appropriate native
+quantized operator controls; differences from the original-input/F64 reference
+must remain explicit. First measure the base decode with the launcher's layer
+placement and adequate RAM/GPU residency; add MTP only after that bottleneck is
+understood. The original tight-reference path remains an independent control.
+
+
+The isolated checked-dot optimization retains the original-input control.
+A compensated F32 dot is accepted only when its conservative error enclosure
+fits strictly within one F32 rounding cell; ambiguous and unsafe ranges fall
+back to the prior F64 dot. Fused gate/up remains unchanged. All three GPUs pass
+the conversion oracle and checked-dot cancellation/halfway/subnormal/extreme
+controls (2,805 accepted and 4,363 fallback dots each, no bitwise errors). All
+18 real IQ2_XXS/IQ1_M expert/graph/cache checks pass. The current 33-token upstream
+replay retains byte-identical teacher, logits, routes and ordered token routes.
+
+A separate same-command Hi/32-token, three-request A/B measures repeated decode
+5.45 / 5.49 before and 7.32 / 7.29 tok/s after. First requests differ in file-cache
+state and are not attributed as optimization gains. Outputs repeat within each
+run; this small diagnostic does not meet or replace the launcher workload.
+Artifacts: `checked-dot-property-tests.json`, `checked-dot-expert-regression/`,
+`checked-dot-reference33/`, `checked-dot-speed-{baseline,checked}/`.

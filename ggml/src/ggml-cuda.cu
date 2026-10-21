@@ -3107,11 +3107,8 @@ static __global__ void explicit_q6_projection(const char * weights, const char *
     const int64_t b2 = (index / (rows * cols)) % batches2, b3 = index / (rows * cols * batches2);
     const char * w = weights + row * w1 + (b2 / repeat2) * w2 + (b3 / repeat3) * w3;
     const float * x = (const float *)(input + col * x1 + b2 * x2 + b3 * x3);
-    double partial = 0;
-    for (int column = lane; column < width; column += 32)
-        partial += expert_f32_to_double(expert_f32_weight<weight_type>(w, column)) * expert_f32_to_double(x[column]);
-    const double sum = expert_f32_reduce(partial);
-    if (lane == 0) ((float *)(output + col * y1 + b2 * y2 + b3 * y3))[row] = expert_f64_to_float(sum);
+    const float result = expert_f32_checked_project<weight_type>(w, x, int(width), lane);
+    if (lane == 0) ((float *)(output + col * y1 + b2 * y2 + b3 * y3))[row] = result;
 }
 
 static bool explicit_q6_layout(const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * y) {

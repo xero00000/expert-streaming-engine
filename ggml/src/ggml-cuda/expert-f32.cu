@@ -27,6 +27,11 @@ static __global__ void expert_f32_indexed(expert_f32_indexed_args args) {
             (slot % args.input_slots) * args.input_slot + token * args.input_token);
     const char * up = args.up + expert * args.up_plane + row * args.up_row;
     const char * gate = fused ? args.gate + expert * args.gate_plane + row * args.gate_row : nullptr;
+    if constexpr (!fused) {
+        const float result = expert_f32_checked_project<type>(up, input, args.columns, lane);
+        if (lane == 0) *output = result;
+        return;
+    }
     double partial_up = 0, partial_gate = 0;
     for (int column = lane; column < args.columns; column += 32) {
         const double x = expert_f32_to_double(input[column]);

@@ -133,6 +133,74 @@ static __device__ __forceinline__ double expert_f32_reduce(double partial) {
     return partial;
 }
 
+// Two-product / two-sum accumulation with a conservative rounding enclosure.
+// Accept only when the enclosure lies strictly inside one F32 rounding cell;
+// ambiguous, very small/large, nonfinite and long dots use the original F64 loop.
+// Explicit PTX prevents fast-math contraction and flush-to-zero in the enclosure.
+static __device__ __forceinline__ float expert_add_rn(float a, float b) {
+    float r; asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r;
+}
+static __device__ __forceinline__ float expert_sub_rn(float a, float b) {
+    float r; asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r;
+}
+struct expert_checked_dot {
+    float high = 0, low = 0, magnitude = 0;
+    bool safe = true;
+    __device__ __forceinline__ void add(float a, float b) {
+        float product, residual;
+        asm("mul.rn.f32 %0, %1, %2;" : "=f"(product) : "f"(a), "f"(b));
+        asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(residual) : "f"(a), "f"(b), "f"(-product));
+        const unsigned ab = __float_as_uint(product) & 0x7fffffffu;
+        safe &= ab == 0 ? ((__float_as_uint(a) & 0x7fffffffu) == 0 ||
+                           (__float_as_uint(b) & 0x7fffffffu) == 0) :
+                          ab >= 0x20000000u && ab <= 0x5f000000u;
+        const float sum = expert_add_rn(high, product);
+        const float back = expert_sub_rn(sum, high);
+        const float error = expert_add_rn(expert_sub_rn(high, expert_sub_rn(sum, back)),
+                                         expert_sub_rn(product, back));
+        low = expert_add_rn(low, expert_add_rn(error, residual));
+        high = sum;
+        magnitude = expert_add_rn(magnitude, fabsf(product));
+    }
+    __device__ __forceinline__ bool finish(int columns, float & output) {
+        if (!__all_sync(0xffffffffu, safe && columns <= 65536)) return false;
+        const double estimate = expert_f32_reduce(expert_f32_to_double(high) + expert_f32_to_double(low));
+        const double absolute = expert_f32_reduce(expert_f32_to_double(magnitude));
+        // Covers both compensated accumulation and the original per-lane and
+        // warp F64 summation errors. Factor eight also covers magnitude rounding.
+        const double error = (8.0 * ((columns + 31) / 32 + 32) * 0x1p-48) * absolute;
+        bool accepted = false;
+        if (threadIdx.x % 32 == 0) {
+            output = expert_f64_to_float(estimate);
+            const unsigned bits = __float_as_uint(output), ab = bits & 0x7fffffffu;
+            if (absolute == 0) { output = 0; accepted = true; }
+            else if (ab < 0x7f7fffffu) {
+                const float below = __uint_as_float(ab == 0 ? 0x80000001u : (bits >> 31 ? bits + 1 : bits - 1));
+                const float above = __uint_as_float(ab == 0 ? 1u : (bits >> 31 ? bits - 1 : bits + 1));
+                const double center = expert_f32_to_double(output);
+                const double lower = (center + expert_f32_to_double(below)) * 0.5;
+                const double upper = (center + expert_f32_to_double(above)) * 0.5;
+                accepted = estimate - error > lower && estimate + error < upper;
+            }
+        }
+        return __shfl_sync(0xffffffffu, int(accepted), 0) != 0;
+    }
+};
+
+template <ggml_type type>
+static __device__ __forceinline__ float expert_f32_checked_project(
+        const void * weights, const float * input, int columns, int lane) {
+    expert_checked_dot dot;
+    for (int column = lane; column < columns; column += 32)
+        dot.add(expert_f32_weight<type>(weights, column), input[column]);
+    float rounded = 0;
+    if (dot.finish(columns, rounded)) return rounded;
+    double partial = 0;
+    for (int column = lane; column < columns; column += 32)
+        partial += expert_f32_to_double(expert_f32_weight<type>(weights, column)) * expert_f32_to_double(input[column]);
+    return expert_f64_to_float(expert_f32_reduce(partial));
+}
+
 template <ggml_type type>
 static __global__ void expert_f32_project(const void * weights, const float * input,
                                          float * output, int columns, int rows, size_t row_bytes) {
@@ -142,15 +210,8 @@ static __global__ void expert_f32_project(const void * weights, const float * in
         return;
     }
     const char * weight_row = (const char *) weights + row * row_bytes;
-    double partial = 0;
-    for (int column = lane; column < columns; column += 32) {
-        partial += expert_f32_to_double(expert_f32_weight<type>(weight_row, column)) *
-                   expert_f32_to_double(input[column]);
-    }
-    const double sum = expert_f32_reduce(partial);
-    if (lane == 0) {
-        output[row] = expert_f64_to_float(sum);
-    }
+    const float result = expert_f32_checked_project<type>(weight_row, input, columns, lane);
+    if (lane == 0) output[row] = result;
 }
 
 template <ggml_type type = GGML_TYPE_IQ3_XXS>
