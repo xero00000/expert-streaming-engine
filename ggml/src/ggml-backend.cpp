@@ -30,6 +30,10 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -714,6 +718,20 @@ static struct ggml_backend_buffer_i cpu_backend_buffer_i = {
     /* .reset           = */ NULL,
 };
 
+#ifdef __linux__
+GGML_CALL static void ggml_backend_cpu_mmap_free(ggml_backend_buffer_t buffer) {
+    munmap(buffer->context, buffer->size);
+}
+
+GGML_CALL static void ggml_backend_cpu_mmap_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    // Owned anonymous mappings read as zero after discard. Keep unused logical
+    // KV capacity out of physical RAM, including after a sequence reset.
+    // External/file-backed buffers retain their ordinary memset interface.
+    if (value == 0 && madvise(buffer->context, buffer->size, MADV_DONTNEED) == 0) return;
+    ggml_backend_cpu_buffer_clear(buffer, value);
+}
+#endif
+
 // for buffers from ptr, free is not called
 static struct ggml_backend_buffer_i cpu_backend_buffer_i_from_ptr = {
     /* .get_name        = */ ggml_backend_cpu_buffer_name,
@@ -736,6 +754,17 @@ GGML_CALL static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend
 
 GGML_CALL static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     if (size > SIZE_MAX - TENSOR_ALIGNMENT) return NULL;
+#ifdef __linux__
+    if (size >= 64 * 1024 * 1024 && TENSOR_ALIGNMENT <= size_t(sysconf(_SC_PAGESIZE))) {
+        void * mapped = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapped != MAP_FAILED) {
+            auto interface = cpu_backend_buffer_i;
+            interface.free_buffer = ggml_backend_cpu_mmap_free;
+            interface.clear = ggml_backend_cpu_mmap_clear;
+            return ggml_backend_buffer_init(buft, interface, mapped, size);
+        }
+    }
+#endif
     // get_base may advance the allocation to reach alignment. This headroom
     // is not reusable tensor capacity: reporting it lets a growing graph
     // reuse a buffer whose aligned end lies beyond the malloc allocation.

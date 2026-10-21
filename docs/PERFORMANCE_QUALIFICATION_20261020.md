@@ -477,3 +477,13 @@ measures 3.60. These eight-token diagnostics still fail the 41.2 overall /
 residency and remaining decode costs are the next performance boundaries.
 Installed Strata configuration, model shards, production loader gate and
 publication hold remain unchanged.
+
+
+Empty host-KV physical residency is now reduced without changing cache capacity
+or contents: the same 1M readiness control falls from 18.25 GB RSS / 14.63 GB
+anonymous to 4.44 GB RSS / 0.824 GB anonymous, with zero sampled swap. Large
+owned Linux CPU buffers discard pages on zero clear; external buffers keep
+their previous memset behavior. Five focused allocation/clear/graph tests and
+the complete byte-identical Q4/1M 33-token placement replay pass. These numbers
+measure readiness, not peak memory or decode speed; the 80% speed requirement
+remains open.

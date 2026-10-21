@@ -448,6 +448,7 @@ if (GGML_CUDA)
     set_tests_properties(test-iq3-cuda-dot PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+llama_target_and_test(test-cpu-buffer-clear.cpp)
 llama_build(test-get-rows-bf16.cpp)
 llama_build(test-expert-f32.cpp)
 llama_build(test-expert-iq-formats.cpp)

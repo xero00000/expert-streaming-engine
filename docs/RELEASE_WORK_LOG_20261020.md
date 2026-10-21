@@ -800,3 +800,30 @@ byte-identical to the passing pre-change teacher, logits and route controls
 (`canonical-host-reference-33/bitwise-control-comparison.json`). The private
 runtime snapshots and full selected-model inputs are preserved; no production
 architecture admission or publication is implied by this checkpoint.
+
+
+#### Empty host-KV residency
+
+The same 1M host-KV server previously reached readiness at 18,248,409,088
+RSS bytes, including 14,634,127,360 anonymous bytes, with no prompt submitted.
+Large owned CPU allocations now use private anonymous mappings on Linux.
+A zero clear discards their pages; subsequent reads still return zero. Nonzero
+clears retain memset, and externally supplied/file-backed buffers retain their
+existing clear/ownership interface. Unsupported mapping/discard operations
+fall back to the prior allocation/clear behavior. Logical buffer sizes and
+allocator budget accounting remain unchanged.
+
+After this isolated change, the same readiness control uses 4,438,892,544 RSS
+bytes and 823,869,440 anonymous bytes, with no swap. These are sampled readiness
+measurements, not process-peak or throughput claims. Startup in these controls
+is 10.02 versus 4.26 seconds; no storage-cold claim follows. The complete Q4
+1M/33-token host placement replay remains byte-identical for all 8,194,560
+logits, ordered routes and input IDs.
+
+Five focused CPU clear, graph/shared-budget, handoff and compact-QSA CTests
+pass. The new clear test writes the owned buffer directly before clearing,
+checks zero/nonzero clears and its unaligned tail, verifies page release where
+available, and proves that clearing an external private file mapping overwrites
+its contents while preserving its underlying file and ownership. Evidence:
+`host-kv-residency-before/`, `host-kv-residency-after/`, `lazy-host-prefill33/`
+and `lazy-host-kv-tests.log` under the selected-model restoration directory.
