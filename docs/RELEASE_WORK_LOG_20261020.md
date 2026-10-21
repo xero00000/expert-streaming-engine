@@ -82,10 +82,14 @@ is now the next reference; the earlier 35B comparison does not qualify a
 Flash-Next launcher model. See the continuation entry below for profile selection
 and compatibility evidence.
 
-Selected reference: **Flash-Next IQ2_XS, 1M experimental**, using the saved
+The user subsequently revised the required speed to **at least 80% of Strata**
+and requested restoring the branch that loaded this model. Selected reference:
+**Flash-Next IQ2_XS, 1M experimental**, using the saved
 `strata-iq2_xs-1m.json` profile across all three GPUs. Its measured short-request
-decode medians are 51.5 tok/s overall and 52.3 on repeats. ESE currently rejects
-this model architecture, so task 4's active dependency is model qualification.
+decode medians are 51.5 tok/s overall and 52.3 on repeats; the corresponding
+ESE thresholds are **41.2 overall and 41.84 tok/s on repeats**. ESE currently
+rejects this model architecture in its default build, so the current work
+restores and tests the existing dedicated loading path before qualification.
 
 - Define the exact model, prompt, resource budget, policies and speed target.
   Use Strata's measured sustained decode rate as the reference; retain startup,
@@ -642,9 +646,10 @@ MTP artifacts, routing profile, control vector, vision and service code.
 
 Required work for this selected model, in order:
 
-1. Establish independent numerical references for the selected 512-expert
-   IQ2_XS artifact. Existing short upstream evidence uses the pruned
-   256-expert Coder artifact and does not qualify this model.
+1. Revalidate the current runtime against the recovered independent references
+   for this exact 512-expert IQ2_XS artifact. The initial reference inventory
+   missed `ese-iq2-xs-selected-model-20261013`; its full and cached 33-token
+   references and six passing historical GPU comparisons are now recovered.
 2. Resolve the remaining model/cache/speculation numerical gates and qualify
    its selected control-vector, YaRN and KV behavior before release admission.
    Existing gated research remains separate; simply opening the gate is not a fix.
@@ -653,3 +658,81 @@ Required work for this selected model, in order:
 
 Task 4 and the publication hold remain open. No engine source, launcher,
 installed Studio runtime or package was changed by this profile test.
+
+### Task 4 continuation — restore loading and reach 80% of Strata
+
+The user explicitly requested getting this model working from the old loading
+branch and set the minimum speed to 80% of Strata. The preserved
+`plan/v0.2.1-qwen4exp` worktree has `build_qwen4exp_probe` with its configure-time
+gate ON; the standard build keeps it OFF. The consolidated source already
+contains the same Qwen model graph/operations. A dedicated local loading build
+will use the current candidate's objects plus the probe-enabled loader, then
+test the selected 512-expert IQ2_XS artifact. This avoids importing unrelated
+GLM/dispatch research or changing the installed launcher during diagnosis.
+Required speed is frozen at 41.2 tok/s overall and 41.84 on repeats for the
+saved short-request reference. Model correctness and memory checks remain
+required; loading by itself does not establish release readiness.
+
+The recovered selected-model evidence has the same two complete GGUF hashes
+as the new launcher baseline. It includes passing 33-token comparisons against
+both pinned upstream references on all three cards. This corrects the earlier
+incomplete statement that reference evidence existed only for the Coder
+artifact. Those old results are bounded evidence, not current-build or 1M
+qualification. Current dedicated loading succeeds and reproduces the saved
+eight-token raw `Hi` control exactly with the explicit precision policy.
+The release runtime and installed launcher remain untouched. A current
+33-token reference replay and normal-policy performance diagnosis follow.
+
+
+#### Restored loading and first decode optimizations
+
+The dedicated current loader now passes the recovered 33-token selected-model
+references: 8,194,560 logits against each of the full/cached upstream controls
+within the unchanged `2e-5 * (1 + abs(reference))` bound, all 1,584 ordered
+expert-route rows and all 33 top-one choices. The lifecycle observer needed to
+recognize the selected IQ4_XS vocabulary head as well as Q6_K; the builder
+already used explicit F32 precision for both. The 1M serving profile and normal
+quantized arithmetic are not qualified by this bounded F32-cache replay.
+
+Two isolated CUDA changes follow the profiling evidence:
+
+- Route top-10 Q2_0 down projections through the existing indexed MMVQ kernel.
+  The old eight-column check treated expert activation rows as matrix batch
+  columns and fell back to host route readback plus ten launches. Expansion is
+  limited to contiguous Q2_0 per-expert inputs. Other formats retain the old
+  limit: an initial broader experiment exposed different reduction orders and
+  was narrowed before further measurement. Dense and sparse top-10 controls at
+  640-by-64 and the actual 640-by-2560 shape match ten independent calls exactly
+  on the 2080 SUPER, 3060 Ti and 3080.
+- Replace the explicit F32-to-F64 conversion's zero/subnormal `ldexp` branch
+  with PTX conversion, preserving the arithmetic. On every card an independent
+  integer oracle checks all 16,777,216 signed zero/subnormal patterns plus
+  16,777,216 spread normal/special patterns (NaN payloads excluded). All pass.
+  Eighteen real IQ2_XXS/IQ1_M expert, graph-update/replay and cache regression
+  runs pass across the three cards, including bitwise explicit CPU parity.
+  The current 33-token logits, teacher values and routes remain byte-identical
+  to the passing pre-conversion current-build control.
+
+Unprofiled three-GPU raw-Hi/eight-token diagnostics used 4K context and 3 GiB
+expert cache per GPU. Normal arithmetic repeats improved from 11.49 to
+13.31/13.26 tok/s after the Q2_0 dispatch change. Explicit arithmetic repeats
+improved from 5.58/5.60 to 7.09/7.40 tok/s after conversion. These small controls
+are not the selected 552-token/128-generation launcher comparison and do not
+meet the 80% requirement. Nsight traces were collected separately from those
+measurements. Raw logs, commands, library hashes and retained failed attempts
+are under `task4/qwen4exp-iq2-restore/`.
+
+The first 1M admission attempt failed allocating GPU KV storage. Inspection
+shows the memory planner replaced requested Q4 K/V with Q8, while the explicit
+policy requires F32 indexer storage. A host-KV control also failed compute
+reservation. Explicit Q4 admission is being isolated without that planner;
+these failures do not qualify 1M support. Task 4 remains open, the production
+loader gate remains OFF, and the installed launcher/publication hold is intact.
+
+The explicit-Q4 retry allocates 6,912 MiB K/V plus 6,144 MiB F32 indexer on
+the three cards, then fails compute reservation even after reducing the
+microbatch to one. The existing QSA path gathers all logical K/V rows before
+applying its sparse mask. Its full-history intermediates are the next memory
+boundary to isolate. Failed reservations now log per-backend required/live/
+budget bytes and rejection counters. Five focused conversion, indexed-vector,
+planner and graph/shared-budget CTests pass on each of the three cards.

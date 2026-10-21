@@ -6904,6 +6904,19 @@ bool ggml_backend_sched_measure_prepared(ggml_backend_sched_t sched, uint64_t * 
 
 bool ggml_backend_sched_reserve_prepared(ggml_backend_sched_t sched) {
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+        for (int i = 0; i < sched->n_backends; ++i) {
+            ggml_gallocr_buffer_stats stats = {};
+            if (ggml_gallocr_get_buffer_stats(sched->galloc, i, &stats)) {
+                fprintf(stderr, "%s: backend=%s required=%llu allocated=%llu budget=%llu "
+                        "budget_rejections=%llu allocation_failures=%llu\n", __func__,
+                        ggml_backend_name(sched->backends[i]),
+                        (unsigned long long) stats.required_bytes,
+                        (unsigned long long) stats.allocated_bytes,
+                        (unsigned long long) stats.allocation_budget_bytes,
+                        (unsigned long long) stats.budget_rejections,
+                        (unsigned long long) stats.allocation_failures);
+            }
+        }
         return false;
     }
 

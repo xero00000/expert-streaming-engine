@@ -6,9 +6,11 @@ push, hosted workflow, tag or publication.
 
 ## Acceptance contract
 
-The user selected **match Strata in speed**. For the first direct comparison,
+The user initially selected **match Strata in speed**, then explicitly revised
+the minimum to **80% of Strata** when requesting restoration of the old model
+loading path. For the first direct comparison,
 freeze one common supported model and prompt on this machine; compare repeated
-sustained decode medians (ESE / Strata at least 1.0). Record every sample and
+sustained decode medians (current requirement: ESE / Strata at least 0.8). Record every sample and
 cold/repeated behavior; retain startup, prefill and first-response separately.
 This does not lift the publication hold or qualify other models/context sizes.
 
@@ -18,7 +20,9 @@ remain scoped to that model. The Flash-Next launcher reference and its current
 ESE model-support blocker are recorded at the end of this document.
 The selected reference is **Flash-Next IQ2_XS, 1M experimental**, with all three
 GPUs and the saved launcher settings. Its repeated-request reference is
-52.3 tok/s (51.5 overall); ESE cannot yet load that model in the release build.
+52.3 tok/s (51.5 overall). The 80% ESE thresholds are **41.84 tok/s on repeats
+and 41.2 overall**. The default release build rejects the model; the existing
+dedicated loading path is now being restored and tested with the current fixes.
 
 Record the following before collecting qualification measurements:
 
@@ -384,11 +388,13 @@ internal file-cache trimming remain limits on the timing evidence.
 
 ESE is retested with the selected 1,048,576 context request and rejects the
 model before KV, YaRN or speculation admission. Its probe gate remains OFF.
-No ESE speed or eligible ratio exists for this model. Existing upstream
-short-prompt numerical evidence uses the pruned 256-expert Coder artifact;
-it does not qualify this selected 512-expert artifact or its 1M profile.
-Model references and the remaining admission gates must be resolved before
-an ESE performance comparison can satisfy task 4.
+At that point no ESE speed or eligible ratio existed for this model. A later
+inventory recovered `ese-iq2-xs-selected-model-20261013`, which contains
+references for this exact 512-expert artifact with the same complete GGUF
+hashes and six passing historical 33-token GPU comparisons against full and
+cached pinned references. The earlier Coder-only reference statement was
+incomplete. Current-build replay and the remaining admission gates still need
+qualification before a supported ESE performance comparison can satisfy task 4.
 
 `launcher-profile-comparison/selected-profile-summary.json` records the
 selected configuration, both complete model hashes, medians, resources,
@@ -400,3 +406,43 @@ preserved separately. No production launcher or engine source was changed.
 `auxiliary-inputs.json` records post-run hashes for pack/tokenizer files,
 MTP, routing profile, control vector, vision and service code; the complete
 GGUF hashes were obtained before timing.
+
+The user then requested restoring the old loading branch and revised the speed
+minimum to 80% of Strata: 41.2 tok/s overall and 41.84 on repeats for this saved
+reference. A private loading runtime uses current candidate objects with the
+existing probe-enabled loader and leaves the standard library/launcher intact.
+Its initial eight-token `Hi` control loads this model and reproduces the saved
+explicit-precision output exactly. That cold smoke is not a speed pass. The
+normal-policy eight-token pilot also repeats its own output exactly, but uses
+different arithmetic and reaches only 11.49 tok/s on its repeat. Both raw pilots
+are retained in `task4/qwen4exp-iq2-restore/`; numerical replay and performance
+profiling are in progress.
+
+
+### Restored selected-model evidence and optimization controls
+
+The current dedicated loader passes both recovered 33-token full/cached
+references: 8,194,560 logits per reference, unchanged relative/absolute bound
+`2e-5 * (1 + abs(reference))`, all 1,584 ordered expert-route rows and 33 top-one
+choices. After the exact F32-to-F64 PTX conversion change, logits, teachers and
+routes remain byte-identical to that passing current-build replay. This uses
+explicit arithmetic and F32 caches at 4K context on the 3080; it does not
+qualify normal quantized arithmetic or the 1M profile.
+
+The top-10 indexed dispatch optimization is limited to contiguous Q2_0 inputs;
+other quantizations retain their prior limit. Dense/sparse controls at short
+and actual down-projection dimensions pass with exact single-route parity on
+all three GPUs. Exhaustive signed-zero/subnormal conversion tests and eighteen
+real IQ2_XXS/IQ1_M expert, graph and cache regressions also pass on all cards.
+
+| 4K raw-Hi diagnostic | Before, warm tok/s | After, warm tok/s |
+| --- | ---: | ---: |
+| Normal arithmetic, Q2_0 indexed dispatch | 11.49 | 13.31 / 13.26 |
+| Explicit arithmetic, exact conversion | 5.58 / 5.60 | 7.09 / 7.40 |
+
+These are eight-token optimization controls, not selected-profile acceptance
+measurements. They remain below the required 41.2 overall / 41.84 repeat tok/s.
+The saved Nsight diagnoses run separately and are excluded from these timings.
+The first 1M startup tests fail allocation/reservation; one cause under
+investigation is the planner replacing requested Q4 cache with Q8. Exact Q4
+admission, profile-specific features and the complete workload remain open.

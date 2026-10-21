@@ -93,7 +93,8 @@ int capture_routes(ggml_tensor * tensor, bool ask, void * user_data) {
     const bool wanted_head = std::getenv("ESE_LIFECYCLE_ASSERT_HEAD_F32") && std::strcmp(tensor->name, "result_output") == 0;
     if (wanted_head) {
         capture.invalid_head_precision |= tensor->op != GGML_OP_MUL_MAT || tensor->op_params[0] != GGML_PREC_F32 ||
-                !tensor->src[0] || tensor->src[0]->type != GGML_TYPE_Q6_K;
+                !tensor->src[0] ||
+                (tensor->src[0]->type != GGML_TYPE_Q6_K && tensor->src[0]->type != GGML_TYPE_IQ4_XS);
         if (!ask) {
             ++capture.head_ops;
             if (tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer)) ++capture.head_gpu_ops;

@@ -1775,6 +1775,76 @@ void test_cuda_model_quantized_cache_geometry() {
 #endif
 }
 
+void test_cuda_top10_quantized_vectors() {
+#ifdef GGML_USE_CUDA
+    if (ggml_backend_cuda_get_device_count() == 0) return;
+    auto * backend = ggml_backend_cuda_init(0, nullptr, nullptr);
+    REQUIRE(backend != nullptr);
+    struct cleanup { ggml_backend_t backend; ~cleanup() { ggml_backend_free(backend); } } free_backend{backend};
+    constexpr int64_t columns = 640, experts = 16, used = 10;
+    constexpr auto type = GGML_TYPE_Q2_0;
+    // Qwen4exp uses 640 -> 2560 top-10 down projections. Include a short
+    // shape and the real output dimension, with distinct per-route inputs.
+    // Other quantizations keep their prior dispatch: their indexed and
+    // scalar kernels may use different floating-point reduction orders.
+    for (const int64_t rows : {64, 2560}) {
+        auto * ctx = ggml_init({1 << 20, nullptr, true});
+        REQUIRE(ctx != nullptr);
+        struct context_cleanup { ggml_context * ctx; ~context_cleanup() { ggml_free(ctx); } } free_ctx{ctx};
+        auto * weights = ggml_new_tensor_3d(ctx, type, columns, rows, experts);
+        auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, columns, used, 1);
+        auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, 1);
+        auto * together = ggml_mul_mat_id(ctx, weights, input, ids);
+        std::array<ggml_tensor *, used> singles{};
+        auto * graph = ggml_new_graph_custom(ctx, 128, false);
+        ggml_build_forward_expand(graph, together);
+        for (int64_t slot = 0; slot < used; ++slot) {
+            auto * x = ggml_view_3d(ctx, input, columns, 1, 1, input->nb[1], input->nb[2], slot*input->nb[1]);
+            auto * route = ggml_view_2d(ctx, ids, 1, 1, ids->nb[1], slot*ids->nb[0]);
+            singles[slot] = ggml_mul_mat_id(ctx, weights, x, route);
+            ggml_build_forward_expand(graph, singles[slot]);
+        }
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        REQUIRE(buffer != nullptr);
+        struct buffer_cleanup { ggml_backend_buffer_t buffer; ~buffer_cleanup() { ggml_backend_buffer_free(buffer); } } free_buffer{buffer};
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_EXPERT_CACHE);
+        std::vector<uint8_t> packed(ggml_nbytes(weights));
+        const size_t block = ggml_type_size(type);
+        for (size_t i = 0; i < packed.size(); i += block) {
+            const auto scale = ggml_fp32_to_fp16(float(1 + i/block%7)/64);
+            std::memcpy(packed.data()+i, &scale, sizeof(scale));
+            for (size_t j = 2; j < block; ++j) packed[i+j] = uint8_t((i/block*37+j*19)%256);
+        }
+        ggml_backend_tensor_set(weights, packed.data(), 0, packed.size());
+        std::vector<float> values(size_t(columns*used));
+        for (size_t i = 0; i < values.size(); ++i) values[i] = float(int((i*13+i/columns*17)%97)-48)/24;
+        ggml_backend_tensor_set(input, values.data(), 0, values.size()*sizeof(float));
+        for (const bool sparse : {false, true}) {
+            std::array<int32_t, used> routes{};
+            for (int slot = 0; slot < used; ++slot) routes[slot] = (slot*7+3)%experts;
+            if (sparse) { routes[3] = -1; routes[8] = -1; }
+            ggml_backend_tensor_set(ids, routes.data(), 0, sizeof(routes));
+            const std::vector<float> poison(size_t(rows*used), std::numeric_limits<float>::quiet_NaN());
+            ggml_backend_tensor_set(together, poison.data(), 0, poison.size()*sizeof(float));
+            REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+            std::vector<float> actual(size_t(rows*used));
+            ggml_backend_tensor_get(together, actual.data(), 0, actual.size()*sizeof(float));
+            for (int slot = 0; slot < used; ++slot) {
+                std::vector<float> expected(size_t(rows), 0.0f);
+                ggml_backend_tensor_get(singles[slot], expected.data(), 0, expected.size()*sizeof(float));
+                for (int row = 0; row < rows; ++row) {
+                    REQUIRE(std::isfinite(actual[size_t(slot*rows+row)]));
+                    REQUIRE(actual[size_t(slot*rows+row)] == expected[row]);
+                    if (routes[slot] < 0) REQUIRE(expected[row] == 0.0f);
+                }
+            }
+            std::cout << "Top-10 CUDA indexed vectors: " << ggml_type_name(type)
+                      << " rows=" << rows << " sparse=" << sparse << " exact single-route parity\n";
+        }
+    }
+#endif
+}
+
 void test_cuda_sparse_quantized_routes() {
 #ifdef GGML_USE_CUDA
     if (ggml_backend_cuda_get_device_count() == 0) return;
@@ -2654,6 +2724,11 @@ int main(int argc, char ** argv) {
         if (argc == 2 && std::strcmp(argv[1], "--model-quant-geometry-only") == 0) {
             test_cuda_model_quantized_cache_geometry();
             std::cout << "PASS: model quantized cache geometry\n";
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--top10-quant-vectors-only") == 0) {
+            test_cuda_top10_quantized_vectors();
+            std::cout << "PASS: top-10 indexed quantized vectors\n";
             return 0;
         }
         test_cpu_router_softmax_replay();

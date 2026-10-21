@@ -3637,7 +3637,15 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     CUDA_CHECK(cudaMemsetAsync((char *)dst->data, 0, ggml_nbytes(dst), ctx.stream()));
 
-    if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+    // For one token, ne[1] selects broadcast or per-expert activations,
+    // not a matrix-vector batch. The indexed kernel receives one column
+    // and indexes the separately quantized activation rows on the device.
+    // Q2_0 has no indexed MMQ fallback: top-10 down projections otherwise
+    // require a host route readback and ten separate matrix launches. Keep
+    // the existing dispatch limit for other formats.
+    if ((src1->ne[1] <= MMVQ_MAX_BATCH_SIZE ||
+         (src0->type == GGML_TYPE_Q2_0 && src1->ne[1] == ids->ne[0] && ggml_is_contiguous(src1))) &&
+        src1->ne[2] == 1 && src1->ne[3] == 1 &&
         ggml_is_quantized(src0->type) &&
         ggml_backend_buffer_is_cuda(src0->buffer) &&
         ggml_backend_buffer_is_cuda(src1->buffer) &&

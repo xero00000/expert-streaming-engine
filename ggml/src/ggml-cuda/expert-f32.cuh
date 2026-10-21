@@ -7,12 +7,12 @@ bool ggml_cuda_expert_f32_supported_layout(const ggml_tensor * op);
 void ggml_cuda_expert_f32(ggml_tensor * op, cudaStream_t stream);
 
 static __device__ __forceinline__ double expert_f32_to_double(float value) {
-    const uint32_t bits = __float_as_uint(value);
-    if ((bits & 0x7f800000u) == 0) {
-        const double magnitude = ldexp(double(bits & 0x007fffffu), -149);
-        return bits & 0x80000000u ? -magnitude : magnitude;
-    }
-    return double(value);
+    // CUDA fast math may flush subnormal F32 inputs in an ordinary cast.
+    // PTX conversion preserves them directly, including signed zero, without
+    // calling general-purpose ldexp for every zero or subnormal operand.
+    double output;
+    asm("cvt.f64.f32 %0, %1;" : "=d"(output) : "f"(value));
+    return output;
 }
 
 static __device__ __forceinline__ float expert_f64_to_float(double value) {
