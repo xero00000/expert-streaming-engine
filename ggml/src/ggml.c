@@ -18789,6 +18789,38 @@ static void ggml_compute_forward_expert_f32(const struct ggml_compute_params * p
     ggml_barrier(params->shared);
 }
 
+struct ggml_mmid_row_mapping {
+    int32_t i1;
+    int32_t i2;
+};
+
+// Store exactly one mapping per valid route, grouped by expert. A token can
+// reference one expert more than once; a fixed token-count stride per expert
+// cannot hold those routes and used to overwrite neighboring groups/workspace.
+static void ggml_mmid_build_row_mapping(const struct ggml_tensor * ids, int n_as,
+        int64_t * counts, int64_t * offsets, struct ggml_mmid_row_mapping * rows) {
+    memset(counts, 0, n_as*sizeof(int64_t));
+    for (int64_t token = 0; token < ids->ne[1]; ++token) {
+        for (int64_t slot = 0; slot < ids->ne[0]; ++slot) {
+            const int32_t expert = *(const int32_t *)((const char *)ids->data + token*ids->nb[1] + slot*ids->nb[0]);
+            if (expert >= 0 && expert < n_as) ++counts[expert];
+        }
+    }
+    int64_t end = 0;
+    for (int expert = 0; expert < n_as; ++expert) {
+        offsets[expert] = end;
+        end += counts[expert];
+        counts[expert] = 0;
+    }
+    for (int64_t token = 0; token < ids->ne[1]; ++token) {
+        for (int64_t slot = 0; slot < ids->ne[0]; ++slot) {
+            const int32_t expert = *(const int32_t *)((const char *)ids->data + token*ids->nb[1] + slot*ids->nb[0]);
+            if (expert >= 0 && expert < n_as)
+                rows[offsets[expert] + counts[expert]++] = (struct ggml_mmid_row_mapping){(int32_t)slot, (int32_t)token};
+        }
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -18840,13 +18872,9 @@ static void ggml_compute_forward_mul_mat_id(
             (char *) params->wdata :
             (char *) params->wdata + GGML_PAD(ggml_row_size(vec_dot_type, src1->ne[0])*ggml_nrows(src1), sizeof(int64_t));
 
-    struct mmid_row_mapping {
-        int32_t i1;
-        int32_t i2;
-    };
-
     int64_t * matrix_row_counts = (int64_t *) (wdata_src1_end); // [n_as]
-    struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][ne11]
+    int64_t * matrix_row_offsets = matrix_row_counts + n_as;  // [n_as]
+    struct ggml_mmid_row_mapping * matrix_rows = (struct ggml_mmid_row_mapping *)(matrix_row_offsets + n_as); // [n_ids * ne12]
 
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
@@ -18869,7 +18897,7 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12 + (i1)]
+#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[matrix_row_offsets[row_id] + (i1)]
 
     if (ids->ne[1] != dst->ne[2] && ith == 0) {
         fprintf(stderr, "ggml MUL_MAT_ID route/output mismatch: dst=%s ne2=%lld ids=%s ne=[%lld,%lld] src0=%s src1=%s\n",
@@ -18890,21 +18918,7 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
-        // initialize matrix_row_counts
-        memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
-
-        // group rows by src0 matrix
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-            for (int id = 0; id < n_ids; ++id) {
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
-
-                if (i02 < 0 || i02 >= n_as) continue;
-                //assert(i02 >= 0 && i02 < n_as);
-
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
-                matrix_row_counts[i02] += 1;
-            }
-        }
+        ggml_mmid_build_row_mapping(ids, n_as, matrix_row_counts, matrix_row_offsets, matrix_rows);
     }
 
     if (ith == 0) {
@@ -18972,7 +18986,7 @@ static void ggml_compute_forward_mul_mat_id(
                         src0->type, group->data[index], nb01,
                         vec_dot_type, (const char *) wdata_mm, row_size_mm,
                         (float *) dst->data, nb1, nb2,
-                        matrix_rows + expert*ne12, local_chunk, chunks_per_expert)) {
+                        matrix_rows + matrix_row_offsets[expert], local_chunk, chunks_per_expert)) {
                     // Preserve the established GEMV/vec-dot fallback while the
                     // group still owns its weights. Releasing the group and
                     // restarting per-thread acquisitions would reintroduce
@@ -18994,7 +19008,7 @@ static void ggml_compute_forward_mul_mat_id(
                     const int64_t first_y = dr1*(local_chunk/nth0);
                     const int64_t last_y = MIN(first_y + dr1, nr1);
                     for (int64_t ir1 = first_y; ir1 < last_y && first < last; ++ir1) {
-                        const struct mmid_row_mapping row = MMID_MATRIX_ROW(expert, ir1);
+                        const struct ggml_mmid_row_mapping row = MMID_MATRIX_ROW(expert, ir1);
                         const char * column = (const char *) wdata_mm +
                                 (src1_cont || src1->type != vec_dot_type
                                  ? (row.i1%ne11 + row.i2*ne11)*row_size_mm
@@ -19062,7 +19076,7 @@ static void ggml_compute_forward_mul_mat_id(
                         src0->type, src0_cur, nb01,
                         vec_dot_type, (const char *)wdata_mm, row_size_mm,
                         (float *)dst->data, nb1, nb2,
-                        matrix_rows + cur_a*ne12, local_chunk, chunks_per_expert)) {
+                        matrix_rows + matrix_row_offsets[cur_a], local_chunk, chunks_per_expert)) {
                 chunked_failed = true;
                 break;
             }
@@ -19114,7 +19128,7 @@ static void ggml_compute_forward_mul_mat_id(
                        src0->type, (const char *)src0_cur, nb01, ///ggml_type_size(src0->type),
                        vec_dot_type, (const char *)wdata, row_size, ///ggml_type_size(vec_dot_type),
                        (float *)dst->data, nb1, nb2,
-                       matrix_rows + cur_a*ne12, ith, nth)) goto IQK_MulMat_Not_Available;
+                       matrix_rows + matrix_row_offsets[cur_a], ith, nth)) goto IQK_MulMat_Not_Available;
                 ggml_cpu_expert_release(params, &expert_lease);
                 continue;
         }
@@ -19132,7 +19146,7 @@ IQK_MulMat_Not_Available:;
             }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                struct ggml_mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
                 const int id       = row_mapping.i1; // selected expert index
 
                 const int64_t  i11 = id % ne11;
@@ -19164,7 +19178,7 @@ IQK_MulMat_Not_Available:;
             }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                struct ggml_mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
                 const int id       = row_mapping.i1; // selected expert index
 
                 const int64_t  i11 = id % ne11;
@@ -19220,7 +19234,7 @@ IQK_MulMat_Not_Available:;
                 for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir111; ++ir1) {
                     const int64_t _i12 = ir1; // logical row index for this expert
 
-                    struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
+                    struct ggml_mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
                     const int id       = row_mapping.i1; // selected expert index
 
                     const int64_t  i11 = id % ne11;
@@ -19317,13 +19331,9 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
             (char *) params->wdata :
             (char *) params->wdata + GGML_PAD(ggml_row_size(vec_dot_type, src1->ne[0])*ggml_nrows(src1), sizeof(int64_t));
 
-    struct mmid_row_mapping {
-        int32_t i1;
-        int32_t i2;
-    };
-
     int64_t * matrix_row_counts = (int64_t *) (wdata_src1_end); // [n_as]
-    struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][ne11]
+    int64_t * matrix_row_offsets = matrix_row_counts + n_as;  // [n_as]
+    struct ggml_mmid_row_mapping * matrix_rows = (struct ggml_mmid_row_mapping *)(matrix_row_offsets + n_as); // [n_ids * ne12]
 
     if (src1->type != vec_dot_type) {
 
@@ -19349,7 +19359,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         }
     }
 
-#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12 + (i1)]
+#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[matrix_row_offsets[row_id] + (i1)]
 
     GGML_ASSERT(ids->ne[1] == dst->ne[2]);
     for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
@@ -19364,21 +19374,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
     }
 
     if (ith == 0) {
-        // initialize matrix_row_counts
-        memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
-
-        // group rows by src0 matrix
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-            for (int id = 0; id < n_ids; ++id) {
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
-
-                if (i02 < 0 || i02 >= n_as) continue;
-                //assert(i02 >= 0 && i02 < n_as);
-
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
-                matrix_row_counts[i02] += 1;
-            }
-        }
+        ggml_mmid_build_row_mapping(ids, n_as, matrix_row_counts, matrix_row_offsets, matrix_rows);
     }
 
 #if defined GGML_EXPERT_CHUNKING
@@ -19443,7 +19439,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                             vec_dot_type, (const char *)wdata_ug, row_size_ug,
                             up_b_cur, gate_b_cur,
                             (float *)dst->data, nb1, nb2,
-                            matrix_rows + cur_a*ne12, limit, local_chunk, chunks_per_expert_ug)) GGML_ABORT("fatal error");
+                            matrix_rows + matrix_row_offsets[cur_a], limit, local_chunk, chunks_per_expert_ug)) GGML_ABORT("fatal error");
 
         ggml_cpu_expert_release(params, &lease_2);
         ggml_cpu_expert_release(params, &lease_1);
@@ -19494,7 +19490,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                             vec_dot_type, (const char *)wdata, row_size,
                             up_b_cur, gate_b_cur,
                             (float *)dst->data, nb1, nb2,
-                            matrix_rows + cur_a*ne12, limit, ith, nth)) GGML_ABORT("fatal error");
+                            matrix_rows + matrix_row_offsets[cur_a], limit, ith, nth)) GGML_ABORT("fatal error");
 
         ggml_cpu_expert_release(params, &lease_2);
         ggml_cpu_expert_release(params, &lease_1);
@@ -29597,9 +29593,9 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                         cur += ggml_row_size(vec_dot_type, node->src[1]->ne[0]) * ggml_nrows(node->src[1]);
                     }
                     const int n_as = src0->ne[2];
-                    cur += GGML_PAD(cur, sizeof(int64_t));       // align
-                    cur += n_as * sizeof(int64_t);               // matrix_row_counts
-                    cur += n_as * src1->ne[2] * sizeof(int64_t); // matrix_rows
+                    cur = GGML_PAD(cur, sizeof(int64_t));        // align activation storage
+                    cur += 2*(size_t)n_as*sizeof(int64_t);       // counts and offsets
+                    cur += ggml_nelements(node->src[2])*sizeof(struct ggml_mmid_row_mapping);
                 } break;
             case GGML_OP_MOE_FUSED_UP_GATE:
                 {
@@ -29618,9 +29614,9 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                         cur += ggml_row_size(vec_dot_type, src2->ne[0]) * ggml_nrows(src2);
                     }
                     const int n_as = src0->ne[2];
-                    cur += GGML_PAD(cur, sizeof(int64_t));       // align
-                    cur += n_as * sizeof(int64_t);               // matrix_row_counts
-                    cur += n_as * src2->ne[2] * sizeof(int64_t); // matrix_rows
+                    cur = GGML_PAD(cur, sizeof(int64_t));        // align activation storage
+                    cur += 2*(size_t)n_as*sizeof(int64_t);       // counts and offsets
+                    cur += ggml_nelements(node->src[3])*sizeof(struct ggml_mmid_row_mapping);
                 } break;
             case GGML_OP_FUSED_UP_GATE:
                 {

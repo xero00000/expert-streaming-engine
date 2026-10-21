@@ -69,16 +69,17 @@ struct lease_source {
     }
 };
 
-static void indexed_matrix(bool native, int width, int rows, int input_slots, bool leased) {
+static void indexed_matrix(bool native, int width, int rows, int input_slots, bool leased, bool repeated) {
+    const int experts = repeated ? 3 : 12, tokens = repeated ? 3 : 1;
     using context_ptr = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
     using backend_ptr = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
     using buffer_ptr = std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>;
     context_ptr ctx(ggml_init({2<<20,nullptr,true}), ggml_free);
     backend_ptr cpu(ggml_backend_cpu_init(), ggml_backend_free);
-    auto * w = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_Q2_0, width, rows, 12);
+    auto * w = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_Q2_0, width, rows, experts);
     ggml_set_name(w,"blk.0.ffn_down_exps.weight");
-    auto * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, width, input_slots, 1);
-    auto * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 10, 1);
+    auto * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, width, input_slots, tokens);
+    auto * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 10, tokens);
     auto * y = ggml_mul_mat_id(ctx.get(), w, x, ids);
     auto * graph = ggml_new_graph_custom(ctx.get(), 16, false); ggml_build_forward_expand(graph, y);
     buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),cpu.get()), ggml_backend_buffer_free);
@@ -95,25 +96,35 @@ static void indexed_matrix(bool native, int width, int rows, int input_slots, bo
         std::vector<uint8_t> poison(ggml_nbytes(w),0xff);
         ggml_backend_tensor_set(w,poison.data(),0,poison.size());
     }
-    std::vector<float> input(width*input_slots), actual(rows*10), reference(actual.size()), one_thread;
+    std::vector<float> input(width*input_slots*tokens), actual(rows*10*tokens), reference(actual.size()), one_thread;
     const auto q8 = ggml_internal_get_type_traits(GGML_TYPE_Q8_0);
-    std::vector<uint8_t> quant(ggml_row_size(GGML_TYPE_Q8_0,width)*input_slots);
-    // A model top-k list contains each expert at most once per token.
-    // CPU route grouping reserves one mapping per expert/token pair.
-    const int32_t route[10] = {11,-1,0,9,1,-1,6,4,8,2};
+    std::vector<uint8_t> quant(ggml_row_size(GGML_TYPE_Q8_0,width)*input_slots*tokens);
+    const std::array<int32_t,10> unique = {11,-1,0,9,1,-1,6,4,8,2};
+    // The generic operation also accepts repeated routes. This geometry
+    // originally overflowed the legacy per-expert/token mapping stride.
+    const std::array<int32_t,10> duplicate = {2,-1,0,2,1,-1,0,1,2,0};
+    const auto & route = repeated ? duplicate : unique;
     for (int round = 0; round < 2; ++round) {
         for (size_t i = 0; i < input.size(); ++i) input[i] = std::cos(float(i)*.031f+round)*1.7f;
         ggml_backend_tensor_set(x,input.data(),0,input.size()*sizeof(float));
-        int32_t selected[10]; for (int i = 0; i < 10; ++i) selected[i] = route[(i+round)%10];
-        ggml_backend_tensor_set(ids,selected,0,sizeof(selected));
-        if (native) for (int i = 0; i < input_slots; ++i)
+        std::vector<int32_t> selected(10*tokens);
+        for (int token = 0; token < tokens; ++token) for (int i = 0; i < 10; ++i)
+            selected[token*10+i] = route[(i+round+token)%10];
+        if (repeated && round == 1) selected.back() = experts; // positive out-of-range mask
+        ggml_backend_tensor_set(ids,selected.data(),0,selected.size()*sizeof(int32_t));
+        if (native) for (int i = 0; i < input_slots*tokens; ++i)
             q8.from_float(input.data()+i*width,quant.data()+i*ggml_row_size(GGML_TYPE_Q8_0,width),width);
         std::fill(reference.begin(),reference.end(),0.f);
-        for (int slot = 0; slot < 10; ++slot) if (selected[slot] >= 0) for (int row = 0; row < rows; ++row) {
-            const void * weight = reinterpret_cast<const uint8_t *>(weights.data())+selected[slot]*w->nb[2]+row*w->nb[1];
-            if (native) ggml_vec_dot_q2_0_q8_0(width,&reference[slot*rows+row],0,weight,0,
-                    quant.data()+(slot%input_slots)*ggml_row_size(GGML_TYPE_Q8_0,width),0,1);
-            else ggml_vec_dot_q2_0_f32(width,&reference[slot*rows+row],0,weight,0,input.data()+(slot%input_slots)*width,0,1);
+        for (int token = 0; token < tokens; ++token) for (int slot = 0; slot < 10; ++slot) {
+            const int expert = selected[token*10+slot];
+            if (expert < 0 || expert >= experts) continue;
+            for (int row = 0; row < rows; ++row) {
+                const void * weight = reinterpret_cast<const uint8_t *>(weights.data())+expert*w->nb[2]+row*w->nb[1];
+                const int column = token*input_slots+slot%input_slots;
+                if (native) ggml_vec_dot_q2_0_q8_0(width,&reference[(token*10+slot)*rows+row],0,weight,0,
+                        quant.data()+column*ggml_row_size(GGML_TYPE_Q8_0,width),0,1);
+                else ggml_vec_dot_q2_0_f32(width,&reference[(token*10+slot)*rows+row],0,weight,0,input.data()+column*width,0,1);
+            }
         }
         for (int threads : {1,4}) {
             ggml_backend_cpu_set_n_threads(cpu.get(),threads);
@@ -128,8 +139,8 @@ static void indexed_matrix(bool native, int width, int rows, int input_slots, bo
         }
     }
     if (leased) require(source.acquired > 0 && source.rejected > 0,"Q2 bounded lease path not exercised");
-    std::printf("Q2 indexed matrix: native=%d width=%d rows=%d input_slots=%d leased=%d masked/replayed/one-four-thread exact\n",
-            int(native),width,rows,input_slots,int(leased));
+    std::printf("Q2 indexed matrix: native=%d width=%d rows=%d input_slots=%d leased=%d repeated=%d tokens=%d masked/replayed/one-four-thread exact\n",
+            int(native),width,rows,input_slots,int(leased),int(repeated),tokens);
 }
 
 int main(int argc,char ** argv) {
@@ -149,9 +160,9 @@ int main(int argc,char ** argv) {
         const auto traits = ggml_internal_get_type_traits(GGML_TYPE_Q2_0);
         require(traits.vec_dot_type == (native ? GGML_TYPE_Q8_0:GGML_TYPE_F32),"Q2 opt-in activation policy");
         packed_integer_reference();
-        for (bool leased : {false,true}) for (int slots : {1,10}) {
-            indexed_matrix(native,64,9,slots,leased);
-            indexed_matrix(native,640,2560,slots,leased);
+        for (bool repeated : {false,true}) for (bool leased : {false,true}) for (int slots : {1,10}) {
+            indexed_matrix(native,64,9,slots,leased,repeated);
+            indexed_matrix(native,640,2560,slots,leased,repeated);
         }
         ggml_free(init);
     } catch (const std::exception & error) { std::fprintf(stderr,"FAIL: %s\n",error.what()); return 1; }

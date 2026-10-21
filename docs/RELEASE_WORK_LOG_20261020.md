@@ -91,6 +91,13 @@ ESE thresholds are **41.2 overall and 41.84 tok/s on repeats**. ESE currently
 rejects this model architecture in its default build, so the current work
 restores and tests the existing dedicated loading path before qualification.
 
+Current local status: the private probe runtime loads the exact selected
+shards and completes the frozen workload. The latest one-start/three-request
+diagnostic reaches 19.84 / 19.66 tok/s on repeats with unchanged native output
+hashes. This remains below the 41.2 / 41.84 tok/s gates. Native arithmetic,
+long-context/lifecycle acceptance and the production admission gate remain
+open; this is not GitHub/release readiness.
+
 - Define the exact model, prompt, resource budget, policies and speed target.
   Use Strata's measured sustained decode rate as the reference; retain startup,
   prefill and first-response timings separately.
@@ -1523,3 +1530,56 @@ The isolated GPU-only `workload-1m-graph-guard-passive1` completes at 14.398 /
 18.755 tok/s with both original native output hashes unchanged, versus the
 preceding 14.340 / 18.901. Treat the full-workload timing as neutral: no
 end-to-end speedup is claimed. Task 4 and the 80% speed gate remain open.
+
+The existing GPU `ESE_EXPERT_CACHE_RETENTION=frequency` option is tested
+separately from the already-selected RAM frequency policy. Its unchanged
+552/128 requests complete at 13.947 / 18.099 tok/s with the same native hashes,
+below the preceding LRU diagnostic. It is not adopted. Testing additional
+GPU cache capacity follows, preserving the existing 1400 MiB physical reserve
+and all arithmetic/context settings.
+
+
+The requested 3328 MiB GPU cache diagnostic completes at 14.712 / 19.269
+tok/s with unchanged native hashes. Combining that request with the already
+validated autotuner completes three 552/128 requests at 13.968 / 19.841 /
+19.664 tok/s. All hashes remain identical. The runtime admits 3,327,270,912
+bytes (about 3.10 GiB), below the requested 3.25 GiB, under its existing
+physical reserve clamp. Peak sampled 3080 usage is 8462 MiB, leaving 1778 MiB
+at one-second sample points; no process swap is sampled. This does not prove
+an instantaneous free-memory minimum. The 1400 MiB reserve and all live
+guards remain enabled. These are one-start diagnostics and do not satisfy
+the three-start qualification or the 80% speed requirement.
+
+
+### Task 4 — duplicate native CPU route mapping safety
+
+The earlier ASan failure exposed a real generic-operator bug, rather than a
+public API prohibition on repeated routes. Model top-k lists are unique, but
+`ggml_mul_mat_id` also accepts repeated expert IDs. The old native CPU mapper
+reserved only one row per expert/token, so repeated IDs could overwrite the
+next expert's mappings or the heap. This affects the default scalar path as
+well as the opt-in Q2/Q8 path. The earlier unique-top-k fixture did not cover
+that accepted generic geometry; this follow-up closes that gap.
+
+Both native indexed matmul and fused up/gate now count routes, prefix-sum
+per-expert offsets, and store one mapping per valid route. Expert grouping
+and within-expert token/slot order are preserved. Workspace planning reserves
+counts, offsets and the full route count, aligning the activation region
+once rather than doubling it. Mapping storage scales with actual routed
+positions instead of experts x tokens. For 512 experts / 10 routes / 128
+tokens, mapping metadata is 18,432 bytes versus the prior 528,384 bytes
+(excluding activation storage). No expert, route, or numerical threshold is
+removed to make the case fit.
+
+The Q2 native/default regressions now include the original repeated-ID
+geometry, three-token batches, changed routes/inputs, negative and positive
+out-of-range masks, broadcast/per-route input, one/four threads, and bounded
+leases with poisoned backing storage. They pass normal and ASan/UBSan
+builds. A separate self-contained IQ4_XS fused regression covers separate and
+merged gate/up, constant-weight analytical outputs at the unchanged
+2e-5*(1+abs(reference)) bound, repeated/masked/batched routes, changed inputs
+and exact thread parity. It passes both builds. The expert-cache suite also
+passes in the ASan CPU build and in the CUDA build with all three cards
+visible. Evidence: `compact-route-*`; the original ASan report remains
+available. The separate strict 33-token / 1M model control matches all
+8,194,560 logits, routes and IDs bitwise with the preceding control.
