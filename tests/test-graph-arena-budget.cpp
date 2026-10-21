@@ -5,6 +5,7 @@
 #include "ggml-cuda.h"
 #endif
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-sched-memory.h"
 
 #include <algorithm>
 #include <cstdio>

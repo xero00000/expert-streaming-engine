@@ -1,5 +1,6 @@
 #include "ggml-alloc.h"
 #include "ggml-memory-budget.h"
+#include "ggml-sched-memory.h"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-impl.h"
