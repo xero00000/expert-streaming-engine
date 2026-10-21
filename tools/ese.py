@@ -18,6 +18,7 @@ llama-server options can be appended after ``--``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import dataclasses
 import glob
@@ -63,7 +64,7 @@ DEFAULT_HARDWARE_BENCH = Path("build/bin") / (
 )
 KNOWN_KV_TYPES = ("auto", "f16", "q8_0", "q4_0")
 POLICIES = ("auto", "resident", "hybrid", "cache", "stream")
-HYBRID_VERIFICATION_VERSION = 3
+HYBRID_VERIFICATION_VERSION = 4
 HYBRID_MAX_CALIBRATION_DRIFT = 4.0
 
 
@@ -1846,6 +1847,7 @@ def _completion_result(
             "temperature": 0,
             "seed": seed,
             "cache_prompt": False,
+            "ignore_eos": True,
         },
         timeout,
     )
@@ -1853,29 +1855,26 @@ def _completion_result(
     timings = response.get("timings")
     if not isinstance(content, str) or not isinstance(timings, dict):
         raise ESEError("completion response omitted content or timings")
-    speed = timings.get("predicted_per_second")
-    if (
-        isinstance(speed, bool)
-        or not isinstance(speed, (int, float))
-        or not math.isfinite(float(speed))
-        or speed <= 0
-    ):
-        predicted_n = timings.get("predicted_n")
-        predicted_ms = timings.get("predicted_ms")
-        if (
-            not isinstance(predicted_n, bool)
-            and not isinstance(predicted_ms, bool)
-            and isinstance(predicted_n, (int, float))
-            and isinstance(predicted_ms, (int, float))
-            and math.isfinite(float(predicted_n))
-            and math.isfinite(float(predicted_ms))
-            and predicted_n > 0
-            and predicted_ms > 0
-        ):
-            speed = predicted_n * 1000.0 / predicted_ms
-        else:
-            raise ESEError("completion response omitted valid decode throughput")
-    return hashlib.sha256(content.encode("utf-8")).hexdigest(), float(speed)
+    for count in (response.get("tokens_predicted"), timings.get("predicted_n")):
+        if type(count) is not int or count != tokens:
+            raise ESEError("completion did not generate the full requested token count")
+    prompt_n = timings.get("prompt_n")
+    if (type(prompt_n) is not int or prompt_n <= 0
+            or type(response.get("tokens_evaluated")) is not int
+            or response["tokens_evaluated"] != prompt_n
+            or response.get("truncated") is not False):
+        raise ESEError("completion prompt counts are inconsistent or truncated")
+    predicted_ms = timings.get("predicted_ms")
+    if (isinstance(predicted_ms, bool) or not isinstance(predicted_ms, (int, float))
+            or not math.isfinite(predicted_ms) or predicted_ms <= 0):
+        raise ESEError("completion response omitted valid decode duration")
+    speed = tokens * 1000.0 / predicted_ms
+    reported_speed = timings.get("predicted_per_second", speed)
+    if (isinstance(reported_speed, bool) or not isinstance(reported_speed, (int, float))
+            or not math.isfinite(reported_speed) or reported_speed <= 0
+            or not math.isclose(reported_speed, speed, rel_tol=0.001, abs_tol=0.001)):
+        raise ESEError("completion decode throughput contradicts its counts and duration")
+    return hashlib.sha256(content.encode("utf-8")).hexdigest(), speed
 
 
 def _run_hybrid_validation_server(
@@ -1919,14 +1918,14 @@ def _run_hybrid_validation_server(
 
             for index in range(warmups):
                 _completion_result(
-                    port, f"{prompt}\nWarmup {index}.", tokens, 1234 + index, request_timeout
+                    port, prompt, tokens, 1234 + index, request_timeout
                 )
             hashes: list[str] = []
             speeds: list[float] = []
             for index in range(samples):
                 output_hash, speed = _completion_result(
                     port,
-                    f"{prompt}\nMeasured trial {index}.",
+                    prompt,
                     tokens,
                     4321 + index,
                     request_timeout,
@@ -1984,7 +1983,13 @@ def _validate_hybrid(args: argparse.Namespace) -> int:
         "A careful local ESE benchmark validates deterministic expert routing, "
         "output parity, and stable decode throughput. " * 32
     )
-    with tempfile.TemporaryDirectory(prefix="ese-hybrid-validation-") as temporary:
+    if args.evidence_dir is not None:
+        args.evidence_dir = args.evidence_dir.expanduser().resolve()
+        args.evidence_dir.mkdir(parents=True, exist_ok=False)
+        evidence_context = contextlib.nullcontext(str(args.evidence_dir))
+    else:
+        evidence_context = tempfile.TemporaryDirectory(prefix="ese-hybrid-validation-")
+    with evidence_context as temporary:
         root = Path(temporary)
         baseline_result = _run_hybrid_validation_server(
             baseline,
@@ -2568,6 +2573,10 @@ def _make_parser() -> argparse.ArgumentParser:
     validate_hybrid.add_argument("--prompt")
     validate_hybrid.add_argument("--startup-timeout", type=float, default=600.0)
     validate_hybrid.add_argument("--request-timeout", type=float, default=600.0)
+    validate_hybrid.add_argument(
+        "--evidence-dir", type=Path,
+        help="retain native A/B server logs in a new directory, including on failure",
+    )
 
     plan = commands.add_parser("plan", help="inspect the policy and native command")
     _add_plan_arguments(plan)

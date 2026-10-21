@@ -171,3 +171,23 @@ lookup reaches 241, overflowing its saturating 16-bit pair sum before offset
 correction. A narrow signed-lookup/abs-sign repair and regression are under
 validation. The independent 0.08 calibration limit remains unchanged; mixed
 routing remains disabled until calibration and its separate workload gate pass.
+
+Native source `f1c381c5f` completes the signed AVX2 repair: all 27 synthetic
+cases pass, and full model-backed calibration is planner-ready with CPU oracle
+errors below 0.004 for each of the three expert formats. Its qualification
+passes 95 CPU tests, 100 CUDA tests plus one expected NCCL skip per GPU, and
+five strict sanitizer targets. The table above still describes the earlier
+`9e55c4925` native benchmark; no speed improvement is inferred from a correctness
+repair or a cache-hot calibration result.
+
+The initial calibrated hybrid A/B trial is invalid and retained in
+`3080-iq4-hybrid-gate-f1c381c5f.log` and `hybrid-gate-f1c381c5f-raw/`.
+The existing validator appended text after the chat generation prefix and
+accepted early EOS as a timing sample. It has been repaired to preserve the
+supplied prompt, force the requested generation length, verify actual/timing
+counts and duration arithmetic, and reject truncation. Four new regression
+tests fail before the repair and pass after it; the complete 160-test Python
+suite passes. Verification schema 4 rejects earlier measurement receipts.
+`validate-hybrid --evidence-dir NEW_DIRECTORY` now preserves both native logs
+on success or failure. A new full-token trial is required before any mixed
+configuration can qualify for the matched Strata comparison.

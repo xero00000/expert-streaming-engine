@@ -453,3 +453,32 @@ IQ4_XS CPU saturation error (12.8% versus scalar reference; the direct row dot
 has 0.4% error). A synthetic regression fails before the narrow repair and
 passes after it; final-source builds and affected checks are next. Calibration
 thresholds and the mixed-routing validation gate remain enforced.
+
+### Task 4 continuation — CPU correctness and workload measurement repair
+
+Committed native source `f1c381c5f` fixes the AVX2 IQ4_XS saturating pair
+products using signed lookup values. All 27 synthetic geometry/sign cases
+agree with scalar dequantization and between one/four threads. Model-backed
+CPU oracle errors are now 0.00377–0.00400 for Q6_K, IQ3_S and IQ4_XS, below
+the unchanged 0.08 limit. Full calibration passes and produces a planner-ready
+profile. The staged Studio runtime has not been rebuilt from this source.
+
+Final-source checks pass: 95 CPU tests, 100 CUDA passes and one expected NCCL
+skip on each physical GPU, and five strict ASAN/UBSAN/leak targets. Evidence:
+`task4/iq4-fix-f1c381c5f/`, `task4/cpu-reference-diagnostic/` and
+`task4/3080-iq4-hardware-profile-f1c381c5f.json` under the existing results root.
+These checks do not replace upstream full-model numerical qualification.
+
+The first mixed-routing A/B attempt is invalid: the existing validator appended
+trial text after the supplied assistant-generation prefix, causing immediate
+EOS. It accepted one generated token as a 128-token timing sample (a meaningless
+1,000,000 tok/s). The run was stopped, its raw logs retained, and no verification
+pass saved. New regressions reproduce the defect before repair. The validator
+now preserves the exact supplied prompt, requests `ignore_eos`, requires full
+generation and consistent prompt/timing counts, rejects truncated or invalid
+durations, and checks throughput against counts/duration. Verification format
+version 4 invalidates earlier receipts. Optional `--evidence-dir` retains native
+logs even when validation fails. All 160 Python tests pass after the repair.
+
+The Strata speed target remains unmet. A valid mixed-routing A/B trial and the
+live prefill-reserve recovery repair are next; publication remains on hold.
