@@ -27,7 +27,7 @@ and `/home/xero/Desktop/test/results/ese-consolidation-review-20261020` for logs
 
 ## Ordered tasks
 
-### 1. Align the release package workflow — LOCAL CHECKS PASS; FULL BUILD PENDING
+### 1. Align the release package workflow — LOCAL EIGHT-PACKAGE CONTRACT PASS
 
 - [x] Define one versioned artifact naming contract for Linux CPU/CUDA
   DEB/RPM/AppImage packages and Windows dual-runtime MSI/NSIS installers.
@@ -44,10 +44,10 @@ and `/home/xero/Desktop/test/results/ese-consolidation-review-20261020` for logs
 Acceptance: automation consistently produces the expected eight packages with
 matching names, signatures/checksums and safe updater targets. Actual package
 builds/installations remain task 6; hosted workflow execution stays on hold.
-The local implementation is checked. The full acceptance criterion is not yet
-claimed: no new eight-package production build or installed-update trial has
-been run. Continue with task 2's clean-source validation, retaining the full
-package acceptance check for tasks 6 and 7.
+The local eight-package collection, provenance, checksums and correctly routed
+signed-update feeds now pass on the final source. Actual packages and installed
+updates are recorded under tasks 6 and 7. Hosted release workflow execution
+remains on hold; no hosted CI result is inferred from local builds.
 
 ### 2. Finish validation of the consolidated source — COMPLETE (LOCAL SOURCE CHECKS)
 
@@ -122,7 +122,7 @@ separate. The speed acceptance does not lift the publication hold.
 Acceptance: sustained runs without corruption, silent truncation or progressive
 memory growth, with exact commands and failed trials preserved.
 
-### 6. Rebuild and install the final packages — LINUX CHECKS PASS; WINDOWS PENDING
+### 6. Rebuild and install the final packages — SOFTWARE CHECKS PASS; WINDOWS GPU GATE OPEN
 
 - Rebuild all eight packages from the recorded final source.
 - Test Linux CPU/CUDA installation, dependencies, startup and inference.
@@ -131,7 +131,7 @@ memory growth, with exact commands and failed trials preserved.
 Acceptance: installed packages reproduce the validated behavior; hosted PE
 checks do not substitute for physical Windows GPU evidence.
 
-### 7. Finish signing and update handling — LINUX CHECKS PASS; WINDOWS PENDING
+### 7. Finish signing and update handling — COMPLETE (LOCAL SIGNED-UPDATE ACCEPTANCE)
 
 - Verify signing-key configuration without exposing key contents.
 - Check signature verification, variant selection, installation and update
@@ -140,7 +140,7 @@ checks do not substitute for physical Windows GPU evidence.
 Acceptance: an update selects the correct runtime and verifies successfully;
 unsigned installer limitations are explicit where applicable.
 
-### 8. Prepare the release — LOCAL REVIEW DRAFT PREPARED; FULL MATRIX PENDING
+### 8. Prepare the release — LOCAL CANDIDATE PREPARED; WINDOWS GPU GATE OPEN
 
 - Freeze source and artifact hashes; finish release notes and evidence links.
 - Complete available final checks and prepare the PR/tag content locally.
@@ -2099,3 +2099,125 @@ qualification. Original VMs, disks, user storage and GPU bindings are untouched.
 Actual Windows installer/install/update checks and the final combined package
 manifest remain pending. Physical Windows NVIDIA inference still requires
 safe hardware isolation. No push, hosted CI, PR, tag or publication occurs.
+
+### Task 7 continuation — final Linux freeze and actual Windows MSI acceptance
+
+Freeze product/package inputs at
+`2ff6389928fb701ad9331275682529cf5896645b`. The 12 packaging metadata controls,
+version consistency and documentation checks pass. Rebuild only cached Linux
+banners/Studio/packages: CPU 87.74 seconds and CUDA 195.92 seconds, followed by
+collection in 1.23/24.54 seconds. All six packages, all 24 relocated native
+payload identities, vendor/notices/dependency checks, real bundle initializers,
+compiled feeds and public keys pass. Both final AppImage signatures and all
+eight package/signature digests verify. Six actual Studio ELFs, both server
+text sections and all native shared libraries match the `e991c3932` build whose
+four installations, ten short inference cases and six update-policy views were
+qualified. This carries forward that scoped behavior without relabelling its
+older installation evidence.
+
+Both actual final AppImages also pass signed replacement of the prior `e991`
+candidates, preserving mode 0755, UID 1000 and exact final payload hashes.
+Their newly updated GUIs start as the unprivileged user, show the enabled
+AppImage update action, and are visually checked with sharing off. Failure
+controls remain separately identified at `e991c3932`. No new speed, sustained
+inference or extended-context workload runs.
+
+MSZIP completes a real Windows MSI with three embedded cabinets and size
+1,048,719,360 bytes, SHA-256
+`efd3ec48fe93ec9a37ec8fa87ffa7b1e3004262cc8122ae9e2e876baaf20769f`.
+Actual Windows Installer installation completes in 16.92 seconds with exit 0.
+The upgrade retains the clone's existing `AppData/Local/ESE Studio` location,
+overriding the harness's requested scratch path; the initial harness path
+assertion is retained, not reported as an installer failure. At the actual
+location, all 33 runtime files match staging, app-local CRT inventories pass,
+the automatic launcher selects the CPU fallback, and one prediction/all top-32
+probabilities exactly match the unpackaged reference with normal CPU shutdown.
+The MSI application opens Settings in interactive session 1. Clearing only the
+probe child's inherited ESE overrides confirms it selects its bundled launcher;
+the user's machine/user environment is unchanged. UI Automation verifies the
+signed-update action and sharing off. The captured MSI image is occluded by the
+clone's Windows upgrade prompt and is explicitly not claimed as visual proof.
+Normal MSI uninstall also returns 0.
+
+The combined MSI/NSIS job reaches its 900-second bound during NSIS compression.
+Preserve the successful MSI. Resume only NSIS in a separate 900-second
+bundle-only job; no application or native build repeats. Resolve its interrupted
+PE initializer via the unique writable pointer/27-byte length pair, back up the
+executable and restore exactly three NSS-to-UNK bytes before resuming. Its
+normalised identity remains the same completed application binary. The earlier
+budget-exhausted jobs and partial files remain distinct evidence.
+
+Prepare Windows updater integration using the actual cached production Tauri
+libraries. A direct helper link initially lacks native import-library paths and
+Tauri's Common Controls v6 manifest; correcting those test-harness inputs makes
+the default same-version/no-download control pass. No application source repair
+is needed. The private helper uses the existing public key, never the signing
+key. Actual NSIS install, signed update checks and full eight-package metadata
+remain pending at this checkpoint. The physical Windows GPU gate remains
+blocked by IOMMU group ownership; no host device, original VM, boot setting or
+user model is changed. Publication stays on hold.
+
+### Task 7/8 continuation — Windows packages and signed update checks complete
+
+The NSIS-only job completes successfully in 808.71 seconds, inside its
+900-second limit. The 654,163,835-byte real installer has SHA-256
+`6044551b526240ef26908d4aff744de2293b9121069a78e45b3f5540f1a90634`.
+Actual installation into the owned scratch path completes in 66.80 seconds
+with exit 0. All 33 runtime files exactly match staging, GUI/native app-local
+CRT inventories pass, the launcher automatically selects the separate CPU
+runtime, and exact top-32 inference/normal shutdown pass. Both real Windows
+installer transfers match their guest hashes.
+
+Sign the actual NSIS payload on the host with the existing updater key and
+cryptographically verify it against the configured public key. Send only the
+public signature to the clone. Seven production-updater API controls pass:
+default same-version/no-download, HTTP 503, truncation, invalid signature,
+byte-altered payload, a real signed Linux payload rejected as the wrong Windows
+installer format, and valid signed download. Every case preserves the installed
+GUI bytes. These use unmodified updater 2.10.1 and a local feed; the same-version
+reinstall comparator is test-only, with default comparison separately checked.
+
+The eighth case downloads/verifies the actual NSIS payload, invokes production
+passive install mode, and observes the real installer process exit 0 in 86.49
+seconds overall. A deliberately removed license document under this review's
+installation is repaired exactly, proving OS installation rather than relying
+on the helper's exit alone. The final 33 runtime files, CPU inference and normal
+shutdown pass again. This does not claim Windows rollback after a partial OS
+installer mutation or migration from an earlier public signing key.
+
+The initial MSI/NSIS screenshots are occluded by the clone's existing Windows
+upgrade prompt even though interactive UI Automation reaches Settings. Decline
+the OS upgrade and its confirmation only in this owned clone; no upgrade is
+accepted, scheduled or installed. The final post-update NSIS Settings capture
+is visually verified, with the bundled launcher, enabled signed-update action
+and community sharing off. The original VMs remain stopped and unchanged.
+
+Collect the actual Windows packages/signature with the copied, authentic CPU
+and CUDA runtime markers, and combine all three original source indices.
+Strict release preparation passes for the complete eight-package set and all
+11 package/signature hashes at source
+`2ff6389928fb701ad9331275682529cf5896645b`. Both variant feeds select their own
+Linux AppImage and the same dual-runtime Windows NSIS payload; the legacy feed
+matches CPU behavior. Six final metadata files are written locally in
+`final-2ff638992-release-assets/`. No test fixture or old artifact substitutes
+for a release package. The PR/tag content and current review are prepared;
+no push, hosted CI, PR, tag, upload or publication occurs.
+
+All available software work is complete. Physical Windows NVIDIA inference
+remains open because of host IOMMU group ownership. The user is asked whether
+to retain that release gate or explicitly defer the qualification. Until an
+answer arrives, retain the gate; elapsed time is not a waiver. Approximately
+19 tok/s remains accepted, long passes remain deferred, and production Qwen
+admission stays OFF. Preserve caches, artifacts and failed attempts.
+
+Final cleanup stops all five owned Linux review containers and verifies zero
+remaining PIDs in their cgroups. Detached AppImage/DBus children outlived the
+probe's process-group cleanup, so earlier helper cleanup booleans are not the
+authoritative ownership proof. The complete cgroup stop is recorded in
+`final-2ff638992-linux-process-cleanup.json`. Runtime outputs and GUI captures
+remain valid; final cleanup preserves all caches and artifacts. Copy and verify
+the 28,180,480-byte Windows evidence archive with SHA-256
+`a6beb807f9944ad78049cd295412d74029568bcc7ad4bf08bf99fb960d765353`.
+The clone receives a normal shutdown request after its process check and
+evidence transfer. Original VMs remain stopped. Guest wall-clock UTC is about
+three hours ahead of host UTC; job durations use monotonic time.

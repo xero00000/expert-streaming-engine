@@ -1,110 +1,126 @@
 # ESE 0.2.1 candidate review — 21 October 2026
 
-Unpublished local candidate. The eight-package release contract is incomplete.
-Push, hosted CI, tag creation and publication remain on hold.
+Unpublished local candidate. Push, hosted CI, PR/tag creation and publication
+remain on hold. All eight packages, their source indices, checksums and updater
+feeds are prepared and pass local software qualification. Physical Windows
+NVIDIA inference remains an open release gate.
 
-Retained initial Linux package source:
-`e4b5739fc9380f401be3c548200a499a7f84ba34` on `review/ese-consolidated-20261020`.
-Current product/package source freeze:
-`1888775e987ba48465e4b48479d0dd1692d081ab`, including the Windows Microsoft
-runtime staging repair. Three refreshed Linux CPU packages are collected from
-that source; the refreshed CUDA packaging attempt reached its 180-second limit
-and was not collected. The final eight-package set is still incomplete;
-earlier Linux artifacts and older Windows assets are not relabelled as the
-current source. Later qualification documentation does not change this freeze.
+Product/package source freeze:
+`2ff6389928fb701ad9331275682529cf5896645b` on
+`review/ese-consolidated-20261020`. It includes the Windows app-local Microsoft
+runtime repair, the DEB/RPM manual-update guard and bounded MSZIP cabinets.
+Later qualification documentation does not change the package source freeze.
+Earlier candidates retain their original source indices and evidence.
 
 ## Current results
 
 | Area | Verified scope |
 | --- | --- |
-| Consolidation and source | Tasks 1–3 in the release work log; source checks and scoped inference/recovery acceptance pass |
-| Selected Flash-Next speed | User accepted approximately 19 tok/s; further speed tuning deferred |
-| Filled context | Two 2K/256 retrieval/replay requests and one 8K/256 request pass; longer passes deferred by user |
-| Linux packages | Six actual CPU/CUDA AppImage/DEB/RPM; Ubuntu DEB/Fedora RPM installs; 24 exact relocated native payloads; 25 short inference cases; six GUI startups |
-| AppImage signing/update | Configured key matches; two real signatures verify; eight updater API integration cases and both updated GUI startups pass |
-| Windows | Current CPU native build, standalone launcher, frontend and Studio Rust build pass; CUDA 12.4 tools are installed and the CUDA build is partial; actual MSI/NSIS and physical GPU acceptance pending |
-| Windows runtime dependencies | Missing app-local MSVC/OpenMP imports reproduced and repaired; six native DLL dependencies load from staging; exact top-32 output and normal shutdown pass; Studio CRT import closure passes |
-| Refreshed Linux CPU packages | Current-source AppImage/DEB/RPM collected; all 12 relocated native payload identities, current notices, dependency checks and AppImage signature pass |
+| Consolidation/source | Tasks 1–3 in the work log; scoped source, inference and recovery acceptance pass |
+| Selected Flash-Next speed | User accepted approximately 19 tok/s; further optimization deferred |
+| Workload scope | Two 2K/256 and one 8K/256 retrieval/replay requests pass; long passes deferred |
+| Final Linux package set | Six actual CPU/CUDA AppImage/DEB/RPM packages; all 24 native payload identities, dependency/notices checks, bundle-type initializers, variant feeds and keys pass |
+| Linux install behavior | Four actual Ubuntu DEB/Fedora RPM installations, ten short inference cases and six Settings views pass on `e991c3932`; the final six GUI binaries, both server text sections and all native shared libraries match that qualified build exactly |
+| Final AppImage updates | Both real signatures verify; final CPU/CUDA signed replacements preserve exact payload hashes, mode 0755 and UID 1000; both updated GUIs and enabled update actions are visually checked |
+| Update failures | Eight production-updater integration controls on `e991c3932` cover same-version rejection, transport/corruption failures, write-failure rollback and valid retries; final-payload replacements are checked separately |
+| Windows builds | CPU, CUDA 12.4, standalone launcher, frontend and Tauri CLI/custom-protocol Studio builds pass; native CUDA finishes in 543.31 seconds |
+| Windows MSI | Real 1,048,719,360-byte package has three embedded cabinets; installation, 33 exact runtime files, GUI CRT inventory, automatic CPU selection, exact top-32 CPU inference and normal uninstall pass |
+| Windows GUI | Actual MSI application opens Settings in the clone's interactive session with community sharing off and its bundled launcher selected; UI Automation confirms the update action. Its first screenshot is occluded by a Windows upgrade prompt; the final post-update NSIS Settings view is visually verified after declining that prompt only in the owned clone |
+| Windows NSIS | Real 654,163,835-byte installer completes in 808.71 seconds; actual install returns 0 in 66.80 seconds; 33 exact runtime files, CPU fallback and exact top-32 inference pass |
+| Windows signed update | Seven download/format controls plus real signed passive-mode reinstall pass; installer exit 0, deliberate license-file repair, all 33 runtime identities, CPU inference and post-update Settings startup verified |
+| Windows physical NVIDIA | Blocked by the host IOMMU group; no GPU is detached and no Windows NVIDIA driver is installed |
 
-The Windows source seal checks all 3,333 tracked files, treating symbolic links
-as links. The resumed CUDA build preserves another 38/325 completed steps before
-being stopped after 289.75 seconds for the user's time constraint. The separate
-Tauri CLI/custom-protocol prebuild reaches its 300-second limit; the earlier raw
-Cargo build remains a distinct passing result. Neither attempt establishes a
-current Windows installer. No NVIDIA display driver is installed in the clone.
-Completed objects remain cached; further cold build attempts are deferred,
-without automatically chaining additional build windows. All owned build/test
-processes stop and the isolated clone is shut off. No physical GPU was detached.
+Inference controls use the pinned TinyMoE fixture, twelve prompt IDs, one
+prediction and top-32 probabilities against the matching unpackaged runtime.
+They do not establish full-vocabulary arithmetic, large-model qualification,
+filled 1M context or sustained throughput. Approximately 19 tok/s remains the
+accepted experimental Flash-Next baseline. Production Qwen admission stays OFF.
 
-Inference package controls compare one generated token and top-32 probabilities
-against the corresponding unpackaged build with the same pinned model. They do
-not establish full-vocabulary arithmetic or large-model/context qualification.
+The final Linux refresh changes the server build banner; its executable code
+and shared libraries match the installed/inference-qualified predecessor.
+Current packages are independently rebuilt, collected, hash checked and
+signature verified. No old artifact index is relabelled as the current source.
+DEB/RPM Settings show manual package-manager instructions and contact no
+AppImage feed; AppImage and Windows retain signed automatic update checks.
 
-Updater tests use the unmodified production `tauri-plugin-updater 2.10.1`, the
-configured public key and actual signed candidate AppImages. A test-only local
-HTTP feed and comparator permit replacement of an older build with the same
-0.2.1 version. Default version comparison separately rejects that same-version
-update. Corrupted signature/payload, truncated transfer, HTTP failure and forced
-write failure preserve the prior bytes and mode. A valid retry replaces them
-with the exact candidate hash, retains mode 0755/UID 1000 and starts the GUI.
-This is local API integration, not a published-channel or previous-public-
-version migration trial. All six compiled app configurations contain only
-their own CPU/CUDA feed plus the configured public key. Windows Authenticode
-and native DEB/RPM package-manager signing are not claimed.
+Updater API tests use unmodified `tauri-plugin-updater 2.10.1`, the configured
+public key, local HTTP feeds and actual signed payloads. A test-only comparator
+permits same-version candidate replacement; the default comparator separately
+rejects it. These tests do not claim a published-channel or earlier-public-key
+migration. Windows Authenticode and native DEB/RPM package-manager signing are
+not claimed.
 
-## Retained initial Linux artifact hashes
-
-The private checksum file is
-`task6/ubuntu-build/LINUX-CANDIDATE-SHA256SUMS.txt`; it includes the six Linux
-packages and their two collected AppImage signature files. Full eight-package
-metadata generation remains pending Windows. Package SHA-256 values:
+## Current retained package hashes
 
 | Package | SHA-256 |
 | --- | --- |
-| `ESE-Studio_0.2.1_linux-x86_64_cpu.AppImage` | `36857f2f6da8519613b846773c5bdbcd04233f0282a5844f59234195c2573ed8` |
-| `ESE-Studio_0.2.1_linux-x86_64_cpu.deb` | `a90054a818e9c790613871267fd5accbaceeddd709bf668a40fd2cfd7cd3269e` |
-| `ESE-Studio_0.2.1_linux-x86_64_cpu.rpm` | `e8376ce14681cdcfb3eebfde0a0cda9457dabbfb6e9233e3ed8237e5ba5b3c1a` |
-| `ESE-Studio_0.2.1_linux-x86_64_cuda.AppImage` | `6bc489866b25391076d56e18a28d75fbcc22919a898dcfe9d845201ee29c1389` |
-| `ESE-Studio_0.2.1_linux-x86_64_cuda.deb` | `f42eb8b5d744d10437ec234f7b4f4c79eec7d4d32bedb773eeb1ba7e2ed78699` |
-| `ESE-Studio_0.2.1_linux-x86_64_cuda.rpm` | `fb75b6facec3da295c6800a6d2fb7ce7a81c16b1698703680aa23df81311ce56` |
+| `ESE-Studio_0.2.1_linux-x86_64_cpu.AppImage` | `75f8efa70bfa61ba2c51aa9b45bfa45caf488559b4ec09484ac5e9d7451253a9` |
+| `ESE-Studio_0.2.1_linux-x86_64_cpu.deb` | `87996828b1f841f7b3b71ef60bb440f76cc8f8d505a6232ea2be62bc40ce1eb0` |
+| `ESE-Studio_0.2.1_linux-x86_64_cpu.rpm` | `6d723a630280f1f8c162d025788bff1f184ed3320af68cec659b846ca81d69aa` |
+| `ESE-Studio_0.2.1_linux-x86_64_cuda.AppImage` | `20ad4f68f60d127c62d54c9d504b442dee2642b0e8790a08feedc72e1a7872de` |
+| `ESE-Studio_0.2.1_linux-x86_64_cuda.deb` | `9ca80374d1d45d9b2caa2f23f276f82a77768b23357a3ea36c7acc373d1b78e6` |
+| `ESE-Studio_0.2.1_linux-x86_64_cuda.rpm` | `c8ac133b83ddfb4d517d58c7aea42145a19429cc22bcaa5e91f84b29e50847cb` |
+| `ESE-Studio_0.2.1_windows-x64-setup.exe` | `6044551b526240ef26908d4aff744de2293b9121069a78e45b3f5540f1a90634` |
+| `ESE-Studio_0.2.1_windows-x64.msi` | `efd3ec48fe93ec9a37ec8fa87ffa7b1e3004262cc8122ae9e2e876baaf20769f` |
+
+The complete `SHA256SUMS` covers eight packages and three signature files.
+`release-manifest.json`, both variant feeds, the legacy CPU feed and Windows
+checksums are in `final-2ff638992-release-assets/`. All three artifact-set indices
+identify the same full source freeze. The directory is private and unpublished.
 
 ## Remaining work before release approval
 
-1. Build current-source dual-runtime Windows MSI/NSIS, install both, and qualify
-   CPU fallback, physical NVIDIA inference and Windows update handling.
-2. Complete the eight-package collector/checksum/updater metadata acceptance
-   against the final release source. Preserve the frozen-source distinction
-   if final documentation/source changes require a new candidate build.
-3. Reconcile final release notes and claims with the accepted short-check scope;
-   retain experimental admission restrictions and deferred long workloads.
-4. Present the complete local candidate for review; retain the user's publication
-   hold until explicit approval. No publication command has been executed.
-
-The accepted approximately 19 tok/s baseline and deferred long-context work
-remain unchanged. Short checks do not waive the unfinished installer/metadata
-requirements or qualify a multi-hour workload.
+1. Resolve physical Windows NVIDIA qualification or obtain an explicit change
+   to the intended supported scope. The spare GPUs share IOMMU group 15 with
+   the mounted-storage SATA controller, USB and Ethernet. Assigning that group
+   would disrupt host devices; the active desktop GPU remains untouched. The
+   user has been asked whether to retain the gate or defer this qualification;
+   no answer or waiver is assumed.
+2. Review the final local candidate while retaining the publication hold.
+   Push, hosted CI, PR/tag creation and release publication require the hold
+   to be lifted. No such action has occurred.
 
 ## Evidence
 
-All paths below are relative to the private evidence root
+Paths are relative to the private evidence root
 `/home/xero/Desktop/test/results/ese-release-work-20261020/`:
 
-- `task6/task6-progress.json`: frozen source and six real package builds.
-- `task6/linux-inspection/linux-acceptance-summary.json`: package and installed-runtime checks.
-- `task6/windows-isolated/preflight-summary.json`: isolated Windows inventory and stopped VM.
-- `task7/linux-update-qualification.json`: signing, updater and post-install startup proofs.
-- `task6/ubuntu-build/update-checks/`: raw updater requests, responses, failures, hashes and helpers.
-- `task6/ubuntu-build/final-1888775e9-assets-cpu/`: refreshed CPU packages,
-  source index and four-file `CPU-CANDIDATE-SHA256SUMS.txt`.
-- `task6/linux-inspection/final-1888775e9/banner-stderr-control/summary.json`:
-  refreshed CPU package and exact native identity checks.
-- `task6/final-1888775e9-cpu-signature.json`: actual refreshed AppImage verification.
-- `task6/windows-isolated/bounded-build-evidence-1888775e9/`: source seal,
-  bounded attempts and explicit CUDA checkpoint record.
+- `task6/linux-inspection/final-2ff638992/qualification-index.json`: current
+  Linux static, native identity, unchanged behavior and updated-GUI evidence.
+- `task6/ubuntu-build/final-2ff638992-assets-{cpu,cuda}/`: final Linux packages
+  and original per-variant source/hash indices.
+- `task6/final-2ff638992-linux-signatures.json`: both final signatures and all
+  eight package/signature digests.
+- `task6/ubuntu-build/update-checks-final-2ff638992/`: actual final CPU/CUDA
+  signed replacement, byte/mode/UID checks and post-update Settings captures.
+- `task6/linux-inspection/final-e991c3932/installed-summary.json`: actual
+  Ubuntu/Fedora installation and short CPU/GPU inference matrix.
+- `task6/ubuntu-build/update-checks-final-e991c3932/`: complete eight-case
+  failure/retry updater API controls, raw requests, helpers and logs.
+- `task6/windows-isolated/build-cuda-background-03.execution.json`: successful
+  bounded Windows CUDA build.
+- `task6/windows-isolated/source-seal-2ff638992.json`: all 3,335 tracked source
+  files, including symbolic-link identities, verified in the isolated clone.
+- `task6/windows-isolated/transfer-final-msi.json`: retained actual MSI hash.
+- `task6/windows-isolated/final-2ff638992-evidence/`: interactive MSI evidence;
+  screenshot occlusion is recorded explicitly.
+- `task6/windows-isolated/physical-gpu-iommu-preflight.json`: actual IOMMU group
+  membership and the Linux VFIO ownership constraint.
+- `task6/windows-isolated/final-2ff638992-evidence/`: copied Windows install,
+  inference, signed-update and process evidence; the final NSIS Settings capture
+  is visually verified. Both earlier occluded captures remain identified.
+- `final-2ff638992-linux-process-cleanup.json`: all five owned container
+  cgroups are empty after final cleanup; detached DBus children are covered.
+- `task6/windows-isolated/final-nsis-signature.json`: real NSIS cryptographic
+  verification; only its public signature is sent back to the clone.
+- `final-2ff638992-release-assets/`: complete eight-package staging, three
+  original source indices, 11 package/signature digests and six metadata files.
+  No asset has been uploaded.
 
-The [release work log](RELEASE_WORK_LOG_20261020.md) retains failures and earlier
-results in order; the [package contract](RELEASE_PACKAGE_CONTRACT.md) defines the
-complete deliverable. Prepared local PR summary: consolidate ESE source and
-release packaging, repair cache/recovery correctness, preserve CPU/CUDA update
-variants, and document the measured/accepted performance and remaining platform
-gates. The PR and tag have not been created.
+See the [work log](RELEASE_WORK_LOG_20261020.md) for retained failures and the
+[package contract](RELEASE_PACKAGE_CONTRACT.md) for the required deliverable.
+Local PR summary: consolidate ESE, repair cache/recovery correctness, preserve
+CPU/CUDA update variants, bundle Windows Microsoft runtimes, and document the
+accepted experimental performance and unresolved physical GPU gate. Prepared tag content identifies `v0.2.1` and this source freeze; the physical
+Windows GPU gate and publication hold must be resolved before creating it.
+No PR or tag has been created.

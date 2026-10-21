@@ -117,3 +117,28 @@ substitute for the unchecked physical NVIDIA sweep above.
   public `main` without missing public-main commits.
 - [ ] The `v0.2.0` tag workflow publishes signed Linux/Windows updater assets,
   installers, checksums, and release notes.
+
+## v0.2.1 local candidate — 2026-10-21
+
+- [x] Final eight actual packages, three source indices, all 11 asset digests,
+  checksums and correctly routed CPU/CUDA/legacy updater feeds pass locally.
+- [x] All six Linux packages pass current native identity, dependency, license,
+  bundle-type, compiled-feed and key checks; installed behavior evidence and
+  exact unchanged-code proofs are linked in the candidate review.
+- [x] Both real final AppImage signatures and replacements pass; updated Settings
+  views retain the correct automatic action while DEB/RPM use manual updates.
+- [x] Windows CPU/CUDA and Studio builds pass; MSI/NSIS install, app-local
+  Microsoft runtime closure, CPU fallback and exact top-32 inference pass.
+- [x] Real NSIS signature, seven updater failure/download controls and actual
+  signed installer completion/file repair pass; final runtime identities, CPU
+  inference and interactive post-update Settings startup pass.
+- [ ] Physical Windows NVIDIA inference. The spare GPUs share host IOMMU group
+  15 with mounted storage; no device is detached and no waiver is assumed.
+- [ ] Lift the user's publication hold before push, hosted CI, PR/tag creation
+  or release upload/publication.
+
+The accepted experimental speed remains approximately 19 tok/s, further long
+passes are deferred, and production Qwen admission stays OFF. Windows installers
+lack Authenticode signatures; the NSIS updater signature is verified separately.
+See the [current review](RELEASE_CANDIDATE_REVIEW_20261021.md) and
+[work log](RELEASE_WORK_LOG_20261020.md) for source, scope, failures and evidence.

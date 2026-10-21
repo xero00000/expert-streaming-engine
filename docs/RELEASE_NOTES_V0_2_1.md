@@ -1,14 +1,15 @@
 # ESE v0.2.1 release notes
 
-**Working draft — unpublished, updated 21 October 2026.** Six consolidated
-Linux CPU/CUDA DEB/RPM/AppImage candidates pass installation, startup and bounded
-inference checks. Both AppImage updater signatures and local installation/
-failure-recovery integration checks pass. Current-source Windows installers
-remain pending. Earlier eight-package and Windows CI records below describe
-older candidates. A subsequent Windows staging repair bundles the required
-Microsoft C++ and OpenMP runtime DLLs; the final package set must include it.
-See the [current candidate review](RELEASE_CANDIDATE_REVIEW_20261021.md)
-for frozen source, hashes, evidence and remaining gates.
+**Working draft — unpublished, updated 21 October 2026.** All eight final
+Linux CPU/CUDA and Windows dual-runtime packages are built, collected and tied
+to one recorded source. Local install/CPU fallback, scoped Linux inference,
+AppImage/NSIS signature verification and installed-update checks pass. Windows
+packages include app-local Microsoft C++ and OpenMP runtimes. DEB/RPM updates
+use their package manager; AppImage and Windows retain signed automatic updates.
+Physical Windows NVIDIA inference remains an open qualification gate. Earlier
+CI and candidate records below retain their original scope. See the
+[current candidate review](RELEASE_CANDIDATE_REVIEW_20261021.md) for the source
+freeze, hashes, evidence and publication hold.
 
 The user accepted approximately 19 tok/s for the selected experimental
 Flash-Next profile and deferred further speed optimization and multi-hour
