@@ -7066,6 +7066,45 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
     return err;
 }
 
+static bool ggml_expert_prefill_reserve_available(ggml_backend_sched_t sched) {
+#ifdef GGML_USE_CUDA
+    if (sched->active_expert_decode || !sched->expert_lease_required ||
+            sched->expert_prefill_staging_capacity_bytes == 0) return true;
+    std::array<bool, GGML_SCHED_MAX_BACKENDS> checked = {};
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const auto & split = sched->splits[i];
+        const int backend_id = split.backend_id;
+        auto backend = sched->backends[backend_id];
+        if (checked[backend_id] || !ggml_backend_is_cuda(backend)) continue;
+        for (int j = 0; j < split.n_inputs; ++j) {
+            const auto * input = split.inputs[j];
+            if (!ggml_active_expert_cache_is_host_expert_weight(input)) continue;
+            int layer = -1;
+            if (ggml_active_expert_cache_component_from_name(input, &layer) < 0 ||
+                    sched->expert_prefill_layer_bytes.count(layer) == 0) continue;
+            checked[backend_id] = true;
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            ggml_backend_cuda_get_device_memory(
+                    ggml_backend_cuda_get_device(backend), &free_bytes, &total_bytes);
+            GGML_UNUSED(total_bytes);
+            if (!sched->expert_prefill_devices[backend_id].ready ||
+                    uint64_t(free_bytes) < sched->expert_prefill_staging_reserve_bytes) {
+                fprintf(stderr, "ggml expert prefill: backend %d cannot retain reserve "
+                        "before graph execution (free %llu, required %llu); rejecting graph\n",
+                        backend_id, (unsigned long long) free_bytes,
+                        (unsigned long long) sched->expert_prefill_staging_reserve_bytes);
+                return false;
+            }
+            break;
+        }
+    }
+#else
+    GGML_UNUSED(sched);
+#endif
+    return true;
+}
+
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
@@ -7075,6 +7114,15 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         if (!ggml_backend_sched_alloc_graph(sched, graph)) {
             return GGML_STATUS_ALLOC_FAILED;
         }
+    }
+
+    // Cache/graph allocations from a previous decode can consume the reserve
+    // after staging was admitted at startup. Reject before launching any split
+    // or entering parallel barriers; strict sidecar mode must never fall back to
+    // copying a full host tensor. Keep admitted lanes for a later exact retry.
+    if (!ggml_expert_prefill_reserve_available(sched)) {
+        ggml_active_expert_cache_reset_pass(sched);
+        return GGML_STATUS_ALLOC_FAILED;
     }
 
     if (!sched->expert_trace) return ggml_backend_sched_compute_splits(sched);

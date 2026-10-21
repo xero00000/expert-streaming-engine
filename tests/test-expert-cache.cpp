@@ -1981,7 +1981,8 @@ void test_exact_cuda_pinned_staging_allocation() {
 std::vector<float> compute_cuda_cache_preflight(bool reverse_completions, bool with_bias = false, bool cached = true, bool mixed_layout = false, ggml_type first_type = GGML_TYPE_F16,
         bool frequency_sweep = false, size_t * acquisition_count = nullptr, int token_batch = 1, bool cross_device = false,
         bool check_residency_choice = false, bool check_route_protection = false,
-        bool check_packing_capacity = false, bool shared_layer_ids = false) {
+        bool check_packing_capacity = false, bool shared_layer_ids = false,
+        bool check_prefill_reserve_recovery = false) {
 #ifdef GGML_USE_CUDA
     if (ggml_backend_cuda_get_device_count() < (cross_device ? 2 : 1)) return {};
     struct mock_source {
@@ -1989,17 +1990,24 @@ std::vector<float> compute_cuda_cache_preflight(bool reverse_completions, bool w
         ggml_tensor * down = nullptr;
         size_t batches = 0;
         size_t acquires = 0;
+        size_t outstanding = 0;
         struct batch { mock_source * source; std::vector<int> experts; int component; int layer; size_t remaining; };
         static bool acquire(void * user, int layer, int expert, int component, ggml_backend_expert_lease * result) {
             auto & source = *static_cast<mock_source *>(user);
             ++source.acquires;
+            ++source.outstanding;
             auto * tensor = layer == 1 || component != 1 ? source.down : source.up;
             auto data = std::make_unique<std::vector<uint8_t>>(tensor->nb[2]);
             std::memcpy(data->data(), static_cast<uint8_t *>(tensor->data) + expert*tensor->nb[2], data->size());
             result->data = data->data(); result->size = data->size(); result->handle = data.release();
             return true;
         }
-        static void release(void *, void * handle) { delete static_cast<std::vector<uint8_t> *>(handle); }
+        static void release(void * user, void * handle) {
+            auto & source = *static_cast<mock_source *>(user);
+            REQUIRE(source.outstanding > 0);
+            --source.outstanding;
+            delete static_cast<std::vector<uint8_t> *>(handle);
+        }
         static void * begin(void * user, int layer, const int * experts, size_t count, int component) {
             auto * source = static_cast<mock_source *>(user);
             ++source->batches;
@@ -2109,6 +2117,12 @@ std::vector<float> compute_cuda_cache_preflight(bool reverse_completions, bool w
     // exercise both ID remapping and eviction, not only a warm identity map.
     const uint64_t capacity = check_packing_capacity ? 64*256 + 192*width*width*3 : with_bias && token_batch == 1 ? 64*256 + 5*2*width*width*sizeof(ggml_fp16_t) : 16ULL*1024*1024;
     if (cached) ggml_backend_sched_set_expert_cache_capacity(scheduler, capacity, 0, 1);
+    const uint64_t prefill_capacity = 2*(ggml_nbytes(up) + ggml_nbytes(down));
+    if (check_prefill_reserve_recovery) {
+        REQUIRE(reverse_completions && !cached && token_batch > 1);
+        ggml_backend_sched_set_active_expert_decode(scheduler, false);
+        ggml_backend_sched_set_expert_prefill_staging(scheduler, prefill_capacity, 0);
+    }
     ggml_backend_sched_set_tensor_backend(scheduler, hidden, cuda);
     ggml_backend_sched_set_tensor_backend(scheduler, output, cuda);
     ggml_backend_sched_set_tensor_backend(scheduler, input, activation);
@@ -2263,6 +2277,36 @@ std::vector<float> compute_cuda_cache_preflight(bool reverse_completions, bool w
         const size_t offset = result.size();
         result.resize(offset + size_t(ggml_nelements(output)));
         ggml_backend_tensor_get(output, result.data() + offset, 0, ggml_nbytes(output));
+        if (check_prefill_reserve_recovery) {
+            REQUIRE(source.outstanding == 0);
+            REQUIRE(ggml_backend_sched_get_resource_device_stats(scheduler, stats.data(), stats.size()));
+            const auto allocated = stats[0].expert_prefill_allocated_bytes;
+            REQUIRE(allocated > 0 && allocated <= prefill_capacity);
+            const auto acquisitions = source.acquires;
+            // Raise only the required reserve, without exhausting the driver or
+            // disturbing another process. The already admitted graph must fail
+            // before output writes/leases and remain retryable with the same buffers.
+            ggml_backend_sched_set_expert_prefill_staging(scheduler, prefill_capacity, UINT64_MAX);
+            REQUIRE(ggml_backend_sched_graph_compute(scheduler, graph) == GGML_STATUS_ALLOC_FAILED);
+            REQUIRE(source.acquires == acquisitions);
+            REQUIRE(source.outstanding == 0);
+            std::vector<float> observed(size_t(ggml_nelements(output)));
+            ggml_backend_tensor_get(output, observed.data(), 0, ggml_nbytes(output));
+            REQUIRE(observed == result);
+            REQUIRE(ggml_backend_sched_get_resource_device_stats(scheduler, stats.data(), stats.size()));
+            REQUIRE(stats[0].expert_prefill_allocated_bytes == allocated);
+            ggml_backend_sched_set_expert_prefill_staging(scheduler, prefill_capacity, 0);
+            // A normal invocation supplies its inputs again: graph scratch may
+            // alias the previous invocation's activation input after execution.
+            ggml_backend_tensor_set(input, input_values.data(), 0, ggml_nbytes(input));
+            ggml_backend_tensor_set(ids_storage, batch_ids.data(), 0, batch_ids.size()*sizeof(int32_t));
+            REQUIRE(ggml_backend_sched_graph_compute(scheduler, graph) == GGML_STATUS_SUCCESS);
+            REQUIRE(source.outstanding == 0);
+            ggml_backend_tensor_get(output, observed.data(), 0, ggml_nbytes(output));
+            REQUIRE(observed == result);
+            REQUIRE(ggml_backend_sched_get_resource_device_stats(scheduler, stats.data(), stats.size()));
+            REQUIRE(stats[0].expert_prefill_allocated_bytes == allocated);
+        }
         if (with_bias) {
             for (size_t i = 0; i < size_t(width*used*token_batch); ++i) {
                 const size_t token = i/(width*used);
@@ -2292,7 +2336,10 @@ std::vector<float> compute_cuda_cache_preflight(bool reverse_completions, bool w
             REQUIRE(ggml_backend_sched_expert_cache_finalize(transaction));
         }
     }
-    if (reverse_completions) REQUIRE(source.batches >= 2);
+    // Prefill staging acquires individual leases; the compact decode cache
+    // exercises the completion-order batch callbacks instead.
+    if (reverse_completions && !check_prefill_reserve_recovery) REQUIRE(source.batches >= 2);
+    if (check_prefill_reserve_recovery) REQUIRE(source.acquires > 0 && source.outstanding == 0);
     if (acquisition_count) *acquisition_count = source.acquires;
     return result;
 #else
@@ -2309,6 +2356,7 @@ std::vector<float> compute_cuda_cache_preflight(bool reverse_completions, bool w
     (void) check_route_protection;
     (void) check_packing_capacity;
     (void) shared_layer_ids;
+    (void) check_prefill_reserve_recovery;
     return {};
 #endif
 }
@@ -2577,6 +2625,12 @@ int main(int argc, char ** argv) {
             std::cout << "PASS: exact CPU lease chunks under bounded cache and forced eviction\n";
             return 0;
         }
+        if (argc == 2 && std::strcmp(argv[1], "--prefill-reserve-only") == 0) {
+            compute_cuda_cache_preflight(true, false, false, false, GGML_TYPE_F16,
+                    false, nullptr, 4, false, false, false, false, false, true);
+            std::cout << "PASS: strict prefill reserve rejection and exact retry\n";
+            return 0;
+        }
         test_cpu_router_softmax_replay();
         test_descriptor_validation();
         test_exact_reads_hits_and_backend_telemetry();
@@ -2612,6 +2666,8 @@ int main(int argc, char ** argv) {
         test_hybrid_runtime_guard_is_one_way_and_fail_closed();
         test_exact_cuda_pinned_staging_allocation();
         test_cuda_cache_preflight_realizes_all_components();
+        compute_cuda_cache_preflight(true, false, false, false, GGML_TYPE_F16,
+                false, nullptr, 4, false, false, false, false, false, true);
         test_cuda_layout_pool_capacity_and_lifetimes();
         REQUIRE(compute_cuda_cache_preflight(false, false, true, false, GGML_TYPE_F16,
                     false, nullptr, 1, false, true) ==
