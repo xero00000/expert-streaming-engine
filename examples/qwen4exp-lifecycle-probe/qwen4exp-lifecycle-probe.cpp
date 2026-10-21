@@ -689,9 +689,10 @@ int main(int argc,char ** argv) {
                     transform(mode, 1);
                     const auto target = save_seq(ctx, 1);
                     const auto other_after = save_seq(ctx, 0);
-                    require(other_after == other_before, "shared transform changed other sequence snapshot");
                     save_state_artifact(("shared-" + mode + "-target-sequence.bin").c_str(), target);
+                    save_state_artifact(("shared-" + mode + "-other-before-sequence.bin").c_str(), other_before);
                     save_state_artifact(("shared-" + mode + "-other-sequence.bin").c_str(), other_after);
+                    require(other_after == other_before, "shared transform changed other sequence snapshot");
                     compare((mode + "_shared_target").c_str(), private_control,
                             decode(ctx, model, capture, tokens[prefix], next, 1), false);
                     compare((mode + "_shared_other").c_str(), other_control, continuation(0), false);

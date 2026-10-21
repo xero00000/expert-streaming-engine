@@ -1602,3 +1602,39 @@ best configuration and all three raw samples remain under
 resolved by explicit user acceptance. Stop performance experiments and advance
 to task 5's correctness, lifecycle and actual filled-context checks. Production
 Qwen admission, package/install checks and publication remain independent.
+
+
+### Task 5 — YaRN position transforms preserve other sessions
+
+Before larger-context qualification, the selected model's shared-position
+probe reproduced corruption of the untouched sequence at YaRN scale four.
+The before/after snapshots differ in 37,845 bytes, confined to the first key
+payload region. Sampled nonzero F32 keys are multiplied by 1.13862943649, the
+YaRN attention gain for this scale. The shift graph was applying this gain
+again, including rows with zero position delta. Stored keys already contain
+their original magnitude; a delta rotation must preserve it.
+
+Qwen4Exp's shift graph now cancels YaRN's internal gain when extrapolation is
+enabled and uses unit magnitude when disabled. Other architectures retain
+their existing shift factors. The lifecycle diagnostic saves both snapshots
+before asserting equality, preserving failure evidence rather than losing it.
+
+On all three selected GPUs together, strict F32 expert/projection-policy runs
+pass with prefixes 8 and 33, plus prefix 33 with Q4_0 K/V and Flash Attention.
+Each run passes 14 full-vocabulary continuation comparisons with exact logits
+and ordered MoE routes: full/sequence migration after shift/divide/partial
+shift, private/shared selected-owner equivalence, untouched-owner continuation,
+and overlapping prefix copies. All three untouched-owner sequence snapshots
+are byte-identical before/after their transformations in every run. Prefix 33
+crosses the first compressed-attention block. The original unshifted prefix-8
+snapshot also remains byte-identical to the pre-fix runtime. Six focused native
+state/cache/production-rejection CTests pass after rebuilding their targets.
+
+Evidence: `task4/qwen4exp-iq2-restore/unit-shift-validation-summary.json`,
+`unit-shift-focused-{build,ctest}.log`, `shared-position-before-unit-rotation/`,
+and the three `shared-position-unit-rotation*` passing directories. The initial
+Q4 test with Flash Attention off rejects before model load because quantized V
+requires it; that failed configuration is retained and the corrected FA-on run
+passes. This is bounded lifecycle validation at scale four/4K allocated context,
+not filled-64K evidence or native quantized-arithmetic qualification. The public
+model gate remains closed. Proceed to actual prompt-length/resource checks.

@@ -195,7 +195,12 @@ ggml_cgraph * llm_build_context::build_k_shift() {
         ? LLAMA_ROPE_TYPE_NEOX
         : hparams.rope_type;
 
-    const float yarn_attn_factor_shift = model.arch == LLM_ARCH_DEEPSEEK2 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_MISTRAL4
+    // Qwen keys already contain their original attention magnitude. A delta
+    // rotation must have unit magnitude, including zero-delta rows belonging
+    // to other sessions. Cancel the gain added inside YaRN when enabled.
+    const float yarn_attn_factor_shift = model.arch == LLM_ARCH_QWEN4EXP
+        ? (ext_factor != 0.0f ? 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale)) : 1.0f)
+        : model.arch == LLM_ARCH_DEEPSEEK2 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_MISTRAL4
         ? 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale))
         : cparams.yarn_attn_factor;
 
