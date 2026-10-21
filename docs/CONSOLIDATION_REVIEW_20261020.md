@@ -121,6 +121,13 @@ Android/device, package-installation and physical Windows qualification remain
 open. Existing package evidence applies to the earlier prepared artifacts;
 installers have not been rebuilt with the new launcher option.
 
+Task 3 subsequently repaired CPU router softmax and implicit BOS warmup defects.
+The [inference/recovery validation](INFERENCE_RECOVERY_VALIDATION_20261020.md)
+records rebuilt source `9e0d3b037`, fixture logits/routes, three-GPU suites,
+worker/prefill/transaction checks, sanitizers and real HTTP disconnects. An
+automatic GPU RAM-plan headroom defect remains open, so task 3 and release
+readiness are not complete. The next repair is recorded in the work log.
+
 ## Findings still requiring work
 
 1. **The corrected release workflow still needs end-to-end qualification.**

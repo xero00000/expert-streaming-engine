@@ -59,7 +59,7 @@ package acceptance check for tasks 6 and 7.
 
 Acceptance: required clean builds/checks pass against one recorded source state.
 
-### 3. Verify inference correctness and recovery — IN PROGRESS
+### 3. Verify inference correctness and recovery — IN PROGRESS (RAM PLANNING DEFECT OPEN)
 
 - Compare supported resident/cache/stream paths against pinned references.
 - Exercise forced eviction, cancellation, allocation failure and session
@@ -311,3 +311,39 @@ occurred; the user's hold is unchanged.
 - Evidence, including unsuccessful controls, is retained under
   `/home/xero/Desktop/test/results/ese-release-work-20261020/task3/`.
   No performance threshold, full-model acceptance or release readiness is claimed.
+
+
+### Task 3 — numerical and recovery validation completed; planning repair next
+
+- Native candidate `9e0d3b037` rebuilds successfully for CPU/CUDA. CPU CTest
+  passes 94/94; each of the three GPUs has 99 passes and one expected
+  single-device NCCL skip. Both targeted strict ASAN/UBSAN/leak suites pass.
+- Forced-token resident/cache/stream comparisons preserve all 512,000 logits
+  and 320 route IDs per configuration. Uninstrumented eviction/storage checks,
+  24 sustained worker trials and bounded prefill on one/two/three GPUs pass.
+  The three-device prefill split is `1,1,8`, assigning MoE layers to every card.
+- CPU and one/three-GPU KV/expert transactions, injected prepare/publish failures
+  and exact continuation pass. The old HTTP verifier compared physical native
+  receipts to serialized forecasts. `60ab8fdf2` reconciles live memory and a
+  separate KV-only receipt, with six positive/negative regressions. Exact byte
+  and peak arithmetic assertions remain mandatory.
+- All 152 Python tests pass. Twenty-one real HTTP disconnects and seven final
+  graph-abort/decode-status controls pass. The refreshed staged Studio CUDA
+  runtime identifies the candidate and passes real inference/cancellation with
+  no library-path/preload override. No new installer was built or installed.
+- Details and limits are in
+  [the inference/recovery validation](INFERENCE_RECOVERY_VALIDATION_20261020.md).
+  Start the evidence review at
+  `/home/xero/Desktop/test/results/ese-release-work-20261020/task3/task3-summary.json`.
+- **Task 3 remains open.** The current CUDA candidate still rejects an automatic
+  4 GiB RAM plan: 4,295,429,216 tracked bytes are required against 4,294,967,296
+  usable. The CPU-only startup control fits; GPU placement leaves no host graph
+  reserve to absorb omitted context metadata/output. Explicit bounded caches
+  permit independent recovery testing but do not repair automatic planning.
+
+Next, stay within task 3 and repair the automatic host forecast: account for
+context/KV metadata, outputs and index maps before filling caches; preserve
+actual capacity/rounding contracts; add a reproducing startup/boundary check;
+then repeat the strict-budget GPU startup and affected recovery checks. Do not
+weaken native host admission. Full-model, physical driver OOM and task 4 onward
+remain unqualified. The performance/publication hold is unchanged.
