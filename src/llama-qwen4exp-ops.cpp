@@ -46,6 +46,41 @@ ggml_tensor * qwen4exp_build_cache_rows(
     return ggml_get_rows_ext(ctx, cache, row_ids, same_type, false);
 }
 
+ggml_tensor * qwen4exp_build_compact_attention_indices(
+        ggml_context * ctx, ggml_tensor * sparse_mask, int64_t capacity) {
+    GGML_ASSERT(ctx && sparse_mask && sparse_mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(capacity > 0 && capacity <= sparse_mask->ne[0]);
+    GGML_ASSERT(sparse_mask->ne[0] <= (1 << 24));
+    // Masks contain only zero and -infinity. Distinct negative integer ranks
+    // break visible-row ties without changing the mask used by attention.
+    // This preserves key order even on backends with an unstable argsort.
+    auto * rank = ggml_arange(ctx, 0, float(sparse_mask->ne[0]), 1);
+    auto * scores = ggml_add(ctx, sparse_mask, ggml_scale(ctx, rank, -1));
+    return ggml_cont(ctx, ggml_top_k(ctx, scores, capacity));
+}
+
+qwen4exp_compact_attention_rows qwen4exp_build_compact_attention_rows(
+        ggml_context * ctx, ggml_tensor * physical_rows, ggml_tensor * sparse_mask,
+        ggml_tensor * selected_rows, int64_t query) {
+    GGML_ASSERT(ctx && physical_rows && sparse_mask && selected_rows);
+    GGML_ASSERT(physical_rows->type == GGML_TYPE_I32 && selected_rows->type == GGML_TYPE_I32);
+    GGML_ASSERT(sparse_mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(physical_rows->ne[0] == sparse_mask->ne[0]);
+    GGML_ASSERT(query >= 0 && query < selected_rows->ne[1] && query < sparse_mask->ne[1]);
+    const int64_t kept = selected_rows->ne[0];
+    auto * logical = ggml_view_2d(ctx, selected_rows, kept, 1,
+            selected_rows->nb[1], query * selected_rows->nb[1]);
+    auto * per_head = ggml_repeat_4d(ctx, logical, kept, physical_rows->ne[1], 1, 1);
+    auto * rows = ggml_get_rows_ext(ctx, physical_rows, per_head, true, true);
+    auto * query_mask = ggml_view_2d(ctx, sparse_mask, sparse_mask->ne[0], 1,
+            sparse_mask->nb[1], query * sparse_mask->nb[1]);
+    auto * mask_rows = ggml_cont(ctx, ggml_transpose(ctx, query_mask));
+    auto * mask = ggml_reshape_2d(ctx, ggml_get_rows(ctx, mask_rows, logical), kept, 1);
+    mask = ggml_pad(ctx, mask, 0, GGML_KQ_MASK_PAD - 1, 0, 0);
+    mask = ggml_cast(ctx, mask, GGML_TYPE_F16);
+    return {rows, mask};
+}
+
 ggml_tensor * qwen4exp_build_recurrent_output_gate(
         ggml_context * ctx, ggml_tensor * normalized, ggml_tensor * gate) {
     GGML_ASSERT(ctx && normalized && gate && ggml_are_same_shape(normalized, gate));

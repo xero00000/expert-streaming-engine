@@ -446,3 +446,34 @@ The saved Nsight diagnoses run separately and are excluded from these timings.
 The first 1M startup tests fail allocation/reservation; one cause under
 investigation is the planner replacing requested Q4 cache with Q8. Exact Q4
 admission, profile-specific features and the complete workload remain open.
+
+
+### 1M allocation now serves short requests
+
+With explicit Qwen arithmetic, Q4_0 K/V, F32 indexer and YaRN scale four, the
+dedicated runtime now starts at 1,048,576 context cells and completes two
+8-token raw-Hi requests with exit zero. Compact sparse attention reduces the
+GPU compute reservation from about 5.2 GB per card to 842–904 MiB. Persistent
+cache payload remains 6,912 MiB K/V plus 6,144 MiB indexer. This establishes
+allocation/readiness and bounded serving, not filled-1M or throughput parity.
+
+The row compaction retains all visible rows exactly once and preserves their
+order. Operator controls cover F32, Q4 and F16 at the model's real head shape,
+with the unchanged numerical bound. Million-row maps and explicit integer
+payload checks caught and correct CUDA I32 repeat corruption. Eleven focused
+CTests pass on each of the three cards.
+
+An initial host-KV trial with a 6 GiB expert cache and no reserve aborts with
+CUDA OOM; a 4 GiB / 1 GiB reserve control completes cleanly. Moving Q4 encoding
+to the host initially changes model outputs at token 24. Encoding on the
+layer's GPU before transferring packed host rows restores byte identity:
+8,194,560 logits and 1,584 ordered expert-route rows match GPU-KV placement in
+the same 33-token/1M-allocation control. It does not qualify Q4 against the
+upstream F32-cache reference or fill the context.
+
+The 1M GPU-KV raw-Hi repeat measures 6.02 tok/s; the reserved host-KV control
+measures 3.60. These eight-token diagnostics still fail the 41.2 overall /
+41.84 repeated target and are not the selected 552/128 workload. Empty host-KV
+residency and remaining decode costs are the next performance boundaries.
+Installed Strata configuration, model shards, production loader gate and
+publication hold remain unchanged.

@@ -168,6 +168,8 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
                 ggml_tensor * sparse_mask = KQ_mask;
                 auto * ids = ggml_view_2d(ctx0, input.rows, sequence_keys, 1, input.rows->nb[1], 0);
                 auto * ordered_keys = qwen4exp_build_cache_rows(ctx0, cached.cached_keys, ids);
+                if (ggml_backend_buffer_is_host(kv_self.kr_l[il]->buffer))
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, ordered_keys, lctx.backend_cpu);
                 const int64_t complete_blocks = sequence_keys / ratio;
                 if (complete_blocks > 0) {
                     GGML_ASSERT(input.block_pos &&

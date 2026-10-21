@@ -18,6 +18,19 @@ bool qwen4exp_validate_cache_type(ggml_type type, int64_t head_width,
 ggml_tensor * qwen4exp_build_cache_rows(
         ggml_context * ctx, ggml_tensor * cache, ggml_tensor * row_ids);
 
+// Compact one query's sparse 0/-infinity mask and physical row map. Capacity
+// must cover every visible row and be padded for Flash Attention. Masked
+// padding rows remain masked; repeated physical rows never gain probability.
+struct qwen4exp_compact_attention_rows {
+    ggml_tensor * rows;
+    ggml_tensor * mask;
+};
+ggml_tensor * qwen4exp_build_compact_attention_indices(
+        ggml_context * ctx, ggml_tensor * sparse_mask, int64_t capacity);
+qwen4exp_compact_attention_rows qwen4exp_build_compact_attention_rows(
+        ggml_context * ctx, ggml_tensor * physical_rows, ggml_tensor * sparse_mask,
+        ggml_tensor * selected_rows, int64_t query);
+
 // Reference L2 normalization is x / sqrt(sum(x*x) + eps), not GGML's
 // clamp-based L2 normalization. Rows run along the first tensor dimension.
 ggml_tensor * qwen4exp_build_l2_norm(ggml_context * ctx, ggml_tensor * input, float eps);

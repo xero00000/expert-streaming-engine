@@ -6176,8 +6176,12 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     return false;
             }
         }
-        case GGML_OP_DUP:
         case GGML_OP_REPEAT:
+            if (op->src[0]->type == GGML_TYPE_I32) {
+                return op->src[0]->nb[0] == sizeof(uint32_t) && ggml_is_contiguous(op);
+            }
+            [[fallthrough]];
+        case GGML_OP_DUP:
         case GGML_OP_CONCAT:
             {
                 ggml_type src0_type = op->src[0]->type;

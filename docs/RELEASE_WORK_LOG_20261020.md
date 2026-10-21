@@ -736,3 +736,67 @@ applying its sparse mask. Its full-history intermediates are the next memory
 boundary to isolate. Failed reservations now log per-backend required/live/
 budget bytes and rejection counters. Five focused conversion, indexed-vector,
 planner and graph/shared-budget CTests pass on each of the three cards.
+
+
+#### 1M Q4 admission and bounded attention gather
+
+The restored runtime now reaches readiness with 1,048,576 context cells,
+Q4_0 K/V and YaRN scale four, then completes two raw-Hi/eight-token requests
+and exits zero. This is configured capacity and short-request serving, not
+filled-1M model correctness or the selected 552/128 throughput qualification.
+The production gate and installed launcher remain unchanged.
+
+Failed-reservation diagnostics isolated approximately 5.2 GB of temporary
+compute per GPU. The QSA graph gathered every logical K/V row into F32 before
+applying its sparse mask. The explicit Qwen arithmetic path now ranks the
+zero/-infinity mask by logical row and gathers at most 2,304 padded rows per
+query (2,048 selected tokens plus at most 31 tail tokens). It retains every
+visible logical row once, preserves visible row order, and retains masked
+padding. Small histories and other architectures retain their existing path.
+The GPU-KV server's reserved compute drops to 841.53 / 904.44 / 841.63 MiB.
+Persistent K/V is 6,912 MiB Q4 plus 6,144 MiB F32 indexer storage.
+
+The new million-row test also caught CUDA integer repeat reinterpreting I32
+payloads as half values. NaN canonicalization corrupted IDs such as 31,750.
+Integer repeat now copies uint32 payloads directly, including strided inputs,
+and its support query advertises that implementation. Tests cover negative
+IDs, half-NaN bit patterns, tiled dimensions and per-head million-row maps.
+
+Dense/compact attention controls retain the fixed `2e-5 * (1 + abs(reference))`
+bound for actual 256-wide / 24-query-head / two-KV-head geometry, using F32,
+Q4_0 and F16 caches. Gathered F32 rows use ordinary explicit F32 KQ/softmax/VQ:
+the existing CUDA Flash Attention dispatch could otherwise convert those rows
+to half despite the precision request. F16 rows retain explicit F32 Flash
+Attention. Eleven focused operator, cache, planner, expert and memory-budget
+CTests pass on each of the three GPUs.
+
+A host-KV option is being qualified to leave more GPU memory for experts.
+Host-backed rows are gathered before their device handoff. An initial 6 GiB
+expert-cache request without a reserve aborted with CUDA OOM at graph launch;
+that failed trial is retained. A 4 GiB cache / 1 GiB reserve retry serves and
+exits cleanly. Its small diagnostic repeat is only 3.60 tok/s, versus 6.02 for
+the 1M GPU-KV control, and is not a performance acceptance result.
+
+The first 33-token host/GPU Q4 placement comparison agreed through token 23,
+then diverged: CPU IQK and CUDA Q4 encoders use different rounding/reduction
+rules. The explicit host-Q4 path now encodes on the layer's GPU and transfers
+the packed rows unchanged. Both placements then reproduce all 8,194,560
+logits and 1,584 ordered route rows byte-for-byte at the same 1M allocation
+(`q4-1m-host-gpu-prefill33-v3-comparison.json`). This is a placement control,
+not an upstream Q4-cache or filled-context qualification. Failed controls,
+commands, source/library snapshots and successful runs remain under
+`task4/qwen4exp-iq2-restore/`.
+
+Remaining work is ordered: retain the upstream F32-cache replay after this
+integration; reduce empty host-KV memory residency; run the actual 552-token /
+128-generation workload; profile and optimize its remaining bottleneck; then
+repeat the complete matched comparison against the frozen 80% thresholds.
+MTP, control-vector projection, prefix reuse and other launcher-specific
+features remain separate unqualified differences. Task 4 and publication stay
+open until the selected profile's requirements actually pass.
+
+The final current-source F32-cache/4K upstream replay also remains
+byte-identical to the passing pre-change teacher, logits and route controls
+(`canonical-host-reference-33/bitwise-control-comparison.json`). The private
+runtime snapshots and full selected-model inputs are preserved; no production
+architecture admission or publication is implied by this checkpoint.

@@ -888,6 +888,31 @@ ggml_tensor * llm_build_context::llm_build_inp_embd(
     return inpL;
 }
 
+static bool qwen4exp_explicit_arithmetic(const llama_context & lctx) {
+    const char * value = std::getenv("ESE_QWEN4EXP_EXPERT_F32");
+    return lctx.model.arch == LLM_ARCH_QWEN4EXP && value && std::strcmp(value, "1") == 0;
+}
+
+static ggml_tensor * qwen4exp_encode_host_q4(
+        llama_context & lctx, ggml_context * ctx, ggml_tensor * value,
+        ggml_tensor * cache, int64_t layer) {
+    if (!qwen4exp_explicit_arithmetic(lctx) || cache->type != GGML_TYPE_Q4_0 ||
+            !ggml_backend_buffer_is_host(cache->buffer)) return value;
+    for (auto * backend : lctx.backends) {
+        if (ggml_backend_is_cpu(backend) ||
+                !ggml_backend_supports_buft(backend, lctx.model.buft_layer[layer].buft)) continue;
+        // CPU IQK and CUDA Q4 encoders use different rounding/reduction rules.
+        // Encode on the layer's device, then transfer the packed row unchanged,
+        // so moving KV to host memory does not change model arithmetic.
+        auto * encoded = ggml_cast(ctx, value, GGML_TYPE_Q4_0);
+        if (ggml_backend_supports_op(backend, encoded)) {
+            ggml_backend_sched_set_tensor_backend(lctx.sched, encoded, backend);
+            return encoded;
+        }
+    }
+    return value;
+}
+
 void llm_build_context::llm_build_kv_store(
        struct llama_context & lctx,
         struct ggml_context * ctx,
@@ -930,6 +955,7 @@ void llm_build_context::llm_build_kv_store(
         ggml_tensor * k_cache_view = ggml_view_2d(ctx, kv.k_l[il], cache_head_k, n_tokens*n_head_kv,
                 k_row_size, k_row_size*n_head_kv*kv_head);
 
+        k_cur = qwen4exp_encode_host_q4(lctx, ctx, k_cur, kv.k_l[il], il);
         lctx.cache_copies[2*il+0].cpy  = ggml_cpy(ctx, k_cur, k_cache_view);
         lctx.cache_copies[2*il+0].step = k_row_size*n_head_kv;
 
@@ -964,15 +990,13 @@ void llm_build_context::llm_build_kv_store(
         }
         cb(v_cache_view, "v_cache_view", il);
 
+        if (!kv.v_trans) v_cur = qwen4exp_encode_host_q4(lctx, ctx, v_cur, kv.v_l[il], il);
         lctx.cache_copies[2*il+1].cpy  = ggml_cpy(ctx, v_cur, v_cache_view);
         ggml_build_forward_expand(graph, lctx.cache_copies[2*il+1].cpy);
     }
 }
 
-static bool qwen4exp_explicit_arithmetic(const llama_context & lctx) {
-    const char * value = std::getenv("ESE_QWEN4EXP_EXPERT_F32");
-    return lctx.model.arch == LLM_ARCH_QWEN4EXP && value && std::strcmp(value, "1") == 0;
-}
+
 
 ggml_tensor * llm_build_context::llm_build_lora_mm(
         struct llama_context & lctx,
@@ -2111,7 +2135,8 @@ static ggml_tensor * llm_build_kqv(
          const llm_build_cb & cb,
                     int       il,
                 ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
-                ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr) {
+                ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr,
+                bool force_f32_attention = false) {
     const llama_model   & model   = lctx.model;
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
@@ -2157,15 +2182,60 @@ static ggml_tensor * llm_build_kqv(
                     ggml_row_size(v_cache->type, value_width), 0);
         }
         for (const auto & input : lctx.qwen4exp_attention_inputs) {
+            const int64_t ratio = hparams.qwen4exp_compress_ratios[il];
+            // QSA exposes at most top_k complete-block tokens plus one tail.
+            // Gather that bounded set before dequantization. Gathering the full
+            // 1M cache first needs roughly 4 GiB of temporary F32 K/V per layer.
+            const int64_t kept = GGML_PAD(hparams.indexer_top_k + ratio - 1, 256);
+            if (cparams.flash_attn && qwen4exp_explicit_arithmetic(lctx) && n_swa == 0 && input.key_count > kept) {
+                auto * mask = input.layer_masks.at(il);
+                mask = ggml_view_2d(ctx, mask, input.key_count, input.query_count, mask->nb[1], 0);
+                if (mask->type != GGML_TYPE_F32) mask = ggml_cast(ctx, mask, GGML_TYPE_F32);
+                mask = ggml_cont(ctx, mask);
+                // Explicit row ranks preserve visible key order across backends
+                // and retain each logical row once, including tails.
+                auto * selected = qwen4exp_build_compact_attention_indices(ctx, mask, kept);
+                auto * row_map = ggml_view_2d(ctx, input.rows, input.key_count, n_head_kv, input.rows->nb[1], 0);
+                for (int64_t query = 0; query < input.query_count; ++query) {
+                    const auto compact = qwen4exp_build_compact_attention_rows(ctx, row_map, mask, selected, query);
+                    auto * compact_k = qwen4exp_build_cache_rows(ctx, physical_k, compact.rows);
+                    auto * compact_v = qwen4exp_build_cache_rows(ctx, physical_v, compact.rows);
+                    if (ggml_backend_buffer_is_host(k_cache->buffer))
+                        ggml_backend_sched_set_tensor_backend(lctx.sched, compact_k, lctx.backend_cpu);
+                    if (ggml_backend_buffer_is_host(v_cache->buffer))
+                        ggml_backend_sched_set_tensor_backend(lctx.sched, compact_v, lctx.backend_cpu);
+                    const bool f32_rows = compact_k->type == GGML_TYPE_F32 && compact_v->type == GGML_TYPE_F32;
+                    if (f32_rows) compact_v = ggml_cont(ctx, ggml_transpose(ctx, compact_v));
+                    auto * queries = ggml_view_3d(ctx, q_cur, q_cur->ne[0], q_cur->ne[1], 1,
+                            q_cur->nb[1], q_cur->nb[2], (input.first_query + query) * q_cur->nb[2]);
+                    auto * output = llm_build_kqv(ctx, lctx, kv, graph, nullptr, nullptr, queries,
+                            compact.mask, 1, int32_t(kept), kq_scale, cb, il,
+                            sinks, n_swa, kv_il, &compact_k, &compact_v, f32_rows);
+                    result = result ? ggml_concat(ctx, result, output, 1) : output;
+                }
+                continue;
+            }
             auto * ids = ggml_view_2d(ctx, input.rows, input.key_count, n_head_kv, input.rows->nb[1], 0);
             auto * ordered_k = qwen4exp_build_cache_rows(ctx, physical_k, ids);
             auto * ordered_v = qwen4exp_build_cache_rows(ctx, physical_v, ids);
-            if (!cparams.flash_attn) ordered_v = ggml_cont(ctx, ggml_transpose(ctx, ordered_v));
+            // Gather host KV before the backend handoff. Moving the complete
+            // persistent cache to CUDA first copies the entire configured
+            // context on every decode, including unused cells.
+            if (ggml_backend_buffer_is_host(k_cache->buffer))
+                ggml_backend_sched_set_tensor_backend(lctx.sched, ordered_k, lctx.backend_cpu);
+            if (ggml_backend_buffer_is_host(v_cache->buffer))
+                ggml_backend_sched_set_tensor_backend(lctx.sched, ordered_v, lctx.backend_cpu);
+            // The CUDA FA implementations for gathered F32 rows can convert
+            // them to half despite GGML_PREC_F32. Preserve explicit arithmetic
+            // through the ordinary F32 KQ/softmax/VQ path for these rows.
+            const bool f32_rows = qwen4exp_explicit_arithmetic(lctx) &&
+                    ordered_k->type == GGML_TYPE_F32 && ordered_v->type == GGML_TYPE_F32;
+            if (!cparams.flash_attn || f32_rows) ordered_v = ggml_cont(ctx, ggml_transpose(ctx, ordered_v));
             auto * queries = ggml_view_3d(ctx, q_cur, q_cur->ne[0], q_cur->ne[1], input.query_count,
                     q_cur->nb[1], q_cur->nb[2], input.first_query * q_cur->nb[2]);
             auto * sequence_output = llm_build_kqv(ctx, lctx, kv, graph, nullptr, nullptr, queries,
                     input.layer_masks.at(il), input.query_count, input.key_count, kq_scale, cb, il,
-                    sinks, n_swa, kv_il, &ordered_k, &ordered_v);
+                    sinks, n_swa, kv_il, &ordered_k, &ordered_v, f32_rows);
             result = result ? ggml_concat(ctx, result, sequence_output, 1) : sequence_output;
         }
         GGML_ASSERT(result && result->ne[1] == n_tokens);
@@ -2213,7 +2283,7 @@ static ggml_tensor * llm_build_kqv(
 
     struct ggml_tensor * cur;
 
-    if (cparams.flash_attn) {
+    if (cparams.flash_attn && !force_f32_attention) {
         GGML_UNUSED(model);
         GGML_UNUSED(n_ctx);
 
