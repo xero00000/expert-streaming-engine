@@ -340,6 +340,7 @@ struct llama_context {
     std::map<uint32_t, ggml_tensor *> dsv41_row_inputs;
 
     struct llama_cparams        cparams;
+    bool warming_up = false;
     // CUDA-visible device order; graph arenas and all this context's pools
     // retain their own references to each shared physical admission ledger.
     std::vector<ggml_memory_budget_t> compute_budgets;

@@ -275,3 +275,39 @@ occurred; the user's hold is unchanged.
 - Small fixtures cannot qualify large-model performance, filled-64K workloads,
   experimental Qwen/MTP/multimodal paths or actual driver out-of-memory recovery.
   Those limits remain explicit; public Qwen admission and publication stay OFF.
+
+
+### Task 3 — cache matrix and two numerical defects
+
+- The initial cache acceptance run stopped at its obsolete 4 MiB fixture budget.
+  Padding headroom now leaves only one usable slot, so top-2 routing correctly
+  stays on CPU. Commit `d249dd3e2` uses 6 MiB for two GPU slots and checks the
+  smaller budget independently against CPU-expert execution. The corrected
+  one/two/three-GPU matrix passed, including mmap/pread/io_uring CPU parity.
+- Before numerical repairs, 24 sustained 128-token worker/backend trials passed
+  with bounded, drained ownership. Bounded prefill passed on one/two GPUs. The
+  equal-share three-GPU launcher run retained matching outputs but used expert
+  staging on only two devices; repeat with explicit placement that assigns MoE
+  layers to all three. Do not report that initial three-GPU trial as passed.
+- Seven fresh HTTP abort/status trials passed against the consolidated runtime:
+  four actual CPU graph aborts (with/without a system prefix), injected -2/+2
+  statuses and recoverable +1 capacity pressure. These are not physical OOM
+  or experimental-model acceptance.
+- New real-disconnect checks found repeat-request corruption before cancellation.
+  A CPU softmax/router adjacency shortcut independently failed a poisoned-output
+  probability/route oracle. `c69fd21d8` restores normal softmax semantics, including
+  masks/scaling and live intermediate output, with a permanent regression.
+- A separate BOS/timing heuristic selected all experts for ordinary first-token
+  microbatches. Replace it with explicit warmup state, invalidate graphs on
+  transitions and preserve allocation-only reservation. The new generated MoE
+  regression failed on the old behavior. With the repair, retained TinyMoE
+  native cold replays match all 32,000 logits exactly and three real CPU-stream
+  disconnects drain resources and preserve retry probabilities. Final rebuilds
+  and affected-matrix reruns are still in progress.
+- A strict 4 GiB automatic-plan startup also rejected its host context: the
+  selected caches leave insufficient tracked context metadata/output headroom.
+  Retain this as an open planning defect; bounded explicit cache configuration
+  can test transaction recovery independently. Do not weaken host admission.
+- Evidence, including unsuccessful controls, is retained under
+  `/home/xero/Desktop/test/results/ese-release-work-20261020/task3/`.
+  No performance threshold, full-model acceptance or release readiness is claimed.

@@ -1445,6 +1445,11 @@ extern "C" {
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
     LLAMA_API void llama_set_n_threads(struct llama_context * ctx, uint32_t n_threads, uint32_t n_threads_batch);
 
+    // Explicit all-expert warmup mode. Disabled by default. Transitions
+    // synchronize and invalidate reusable graphs; token IDs/timings never
+    // select this mode implicitly. Clear warmup KV before real inference.
+    LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+
     // Get the number of threads used for generation of a single token.
     LLAMA_API uint32_t llama_n_threads(struct llama_context * ctx);
 

@@ -15588,6 +15588,13 @@ void llama_set_n_threads(struct llama_context * ctx, uint32_t n_threads, uint32_
     ctx->cparams.n_threads_batch = n_threads_batch;
 }
 
+void llama_set_warmup(struct llama_context * ctx, bool warmup) {
+    if (ctx->warming_up == warmup) return;
+    llama_synchronize(ctx);
+    ctx->reset_scheduler();
+    ctx->warming_up = warmup;
+}
+
 uint32_t llama_n_threads(struct llama_context * ctx) {
     return ctx->cparams.n_threads;
 }

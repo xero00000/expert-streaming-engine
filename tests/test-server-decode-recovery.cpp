@@ -101,7 +101,7 @@ struct fixture {
         ("ese-server-recovery-" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count()) + ".gguf");
 
-    fixture() {
+    fixture(bool moe = false) {
         auto * tensors = ggml_init({128 * ggml_tensor_overhead(), nullptr, true});
         auto * meta = gguf_init_empty();
         check(tensors && meta, "fixture allocation");
@@ -115,6 +115,10 @@ struct fixture {
             {"tokenizer.ggml.unknown_token_id", 0}, {"tokenizer.ggml.bos_token_id", 1},
             {"tokenizer.ggml.eos_token_id", 2},
         }) gguf_set_val_u32(meta, item.first, item.second);
+        if (moe) {
+            gguf_set_val_u32(meta, "llama.expert_count", 4);
+            gguf_set_val_u32(meta, "llama.expert_used_count", 2);
+        }
         gguf_set_val_bool(meta, "tokenizer.ggml.add_bos_token", false);
         gguf_set_val_f32(meta, "llama.attention.layer_norm_rms_epsilon", 1e-6f);
         std::vector<std::string> pieces = {"<unk>", "<s>", "</s>", "▁", "t", "3", "8"};
@@ -130,10 +134,11 @@ struct fixture {
         gguf_set_arr_data(meta, "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
         std::vector<std::vector<float>> payloads;
         payloads.reserve(40);
-        auto tensor = [&](const std::string & name, int64_t width, int64_t rows = 1) {
-            auto * value = ggml_new_tensor_2d(tensors, GGML_TYPE_F32, width, rows);
+        auto tensor = [&](const std::string & name, int64_t width, int64_t rows = 1, int64_t experts = 1) {
+            auto * value = experts == 1 ? ggml_new_tensor_2d(tensors, GGML_TYPE_F32, width, rows) :
+                ggml_new_tensor_3d(tensors, GGML_TYPE_F32, width, rows, experts);
             ggml_set_name(value, name.c_str());
-            payloads.emplace_back(width * rows);
+            payloads.emplace_back(width * rows * experts);
             auto & data = payloads.back();
             for (size_t i = 0; i < data.size(); ++i) data[i] =
                 name.find("norm") != std::string::npos ? 1.f :
@@ -152,9 +157,16 @@ struct fixture {
             tensor(p + "attn_v.weight", 32, 32);
             tensor(p + "attn_output.weight", 32, 32);
             tensor(p + "ffn_norm.weight", 32);
-            tensor(p + "ffn_gate.weight", 32, 64);
-            tensor(p + "ffn_up.weight", 32, 64);
-            tensor(p + "ffn_down.weight", 64, 32);
+            if (moe) {
+                tensor(p + "ffn_gate_inp.weight", 32, 4);
+                tensor(p + "ffn_gate_exps.weight", 32, 64, 4);
+                tensor(p + "ffn_up_exps.weight", 32, 64, 4);
+                tensor(p + "ffn_down_exps.weight", 64, 32, 4);
+            } else {
+                tensor(p + "ffn_gate.weight", 32, 64);
+                tensor(p + "ffn_up.weight", 32, 64);
+                tensor(p + "ffn_down.weight", 64, 32);
+            }
         }
         gguf_write_to_file(meta, path.string().c_str(), false);
         gguf_free(meta);
@@ -187,6 +199,64 @@ static std::vector<float> decode(llama_context * ctx, llama_tokens tokens, int p
 }
 
 struct abort_control { int polls = 0; int threshold; };
+
+struct route_width_control { int expected = 2; int observed = 0; bool invalid = false; };
+static int capture_route_width(ggml_tensor * tensor, bool ask, void * opaque) {
+    if (std::strncmp(tensor->name, "ffn_moe_topk-", 13) != 0) return 0;
+    if (!ask) {
+        auto & control = *static_cast<route_width_control *>(opaque);
+        ++control.observed;
+        control.invalid |= tensor->ne[0] != control.expected;
+    }
+    return 1;
+}
+
+static void run_moe_first_request() {
+    fixture file(true);
+    auto mp = llama_model_default_params();
+    mp.devices = "";
+    mp.n_gpu_layers = 0;
+    std::unique_ptr<llama_model, decltype(&llama_free_model)> model(
+            llama_model_load_from_file(file.path.string().c_str(), mp), llama_free_model);
+    check(bool(model), "MoE fixture load failed");
+    for (bool reuse : {false, true}) {
+        route_width_control routes;
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 128;
+        cp.n_batch = 8;
+        cp.n_ubatch = 1;
+        cp.n_threads = cp.n_threads_batch = 1;
+        cp.graph_reuse = reuse;
+        cp.cb_eval = capture_route_width;
+        cp.cb_eval_user_data = &routes;
+        std::unique_ptr<llama_context, decltype(&llama_free)> ctx(
+                llama_init_from_model(model.get(), cp), llama_free);
+        check(bool(ctx), "MoE fixture context failed");
+        const llama_tokens prompt = {1, 3, 8, 14};
+        const auto teacher = decode(ctx.get(), prompt, 0, 0);
+        check(routes.observed > 0 && !routes.invalid, "first BOS microbatch used warmup expert width");
+        for (int trial = 0; trial < 3; ++trial) {
+            llama_kv_cache_clear(ctx.get());
+            llama_reset_timings(ctx.get());
+            check(decode(ctx.get(), prompt, 0, 0) == teacher, "MoE cold replay changed logits");
+            check(!routes.invalid, "timing reset enabled warmup expert width");
+        }
+        llama_kv_cache_clear(ctx.get());
+        routes.expected = 4;
+        routes.observed = 0;
+        llama_set_warmup(ctx.get(), true);
+        decode(ctx.get(), {1}, 0, 0);
+        check(routes.observed > 0 && !routes.invalid, "explicit warmup did not execute every expert");
+        llama_set_warmup(ctx.get(), false);
+        llama_kv_cache_clear(ctx.get());
+        llama_reset_timings(ctx.get());
+        routes.expected = 2;
+        check(decode(ctx.get(), prompt, 0, 0) == teacher && !routes.invalid,
+                "warmup graph or timing reset contaminated real inference");
+    }
+    std::puts("MoE first request: BOS microbatches, graph reuse and timing resets preserve top-k and logits");
+}
+
 static bool abort_after(void * opaque) {
     auto & control = *static_cast<abort_control *>(opaque);
     return ++control.polls >= control.threshold;
@@ -573,6 +643,7 @@ int main(int argc, char ** argv) {
     try {
         run_result_defaults();
         run_slot_action_errors();
+        run_moe_first_request();
         fixture file;
         for (int threshold : {1, 20}) for (bool system : {false, true}) run(file, threshold, system);
         run(file, 1, true, true);
