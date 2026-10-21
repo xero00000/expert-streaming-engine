@@ -529,3 +529,40 @@ TTFT with only 21.9% initial file residency on the FUSE volume. A separate
 byte-identical model copy is being prepared on local NVMe/btrfs to separate
 storage costs from cache tuning. Both engines will be rerun on the same new
 copy; all previous models, manifests and comparison results are preserved.
+
+### Task 4 continuation — 21 October NVMe controls and resident profile
+
+The NVMe copy verifies byte-for-byte against the comparison SHA; both engines
+are rerun on that copy. Strata completes nine requests at a 45.51 tok/s median.
+The repaired ESE uniform-cache control repeats the original output exactly,
+at 30.60 tok/s overall / 30.93 on repeats. NVMe cuts its initial TTFT to 15.29 s
+in this run, without closing the steady decode gap.
+
+Packing's output change is attributable to its automatic stable-reduction
+mode: the unpacked stable-mode full-model control matches packing exactly.
+All 36 added geometry cases pass in that mode on all three GPUs; disabling
+CUDA graphs preserves the packed output. The initially suspected packing
+parity failure is not supported by the controls with the same reduction mode.
+Legacy reduction is sensitive to physical cache geometry. The new CTest
+explicitly enables stable reduction. Frequency retention is slower and rejected.
+
+A residency index reuses observation nodes, preserving output and cache counts,
+but its pilot shows no gain. Commit `9c25eee77` is reverted by `d3bd3fa48`.
+Current native production source content is identical to the fully qualified
+`8cd98995a` implementation; the additional geometry test passes on every card.
+
+The fully resident **three-GPU** profile completes three fresh starts with
+three requests each: 81.03 tok/s median (81.24 on repeats), exact independent
+output replay, full 512/128 counts and normal shutdown. It exceeds Strata's
+single-GPU rate by 1.78x using a different allocation. It does not close the
+same-GPU gap. The user has been asked whether to qualify this practical fast
+profile or continue requiring single-3080 parity; the existing contract remains
+open pending that choice. Detailed resource/latency limits and every pilot are
+recorded in the performance qualification document and the results root.
+Studio staging, later work-log tasks and the publication hold remain unchanged.
+
+The 4.375 GiB packed-cache pilot retains the 1 GiB reserve and completes all
+three requests with stable-mode exact replay and normal drain/shutdown, but
+repeated decode is only 33.37/33.47 tok/s. Single-3080 acceptance remains open.
+The corrected nine-run resident median is 81.02568 tok/s; the earlier 81.46
+figure was an individual sample and has been corrected in user-facing status.

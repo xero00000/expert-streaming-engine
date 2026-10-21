@@ -239,3 +239,61 @@ The model SHA, frozen prompt, 512/128 counts, RTX 3080, eight CPU threads and
 memory limits remain unchanged. The copy manifest is
 `nvme-comparison-model.json`; native and Strata baselines on the new storage
 will be recorded separately from the table above.
+
+### NVMe follow-up — 21 October
+
+Both engines now use the same byte-identical NVMe/btrfs copy (SHA-256 still
+`2b442ab092f23747224e62b74b8a14a45e777629d28aa97427d0c1b62a49010e`).
+The frozen 512-token prompt, 128 generated tokens, eight CPU threads, 8,192
+context, zero-temperature sampler and no prompt reuse are unchanged.
+
+| Configuration | GPUs | Fresh starts × requests | Decode median | Repeated-request median |
+| --- | ---: | ---: | ---: | ---: |
+| Strata 0.1.45 | one RTX 3080 | 3 × 3 | 45.51 tok/s | 45.66 tok/s |
+| ESE uniform cache control | one RTX 3080 | 1 × 3 pilot | 30.60 tok/s | 30.93 tok/s |
+| ESE stable-reduction control | one RTX 3080 | 1 × 3 pilot | 29.25 tok/s | 29.56 tok/s |
+| ESE fully resident | RTX 3060 Ti + 2080 SUPER + 3080 | 3 × 3 | 81.03 tok/s | 81.24 tok/s |
+
+The three-GPU profile is 1.78x Strata's single-GPU decode rate on this workload.
+This meets an absolute-speed target using the available machine; it does not
+establish parity with equal GPU allocation. Single-3080 parity remains unmet.
+The user has been asked which allocation should guide the remaining work;
+the existing same-GPU acceptance contract is not silently replaced.
+
+Both nine-request runs independently repeat their output exactly and preserve
+full counts with normal shutdown. Each engine uses different arithmetic, so
+this is not cross-engine/full-model numerical acceptance. Native resident
+startup is 12.59–12.98 s; Strata's is 12.63–17.88 s. Native median prefill/TTFT
+is about 416 tok/s / 1.23 s versus Strata's 611 tok/s / 0.84 s. Native process
+high-water RSS is 17.28 GiB versus Strata's 32.55 GiB; sampled process swap is
+zero for both. GPU-driver measurements include desktop allocations.
+
+The apparent packing output discrepancy is resolved: packing automatically
+enables the existing `ESE_CUDA_STABLE_EXPERT_REDUCTION` mode, while the legacy
+control did not. An unpacked full-model control with that same mode enabled
+has exactly the packed output hash (`941a650f…`); legacy uniform output remains
+`acc68310…`. Disabling CUDA graphs does not change the packed result. There is
+no packing-only parity failure demonstrated by those comparisons. The 36 new
+IQ3_S/IQ4_XS/Q6_K geometry cases cover one/two/five/eight tokens and relocated
+physical slots; all pass in stable mode on every card. The synthetic default-
+mode discrepancy demonstrates legacy reduction-order sensitivity. The new
+CTest supplies the stable-mode environment explicitly.
+
+Frequency retention is rejected at roughly 24.3 tok/s on repeats. The native
+residency-index experiment (`9c25eee77`) preserves output and all hit/miss/upload
+counts but shows no speedup in its pilot (28.64/29.09 tok/s); it was reverted
+at `d3bd3fa48`. No causal regression is inferred from one shared-desktop trial.
+Current production source content matches the fully tested `8cd98995a` native
+implementation; only test/documentation/tooling changes remain beyond it.
+
+Raw records: `strata-iq4-3080-nvme/`, `ese-iq4-3080-nvme-control/`,
+`ese-iq4-3080-nvme-stable-control/`, `packing-parity-diagnostic/`,
+`cache-residency-index/` and `ese-iq4-three-gpu-nvme-resident/`.
+`nvme-comparison-summary.json` keeps allocations, pilots and acceptance limits
+explicit. Shared desktop load and sequential run order remain limitations.
+The staged Studio runtime is still older; publication remains on hold.
+
+A 4.375 GiB packed-cache pilot keeps the 1 GiB reserve and completes three
+requests with exact stable-mode replay, clean lease drain and normal exit.
+Its repeated requests reach 33.37/33.47 tok/s, still below the single-3080
+target. See `ese-iq4-3080-nvme-packed-4375g-pilot/`; it remains tuning evidence.
