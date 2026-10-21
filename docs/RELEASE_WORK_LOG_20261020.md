@@ -1347,3 +1347,72 @@ unchanged. This remains a one-start/two-request diagnostic; the three-start
 qualification and speed thresholds remain open. The launch fix preserves
 existing precision and applies to Q4_0->F32 copies without an experiment
 flag; the host-cache handoff and native model policies remain opt-in.
+
+
+### Task 4 — Strata-style native CPU expert arithmetic (experimental)
+
+The selected model's four real expert geometries were calibrated separately
+with four CPU threads and all three devices. The original Q2_0 down dot uses
+scalar F32 activations: its CUDA2-contended cost is 309,866 ns per component,
+versus 40,470–54,995 ns for each up/gate component. Strata uses integer Q8
+activation dots for these weights. The new process-start opt-in
+`ESE_CPU_Q2_0_Q8_DOT=1` uses Q8_0 activations and an AVX2 Q2/Q8 dot, retaining
+the original F32 dot by default. CPU execution and workspace planning consult
+the same activation policy. This changes native arithmetic and does not
+establish full-model numerical qualification.
+
+The integer dot passes 5,376 independent packed-code/extreme/width cases,
+including -128 signed activations. Indexed-matrix fixtures cover actual
+640->2560 down geometry, broadcast/per-route input, masked routes, changed
+inputs/routes, one/four threads, and two-expert bounded leases with poisoned
+backing storage. Native and default policies pass normal and ASan/UBSan
+builds. The initial fixture incorrectly repeated experts within one token's
+route list; AddressSanitizer localized an existing generic route-mapping
+overflow under that geometry, also present with the default dot. The
+corrected fixture uses unique top-k routes as produced by the model. Raw
+failure and corrected logs are retained. Duplicate-per-token native route
+inputs remain outside this validated fixture and the generic mapper still
+assumes at most one occurrence per expert/token; no claim of general
+repeated-ID safety is made here.
+
+Actual selected-model Q2 weights pass the existing dequantized scalar
+reference (NRMSE 0.003646, unchanged 0.08 calibration limit). The first
+21-iteration opt-in calibration is not planner-ready because one contention
+confidence is below the existing cutoff; it is not promoted. A separate
+49-iteration run passes all existing confidence checks and is planner-ready.
+Its CUDA2 Q2 cost is 51,155 ns, about 6.1 times faster than the preceding
+309,866 ns diagnostic. Both calibration files remain in the evidence folder.
+Transfer costs include a bounded RAM refill, not a resident pinned-hit
+measurement. They must not be represented as pinned-cache-hit costs.
+
+Hybrid graph construction now requires all expert weight components to be
+host-backed before splitting a layer. Fully GPU-resident layers remain on
+GPU; a CPU branch there would copy whole expert tensors back to the host.
+A four-GPU/six-CPU route diagnostic uses residency-aware selection and early
+CPU input transfer, with conservative whole-expert costs derived from the
+49-iteration CUDA2 measurements and unchanged live drift/fallback guards.
+Its full workload result follows. The opt-in CPU policy with explicit F32
+experts still matches all 8,194,560 strict-reference logits, routes and IDs
+bitwise at ubatch 128 / 1M context (`native-q2-cpu-strict-reference33`). This
+control bypasses native expert arithmetic and does not qualify it.
+
+The first `workload-1m-native-q2-hybrid4-passive4` is excluded: the existing
+upload-drift guard revoked hybrid execution after 70 CPU layer calls, with
+16.25 ms of lease acquisition across seven misses. Requests reach 10.484 /
+16.679 tok/s and have different hashes as execution changes after revocation.
+The warm-only upload estimate does not cover cold storage refills.
+
+A second diagnostic uses the actual cold-refill component medians from the
+same 49-iteration calibration (CUDA2 0.835–1.015 ms; each confidence >0.99).
+The conservative maximum whole-expert refill cost is 2,950,006 ns. The drift
+multiplier remains 4x. It assigns eight expert positions to GPU and two to
+CPU, with active four-thread OpenMP to avoid passive worker wakeups during
+CPU expert computation. This run stays within the guard, reports 8,890 CPU
+layer calls (35 host-backed layers x 127 decode steps x two requests), and
+has no forced fallback. Its 12.550 / 15.202 tok/s is slower than the preceding
+GPU-only diagnostic, and the requests' output hashes differ. The runner
+correctly marks both mixed runs failed. No change to output-repeatability or
+numerical acceptance is made. Keep the native CPU option off in the selected
+profile and retain the prior 18.408 tok/s GPU diagnostic as the best tested
+repeat. CPU dot acceleration alone does not establish useful overlap or
+full-model qualification. Task 4 and the release gate remain open.

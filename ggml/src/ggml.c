@@ -2139,10 +2139,31 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
     },
 };
 
-// For internal test use
-ggml_type_traits_t ggml_internal_get_type_traits(enum ggml_type type) {
+static inline ggml_type_traits_t ggml_cpu_type_traits(enum ggml_type type) {
     GGML_ASSERT(type < GGML_TYPE_COUNT);
-    return type_traits[type];
+    ggml_type_traits_t result = type_traits[type];
+    if (type == GGML_TYPE_Q2_0) {
+        // Process-start opt-in. Keep the immutable format table and default
+        // F32 activation dot unchanged; all CPU workspace and execution users
+        // below consult this same policy so activation geometry cannot drift.
+        static atomic_int enabled = -1;
+        int value = atomic_load(&enabled);
+        if (value < 0) {
+            const char * flag = getenv("ESE_CPU_Q2_0_Q8_DOT");
+            value = flag && strcmp(flag, "1") == 0;
+            atomic_store(&enabled, value);
+        }
+        if (value) {
+            result.vec_dot = ggml_vec_dot_q2_0_q8_0;
+            result.vec_dot_type = GGML_TYPE_Q8_0;
+        }
+    }
+    return result;
+}
+
+// CPU activation policy is also observable by calibration and focused tests.
+ggml_type_traits_t ggml_internal_get_type_traits(enum ggml_type type) {
+    return ggml_cpu_type_traits(type);
 }
 
 static inline int ggml_packed_rows(enum ggml_type type) {
@@ -18134,8 +18155,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    ggml_vec_dot_t const vec_dot      = type_traits[type].vec_dot;
-    enum ggml_type const vec_dot_type = type_traits[type].vec_dot_type;
+    ggml_vec_dot_t const vec_dot      = ggml_cpu_type_traits(type).vec_dot;
+    enum ggml_type const vec_dot_type = ggml_cpu_type_traits(type).vec_dot_type;
 
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
@@ -18231,9 +18252,9 @@ static int ggml_compute_forward_mul_mat(
 
     const enum ggml_type type = src0->type;
 
-    enum ggml_type           const vec_dot_type         = type_traits[type].vec_dot_type;
+    enum ggml_type           const vec_dot_type         = ggml_cpu_type_traits(type).vec_dot_type;
     ggml_from_float_t        const from_float           = type_traits[vec_dot_type].from_float;
-    int64_t                  const vec_dot_num_rows     = type_traits[type].nrows;
+    int64_t                  const vec_dot_num_rows     = ggml_cpu_type_traits(type).nrows;
     int64_t                  const matmul_num_cols      = type_traits[type].ncols;
 #if !GGML_USE_IQK_MULMAT
     ggml_from_float_to_mat_t const from_float_to_mat    = type_traits[vec_dot_type].from_float_to_mat;
@@ -18393,7 +18414,7 @@ static int ggml_compute_forward_mul_mat(
                    cgraph->nodes[node_n+1]->op == GGML_OP_MUL_MAT &&
                    cgraph->nodes[node_n+1]->src[1] == src1 &&
                    ggml_get_op_params_i32(cgraph->nodes[node_n+1], 0) == GGML_PREC_DEFAULT &&
-                   type_traits[cgraph->nodes[node_n+1]->src[0]->type].vec_dot_type == vec_dot_type) {
+                   ggml_cpu_type_traits(cgraph->nodes[node_n+1]->src[0]->type).vec_dot_type == vec_dot_type) {
                 struct ggml_tensor * dst_next  = cgraph->nodes[node_n+1];
                 struct ggml_tensor * src0_next = dst_next->src[0];
                 GGML_ASSERT(dst_next->type == GGML_TYPE_F32);
@@ -18790,8 +18811,8 @@ static void ggml_compute_forward_mul_mat_id(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    ggml_vec_dot_t    const vec_dot         = type_traits[type].vec_dot;
-    enum ggml_type    const vec_dot_type    = type_traits[type].vec_dot_type;
+    ggml_vec_dot_t    const vec_dot         = ggml_cpu_type_traits(type).vec_dot;
+    enum ggml_type    const vec_dot_type    = ggml_cpu_type_traits(type).vec_dot_type;
     ggml_from_float_t const from_float      = type_traits[vec_dot_type].from_float;
     int64_t           const matmul_num_cols = type_traits[type].ncols;
     ggml_gemv_t       const gemv            = type_traits[type].gemv;
@@ -19266,7 +19287,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
     const enum ggml_type type = src0->type;
 
-    enum ggml_type    const vec_dot_type    = type_traits[type].vec_dot_type;
+    enum ggml_type    const vec_dot_type    = ggml_cpu_type_traits(type).vec_dot_type;
 
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -19505,7 +19526,7 @@ static void ggml_compute_forward_mul_mat_up_gate(
 
     const enum ggml_type type = src0->type;
 
-    enum ggml_type    const vec_dot_type    = type_traits[type].vec_dot_type;
+    enum ggml_type    const vec_dot_type    = ggml_cpu_type_traits(type).vec_dot_type;
 
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -23848,9 +23869,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-    enum ggml_type    const k_vec_dot_type = type_traits[k->type].vec_dot_type;
+    enum ggml_type    const k_vec_dot_type = ggml_cpu_type_traits(k->type).vec_dot_type;
     ggml_from_float_t const q_to_vec_dot   = type_traits[k_vec_dot_type].from_float;
-    ggml_vec_dot_t    const kq_vec_dot     = type_traits[k->type].vec_dot;
+    ggml_vec_dot_t    const kq_vec_dot     = ggml_cpu_type_traits(k->type).vec_dot;
     ggml_to_float_t   const v_to_float     = type_traits[v->type].to_float;
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
@@ -29553,7 +29574,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                 } break;
             case GGML_OP_MUL_MAT:
                 {
-                    const enum ggml_type vec_dot_type = type_traits[node->src[0]->type].vec_dot_type;
+                    const enum ggml_type vec_dot_type = ggml_cpu_type_traits(node->src[0]->type).vec_dot_type;
 
                     if (node->src[1]->type != vec_dot_type) {
                         cur = ggml_row_size(vec_dot_type, node->src[1]->ne[0]) * ggml_nrows(node->src[1]);
@@ -29571,7 +29592,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     cur = 0;
                     const struct ggml_tensor * src0 = node->src[0];
                     const struct ggml_tensor * src1 = node->src[1];
-                    const enum ggml_type vec_dot_type = type_traits[src0->type].vec_dot_type;
+                    const enum ggml_type vec_dot_type = ggml_cpu_type_traits(src0->type).vec_dot_type;
                     if (src1->type != vec_dot_type) {
                         cur += ggml_row_size(vec_dot_type, node->src[1]->ne[0]) * ggml_nrows(node->src[1]);
                     }
@@ -29589,7 +29610,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     cur = 0;
                     const struct ggml_tensor * src0 = node->src[0];
                     const struct ggml_tensor * src2 = node->src[2];
-                    const enum ggml_type vec_dot_type = type_traits[src0->type].vec_dot_type;
+                    const enum ggml_type vec_dot_type = ggml_cpu_type_traits(src0->type).vec_dot_type;
                     // Workspace converts the activation tensor, regardless of
                     // whether gate/up weights are separate or merged. Testing
                     // src[1] omitted this allocation for merged layouts.
@@ -29606,7 +29627,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     cur = 0;
                     const struct ggml_tensor * src0 = node->src[0];
                     const struct ggml_tensor * src2 = node->src[2];
-                    const enum ggml_type vec_dot_type = type_traits[src0->type].vec_dot_type;
+                    const enum ggml_type vec_dot_type = ggml_cpu_type_traits(src0->type).vec_dot_type;
                     if (src2->type != vec_dot_type) {
                         cur += ggml_row_size(vec_dot_type, node->src[1]->ne[0]) * ggml_nrows(node->src[1]);
                     }

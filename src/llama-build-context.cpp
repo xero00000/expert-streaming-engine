@@ -1833,8 +1833,16 @@ llm_expert_gating_func_type   gating_op,
             lctx.cparams.expert_hybrid_gpu_experts, n_expert_used);
     const int64_t graph_tokens = lctx.inp_tokens ? lctx.inp_tokens->ne[0] :
             lctx.inp_embd ? lctx.inp_embd->ne[1] : n_tokens;
+    // CPU branches consume leased host weights. Fully resident GPU experts
+    // already avoid uploads; splitting them would copy their entire weight
+    // tensors back to the host instead of overlapping a bounded lease.
+    const auto host_experts = [](const ggml_tensor * weight) {
+        return weight && weight->buffer && ggml_backend_buffer_is_host(weight->buffer);
+    };
+    const bool hybrid_host_weights = host_experts(down_exps) &&
+            (up_gate_exps ? host_experts(up_gate_exps) : host_experts(up_exps) && host_experts(gate_exps));
     const bool use_hybrid = lctx.active_expert_decode && graph_tokens == 1 && n_tokens == 1 && hybrid_gpu_experts > 0 &&
-            hybrid_gpu_experts < n_expert_used && lctx.cparams.expert_vram_cache_bytes > 0 &&
+            hybrid_gpu_experts < n_expert_used && hybrid_host_weights && lctx.cparams.expert_vram_cache_bytes > 0 &&
             ggml_backend_sched_get_expert_hybrid_guard_status(lctx.sched) ==
                     GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING;
     if (!use_hybrid) {
