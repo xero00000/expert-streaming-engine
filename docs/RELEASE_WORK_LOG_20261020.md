@@ -1638,3 +1638,28 @@ requires it; that failed configuration is retained and the corrected FA-on run
 passes. This is bounded lifecycle validation at scale four/4K allocated context,
 not filled-64K evidence or native quantized-arithmetic qualification. The public
 model gate remains closed. Proceed to actual prompt-length/resource checks.
+
+
+### Task 5 — exact filled-context retrieval runner and pilot
+
+Added `scripts/qualify-native-context.py` and usage/scope documentation in
+`CONTEXT_QUALIFICATION_20261021.md`. It freezes server-tokenized prompts at
+exact requested lengths, retaining the complete chat suffix and three records
+near the beginning, middle and end. Raw streams/final receipts are preserved;
+actual prompt/output counts, no truncation, finite consistent timings, correctly
+labelled retrieval and exact repeated output are mandatory. It never starts or
+changes an existing server and refuses to overwrite evidence. Three regression
+cases cover exact 65,536-token fixture construction, complete record/suffix
+preservation, wrong/missing/contradictory assignments and invalid templates.
+All 19 native benchmark/context/surface Python checks pass.
+
+The selected-model 2,048/128 pilot completes inference with no context
+truncation, but fails the retrieval assertion: its reasoning contains all three
+correct codes, while the fixed 128-token generation limit cuts the final answer
+after `GAMMA=84507`. This failed result is retained at
+`task5/flash-next-context-pilot/`; it is not a retrieval pass. Server exit is
+normal, leases/queues/staging drain, and no process swap is sampled. Increase
+the correctness workload's explicit generation headroom to 256 tokens and rerun
+before advancing to larger lengths. This changes only the test output budget;
+it is independent of the accepted 552/128 speed observation. Original model,
+launcher and production admission remain unchanged.
