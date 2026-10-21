@@ -125,6 +125,8 @@ def main():
     parser.add_argument('--predict', type=int, default=128)
     parser.add_argument('--context', type=int, default=8192)
     parser.add_argument('--threads', type=int, default=8)
+    parser.add_argument('--ubatch', type=int, default=128)
+    parser.add_argument('--fused-mmad', action='store_true', help='use the production fused expert reduction (default: unfused control)')
     parser.add_argument('--max-ram', default='32GiB')
     parser.add_argument('--reserve-vram', default='1GiB')
     parser.add_argument('--ram-cache-mib', type=int, default=1024)
@@ -133,7 +135,7 @@ def main():
     parser.add_argument('--prefill-staging-mib', default='0', help='MiB per GPU, or auto for native sizing')
     parser.add_argument('--server-arg', action='append', default=[])
     args = parser.parse_args()
-    if min(args.starts, args.requests, args.predict, args.context, args.threads) < 1:
+    if min(args.starts, args.requests, args.predict, args.context, args.threads, args.ubatch) < 1:
         parser.error('counts must be positive')
     server, model = args.server.resolve(strict=True), args.model.resolve(strict=True)
     prompt = json.loads(args.prompt_json.read_text())['tokens']
@@ -152,6 +154,7 @@ def main():
     version = subprocess.run([str(server), '--version'], text=True, capture_output=True)
     report['server_version'] = version.stdout + version.stderr
     identity = (model.stat().st_size, model.stat().st_mtime_ns)
+    report['model_identity'] = dict(path=str(model), bytes=identity[0], mtime_ns=identity[1])
     environment = dict(os.environ, CUDA_VISIBLE_DEVICES=args.gpus)
     environment.pop('LD_PRELOAD', None)
     report['environment'] = {k:v for k,v in environment.items() if k.startswith(('CUDA_', 'LD_', 'ESE_', 'GGML_'))}
@@ -169,9 +172,11 @@ def main():
                 listener.bind(('127.0.0.1',0)); port = listener.getsockname()[1]
             command = [str(server), '-m', str(model), '--memory-policy', args.policy, '--max-ram', args.max_ram,
                 '--reserve-vram', args.reserve_vram, '--max-context', str(args.context), '--min-kv-quality', 'f16',
-                '-c', str(args.context), '-b', '512', '-ub', '128', '-np', '1', '-t', str(args.threads), '-tb', str(args.threads),
+                '-c', str(args.context), '-b', '512', '-ub', str(args.ubatch), '-np', '1', '-t', str(args.threads), '-tb', str(args.threads),
                 '-ngl', '99', '-sm', 'layer', '-ts', args.tensor_split, '--cache-ram', '64', '--no-warmup',
-                '--no-fused-mul-multiadd', '--host', '127.0.0.1', '--port', str(port)]
+                '--host', '127.0.0.1', '--port', str(port)]
+            if not args.fused_mmad:
+                command += ['--no-fused-mul-multiadd']
             if args.policy != 'resident':
                 command += ['--cpu-moe', '--expert-ram-cache-mib', str(args.ram_cache_mib),
                     '--expert-ram-staging-mib', str(args.staging_mib), '--expert-vram-cache-mib', str(args.vram_cache_mib),
@@ -208,13 +213,16 @@ def main():
                             if time.monotonic()-started>300:raise RuntimeError('startup timeout')
                             time.sleep(.1)
                     entry['startup_to_ready_seconds']=time.monotonic()-started
+                    entry['file_cache_after_startup']=file_residency(model)
                     request('/detokenize', dict(tokens=prompt), name='prompt-decoded')
                     request('/v1/ese/resources',name='resources-before')
                     for trial in range(args.requests):
                         payload=dict(prompt=prompt,n_predict=args.predict,n_probs=0,temperature=0,seed=4242,
                             ignore_eos=True,cache_prompt=False,stream=True)
                         (run/f'request-{trial+1}.json').write_text(json.dumps(payload)+'\n')
-                        before=process_memory(process.pid);tick=time.monotonic()
+                        before=process_memory(process.pid)
+                        cache_before=file_residency(model)
+                        tick=time.monotonic()
                         req=urllib.request.Request(f'http://127.0.0.1:{port}/completion',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
                         with urllib.request.urlopen(req,timeout=600) as response,(run/f'response-{trial+1}.sse').open('wb') as raw:
                             content,final,ttft,first_text=consume_stream(response,tick,raw)
@@ -225,7 +233,8 @@ def main():
                         if signature is None:signature=value
                         row=dict(start=iteration,request=trial,wall_seconds=wall,first_token_seconds=ttft,
                             first_visible_text_seconds=first_text,timings=timing,output_sha256=value,
-                            exact_replay=value==signature,process_before=before,process_after=process_memory(process.pid))
+                            exact_replay=value==signature,file_cache_before=cache_before,
+                            process_before=before,process_after=process_memory(process.pid))
                         report['samples'].append(row);save()
                         if not row['exact_replay']:raise RuntimeError('greedy cold-request output changed')
                         request('/v1/ese/resources',name=f'resources-after-{trial+1}')
@@ -249,7 +258,7 @@ def main():
             first_request_decode_tps=[s['timings']['predicted_per_second'] for s in report['samples'] if s['request']==0],
             repeated_request_decode_tps=[s['timings']['predicted_per_second'] for s in report['samples'] if s['request']>0])
         report['status']='measurements_complete'
-    except Exception as error:
+    except BaseException as error:
         report.update(status='failed',error=str(error));raise
     finally:save()
     return 0
