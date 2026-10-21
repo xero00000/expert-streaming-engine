@@ -505,3 +505,27 @@ restored. The test raises the configured reserve without exhausting the driver.
 CPU (95), Python (160) and five strict sanitizer checks pass. Final CUDA checks
 on each card and the original full-model recovery control are underway.
 External allocations racing after the boundary check remain outside this repair.
+
+The committed reserve repair now passes the complete local native suite: 95 CPU
+tests, 100 CUDA passes plus one expected NCCL skip on each of the three cards,
+five strict ASAN/UBSAN/leak targets, and 160 Python tests. Source/binary/library
+identities and raw evidence are retained in `task4/prefill-reserve-fix/`.
+Its full-model 4.75 GiB control finishes three 512/128 requests with exact
+independent replay, safe idle resources, zero active leases and normal exit.
+In this live memory state, component preflight rejects the GPU cache and uses
+CPU execution; the old reserve abort is **not** reproduced. That control is
+neither GPU-cache performance acceptance nor proof of a real driver-boundary
+recovery. The deterministic staged CUDA regression supplies the reserve-loss
+rejection/retry evidence. The oversized cache remains a rejected tuning setting.
+The next pilot packs heterogeneous expert layouts within the original 4 GiB
+cache, with the frozen workload and benchmark protocol unchanged.
+
+The packing pilot completes with 2,900 slots in 4 GiB and 32.85/33.15 tok/s
+on repeated requests, below Strata's target. Its own output repeats exactly;
+its hash differs from the earlier native source's control. That difference is
+unresolved until the repaired source is rerun without packing; no numerical
+parity or packing-only gain is accepted yet. The initial request has 203.76 s
+TTFT with only 21.9% initial file residency on the FUSE volume. A separate
+byte-identical model copy is being prepared on local NVMe/btrfs to separate
+storage costs from cache tuning. Both engines will be rerun on the same new
+copy; all previous models, manifests and comparison results are preserved.

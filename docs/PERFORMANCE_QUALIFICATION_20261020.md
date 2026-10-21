@@ -209,3 +209,33 @@ the old abort, then verifies recoverable allocation failure, unchanged output,
 zero outstanding leases and exact retry with retained staging buffers. This
 does not relax the reserve or claim recovery from external mid-graph exhaustion.
 Larger-cache performance remains unqualified pending its full-model control.
+
+The reserve repair's final checks pass: 95 CPU tests, 100 CUDA passes plus one
+expected NCCL skip per card, five strict sanitizer targets and 160 Python tests.
+See `prefill-reserve-fix/qualification.json` for identities and raw log paths.
+The full-model larger-cache control completes all three 512/128 requests with
+exact replay, idle resources, zero active leases and normal shutdown. In this
+run the GPU component preflight refuses the allocation and falls back to CPU,
+leaving actual GPU cache capacity zero. The former reserve abort is not
+reproduced; this control does not qualify the larger cache or substitute for
+driver-boundary recovery evidence. The synthetic staged test deterministically
+verifies rejection and exact retry without exhausting the driver.
+
+The 4 GiB layout-packing pilot holds 2,900 expert slots versus 2,437 in the
+earlier uniform layout, with 32.85/33.15 tok/s on its two repeated requests.
+All three outputs repeat exactly within the pilot, leases/queues drain and
+the process exits normally. The first request takes 203.76 s to first token
+and decodes at 1.80 tok/s; file residency before startup is only 21.9% on the
+FUSE-backed comparison volume. This is not storage-cold certification.
+See `ese-iq4-3080-cache-packed-pilot/` for raw receipts. The pilot's output hash
+differs from the older `9e55c4925` uniform-cache control, so neither cross-build
+numerical parity nor a packing-only speedup is accepted. A uniform-cache
+control on repaired source `8cd98995a` is required to separate those changes.
+
+Further tuning will use a byte-identical copy on local NVMe/btrfs, preserving
+the existing comparison copy and every earlier trial. Both engines must be
+rerun against that same new path before making a new matched performance claim.
+The model SHA, frozen prompt, 512/128 counts, RTX 3080, eight CPU threads and
+memory limits remain unchanged. The copy manifest is
+`nvme-comparison-model.json`; native and Strata baselines on the new storage
+will be recorded separately from the table above.
