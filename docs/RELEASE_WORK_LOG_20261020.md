@@ -2075,3 +2075,27 @@ build/install/update qualification independently; physical Windows NVIDIA
 inference remains blocked by the current host isolation. Evidence is
 `task6/windows-isolated/physical-gpu-iommu-preflight.json`, with the kernel
 documentation reference and actual group membership. Publication stays on hold.
+
+### Task 7 continuation — Windows CUDA completes; bound installer compression
+
+The background Windows CUDA build completes successfully in 543.31 seconds
+(288/288 steps). The final `e991c3932` Linux set also completes: six packages,
+all 24 native payload identities, both real AppImage signatures, four actual
+DEB/RPM installations, ten short inference cases, eight updater integration
+cases, and all six format-specific Settings views pass. No new speed or extended
+context qualification is claimed.
+
+Windows Studio and WiX compilation succeed, but high LZX compression of the
+1,941,162,496-byte CUDA DLL exhausts the 900-second installer budget before MSI
+completion; NSIS has not started. Preserve that terminal failure and resume
+packaging from the completed binaries. Change the tracked WiX compression to
+MSZIP, preserving both 768 MiB cabinet bounds and the complete CUDA payload.
+Refresh source seals and final package indices rather than relabel old bundles.
+
+The clone's completed native cache is copied to its owned scratch disk with
+all 534 file hashes verified, then replaced by an NTFS directory junction at
+the original build path. This frees approximately 4.9 GiB on C: for install
+qualification. Original VMs, disks, user storage and GPU bindings are untouched.
+Actual Windows installer/install/update checks and the final combined package
+manifest remain pending. Physical Windows NVIDIA inference still requires
+safe hardware isolation. No push, hosted CI, PR, tag or publication occurs.

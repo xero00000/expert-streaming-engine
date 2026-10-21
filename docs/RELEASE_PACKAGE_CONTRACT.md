@@ -15,6 +15,10 @@ components and NCCL 2.25.1 from NVIDIA, including the runtime versions retained
 in the existing Linux packaging notices. The Windows job retains its CUDA 12.4
 toolchain and separately builds the driver-independent CPU runtime.
 
+Windows MSI packaging uses MSZIP and bounded embedded cabinets, including
+splitting unusually large CUDA runtime files. This keeps compression practical
+without removing runtime payloads or supported GPU architectures.
+
 Windows staging also resolves the native binaries' transitive Microsoft C++
 and OpenMP imports from the installed Visual Studio desktop x64 release redist.
 It bundles those unmodified files beside each native server and places Studio's

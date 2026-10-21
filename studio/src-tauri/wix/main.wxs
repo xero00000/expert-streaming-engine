@@ -52,10 +52,12 @@
           ESE's bundled CUDA runtime exceeds a single WiX cabinet. Keep each
           embedded stream well below the 2 GiB cabinet limit and allow WiX to
           split any future unusually large runtime file safely.
+          Use MSZIP so packaging the large CUDA DLL stays bounded; high LZX
+          compression exceeded the local 15-minute packaging budget.
         -->
         <MediaTemplate
                 CabinetTemplate="ese{0}.cab"
-                CompressionLevel="high"
+                CompressionLevel="mszip"
                 EmbedCab="yes"
                 MaximumUncompressedMediaSize="768"
                 MaximumCabinetSizeForLargeFileSplitting="768" />
