@@ -70,7 +70,7 @@ Acceptance: required clean builds/checks pass against one recorded source state.
 Acceptance: reproducible correctness and recovery evidence for every claimed
 supported execution path.
 
-### 4. Resolve the performance hold — IN PROGRESS (TARGET: AT LEAST 80% OF STRATA)
+### 4. Resolve the performance hold — CURRENT SPEED ACCEPTED; SAFETY CHECKS CONTINUE
 
 The [performance qualification protocol](PERFORMANCE_QUALIFICATION_20261020.md)
 is prepared. The initial speed target was to match Strata; the user later
@@ -91,12 +91,15 @@ ESE thresholds are **41.2 overall and 41.84 tok/s on repeats**. ESE currently
 rejects this model architecture in its default build, so the current work
 restores and tests the existing dedicated loading path before qualification.
 
-Current local status: the private probe runtime loads the exact selected
-shards and completes the frozen workload. The latest one-start/three-request
-diagnostic reaches 19.84 / 19.66 tok/s on repeats with unchanged native output
-hashes. This remains below the 41.2 / 41.84 tok/s gates. Native arithmetic,
-long-context/lifecycle acceptance and the production admission gate remain
-open; this is not GitHub/release readiness.
+On continuation, the user accepted the current speed: **“ill take 19 tokens
+for now we can continue to improve speeds in later updates.”** This supersedes
+the 80% speed requirement for this version. Further Strata-speed optimization
+is deferred; the original baseline and failed comparisons remain historical
+evidence. The accepted one-start/three-request diagnostic reaches 13.968 /
+19.841 / 19.664 tok/s, with unchanged native output hashes. This is acceptance
+of the observed speed, not a three-start qualification or a claim of Strata
+parity. Native arithmetic, long-context/lifecycle acceptance and the production
+admission gate remain open; this is not GitHub/release readiness.
 
 - Define the exact model, prompt, resource budget, policies and speed target.
   Use Strata's measured sustained decode rate as the reference; retain startup,
@@ -105,10 +108,11 @@ open; this is not GitHub/release readiness.
   decode timings; compare like-for-like ESE/Strata conditions where possible.
 - Profile and improve measured bottlenecks, preserving correctness and limits.
 
-Acceptance: repeated measurements meet the agreed target. Performance evidence
-does not itself lift the user's publication hold.
+Acceptance: the user accepts the observed approximately 19 tok/s for this
+version. Record the selected configuration and keep correctness/resource gates
+separate. The speed acceptance does not lift the publication hold.
 
-### 5. Qualify realistic workloads — PENDING
+### 5. Qualify realistic workloads — IN PROGRESS
 
 - Fill at least 65,536 actual prompt tokens with generation headroom and no
   silent truncation; check retrieval near the start, middle and end.
@@ -1583,3 +1587,18 @@ passes in the ASan CPU build and in the CUDA build with all three cards
 visible. Evidence: `compact-route-*`; the original ASan report remains
 available. The separate strict 33-token / 1M model control matches all
 8,194,560 logits, routes and IDs bitwise with the preceding control.
+
+
+### Task 4 — user acceptance of the current speed
+
+The user accepted approximately 19 tok/s for this version and deferred further
+speed improvement to later updates. The previous 80%-of-Strata criterion is
+superseded for this version, rather than reported as achieved. The retained
+best configuration and all three raw samples remain under
+`task4/qwen4exp-iq2-restore/`: command
+`run-workload-graph-guard-vram3328-autotune-passive1.json`, measurements
+`workload-1m-graph-guard-vram3328-autotune-passive1/`, resource summary
+`best-cache-autotune-diagnostic-summary.json`. Task 4's speed decision is
+resolved by explicit user acceptance. Stop performance experiments and advance
+to task 5's correctness, lifecycle and actual filled-context checks. Production
+Qwen admission, package/install checks and publication remain independent.

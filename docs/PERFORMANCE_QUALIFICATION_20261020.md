@@ -24,6 +24,16 @@ GPUs and the saved launcher settings. Its repeated-request reference is
 and 41.2 overall**. The default release build rejects the model; the existing
 dedicated loading path is now being restored and tested with the current fixes.
 
+The user subsequently accepted the observed current speed: **“ill take 19
+tokens for now we can continue to improve speeds in later updates.”** For this
+version, the earlier 80% minimum is superseded by that explicit acceptance.
+The retained one-start/three-request ESE diagnostic is 13.968 / 19.841 /
+19.664 tok/s (first / repeat / repeat), all with the same native output hash.
+Further speed optimization is deferred. This does not establish Strata parity,
+three-start reproducibility, numerical acceptance, long-context qualification
+or public model admission. Those checks remain independent. Historical targets
+and failures below are retained without relabelling them as passes.
+
 Record the following before collecting qualification measurements:
 
 - Exact model and quantization, local path and SHA-256; any conversion or
