@@ -416,3 +416,40 @@ tag or publication occurred.
 Task 4 has begun with a concrete measurement protocol and local model/hardware
 inventory. Its acceptance contract remains open pending the selected model,
 prompt/resource budget and required speed target; no threshold was invented.
+
+### Task 4 continuation — Strata target and first direct baseline
+
+The user has now set the speed target: **match Strata**. Both engines complete
+three fresh processes with three 512-prompt/128-generation requests each on the
+same local IQ4_XS qwen35moe model, RTX 3080 and eight CPU threads. A separate
+benchmark copy adds only Strata's required explicit zero-MTP metadata; every
+one of its 733 tensor hashes matches the original. Original model files,
+Strata service configurations and the experimental Qwen4Exp gate are preserved.
+
+Strata's median decode is 45.29 tok/s; ESE's mapped-cache control is 31.18 tok/s
+(0.688x). Repeated-request medians are 45.75 versus 31.38 tok/s. Both independently
+repeat the exact generated output across all nine requests, preserve full token
+counts and exit cleanly. Shared desktop load, differing actual resource use,
+Strata swap and ESE's deferred first-request cache loading remain explicit.
+The initial ESE pinned-model control was aborted above 35 GiB process RAM;
+disabling only model-weight pinning eliminates a duplicate 14.63 GiB host copy,
+reduces startup to 1.53–5.91 s and keeps observed process swap at zero.
+
+Reusable native/Strata benchmark runners retain commands, binary/model/runner
+identities, raw responses, receipts and sampled memory. Four measurement-integrity
+tests and documentation checks pass. Fused-reduction tuning preserves output
+but has no demonstrated speedup; cache/upload tuning is next. Native source
+and binaries remain `9e55c4925`, so no new native qualification is claimed.
+
+Task 4 remains open: the recorded comparison **does not match Strata**. Do not
+advance to task 5 or lift the publication hold on these results. Detailed values,
+limits and evidence paths are in the
+[performance qualification record](PERFORMANCE_QUALIFICATION_20261020.md).
+
+The larger-cache pilot exposed a second-request prefill abort at the live GPU
+reserve boundary; that configuration is rejected and retained for admission/
+recovery repair. Model-backed hybrid calibration independently exposed an AVX2
+IQ4_XS CPU saturation error (12.8% versus scalar reference; the direct row dot
+has 0.4% error). A synthetic regression fails before the narrow repair and
+passes after it; final-source builds and affected checks are next. Calibration
+thresholds and the mixed-routing validation gate remain enforced.

@@ -88,3 +88,86 @@ Strata first-token latency excludes HTTP; compare it separately from ESE HTTP
 latency. Both runners reject missing/invalid timing receipts, prompt reuse,
 wrong actual token counts, early stops and truncation. They retain raw logs,
 commands, model/binary/runner identities and sampled process/driver memory.
+
+## First completed measurements
+
+Both completed baselines use the identical comparison file (SHA-256
+`2b442ab092f23747224e62b74b8a14a45e777629d28aa97427d0c1b62a49010e`).
+Its original IQ4_XS file hashes to
+`649d7508507b84638732c4f52c24c8b15843c6dca2f3ff793ae07c14a67ebbb3`;
+the model-preparation manifest verifies all 733 tensors unchanged. Native ESE
+remains source `9e55c4925`; only benchmark tooling has changed.
+
+| Measurement | Strata 0.1.45 | ESE mapped cache, unfused control |
+| --- | ---: | ---: |
+| Fresh processes / requests each | 3 / 3 | 3 / 3 |
+| Decode median, all nine requests | 45.29 tok/s | 31.18 tok/s |
+| Decode median, six repeated requests | 45.75 tok/s | 31.38 tok/s |
+| First request decode, each fresh process | 44.04 / 41.90 / 42.28 | 2.28 / 2.12 / 23.13 |
+| Startup to ready, seconds | 191.98 / 82.31 / 13.01 | 1.53 / 5.91 / 4.76 |
+| Median prompt prefill | 623.40 tok/s | 123.77 tok/s |
+| Median first token | 0.82 s (engine protocol) | 4.14 s (HTTP) |
+| Process high-water RSS | 32.53 GiB | 25.48 GiB |
+| Sampled process swap peak | 1.19 GiB | 0 |
+| Sampled total RTX 3080 usage | 9,431 MiB | 8,236 MiB |
+
+ESE has not met the target: its overall ratio is 0.688 and its repeated-request
+ratio is 0.686. These were sequential runs on a shared desktop, not randomized
+quiet-system pairs. Strata and ESE have different actual placements/footprints:
+Strata uses adaptive CPU/GPU expert execution and ESE uses bounded expert
+uploads. ESE's 32 GiB tracked-capacity ceiling and 1 GiB VRAM reserve do not
+assert an equivalent Strata host limit or a process-RSS cap. Device samples
+include desktop allocations and are not exact driver peaks.
+
+All completed requests process 512 prompt tokens, generate 128 tokens, and
+report no reuse/early stop/truncation. Each engine independently repeats its
+output exactly across nine requests and exits normally after each process.
+This is bounded workload evidence, not upstream full-model numerical acceptance.
+
+The initial ESE pinned-model control was stopped during its first request:
+startup took 218.46 s and process high-water RSS reached 35.89 GiB before a
+complete token receipt. The failed trial and operator-abort note are retained.
+The successful ESE run changes only `GGML_CUDA_NO_MODEL_PINNED=1`: expert
+weights remain mapped/deferred, avoiding a duplicate 14.63 GiB pinned model
+copy. The bounded cache is 16 GiB RAM / 4 GiB VRAM, with native automatic
+two-lane prefill staging (860 MiB), 64 MiB host staging and a 1 GiB GPU reserve.
+RAM-cache leases and worker queues drain to zero; no forced host-tensor fallback
+occurs in completed trials. Fresh-process cache loading affects early decode
+and is retained, not averaged into a warm-only claim.
+
+A three-request pilot using production fused reduction preserves the unfused
+output exactly but gives about 31.29 tok/s on repeated requests: no demonstrated
+speedup. Current tuning targets the observed upload work; the unfused baseline's
+first process records 102,135 lease-backed component uploads across three
+requests. Cache-capacity/prefill pilots must retain the same model, prompt,
+counts and independent replay checks before any passing configuration is
+repeated over three fresh processes.
+
+Evidence lives under
+`/home/xero/Desktop/test/results/ese-release-work-20261020/task4/`:
+`comparison-model-manifest.json`, `comparison-summary.json`,
+`strata-iq4-3080/`, `ese-iq4-3080-cache/`,
+`ese-iq4-3080-cache-mapped/` and `ese-iq4-3080-cache-fused-pilot/`.
+Raw protocol/SSE responses, exact commands, timing receipts, memory samples,
+resources and failed controls remain available. No publication action occurred.
+
+### Failures exposed during tuning
+
+The 4,864 MiB VRAM-cache pilot completes its first 512/128 request but aborts
+on the second prefill with `sidecar-only prefill staging refused original-tensor
+fallback`. The cache clamps itself to about 4,715 MiB on this run; subsequent
+live free memory falls below the 1 GiB prefill reserve. The process exits by
+SIGABRT. This configuration is rejected; neither its timing nor relaxed
+reserve/fallback settings qualify it. Retain `ese-iq4-3080-cache-475g-pilot/`
+as a startup-versus-repeated-request admission/recovery issue requiring follow-up.
+
+Hardware calibration also rejects the IQ4_XS CPU matrix path against the
+independent scalar oracle (NRMSE 0.127736). An isolated diagnostic keeps the
+same weights/activations but uses the direct row-dot path: NRMSE 0.003938.
+Matching activation precision does not explain the matrix discrepancy.
+A deterministic synthetic IQ4_XS case reproduces saturation: 8.03149 is returned
+where scalar dequantization requires 904. The AVX2 matrix path's unsigned
+lookup reaches 241, overflowing its saturating 16-bit pair sum before offset
+correction. A narrow signed-lookup/abs-sign repair and regression are under
+validation. The independent 0.08 calibration limit remains unchanged; mixed
+routing remains disabled until calibration and its separate workload gate pass.
