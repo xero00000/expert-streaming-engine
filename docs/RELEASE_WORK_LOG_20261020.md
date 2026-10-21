@@ -59,7 +59,7 @@ package acceptance check for tasks 6 and 7.
 
 Acceptance: required clean builds/checks pass against one recorded source state.
 
-### 3. Verify inference correctness and recovery — PENDING
+### 3. Verify inference correctness and recovery — IN PROGRESS
 
 - Compare supported resident/cache/stream paths against pinned references.
 - Exercise forced eviction, cancellation, allocation failure and session
@@ -256,3 +256,22 @@ inference correctness and recovery with pinned model references. Performance,
 filled-64K/concurrency, eight real installers, signing/updates and physical
 Windows evidence remain open. No push, remote workflow, tag or publication
 occurred; the user's hold is unchanged.
+
+
+### Task 3 — pinned fixture and execution plan
+
+- Reuse the retained TinyMoE F16 fixture, SHA-256
+  `c559eaabd8a56589b8abe09d678fbb56c673a3dcc28907e193d27b25ecd60684`.
+  Compare resident, storage/cache and native stream paths using the consolidated
+  runtime, then check worker queues and bounded prefill staging on the three
+  available GPUs. Resident execution is the path reference; this does not
+  establish upstream full-model numerical acceptance.
+- Retain raw outputs, forced-token routes/logits, resource accounting and
+  source/runtime identities. Check eviction and multi-device rollback without
+  relaxing existing numerical assertions.
+- Rebuild the retained HTTP abort shim against the consolidated API. Distinguish
+  a real CPU graph abort from injected decode statuses and allocation admission
+  failures. Check client disconnect cancellation and subsequent session use.
+- Small fixtures cannot qualify large-model performance, filled-64K workloads,
+  experimental Qwen/MTP/multimodal paths or actual driver out-of-memory recovery.
+  Those limits remain explicit; public Qwen admission and publication stay OFF.
