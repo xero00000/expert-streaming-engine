@@ -6428,8 +6428,22 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 if (std::strcmp(pinned, "1") != 0 && std::strcmp(pinned, "0") != 0)
                     throw std::runtime_error("ESE_EXPERT_RAM_PINNED must be 0 or 1");
                 if (std::strcmp(pinned, "1") == 0) {
-                    if (params.expert_ram_cache_bytes > (1ULL << 30))
-                        throw std::runtime_error("experimental pinned expert RAM cache is limited to 1 GiB");
+                    if (params.expert_ram_cache_bytes > (32ULL << 30))
+                        throw std::runtime_error("experimental pinned expert RAM cache is limited to 32 GiB");
+                    if (params.expert_ram_cache_bytes > (1ULL << 30)) {
+                        uint64_t available = 0;
+#ifdef __linux__
+                        std::ifstream info("/proc/meminfo");
+                        std::string key, unit;
+                        uint64_t value;
+                        while (info >> key >> value >> unit) {
+                            if (key == "MemAvailable:" && unit == "kB") { available = value * 1024; break; }
+                        }
+#endif
+                        constexpr uint64_t reserve = 6ULL << 30;
+                        if (available <= reserve || params.expert_ram_cache_bytes > available - reserve)
+                            throw std::runtime_error("large pinned expert RAM cache requires 6 GiB of available host headroom");
+                    }
 #ifdef GGML_USE_CUDA
                     auto * buffer = ggml_backend_cuda_host_buffer_alloc(size_t(params.expert_ram_cache_bytes));
                     if (!buffer) throw std::runtime_error("cannot allocate pinned expert RAM arena");

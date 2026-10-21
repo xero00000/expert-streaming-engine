@@ -1107,3 +1107,159 @@ preceding GPU-attention and Q2_0-only capture workloads exactly. The effect is
 modest, and the 41.2 / 41.84 tok/s thresholds remain unmet. The bounded capture
 exception stays opt-in (`ESE_CUDA_CAPTURE_INDEXED_MMVQ=1`). The selected native
 arithmetic and long-context policies still require independent qualification.
+
+
+### Task 4 — direct BF16 gated-residual experiment (NOT NUMERICALLY QUALIFIED)
+
+- An opt-in direct projection (`ESE_QWEN4EXP_NATIVE_GR=1`) reads original BF16
+  GR weights and F32 inputs directly, with native F32 accumulation. It is
+  limited to selected GR matrix shapes/names, contiguous tensors, 1–8 input
+  columns and same-device CUDA storage. Default precision behavior remains
+  unchanged; larger prefill batches retain their previous implementation.
+- Operator controls cover 10240→320, 320→10240 and 10240→4 at B1/B5/B8 on
+  all three cards. They pass the fixed `2e-5*(1+abs(reference))` GR bound
+  against F32 calculations and sampled independent double dots. Existing
+  head controls retain their previous bound; maximum observed combined error
+  is 8.59e-6. No tolerance is relaxed.
+- The isolated 33-token strict model comparison FAILS: 2,229,381 of 8,194,560
+  logits exceed the original bound, maximum absolute difference 0.77685,
+  and routes differ. Tokens 0–23 remain within the fixed bound; the first
+  route-order difference is token 24, layer 23. All 33 argmax IDs agree.
+  `native-gr-strict-reference33` retains all logits/routes and per-token
+  divergence, rather than treating finite output or argmax agreement as a
+  numerical pass. This path remains experimental and must not replace the
+  strict arithmetic control.
+- A separately labeled speed diagnostic completes 552/128 twice at 14.507 /
+  15.620 tok/s, with 11.16 / 8.92 seconds TTFT. Native-policy output repeats
+  exactly within that run, but changes from the preceding implementation.
+  The repeat reads zero storage bytes and samples zero process swap. These
+  are potential-speed measurements only, not qualification. They remain
+  below 41.2 overall / 41.84 repeat tok/s even without the numerical blocker.
+
+`native-gr-operator-tests.*`, `native-gr-runtime-identity.json` and
+`workload-1m-native-gr-passive4/` preserve commands, binaries, failures, raw SSE
+and resources. Further work must address numerical qualification and remaining
+host launch/synchronization costs; no supported behavior or release is claimed.
+
+
+### Task 4 — graph replay diagnosis and bounded CPU upload ownership
+
+`graph-update-diagnostic` uses a bounded opt-in update/rejection logger
+(`ESE_CUDA_GRAPH_UPDATE_TRACE=1`). No updates/rejections are emitted in the
+short Hi run: all 11 / 18 / 214 cached graphs have executable instances at
+shutdown. The suspicion that repeated updates disable the warm graphs is not
+supported by this run.
+
+`nsight-capture-native-mmap` collects CUDA and process CPU samples after the
+selected native capture improvement. The async PLE attempt fails because
+io_uring cannot allocate under the profiler; its original failed trace is
+retained in `nsight-capture-native`. Only the diagnostic retry uses mmap PLE.
+These short traced requests are excluded from speed qualification. In the
+approximate last request window, individual kernel launches drop from 37,457
+in the preceding uncaptured trace to 191, while 1,952 graph launches remain.
+The window has 4,720 stream synchronizations (639 ms API time) and 8,907
+asynchronous memcpy calls (222 ms API time). GPU kernel/copy intervals and
+host API times overlap and must not be added as independent elapsed costs.
+The prior graph-capture change addressed most individual launch overhead;
+CPU/GPU boundary ordering and transfer ownership remain significant.
+
+An opt-in CPU->CUDA copy path (`ESE_CUDA_STAGED_CPU_UPLOADS=1`) takes an
+immediate CPU copy into backend-owned pinned slots, then queues H2D on the
+destination CUDA stream. Four 8 MiB slots bound staging to 32 MiB per CUDA
+backend context. Per-slot completion events prevent reuse before transfer
+completion; backend teardown drains pending copies. Other backend pairs,
+unsupported storage, copies larger than 8 MiB, active capture and failed
+pinned allocation retain the existing fallback. No arithmetic is changed.
+This addresses the generic CPU->CUDA fallback's destination-wide host wait
+without retaining pointers into mutable CPU tensor storage.
+
+`test-cuda-staged-upload` passes on all three cards: 288 staged copies and
+72 oversize fallback copies, with pageable and pinned sources, immediate
+source overwrite/release, repeated four-slot wrap, and three pending-copy
+backend teardown cases. `staged-upload-strict-reference33` then matches
+`gpu-attention-strict-reference33` bitwise for all 8,194,560 logits, all
+ordered routes and input IDs; zero fixed-bound violations.
+
+The failed native GR experiment is removed from working source after its
+runtime, complete source diff, operator tests, model-reference failure and
+potential-speed results were archived. Its 15.62 tok/s result remains an
+unqualified experiment, not the current implementation. The staging
+experiment and subsequent workloads keep that GR path disabled.
+
+
+`workload-1m-staged-upload-passive4` completes both full 552/128 requests
+with the preceding output hash unchanged, but slows to 12.556 / 13.009 tok/s
+(TTFT 19.08 / 8.83 s) versus 13.569 / 13.940. This is no demonstrated speed
+improvement. The staging implementation and its fixture are shelved from
+working source; immutable runtime, complete patch and test source remain in
+the result directory. The bounded graph diagnostics remain available. The
+next isolated experiment pins a capped prefix of existing mapped CPU model
+buffers, following Strata's resident pinned-source design without a second
+large RAM copy. It keeps a 6 GiB host-availability reserve and is private,
+explicitly opt-in, limited to 32 GiB and Qwen4exp.
+
+
+`mapped-pin24-hi-diagnostic` reports CUDA `operation not supported` when
+registering its read-only mapping; zero bytes were registered and it falls
+back cleanly. Device attribute 113 (`HostRegisterReadOnlySupported`) is zero
+on all three GPUs. The installed CUDA 12.8 headers document that this flag
+requires that attribute; the mapped-source experiment is removed after its
+source patch/runtime and failed-registration logs are archived. Its short
+17.45 / 17.67 tok/s repeats are ordinary fallback diagnostics, not pinned
+source results or speed qualification. Strata's `PinnedArena` owns writable
+storage. ESE's existing writable pinned RAM arena is therefore the next
+comparison, with a 32 GiB experimental maximum and an explicit 6 GiB host
+availability check for capacities above its prior 1 GiB limit.
+
+
+### Task 4 — resident pinned expert arena and first-fit fill cost
+
+`workload-1m-pinned32-passive4` uses the existing writable expert arena with
+32 GiB pinned capacity and frequency retention. It completes 552/128 twice
+at 8.568 / 15.001 tok/s; output hashes match the preceding native workloads
+exactly. Startup takes 32.93 seconds and TTFT is 60.46 / 7.23 seconds. The
+first request reads 29.0 GB of storage and the repeat 114 MB. Only 18.13 GB
+(16.89 GiB) of expert payload becomes resident, with zero RAM evictions.
+The excessive arena capacity displaces useful file cache: process swap peaks
+at 8.57 GB during startup/population and finishes near 150 MB. A 32 GiB
+allocation is therefore not selected as the practical profile despite the
+repeat improvement. This remains below 41.2 / 41.84 tok/s.
+
+The RAM allocation planner previously walked the entire ordered resident
+index for every admission, including dense initial fills. A new shortcut
+uses the existing resident-byte total and final occupied end to recognize a
+fully occupied prefix, merges only the bounded pending reservations, and
+appends only when no earlier fit exists. Holes, partially published entries,
+eviction and ambiguous reservations retain the original planner. A 1024-entry
+fixture checks exact payload/placement and then requires reuse of an earlier
+erased hole despite ample unused tail capacity. The full expert-cache suite
+passes on the RTX 3080 and again with all three selected GPUs visible,
+including concurrent fills, lease lifetime, failure recovery and multi-GPU
+transaction publication. Logs are `dense-arena-cache-tests*.log`.
+
+`pinned20-dense-strict-reference33` uses a 20 GiB pinned arena and the new
+planner. It matches all 8,194,560 reference logits, ordered routes and input
+IDs bitwise against `gpu-attention-strict-reference33`, with zero fixed-bound
+violations. The following full workload uses 20 GiB, enough for the observed
+16.89 GiB expert set with additional capacity, while leaving more host memory
+for the model's file-backed PLE and other data. Private runtime hashes and
+source differences remain in `pinned20-dense-runtime-identity.json`.
+
+
+`workload-1m-pinned20-dense-passive4` completes 552/128 twice at 11.819 /
+15.213 tok/s with unchanged native-policy output hashes. Startup takes 22.80
+seconds; TTFT is 44.48 / 6.49 seconds. The first request reads 28.14 GB of
+storage and the repeat reads zero bytes. Every sampled process-swap value is
+zero, improving the memory behavior over the excessive 32 GiB arena. This
+combines a smaller arena and the dense-fill shortcut, so these two effects
+are not individually attributed. It remains a one-start diagnostic and is
+not the three-start/nine-request qualification. The speed thresholds remain
+unmet, and native arithmetic, long-context behavior, model features and
+publication are still held.
+
+The CUDA trace now points to the next architectural comparison: Strata keeps
+a 32K KV window resident on GPU while the ESE 1M profile keeps ordinary
+attention/indexer KV on the host. GPU attention alone still requires host
+cache encoding/gathers and transfer boundaries. Further work must preserve
+full logical history and lifecycle correctness when introducing any resident
+window; reducing the logical cache to 32K would not qualify the 1M profile.

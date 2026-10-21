@@ -5383,6 +5383,25 @@ static bool ggml_cuda_capture_indexed_mmvq(const ggml_tensor * node) {
     return true;
 }
 
+// Bounded, opt-in diagnostics for graph invalidation. No capture policy changes.
+static bool ese_cuda_graph_trace_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("ESE_CUDA_GRAPH_UPDATE_TRACE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static void ese_cuda_graph_trace(const ggml_cuda_graph * graph, const ggml_tensor * node,
+        const char * reason, int index = -1, int source = -1) {
+    if (!ese_cuda_graph_trace_enabled()) return;
+    static std::atomic<unsigned> records{0};
+    if (records.fetch_add(1, std::memory_order_relaxed) >= 512) return;
+    std::fprintf(stderr, "ESE_GRAPH_TRACE graph=%p updates=%d reason=%s node=%d name=%s op=%s source=%d\n",
+            static_cast<const void *>(graph), graph->number_consecutive_updates, reason, index,
+            node ? node->name : "-", node ? ggml_op_name(node->op) : "-", source);
+}
+
 static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph * graph, ggml_cgraph * cgraph,
     bool use_cuda_graph, cudaStream_t stream) {
 
@@ -5401,6 +5420,7 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
         if (ggml_is_noop(node)) continue;
 
         if (node->op == GGML_OP_REDUCE) {
+            ese_cuda_graph_trace(graph, node, "unsupported-reduce", i);
             use_cuda_graph = false;
             break;
         }
@@ -5410,6 +5430,7 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
         // The legacy indexed path's capture restrictions do not apply.
         if (ggml_expert_f32_enabled(node)) {
             if (!ggml_cuda_expert_f32_supported_layout(node)) {
+                ese_cuda_graph_trace(graph, node, "unsupported-explicit-expert", i);
                 use_cuda_graph = false;
                 break;
             }
@@ -5418,6 +5439,7 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
 
         if (node->op == GGML_OP_MUL_MAT_ID && (node->ne[2] != 1 || node->src[2]->ne[0] != 1) &&
                 !ggml_cuda_capture_indexed_mmvq(node)) {
+            ese_cuda_graph_trace(graph, node, "unsupported-indexed-matmul", i);
             use_cuda_graph = false; // This node type is not supported by CUDA graph capture
 #ifndef NDEBUG
             GGML_CUDA_LOG_DEBUG("%s(%s): disabling CUDA graphs due to unsupported node type %ld %ld\n",
@@ -5430,6 +5452,7 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
             auto src1   = node->src[2];
             if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->type != GGML_TYPE_F32 ||
                 !ggml_is_quantized(src0_1->type) || (src0_2 && !ggml_is_quantized(src0_2->type))) {
+                ese_cuda_graph_trace(graph, node, "unsupported-fused-expert", i);
                 use_cuda_graph = false;
             } else {
                 if (i < cgraph->n_nodes-1) {
@@ -5470,6 +5493,7 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
             // store a pointer to each copy op CUDA kernel to identify it later
             void * ptr = ggml_cuda_cpy_fn(node->src[0], node->src[1]);
             if (!ptr) {
+                ese_cuda_graph_trace(graph, node, "unsupported-copy", i);
                 use_cuda_graph = false;
 #ifndef NDEBUG
                 GGML_CUDA_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported copy op\n", __func__);
@@ -5623,6 +5647,9 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
         }
     }
     if (bindings_changed || layout_changed) {
+        if (graph->number_consecutive_updates >= 2) {
+            ese_cuda_graph_trace(graph, nullptr, bindings_changed ? "allocation-bindings" : "tensor-layout");
+        }
         cuda_graph_update_required = true;
         // Changed source geometry/type can select a different kernel/capture
         // topology even when output geometry and all data pointers match.
@@ -5656,6 +5683,24 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
             has_matching_properties = ggml_graph_node_has_matching_properties(cgraph->nodes[i], &graph->ggml_graph_properties[i]);
         }
         if (!has_matching_properties) {
+            if (ese_cuda_graph_trace_enabled()) {
+                const auto * node = cgraph->nodes[i];
+                const auto & old = graph->ggml_graph_properties[i];
+                const char * reason = "node-properties";
+                int source = -1;
+                if (node->data != old.node_address && node->op != GGML_OP_CPY && node->op != GGML_OP_VIEW) reason = "output-address";
+                else if (node->op != old.node_op) reason = "operation";
+                else if (memcmp(old.op_params, node->op_params, GGML_MAX_OP_PARAMS) != 0) reason = "operation-parameters";
+                else for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (node->src[j] && node->src[j]->data != old.src_address[j] &&
+                            node->op != GGML_OP_VIEW && !(node->op == GGML_OP_CPY && j == 1)) {
+                        reason = "source-address";
+                        source = j;
+                        break;
+                    }
+                }
+                ese_cuda_graph_trace(graph, node, reason, i, source);
+            }
             cuda_graph_update_required = true;
         }
         set_ggml_graph_node_properties(cgraph->nodes[i], &graph->ggml_graph_properties[i]);
@@ -5851,6 +5896,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
         }
 
         if (graph->number_consecutive_updates >= 4) {
+            ese_cuda_graph_trace(graph, nullptr, "disabled-after-four-updates");
             graph->disable_due_to_too_many_updates = true;
             use_cuda_graph = false;
             cuda_ctx->cur_graph = nullptr;

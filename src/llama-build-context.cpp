@@ -37,6 +37,16 @@ uint32_t llm_build_context::llama_kv_qnext_state_slots(const llama_kv_cache & kv
     return n_slots;
 }
 
+static uint32_t qwen4exp_initial_compute_rows(const llama_context & lctx, uint32_t tokens) {
+    const char * lazy = std::getenv("ESE_QWEN4EXP_LAZY_GRAPH_RESERVE");
+    if (lctx.model.arch != LLM_ARCH_QWEN4EXP || !lazy || std::strcmp(lazy, "1") != 0)
+        return lctx.kv_self.size;
+    // Reserve a 32K working graph initially, retaining the complete KV capacity.
+    // Existing history and the requested batch can only grow this reservation;
+    // runtime graphs continue to use their actual full chronological history.
+    return std::min(lctx.kv_self.size, std::max({32768u, lctx.kv_self.n, tokens}));
+}
+
 llm_build_context::llm_build_context(
         llama_context  & lctx,
     const llama_batch  & batch,
@@ -77,10 +87,10 @@ llm_build_context::llm_build_context(
         norm_eps         (hparams.f_norm_eps),
         norm_rms_eps     (hparams.f_norm_rms_eps),
         n_tokens         (batch.n_tokens),
-        n_kv             (worst_case ? kv_self.size : kv_self.n),
+        n_kv             (worst_case ? qwen4exp_initial_compute_rows(lctx, batch.n_tokens) : kv_self.n),
         n_outputs        (worst_case ? n_outputs_ > 0 ? n_outputs_ : n_tokens : lctx.n_outputs),
         n_outputs_enc    (worst_case ? n_tokens : lctx.embd_enc.size() / hparams.n_embd),
-        kv_head          (worst_case ? (kv_self.recurrent ? 0 : kv_self.size - n_tokens) : kv_self.head),
+        kv_head          (worst_case ? (kv_self.recurrent ? 0 : n_kv - n_tokens) : kv_self.head),
         n_ctx_orig       (cparams.n_ctx_orig_yarn),
         flash_attn       (cparams.flash_attn),
         mla_attn         (cparams.mla_attn),
@@ -1003,6 +1013,13 @@ ggml_tensor * llm_build_context::llm_build_lora_mm(
          struct ggml_context * ctx0,
           struct ggml_tensor * w,
           struct ggml_tensor * cur, enum ggml_prec precision) {
+    const char * quantized_flag = std::getenv("ESE_QWEN4EXP_QUANTIZED_PROJECTIONS");
+    if (qwen4exp_explicit_arithmetic(lctx) && ggml_is_quantized(w->type) &&
+            quantized_flag && std::strcmp(quantized_flag, "1") == 0) {
+        // Opt-in native Q8 activation codecs for packed projections. Retain
+        // explicit precision for BF16/F16/F32 weights and the reference mode.
+        precision = GGML_PREC_DEFAULT;
+    }
     struct ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
     ggml_mul_mat_set_prec(res, precision);
     for (auto & it : lctx.lora_adapters) {
@@ -1454,13 +1471,19 @@ llm_expert_gating_func_type   gating_op,
     bool weight_before_ffn = lctx.model.arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     const char * expert_f32_env = std::getenv("ESE_QWEN4EXP_EXPERT_F32");
-    const bool expert_f32 = lctx.model.arch == LLM_ARCH_QWEN4EXP &&
+    const bool explicit_qwen = lctx.model.arch == LLM_ARCH_QWEN4EXP &&
             expert_f32_env && std::strcmp(expert_f32_env, "1") == 0;
+    // Separate the original-input arithmetic control from native quantized
+    // expert decoding. Dense/indexer/router precision and route ordering stay
+    // fixed while the opt-in exercises the ordinary ggml activation codecs.
+    const char * quantized_flag = std::getenv("ESE_QWEN4EXP_QUANTIZED_EXPERTS");
+    const bool quantized_experts = quantized_flag && std::strcmp(quantized_flag, "1") == 0;
+    const bool expert_f32 = explicit_qwen && !quantized_experts;
     ggml_tensor * logits = gate_inp ? llm_build_lora_mm(lctx, ctx, gate_inp, cur) : input_logits; // [n_expert, n_tokens]
     // BF16 output rounding can turn distinct cutoff scores into a tie and
     // change the routed expert set. Preserve F32 activations/results under
     // the same explicit arithmetic policy used for expert projections.
-    if (expert_f32 && gate_inp) ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+    if (explicit_qwen && gate_inp) ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
     cb(logits, "ffn_moe_logits", il);
 
     if (gate_inp_b) {
@@ -1808,7 +1831,7 @@ llm_expert_gating_func_type   gating_op,
         ggml_build_forward_expand(graph, cpu_input);
         ggml_build_forward_expand(graph, cpu_weights);
     }
-    preserve_expert_routes = expert_f32;
+    preserve_expert_routes = explicit_qwen;
     ggml_tensor * branches[] = {
         build_expert_branch(gpu_ids, false),
         build_expert_branch(cpu_ids, false, cpu_input, cpu_weights),
@@ -2924,6 +2947,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     auto tim1 = ggml_time_us();
 #endif
 
+    const char * gpu_attention_flag = std::getenv("ESE_QWEN4EXP_GPU_ATTENTION");
+    const bool gpu_attention = model.arch == LLM_ARCH_QWEN4EXP && lctx.cparams.offload_kqv &&
+            gpu_attention_flag && std::strcmp(gpu_attention_flag, "1") == 0;
+
     // this callback allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
     llm_build_cb cb = [&](struct ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
@@ -2949,6 +2976,22 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             if (strcmp(name, "kqv_merged_cont") == 0) {
                 // all nodes between the KV store and the attention output are run on the CPU
                 ggml_backend_sched_set_tensor_backend(lctx.sched, cur, lctx.backend_cpu);
+            }
+        }
+
+        if (gpu_attention && il >= 0 &&
+                (std::strcmp(name, "kq") == 0 || std::strcmp(name, "kq_soft_max_ext") == 0 ||
+                 std::strcmp(name, "kqv") == 0 || std::strcmp(name, "kqv_merged_cont") == 0)) {
+            // Host placement applies to persistent storage and row gathering.
+            // Explicitly place attention compute on the layer GPU so host
+            // gathers do not pull KQ/softmax/VQ and their queries onto the CPU.
+            for (auto * backend : lctx.backends) {
+                if (backend != lctx.backend_cpu &&
+                        ggml_backend_supports_buft(backend, model.buft_layer[il].buft) &&
+                        ggml_backend_supports_op(backend, cur)) {
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend);
+                    break;
+                }
             }
         }
 

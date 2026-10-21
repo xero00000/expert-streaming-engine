@@ -8,9 +8,21 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <unordered_set>
 
 #define QWEN3NEXT_CHUNK_SIZE 64
+
+// Keep the packed projection experiment consistent with the common builder.
+// Setting F32 after that builder would silently undo its native Q8 policy.
+static ggml_prec qwen4exp_projection_precision(const ggml_tensor * weight) {
+    const char * explicit_policy = std::getenv("ESE_QWEN4EXP_EXPERT_F32");
+    const char * native = std::getenv("ESE_QWEN4EXP_QUANTIZED_PROJECTIONS");
+    return ggml_is_quantized(weight->type) && explicit_policy &&
+            std::strcmp(explicit_policy, "1") == 0 && native && std::strcmp(native, "1") == 0
+        ? GGML_PREC_DEFAULT : GGML_PREC_F32;
+}
 
 delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_lctx), batch(_batch) {
     auto & model = lctx.model;
@@ -182,12 +194,12 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_qkvz(llama_context & lc
     const int64_t n_tok = input->ne[1];
     auto qkv_mixed = llm_build_context::llm_build_lora_mm(lctx, ctx0, wqkv, input);
     if (lctx.model.arch == LLM_ARCH_QWEN4EXP && qkv_mixed->op == GGML_OP_MUL_MAT) {
-        ggml_mul_mat_set_prec(qkv_mixed, GGML_PREC_F32);
+        ggml_mul_mat_set_prec(qkv_mixed, qwen4exp_projection_precision(wqkv));
     }
     cb(qkv_mixed, "qkv_mixed", il);
     ggml_tensor * z = llm_build_context::llm_build_lora_mm(lctx, ctx0, wqkv_gate, input);
     if (lctx.model.arch == LLM_ARCH_QWEN4EXP && z->op == GGML_OP_MUL_MAT) {
-        ggml_mul_mat_set_prec(z, GGML_PREC_F32);
+        ggml_mul_mat_set_prec(z, qwen4exp_projection_precision(wqkv_gate));
     }
     cb(z, "z", il);
     ggml_build_forward_expand(gf, qkv_mixed);
@@ -294,7 +306,7 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_beta_gate(llama_context
     } else {
         beta = llm_build_context::llm_build_lora_mm(lctx, ctx0, ssm_beta, cur);
         if (lctx.model.arch == LLM_ARCH_QWEN4EXP && beta->op == GGML_OP_MUL_MAT) {
-            ggml_mul_mat_set_prec(beta, GGML_PREC_F32);
+            ggml_mul_mat_set_prec(beta, qwen4exp_projection_precision(ssm_beta));
         }
         cb(beta, "beta", il);
         beta = ggml_reshape_4d(ctx0, beta, num_v_heads, 1, n_tok, 1);
@@ -302,7 +314,7 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_beta_gate(llama_context
         alpha = llm_build_context::llm_build_lora_mm(lctx, ctx0, ssm_alpha, cur);
         if (lctx.model.arch == LLM_ARCH_QWEN4EXP && alpha->op == GGML_OP_MUL_MAT) {
             // Decay coefficients magnify small alpha-projection rounding errors.
-            ggml_mul_mat_set_prec(alpha, GGML_PREC_F32);
+            ggml_mul_mat_set_prec(alpha, qwen4exp_projection_precision(ssm_alpha));
         }
         cb(alpha, "alpha", il);
         alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
@@ -484,7 +496,7 @@ ggml_tensor * delta_net::build_gated_output(llama_context & lctx, ggml_context *
 
     ggml_tensor * out = llm_build_context::llm_build_lora_mm(lctx, ctx0, ssm_out, final_output);
     if (lctx.model.arch == LLM_ARCH_QWEN4EXP && out->op == GGML_OP_MUL_MAT) {
-        ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+        ggml_mul_mat_set_prec(out, qwen4exp_projection_precision(ssm_out));
     }
     cb(out, "linear_attn_out", il);
 
