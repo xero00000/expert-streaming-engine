@@ -78,9 +78,16 @@ def validate_completion(final, prompt_tokens, predicted):
     if (final.get('tokens_predicted') != predicted or final.get('tokens_evaluated') != prompt_tokens or
             timing.get('predicted_n') != predicted or timing.get('prompt_n') != prompt_tokens):
         raise RuntimeError('actual prompt/generation counts differ from the frozen workload')
+    if any(type(value) is not int for value in (final.get('tokens_predicted'),
+            final.get('tokens_evaluated'), timing.get('predicted_n'), timing.get('prompt_n'))):
+        raise RuntimeError('token counts must be integers')
     for key in ('prompt_ms', 'predicted_ms', 'prompt_per_second', 'predicted_per_second'):
-        if not isinstance(timing.get(key), (int, float)) or not math.isfinite(timing[key]) or timing[key] <= 0:
+        if isinstance(timing.get(key), bool) or not isinstance(timing.get(key), (int, float)) or not math.isfinite(timing[key]) or timing[key] <= 0:
             raise RuntimeError('invalid server timing: '+key)
+    for prefix, count in (('prompt', prompt_tokens), ('predicted', predicted)):
+        if not math.isclose(timing[prefix+'_per_second'], count*1000/timing[prefix+'_ms'],
+                            rel_tol=0.001, abs_tol=0.001):
+            raise RuntimeError('throughput contradicts counts and duration: '+prefix)
     return timing
 
 

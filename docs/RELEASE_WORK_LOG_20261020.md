@@ -482,3 +482,26 @@ logs even when validation fails. All 160 Python tests pass after the repair.
 
 The Strata speed target remains unmet. A valid mixed-routing A/B trial and the
 live prefill-reserve recovery repair are next; publication remains on hold.
+
+The repaired full-token mixed A/B trial finishes with exact output parity, but
+fails acceptance: measured medians are 29.16 tok/s for its established-path
+control and 26.13 tok/s for the candidate after fallback (0.896x). The live
+guard revokes the candidate during its first decode at 6.108x predicted upload
+cost; it remains disabled. Its first prefill takes 197.13 s and first decode
+78.14 s, retained separately from the three measured repeats. Evidence:
+`task4/3080-iq4-hybrid-verification-full128-f1c381c5f.json`, the command record,
+and `task4/hybrid-gate-full128-f1c381c5f-raw/`. The native runner now also checks
+reported throughput against count/duration arithmetic; its regressions pass.
+
+Native source `8cd98995a` repairs request-boundary prefill reserve loss. Strict
+sidecar mode checks the actual CUDA free memory on staging backends before
+launching any graph split or parallel barrier. Insufficient reserve returns
+`GGML_STATUS_ALLOC_FAILED` and drains pass leases/redirects while retaining
+admitted lanes for retry. No host-tensor fallback or reduced reserve is enabled.
+A tiny staged CUDA graph reproduces the original SIGABRT before repair. After
+repair it returns the allocation error without leases or output mutation, then
+retries with exact output and unchanged staging allocation after the reserve is
+restored. The test raises the configured reserve without exhausting the driver.
+CPU (95), Python (160) and five strict sanitizer checks pass. Final CUDA checks
+on each card and the original full-model recovery control are underway.
+External allocations racing after the boundary check remain outside this repair.

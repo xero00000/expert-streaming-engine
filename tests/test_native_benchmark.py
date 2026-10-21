@@ -29,7 +29,9 @@ class MeasurementIntegrityTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): benchmark.validate_completion(wrong, 512, 128)
         for field, value in [('prompt_n', 511), ('predicted_n', 127), ('prompt_ms', 0),
                              ('predicted_ms', -1), ('prompt_per_second', float('nan')),
-                             ('predicted_per_second', float('inf'))]:
+                             ('predicted_per_second', float('inf')), ('prompt_n', 512.0),
+                             ('predicted_per_second', 1000000), ('prompt_per_second', 640),
+                             ('prompt_ms', True)]:
             wrong = copy.deepcopy(self.receipt)
             wrong['timings'][field] = value
             with self.assertRaises(RuntimeError): benchmark.validate_completion(wrong, 512, 128)

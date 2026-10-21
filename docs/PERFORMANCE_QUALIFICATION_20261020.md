@@ -191,3 +191,21 @@ suite passes. Verification schema 4 rejects earlier measurement receipts.
 `validate-hybrid --evidence-dir NEW_DIRECTORY` now preserves both native logs
 on success or failure. A new full-token trial is required before any mixed
 configuration can qualify for the matched Strata comparison.
+
+The full-token retry passes output parity but is rejected: its established-path
+median is 29.16 tok/s and candidate median after guard fallback is 26.13 tok/s
+(0.896x). The live guard revokes the mixed route at 6.108x predicted upload cost
+on its first decode. This is a failed candidate, not evidence of sustained mixed
+execution. All eight requests (one warmup plus three samples per configuration)
+retain full 512/128 counts. Its first hybrid prefill/decode takes 197.13/78.14 s.
+The A/B uses `pread` and two-observation cache admission as its calibration
+contract requires; its control is distinct from the table's `mmap` control.
+See `3080-iq4-hybrid-verification-full128-f1c381c5f.json` and
+`hybrid-gate-full128-f1c381c5f-raw/` for receipts and native telemetry.
+
+Native source `8cd98995a` adds a strict prefill request-boundary CUDA reserve
+check before graph execution. Its focused staged-graph regression reproduces
+the old abort, then verifies recoverable allocation failure, unchanged output,
+zero outstanding leases and exact retry with retained staging buffers. This
+does not relax the reserve or claim recovery from external mid-graph exhaustion.
+Larger-cache performance remains unqualified pending its full-model control.
