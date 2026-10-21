@@ -111,10 +111,15 @@ therefore run through the same three declared script stages directly with the
 existing dependencies: runtime staging, TypeScript and Vite. Both the failed
 pnpm attempt and successful direct build are retained in the evidence folder.
 
-No new CUDA build, GPU model qualification, Rust test/Clippy run, Android
-build/device test, package installation or Windows execution was performed in
-this consolidation. Existing package evidence applies to the earlier prepared
-artifacts; installers have not been rebuilt with the new launcher option.
+The initial consolidation did not include a new CUDA build or Rust test/Clippy
+run. Subsequent task 2 validation now passes clean local CPU/CUDA builds, the
+registered suites on all three installed NVIDIA cards, explicit GPU/NCCL
+checks, isolated frozen frontend builds and strict Rust checks. The
+[release work log](RELEASE_WORK_LOG_20261020.md) records source `f27f6462c`, exact
+counts, expected skips, fixture repairs and retained evidence. Full-model,
+Android/device, package-installation and physical Windows qualification remain
+open. Existing package evidence applies to the earlier prepared artifacts;
+installers have not been rebuilt with the new launcher option.
 
 ## Findings still requiring work
 

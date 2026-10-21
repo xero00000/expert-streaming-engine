@@ -49,13 +49,13 @@ claimed: no new eight-package production build or installed-update trial has
 been run. Continue with task 2's clean-source validation, retaining the full
 package acceptance check for tasks 6 and 7.
 
-### 2. Finish validation of the consolidated source — IN PROGRESS
+### 2. Finish validation of the consolidated source — COMPLETE (LOCAL SOURCE CHECKS)
 
-- Pin the package-manager toolchain and prove a frozen-lockfile build without
+- [x] Pin the package-manager toolchain and prove a frozen-lockfile build without
   modifying dependencies in another worktree.
-- Build the consolidated CUDA runtime and run relevant CPU/CUDA regressions on
+- [x] Build the consolidated CUDA runtime and run relevant CPU/CUDA regressions on
   RTX 3060 Ti, RTX 3080 and RTX 2080 SUPER, retaining device/source identities.
-- Run Rust tests and Clippy; repair failures without bypassing checks.
+- [x] Run Rust tests and Clippy; repair failures without bypassing checks.
 
 Acceptance: required clean builds/checks pass against one recorded source state.
 
@@ -211,3 +211,48 @@ recorded and no outstanding supported-scope release blockers.
   discovery of all three GPUs and vendor linkage without `LD_LIBRARY_PATH`
   passed. A discarded smoke command used an unsupported `--list-devices` CLI
   option; device discovery was checked with the actual staged backend C API.
+
+### Task 2 — final acceptance results
+
+Validated source: `f27f6462c6d71dd686108a91d6a524446e9d2681`. Subsequent
+work-log/report edits only record these results; they do not change runtime
+code. Both native runtime version strings identify that source commit.
+
+- Complete CPU and CUDA Release builds passed. CPU uses local GCC 16.2.1;
+  CUDA uses GCC 12.4.0, the pinned CUDA 12.8 SDK and NCCL 2.25.1, with real
+  SM 75/86 code plus SM 86 PTX. `GGML_NATIVE` and the production Qwen gate
+  remain OFF. Native production sources are unchanged by task 2.
+- **CPU: 94/94 CTest checks passed.**
+- **RTX 3060 Ti, RTX 2080 SUPER and RTX 3080: each has 99 CTest passes, zero
+  failures and one expected single-device NCCL skip.** The BF16 batch test
+  reports an internal skip under default CTest settings; it was separately
+  enabled explicitly and **all 64 cases passed on each card**, including
+  scalar-bit equality, the quantization-aware double oracle and graph replay.
+- **30 additional explicit CUDA reference checks passed**, ten per GPU,
+  covering expert IQ formats and DeepSeek operator/index/QAT/attention/MoE,
+  block, forward, BF16-forward and whole-model synthetic fixtures. These
+  fixtures are regression evidence, not real-model acceptance.
+- **Five multi-GPU checks passed.** All-three-device NCCL initialized and
+  produced exact F32/F16/BF16 reductions across two concurrent contexts. The
+  two-of-three case correctly used the exact reduction fallback. Device
+  selection, asynchronous copies and primary-context isolation also passed.
+- Repeated final-source checks: **146 Python unittests, 42 reference/replay
+  pytest checks, 35 Studio JavaScript checks, 27 Rust tests and four telemetry
+  tests passed**. Locked strict Clippy, Rust formatting, frozen frontend
+  installation/build, telemetry type checks/dry-run, documentation and both
+  workflow lints passed. The three dependency lockfiles remain unchanged.
+- Final CUDA staging passed its variant marker, source version, backend API
+  discovery of all three GPUs and vendor-library linkage checks with no
+  `LD_LIBRARY_PATH` or `LD_PRELOAD` override.
+- Failed initial attempts, the uncached F16 reproduction, the corrected
+  fixture checks and all final commands/logs are retained. Start with
+  `/home/xero/Desktop/test/results/ese-release-work-20261020/task2-summary.json`;
+  final per-device logs and hashes are in `task2-gpu-final/`. Exact compiler,
+  SDK, device UUID and source identities are in
+  `task2-source-environment-final.json`.
+
+Task 2's local acceptance criterion is met. Task 3 is next: supported-path
+inference correctness and recovery with pinned model references. Performance,
+filled-64K/concurrency, eight real installers, signing/updates and physical
+Windows evidence remain open. No push, remote workflow, tag or publication
+occurred; the user's hold is unchanged.
