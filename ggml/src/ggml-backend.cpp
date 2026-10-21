@@ -1364,6 +1364,7 @@ struct ggml_active_expert_cache_device {
     bool ready = false;
     bool frequency_retention = false;
     uint64_t preflight_generation = 0;
+    uint64_t physical_reserve_shortfall = 0;
     int backend_id = -1;
     int slots = 0;
     std::vector<ggml_active_expert_cache_pool> pools;
@@ -2881,7 +2882,7 @@ static bool ggml_active_expert_cache_init(
         ggml_backend_sched_t sched,
         int backend_id,
         const ggml_tensor * source) {
-    const ggml_active_expert_cache_policy policy = {
+    ggml_active_expert_cache_policy policy = {
         sched->active_expert_cache_capacity_bytes,
         sched->active_expert_cache_reserve_bytes,
         sched->active_expert_cache_min_observations,
@@ -2917,42 +2918,61 @@ static bool ggml_active_expert_cache_init(
         return false;
     }
 
-    // Realize every component layout while graph assignment can still retain
-    // the established CPU path.  Deferring these allocations until input
-    // staging is unsafe: compact copies have already removed the full-tensor
-    // fallback by then, and a free-VRAM clamp or backend padding would turn an
-    // optional cache miss into a mid-graph abort.
-    for (int component = 0;
-            component < GGML_ACTIVE_EXPERT_CACHE_COMPONENT_COUNT;
-            ++component) {
-        uint64_t maximum = sched->active_expert_component_max_bytes[size_t(component)];
-        for (const auto & descriptor :
-                sched->active_expert_cache_layout_catalog[size_t(component)]) {
-            maximum = std::max<uint64_t>(maximum, descriptor.nb2);
-        }
-        for (const auto & descriptor :
-                sched->active_expert_cache_layout_catalog[size_t(component)]) {
-            ggml_tensor layout = {};
-            if (!ggml_active_expert_cache_materialize_layout(descriptor, &layout) ||
-                    !ggml_active_expert_cache_init_component_for_policy(
-                        sched,
-                        cache,
-                        component,
-                        &layout,
-                        policy.reserve_bytes,
-                        maximum)) {
-                fprintf(stderr,
-                        "ggml active-expert cache: backend %d component preflight failed; using CPU fallback\n",
-                        backend_id);
-                ggml_active_expert_cache_drain_leases(sched, cache);
-                ggml_active_expert_cache_release(cache);
-                cache.attempted = true;
-                return false;
+    // Preflight unpublished buffers. CUDA allocations can consume more device
+    // memory than their logical byte size (page rounding and backend state).
+    // A physical reserve failure should reduce this optional cache, rather
+    // than discard the entire GPU path. Never relax the requested reserve.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        cache.physical_reserve_shortfall = 0;
+        bool complete = true;
+        for (int component = 0; component < GGML_ACTIVE_EXPERT_CACHE_COMPONENT_COUNT && complete; ++component) {
+            uint64_t maximum = sched->active_expert_component_max_bytes[size_t(component)];
+            for (const auto & descriptor : sched->active_expert_cache_layout_catalog[size_t(component)])
+                maximum = std::max<uint64_t>(maximum, descriptor.nb2);
+            for (const auto & descriptor : sched->active_expert_cache_layout_catalog[size_t(component)]) {
+                ggml_tensor layout = {};
+                if (!ggml_active_expert_cache_materialize_layout(descriptor, &layout) ||
+                        !ggml_active_expert_cache_init_component_for_policy(
+                            sched, cache, component, &layout, policy.reserve_bytes, maximum)) {
+                    complete = false;
+                    break;
+                }
             }
         }
+#ifdef GGML_USE_CUDA
+        if (complete && ggml_backend_is_cuda(sched->backends[backend_id])) {
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device(sched->backends[backend_id]),
+                    &free_bytes, &total_bytes);
+            if (free_bytes < policy.reserve_bytes) {
+                cache.physical_reserve_shortfall = policy.reserve_bytes - free_bytes;
+                complete = false;
+            }
+        }
+#endif
+        if (complete) {
+            cache.preflight_generation = sched->active_expert_cache_catalog_generation;
+            return true;
+        }
+        const uint64_t capacity = cache.capacity_bytes;
+        const uint64_t shortfall = cache.physical_reserve_shortfall;
+        ggml_active_expert_cache_drain_leases(sched, cache);
+        ggml_active_expert_cache_release(cache);
+        cache.attempted = true;
+        constexpr uint64_t mib = 1024*1024;
+        if (attempt == 2 || shortfall == 0 || shortfall >= capacity || capacity-shortfall <= mib) break;
+        // Leave another 1/64 of the old capacity for allocation granularity,
+        // while covering a larger measured shortfall when necessary.
+        policy.capacity_bytes = capacity - std::max(capacity/64, shortfall+mib);
+        fprintf(stderr, "ggml active-expert cache: backend %d physical reserve shortfall %llu; "
+                "retrying unpublished cache at %llu bytes\n", backend_id,
+                (unsigned long long)shortfall, (unsigned long long)policy.capacity_bytes);
+        cache.attempted = false;
+        if (!ggml_active_expert_cache_init_for_policy(sched, cache, backend_id, source, policy,
+                sched->active_expert_set_bytes, sched->active_expert_cache_route_capacity)) return false;
     }
-    cache.preflight_generation = sched->active_expert_cache_catalog_generation;
-    return true;
+    fprintf(stderr, "ggml active-expert cache: backend %d component preflight failed; using CPU fallback\n", backend_id);
+    return false;
 }
 
 static bool ggml_active_expert_cache_init_packed_component(
@@ -2962,9 +2982,25 @@ static bool ggml_active_expert_cache_init_packed_component(
     GGML_UNUSED(reserve_bytes);
 #endif
     auto & component = cache.components[size_t(component_index)];
+    const auto fail = [&](int line) {
+        size_t free_bytes = 0;
+#ifdef GGML_USE_CUDA
+        if (ggml_backend_is_cuda(sched->backends[cache.backend_id])) {
+            size_t total_bytes = 0;
+            ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device(sched->backends[cache.backend_id]),
+                    &free_bytes, &total_bytes);
+        }
+#endif
+        fprintf(stderr, "ggml active-expert packed allocation rejected: line=%d backend=%d component=%d "
+                "type=%s stride=%zu capacity=%llu allocated=%llu free=%zu reserve=%llu\n",
+                line, cache.backend_id, component_index, ggml_type_name(source->type), source->nb[2],
+                (unsigned long long)cache.capacity_bytes, (unsigned long long)cache.allocated_bytes,
+                free_bytes, (unsigned long long)reserve_bytes);
+        return false;
+    };
     const int layer = ggml_active_expert_cache_layer_from_name(ggml_get_name(source));
     const auto * pool_for_source = ggml_active_expert_cache_pool_for_layer(cache, layer);
-    if (layer >= 0 && !pool_for_source) return false;
+    if (layer >= 0 && !pool_for_source) return fail(__LINE__);
     if (!component.buffer) {
         size_t bytes = 0;
         for (const auto & pool : cache.pools) {
@@ -2972,26 +3008,30 @@ static bool ggml_active_expert_cache_init_packed_component(
         }
         // A component can exist only on the other device's layers.
         if (bytes == 0) return true;
-        if (bytes > cache.capacity_bytes || cache.allocated_bytes > cache.capacity_bytes - bytes) return false;
+        if (bytes > cache.capacity_bytes || cache.allocated_bytes > cache.capacity_bytes - bytes) return fail(__LINE__);
 #ifdef GGML_USE_CUDA
         if (ggml_backend_is_cuda(sched->backends[cache.backend_id])) {
             size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device(sched->backends[cache.backend_id]),
                     &free_bytes, &total_bytes);
-            if (free_bytes <= reserve_bytes || bytes > uint64_t(free_bytes) - reserve_bytes) return false;
+            if (free_bytes <= reserve_bytes || bytes > uint64_t(free_bytes) - reserve_bytes) {
+                const uint64_t available = free_bytes > reserve_bytes ? uint64_t(free_bytes)-reserve_bytes : 0;
+                cache.physical_reserve_shortfall = bytes > available ? bytes-available : 1;
+                return fail(__LINE__);
+            }
         }
 #endif
         component.buffer = ggml_backend_buft_alloc_buffer(sched->bufts[cache.backend_id], bytes);
-        if (!component.buffer) return false;
+        if (!component.buffer) return fail(__LINE__);
         component.buffer_bytes = ggml_backend_buffer_get_size(component.buffer);
         cache.allocated_bytes += component.buffer_bytes;
-        if (cache.allocated_bytes > cache.capacity_bytes) return false;
+        if (cache.allocated_bytes > cache.capacity_bytes) return fail(__LINE__);
         ggml_backend_buffer_set_usage(component.buffer, GGML_BACKEND_BUFFER_USAGE_EXPERT_CACHE);
         ggml_backend_buffer_clear(component.buffer, 0);
         for (const auto & pool : cache.pools) {
             for (const auto & descriptor : pool.layouts[size_t(component_index)]) {
                 ggml_tensor logical = {};
-                if (!ggml_active_expert_cache_materialize_layout(descriptor, &logical)) return false;
+                if (!ggml_active_expert_cache_materialize_layout(descriptor, &logical)) return fail(__LINE__);
                 const auto known = std::find_if(component.layouts.begin(), component.layouts.end(),
                         [&](const ggml_active_expert_cache_stored_layout & layout) {
                             return layout.slot_begin == pool.begin && ggml_active_expert_cache_layout_matches(layout, &logical);
@@ -3002,7 +3042,7 @@ static bool ggml_active_expert_cache_init_packed_component(
                 tensor->nb[2] = size_t(pool.strides[size_t(component_index)]);
                 tensor->nb[3] = tensor->nb[2]*size_t(pool.slots);
                 if (ggml_backend_buft_get_alloc_size(sched->bufts[cache.backend_id], tensor) >
-                        pool.spans[size_t(component_index)]) return false;
+                        pool.spans[size_t(component_index)]) return fail(__LINE__);
                 auto * base = (uint8_t *) ggml_backend_buffer_get_base(component.buffer);
                 ggml_backend_tensor_alloc(component.buffer, tensor, base + pool.offsets[size_t(component_index)]);
                 component.layouts.push_back({tensor, descriptor.nb2, pool.begin});

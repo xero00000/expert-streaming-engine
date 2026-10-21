@@ -901,3 +901,52 @@ state and are not attributed as optimization gains. Outputs repeat within each
 run; this small diagnostic does not meet or replace the launcher workload.
 Artifacts: `checked-dot-property-tests.json`, `checked-dot-expert-regression/`,
 `checked-dot-reference33/`, `checked-dot-speed-{baseline,checked}/`.
+
+
+#### Physical reserve preflight and Strata-style runtime experiments
+
+The native quantized expert opt-in with the launcher split, 16 GiB RAM cache
+and 6 GiB requested GPU cache gives 10.58 / 10.53 tok/s on Hi/32 repeats.
+Enabling native packed projections also exposes component preflight fallback.
+These are experimental arithmetic modes, not tight-reference qualifications.
+The original explicit policy is retained independently. No quantization error
+is accepted by relaxing its numerical bound.
+
+A 128 MiB prefill staging limit cannot hold this model's full expert layers.
+Two lanes actually require 1,475 MiB/device. The corrected 1,536 MiB limit
+enables GPU staging, but a 552/128 run still measures 2.76 / 3.53 tok/s because
+the 3080 cache falls back. First-token times improve to 136.63 / 85.70 seconds.
+A separate native-projection trial was stopped before a complete request when
+its insufficient staging and host-memory pressure became clear; its abort and
+failed receipt are retained.
+
+An opt-in initial 32K compute reservation leaves the 1M KV capacity intact;
+runtime graph construction continues to use actual full history. This allows
+a 128-token prefill batch, with 529 / 601 / 596 MiB initial GPU graph buffers
+versus the prior smaller batch's roughly 900 MiB. A first reservation probe
+incorrectly retained a 1M reservation write head and aborted an assertion;
+the write head now follows the reserved rows. The corrected probe retains
+byte-identical 33-token Q4 logits/routes/IDs. It does not qualify a filled 1M
+context. With the cache allocation defect still present, the full 128-batch
+run improves first-token times to 41.54 / 39.40 seconds but measures only
+2.60 / 2.62 tok/s: all three expert caches fall back. A metadata inspection
+overlaps that diagnostic's first prefill, so its prefill timing is not an
+isolated acceptance measurement.
+
+Allocation diagnostics isolate physical reserve shortfalls of a few MiB when
+logical cache capacity fills the free-minus-reserve allowance. Page rounding
+and backend state consume more physical device memory than the reported
+logical buffer sizes. Component preflight now releases an unpublished cache
+and retries up to twice with a smaller capacity, covering the measured
+shortfall plus a modest allocation margin. It never reduces the reserve,
+never retries unrelated layout failures, and checks physical free memory
+after completing the allocation before publishing it.
+
+Cache/alias/replacement/rollback and top-10 vector CTests pass on all three
+GPUs. A selected-model clamped-cache replay triggers a physical retry on
+every card, retains all 8,194,560 logits, 1,584 ordered routes and input IDs
+byte-for-byte, reports all three active GPU caches and zero forced fallbacks,
+and drains leases at exit. Evidence: `cache-preflight-diagnostic-hi/`,
+`cache-physical-retry-tests-*.log`, `cache-physical-retry-reference33/` and
+private library/source identities. The full-workload retry is a separate
+measurement; the 80% speed requirement remains open.

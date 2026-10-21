@@ -487,3 +487,31 @@ their previous memset behavior. Five focused allocation/clear/graph tests and
 the complete byte-identical Q4/1M 33-token placement replay pass. These numbers
 measure readiness, not peak memory or decode speed; the 80% speed requirement
 remains open.
+
+
+### Strata source comparison and current decode blocker
+
+Read-only local source and saved runtime logs identify native quantized
+activation dots, grouped CPU/GPU expert execution, a resident RAM complement,
+profile-filled/adaptive GPU caches, streamed KV and pipelined MTP windows.
+The selected machine's saved H2D probes are 0.7 / 2.8 / 20.6 GB/s in selected
+GPU order, so placement and upload avoidance matter. An isolated no-MTP,
+no-suffix/lookup, no-pipeline copy runs the same 552/128 requests at
+35.9 / 42.1 / 43.6 tok/s with zero draft tokens. Its changed memory footprint
+and variable outputs prevent interpreting this as a pure fixed-memory causal
+estimate. The frozen 51.5 overall / 52.3 repeat baseline remains unchanged.
+
+Current ESE experiments retain 1M Q4 KV allocation and add opt-in native
+quantized expert/projection arithmetic; they are distinct from the existing
+original-input reference policy. Full request diagnostics remain below target.
+Correctly sized two-lane staging and larger prefill batches improve prompt
+processing, but physical allocation overhead caused GPU expert-cache preflight
+to discard entire caches. A bounded smaller-cache retry now preserves the
+physical reserve and passes the selected-model 33-token exact replay after
+triggering retries on all three GPUs, with zero forced fallbacks. This does
+not constitute throughput acceptance or filled-context qualification.
+
+The associated commands, failures, raw receipts, library identities and
+checks are under `task4/qwen4exp-iq2-restore/`; the work log records each
+intermediate result. The next full workload is measured separately without
+concurrent compilation or tracing. Publication remains on hold.
