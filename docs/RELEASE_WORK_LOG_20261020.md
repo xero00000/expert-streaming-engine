@@ -5,7 +5,7 @@ Starting commit: `332a0af11`.
 
 Work proceeds one task at a time. Finish the task's available checks and record
 its evidence before advancing. An implementation pass does not imply package,
-hardware or release qualification. The user's performance/publication hold
+hardware or release qualification. The user's publication hold
 remains active: no push, remote CI dispatch, public tag or publication until
 that hold is explicitly lifted.
 
@@ -70,7 +70,7 @@ Acceptance: required clean builds/checks pass against one recorded source state.
 Acceptance: reproducible correctness and recovery evidence for every claimed
 supported execution path.
 
-### 4. Resolve the performance hold — CURRENT SPEED ACCEPTED; SAFETY CHECKS CONTINUE
+### 4. Resolve the performance hold — COMPLETE (CURRENT SPEED ACCEPTED BY USER)
 
 The [performance qualification protocol](PERFORMANCE_QUALIFICATION_20261020.md)
 is prepared. The initial speed target was to match Strata; the user later
@@ -1663,3 +1663,18 @@ the correctness workload's explicit generation headroom to 256 tokens and rerun
 before advancing to larger lengths. This changes only the test output budget;
 it is independent of the accepted 552/128 speed observation. Original model,
 launcher and production admission remain unchanged.
+
+
+The 256-token-headroom retry is retained at `task5/flash-next-context-256/`.
+Both 2,048-token requests pass full receipt counts, three-position retrieval
+and exact generated-text replay. The first 8,192-token request also passes
+actual counts, no truncation and all three retrieval assignments; its repeat
+and the 65,536-token stage are still running/pending. The first 8K request
+uses 449.48 s for prefill and 30.43 s for 256 generated tokens (8.41 tok/s).
+The accepted approximately 19 tok/s remains scoped to the earlier frozen
+552-token workload, not a speed floor at larger filled contexts. These
+correctness tests do not reopen performance optimization. Process swap is
+sampled in this retry and will be reported with the completed resource audit;
+no zero-swap claim applies. Both shards' exact size/mtime seals match the
+previously completed SHA-256 identities. No filled-64K, concurrency, native
+arithmetic or release acceptance is claimed by these intermediate results.

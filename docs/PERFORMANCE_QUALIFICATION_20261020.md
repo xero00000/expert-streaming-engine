@@ -10,7 +10,7 @@ The user initially selected **match Strata in speed**, then explicitly revised
 the minimum to **80% of Strata** when requesting restoration of the old model
 loading path. For the first direct comparison,
 freeze one common supported model and prompt on this machine; compare repeated
-sustained decode medians (current requirement: ESE / Strata at least 0.8). Record every sample and
+sustained decode medians (the then-required ESE / Strata ratio was at least 0.8). Record every sample and
 cold/repeated behavior; retain startup, prefill and first-response separately.
 This does not lift the publication hold or qualify other models/context sizes.
 
