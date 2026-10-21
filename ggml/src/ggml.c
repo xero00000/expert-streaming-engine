@@ -27363,21 +27363,12 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             } break;
         case GGML_OP_SOFT_MAX:
             {
-                if (fusion && i + 4 < cgraph->n_nodes &&
-                    cgraph->nodes[i+1]->op == GGML_OP_RESHAPE  &&
-                    cgraph->nodes[i+2]->op == GGML_OP_ARGSORT  &&
-                    cgraph->nodes[i+3]->op == GGML_OP_VIEW     &&
-                    cgraph->nodes[i+4]->op == GGML_OP_GET_ROWS &&
-                    cgraph->nodes[i+0]->type == GGML_TYPE_F32  &&
-                    cgraph->nodes[i+4]->type == GGML_TYPE_F32  &&
-                    cgraph->nodes[i+3]->type == GGML_TYPE_I32) {
-                    iqk_topk_moe(cgraph->nodes[i]->ne[0], cgraph->nodes[i+4]->ne[1], cgraph->nodes[i]->ne[1],
-                            (const float *)cgraph->nodes[i]->data, (float *)cgraph->nodes[i+4]->data, (int32_t *)cgraph->nodes[i+3]->data,
-                            params->ith, params->nth);
-                    i += 4;
-                } else {
-                    ggml_compute_forward_soft_max(params, tensor);
-                }
+                // Materialize fresh probabilities before routing. The old
+                // adjacent-op shortcut read this node's unwritten output as
+                // logits, left other consumers stale, and ignored softmax
+                // scaling/masks. Preserve the complete operation semantics;
+                // argsort and gather execute normally after this barrier.
+                ggml_compute_forward_soft_max(params, tensor);
             } break;
         case GGML_OP_SOFT_MAX_BACK:
             {

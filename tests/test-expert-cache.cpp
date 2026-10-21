@@ -873,6 +873,69 @@ void test_read_ahead_demand_priority_budget_and_expiration() {
     require_throws<std::invalid_argument>([&] { read_ahead_queue invalid(cache, nullptr, (1ULL << 30) + 1); });
 }
 
+void test_cpu_router_softmax_replay() {
+    // Match the model router's softmax -> reshape -> sort -> view -> gather.
+    // Poison its output and change logits between replays: routing must never
+    // consume a previous invocation's softmax storage. Check independent
+    // probabilities as well as IDs, including scaled and masked softmax.
+    for (int threads : {1, 4}) {
+        for (bool masked : {false, true}) {
+            ggml_init_params params = {1024*1024, nullptr, false};
+            auto * ctx = ggml_init(params);
+            REQUIRE(ctx != nullptr);
+            struct cleanup { ggml_context * ctx; ~cleanup() { ggml_free(ctx); } } free_ctx{ctx};
+            constexpr int experts = 8, rows = 3, selected = 2;
+            auto * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts, rows);
+            auto * mask = masked ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts, rows) : nullptr;
+            const float scale = masked ? 0.5f : 1.0f;
+            auto * probs = ggml_soft_max_ext(ctx, logits, mask, scale, 0.0f);
+            auto * ids = ggml_top_k(ctx, probs, selected);
+            auto * weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, experts, rows), ids);
+            auto * graph = ggml_new_graph_custom(ctx, 32, false);
+            ggml_build_forward_expand(graph, weights);
+            auto plan = ggml_graph_plan(graph, threads);
+            std::vector<uint8_t> work(plan.work_size);
+            plan.work_data = work.empty() ? nullptr : work.data();
+            for (int trial = 0; trial < 3; ++trial) {
+                std::fill_n(static_cast<float *>(probs->data), experts*rows,
+                        std::numeric_limits<float>::quiet_NaN());
+                for (int row = 0; row < rows; ++row) {
+                    for (int expert = 0; expert < experts; ++expert) {
+                        static_cast<float *>(logits->data)[row*experts + expert] =
+                                float((expert + 3*row + 2*trial) % experts) - 4.0f;
+                        if (mask) static_cast<float *>(mask->data)[row*experts + expert] =
+                                expert == row ? -INFINITY : 0.0f;
+                    }
+                }
+                REQUIRE(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS);
+                for (int row = 0; row < rows; ++row) {
+                    std::array<double, experts> expected = {};
+                    std::array<int, experts> order = {};
+                    double sum = 0;
+                    for (int expert = 0; expert < experts; ++expert) {
+                        const float value = static_cast<float *>(logits->data)[row*experts + expert];
+                        expected[expert] = mask && expert == row ? 0 : std::exp(double(value)*scale);
+                        sum += expected[expert];
+                        order[expert] = expert;
+                    }
+                    std::sort(order.begin(), order.end(), [&](int a, int b) { return expected[a] > expected[b]; });
+                    for (int expert = 0; expert < experts; ++expert) {
+                        const float actual = static_cast<float *>(probs->data)[row*experts + expert];
+                        REQUIRE(std::abs(actual - expected[expert]/sum) < 1e-6);
+                    }
+                    for (int slot = 0; slot < selected; ++slot) {
+                        const auto actual_id = *reinterpret_cast<int32_t *>(
+                                static_cast<char *>(ids->data) + row*ids->nb[1] + slot*ids->nb[0]);
+                        REQUIRE(actual_id == order[slot]);
+                        const float actual_weight = static_cast<float *>(weights->data)[row*selected + slot];
+                        REQUIRE(std::abs(actual_weight - expected[order[slot]]/sum) < 1e-6);
+                    }
+                }
+            }
+        }
+    }
+}
+
 void test_cpu_kernel_exact_parity_and_no_original_fallback() {
     ggml_init_params params = { 1024*1024, nullptr, false };
     ggml_context * ctx = ggml_init(params);
@@ -2479,6 +2542,11 @@ void test_expert_cache_partial_publication_rollback() {
 
 int main(int argc, char ** argv) {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--router-softmax-only") == 0) {
+            test_cpu_router_softmax_replay();
+            std::cout << "PASS: CPU router softmax, IDs and weights survive poisoned replay\n";
+            return 0;
+        }
         if (argc == 2 && std::strcmp(argv[1], "--router-cache-only") == 0) {
             test_cuda_router_precedes_compact_staging();
             std::cout << "PASS: computed GPU router precedes compact expert staging\n";
@@ -2509,6 +2577,7 @@ int main(int argc, char ** argv) {
             std::cout << "PASS: exact CPU lease chunks under bounded cache and forced eviction\n";
             return 0;
         }
+        test_cpu_router_softmax_replay();
         test_descriptor_validation();
         test_exact_reads_hits_and_backend_telemetry();
         test_deterministic_eviction_and_lease_lifetime();
