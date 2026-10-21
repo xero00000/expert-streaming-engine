@@ -1623,7 +1623,11 @@ void test_cuda_router_precedes_compact_staging() {
         {{10,5,0,8,11,3,14,4,6,2}}, {{10,5,0,8,11,3,14,4,6,2}},
         {{15,12,13,7,1,10,5,0,8,11}}, {{10,5,0,8,11,3,14,4,6,2}},
     }};
-    std::vector<float> input_values(width, 1.f/width);
+    // Keep every partial sum representable even in the default F16 reduction.
+    // A dense 256-term sum can round despite exact weights/products, which
+    // would conflate arithmetic precision with router/cache ordering.
+    std::vector<float> input_values(width, 0.f);
+    std::fill_n(input_values.begin(), 16, 1.f/16);
     for (size_t pass = 0; pass < routes.size(); ++pass) {
         source.expected = routes[pass].data();
         const auto before = source.acquires;
@@ -1644,9 +1648,15 @@ void test_cuda_router_precedes_compact_staging() {
         std::vector<float> actual(rows*used);
         ggml_backend_tensor_get(output, actual.data(), 0, actual.size()*sizeof(float));
         for (int position = 0; position < used; ++position) for (int row = 0; row < rows; ++row) {
-            // Constant representable F16 rows dotted with 256 copies of 1/256.
+            // Constant F16 rows dotted with 16 copies of 1/16 and zero padding.
             // This oracle needs neither production decoding nor another backend.
             const double expected = double((routes[pass][position] + 1)*(row + 1))/256;
+            if (!std::isfinite(actual[position*rows + row]) ||
+                    std::abs(actual[position*rows + row] - expected) > 2e-5*(1 + std::abs(expected))) {
+                std::cerr << "router-cache mismatch: pass=" << pass << " position=" << position
+                          << " expert=" << routes[pass][position] << " row=" << row
+                          << " actual=" << actual[position*rows + row] << " expected=" << expected << '\n';
+            }
             REQUIRE(std::isfinite(actual[position*rows + row]));
             REQUIRE(std::abs(actual[position*rows + row] - expected) <= 2e-5*(1 + std::abs(expected)));
         }

@@ -184,3 +184,30 @@ recorded and no outstanding supported-scope release blockers.
   evidence. The corrected full native CUDA build is in progress.
 - Rust tests passed (27 tests, zero ignored). Clippy and GPU qualification are
   still pending; task 2 remains in progress.
+
+### Task 2 — local build and numerical fixture repairs
+
+- The full CUDA build completed with the pinned SDK. Local Conda GCC 12.4
+  needs its host `lib` directory during executable linking; the SDK is first
+  in that build search path. Runtime validation uses only the SDK environment,
+  and linkage confirms CUDA/cuBLAS/NCCL come from the pinned SDK. Hosted
+  Ubuntu GCC 12 has not been exercised remotely.
+- Strict locked Clippy passed without suppressions. Rust tests (27), Studio
+  tests (35), Python unittests (146), reference/replay pytest checks (42),
+  telemetry tests (4), type checks and a local Worker dry-run bundle passed.
+- Documentation validation initially entered installed third-party READMEs.
+  It now prunes dependency/build trees; a regression check still rejects
+  missing links in maintained ESE documents. The repaired check passed.
+- The initial RTX 3060 Ti suite exposed an expert-cache router fixture failure:
+  actual `0.3002929688` versus an exact `0.30078125`. An independent uncached
+  F16 operation reproduced the same result. Exact weights/products did not
+  guarantee exact 256-term half-precision partial sums.
+- Kept the same strict tolerance, poison, routes, eviction, cache-hit and lease
+  checks. Changed the input to 16 nonzero terms of `1/16` plus zero padding,
+  making every partial sum representable for these fixture weights. The
+  uncached oracle and isolated cache-router check now agree exactly. Production
+  arithmetic is unchanged. The complete final GPU rerun is still pending.
+- CUDA Studio staging, frontend production build, runtime version, backend API
+  discovery of all three GPUs and vendor linkage without `LD_LIBRARY_PATH`
+  passed. A discarded smoke command used an unsupported `--list-devices` CLI
+  option; device discovery was checked with the actual staged backend C API.
