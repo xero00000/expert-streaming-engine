@@ -1045,6 +1045,7 @@ def require_serialized_plan(
 
 def require_combined_preparation_peak(
     dry_run: dict,
+    port: int,
     include_transient: bool = False,
 ) -> None:
     peak = dry_run.get("preparation_peak", {})
@@ -1063,44 +1064,71 @@ def require_combined_preparation_peak(
         current_devices
     ) != set(peak_devices):
         raise RuntimeError("combined dry run returned inconsistent device topology")
+    # Serialized plans retain forecasts. Admission reconciles those with live
+    # allocations and native KV sizing; verify that basis independently rather
+    # than requiring a physical receipt to equal an estimate. A separate KV-only
+    # dry run supplies the same target geometry without changing expert owners.
+    snapshot = resources(port)
+    kv_reference = rebalance(port, dry_run["target_plan"]["context"], True)
+    kv_peak = kv_reference.get("preparation_peak", {})
+    if not kv_peak.get("prepares_kv") or kv_peak.get("prepares_expert_cache"):
+        raise RuntimeError("KV reference did not isolate native KV preparation")
+    native_targets = {item["id"]: item["prepared_kv_bytes"] for item in kv_peak.get("devices", [])}
+    if set(native_targets) != set(peak_devices):
+        raise RuntimeError("native KV reference topology differs from combined preparation")
+    live_caches = {item["id"]: item["expert_cache"]["allocated_bytes"]
+                   for item in snapshot.get("devices", [])}
+    tracked = {device: {"weights": 0, "fixed": 0, "kv": 0} for device in peak_devices}
+    # Category values are the public llama_resource_memory_category contract.
+    fixed_categories = {3, 4, 5, 13, 14}  # checkpoint, graph, output, handoff, CUDA pool
+    for pool in snapshot["memory_inventory"]["pools"]:
+        device = pool["device_id"]
+        if device not in tracked:
+            continue
+        category, value = pool["category"], pool["bytes"]
+        if not isinstance(value, int) or value < 0:
+            raise RuntimeError("live memory receipt contains an invalid byte count")
+        key = None
+        if category == 0:
+            key = "weights"
+        elif category == 2:
+            key = "kv"
+        elif category in fixed_categories:
+            key = "fixed"
+        if key is not None:
+            tracked[device][key] += value
     for device_id, item in peak_devices.items():
         current = current_devices[device_id]
         target = target_devices[device_id]
+        actual = tracked[device_id]
+        target_kv = native_targets[device_id]
+        if device_id < 0 or device_id not in live_caches:
+            raise RuntimeError("combined expert preparation requires accelerator receipts")
+        def realized(plan: dict, kv: int, expert: int) -> int:
+            return (max(plan["dense_bytes"], actual["weights"])
+                    + max(plan["graph_bytes"], actual["fixed"])
+                    + kv + expert + plan["expert_prefill_staging_bytes"]
+                    + plan["transient_bytes"])
+        current_live = realized(current, actual["kv"], live_caches[device_id])
         expected = {
-            "target_live_bytes": target.get("planned_bytes"),
-            "prepared_kv_bytes": target.get("kv_bytes"),
-            "prepared_expert_cache_bytes": target.get("expert_cache_bytes"),
-            "prepared_transient_bytes": (
-                target.get("transient_bytes") if include_transient else 0
-            ),
+            "current_live_bytes": current_live,
+            "target_live_bytes": realized(target, target_kv, target["expert_cache_bytes"]),
+            "prepared_kv_bytes": target_kv,
+            "prepared_expert_cache_bytes": target["expert_cache_bytes"],
+            "prepared_transient_bytes": target["transient_bytes"] if include_transient else 0,
+            "capacity_bytes": current["capacity_bytes"],
+            "reserve_bytes": current["reserve_bytes"],
         }
         if any(item.get(key) != value for key, value in expected.items()):
             raise RuntimeError(
-                f"combined preparation peak is inconsistent on device {device_id}: {item}"
+                f"combined preparation peak is inconsistent on device {device_id}: {item}; expected {expected}"
             )
-        current_live = item.get("current_live_bytes")
-        current_without_expert = (
-            current.get("planned_bytes", 0)
-            - current.get("expert_cache_bytes", 0)
-        )
-        if not isinstance(current_live, int) or current_live < current_without_expert:
-            raise RuntimeError(
-                f"combined preparation peak omitted realized live bytes on device {device_id}"
-            )
-        expected_peak = (
-            current_live
-            + expected["prepared_kv_bytes"]
-            + expected["prepared_expert_cache_bytes"]
-            + expected["prepared_transient_bytes"]
-        )
-        usable = item.get("capacity_bytes", 0) - item.get("reserve_bytes", 0)
-        if (
-            item.get("peak_bytes") != expected_peak
-            or item.get("peak_headroom_bytes") != usable - expected_peak
-        ):
-            raise RuntimeError(
-                f"combined preparation peak arithmetic failed on device {device_id}: {item}"
-            )
+        expected_peak = (current_live + expected["prepared_kv_bytes"]
+                         + expected["prepared_expert_cache_bytes"]
+                         + expected["prepared_transient_bytes"])
+        usable = expected["capacity_bytes"] - expected["reserve_bytes"]
+        if item.get("peak_bytes") != expected_peak or item.get("peak_headroom_bytes") != usable - expected_peak:
+            raise RuntimeError(f"combined preparation peak arithmetic failed on device {device_id}: {item}")
 
 
 def require_transient_preparation_peak(
@@ -1393,7 +1421,7 @@ def validate_expert_success(args: argparse.Namespace) -> dict:
             )
         ):
             raise RuntimeError("combined dry run did not preserve the exact requested target")
-        require_combined_preparation_peak(combined_dry)
+        require_combined_preparation_peak(combined_dry, port)
 
         combined_shrink, shrink_props_samples = rebalance_combined_observing_props(
             port, args.target_context, target
@@ -2646,7 +2674,7 @@ def validate_transient_success(args: argparse.Namespace) -> dict:
             != combined_policy
         ):
             raise RuntimeError("three-pool dry run did not preserve the requested target")
-        require_combined_preparation_peak(combined_dry, include_transient=True)
+        require_combined_preparation_peak(combined_dry, port, include_transient=True)
 
         combined_commit, commit_samples = rebalance_all_observing_views(
             port,
@@ -2870,7 +2898,7 @@ def validate_combined_failure(
         recovery_dry_run = rebalance_combined(
             port, args.target_context, target, True
         )
-        require_combined_preparation_peak(recovery_dry_run)
+        require_combined_preparation_peak(recovery_dry_run, port)
 
         after = completion(port, args.predict, args.request_timeout)
         before_hash = content_hash(before)
@@ -3195,7 +3223,7 @@ def validate_transient_combined_failure(
             True,
         )
         require_combined_preparation_peak(
-            recovery_dry_run, include_transient=True
+            recovery_dry_run, port, include_transient=True
         )
         require_rollback_message(failure, failure_kind)
 
