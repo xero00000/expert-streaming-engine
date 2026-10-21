@@ -256,8 +256,12 @@ static void ggml_cpy_q4_0_f32_cuda(
     const int nb03, const int ne10, const int ne11, const int ne12,
     const int nb10, const int nb11, const int nb12, const int nb13,
     cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
-    const int num_blocks = ne;
-    cpy_q_f32<cpy_blck_q_f32<dequantize_q4_0, QK4_0>, QK4_0><<<num_blocks, 1, 0, stream>>>(
+    // One thread expands one packed block, not one logical value. Keep the
+    // same per-block arithmetic/strides and destination-pointer indirection,
+    // while covering the packed blocks with full CUDA thread blocks.
+    constexpr int threads = 128;
+    const int num_blocks = (ne / QK4_0 + threads - 1) / threads;
+    cpy_q_f32<cpy_blck_q_f32<dequantize_q4_0, QK4_0>, QK4_0><<<num_blocks, threads, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
          ne10, ne11, ne12, nb10, nb11, nb12, nb13, cdst_indirect, graph_cpynode_index++);
 }

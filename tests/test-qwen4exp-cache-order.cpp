@@ -86,6 +86,43 @@ static void packed_host_gather_case(ggml_backend_t compute, ggml_backend_t cpu, 
     ggml_backend_sched_free(sched); ggml_backend_buffer_free(input_buffer); ggml_free(ctx); ggml_free(leaves);
 }
 
+static void q4_copy_destination_replay(ggml_backend_t backend, int width, int heads, int rows) {
+    auto * ctx = ggml_init({2*1024*1024, nullptr, true}); require(ctx, "Q4 copy context");
+    auto * storage = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, width+32, heads+1, rows+2);
+    const size_t source_offset = storage->nb[2] + ggml_type_size(GGML_TYPE_Q4_0);
+    auto * source = ggml_view_3d(ctx, storage, width, rows, heads, storage->nb[2], storage->nb[1], source_offset);
+    const size_t pitch = width+11, head_pitch = pitch*rows+13;
+    auto * destination = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_pitch*heads+128);
+    auto * view = ggml_view_3d(ctx, destination, width, rows, heads, pitch*sizeof(float), head_pitch*sizeof(float), 32*sizeof(float));
+    auto * copy = ggml_cpy(ctx, source, view);
+    auto * graph = ggml_new_graph_custom(ctx, 64, false); ggml_build_forward_expand(graph, copy);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend); require(buffer, "Q4 copy allocation");
+    std::vector<float> values(ggml_nelements(storage)), actual(ggml_nelements(destination)), expected(actual.size()), decoded(width);
+    std::vector<uint8_t> payload(ggml_nbytes(storage));
+    for (int round = 0; round < 3; ++round) {
+        for (size_t i = 0; i < values.size(); ++i) values[i] = std::sin(float(i)*.019f+round)*7.f;
+        ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), payload.data(), 0,
+                storage->ne[1]*storage->ne[2], storage->ne[0], nullptr, nullptr);
+        ggml_backend_tensor_set(storage, payload.data(), 0, payload.size());
+        std::fill(expected.begin(), expected.end(), -9999.25f);
+        ggml_backend_tensor_set(destination, expected.data(), 0, expected.size()*sizeof(float));
+        const size_t offset = 32+round*5;
+        view->data = static_cast<float *>(destination->data)+offset;
+        copy->data = view->data;
+        for (int head = 0; head < heads; ++head) for (int row = 0; row < rows; ++row) {
+            dequantize_row_q4_0(reinterpret_cast<const block_q4_0 *>(
+                    payload.data()+source_offset+row*source->nb[1]+head*source->nb[2]), decoded.data(), width);
+            std::copy(decoded.begin(), decoded.end(), expected.begin()+offset+head*head_pitch+row*pitch);
+        }
+        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "Q4 copy replay compute");
+        ggml_backend_tensor_get(destination, actual.data(), 0, actual.size()*sizeof(float));
+        require(std::memcmp(actual.data(), expected.data(), actual.size()*sizeof(float)) == 0,
+                "Q4 copy changed row bits, guard bytes or captured destination");
+    }
+    std::printf("q4_copy_replay: width=%d heads=%d rows=%d strided rows/heads and changed destinations exact\n", width, heads, rows);
+    ggml_backend_buffer_free(buffer); ggml_free(ctx);
+}
+
 static void gather_case(ggml_backend_t backend, ggml_type type, int width, int heads, int rows) {
     auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
     require(ctx, "context");
@@ -350,6 +387,9 @@ int main(int argc, char ** argv) {
         for (int width : {32, 256}) for (int heads : {1, 2}) for (int rows : {1, 17, 256, 2304})
             packed_host_gather_case(backend, host_backend, width, heads, rows);
         if (host_backend != backend) ggml_backend_free(host_backend);
+        q4_copy_destination_replay(backend, 32, 1, 1);
+        q4_copy_destination_replay(backend, 256, 2, 17);
+        q4_copy_destination_replay(backend, 256, 2, 2304);
         validate_formats();
         for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32}) for (int width : {63, 64, 256})
             for (int heads : {1, 2, 4}) for (int rows : {1, 17, 256})

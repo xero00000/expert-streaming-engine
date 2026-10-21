@@ -1308,3 +1308,42 @@ not the three-start qualification. The full model prompt has fewer than
 lifecycle remain unqualified, despite the 2304-row operator fixtures and
 successful worst-case constructor reservation. Keep the path opt-in and the
 release gate closed. The 41.2 / 41.84 tok/s thresholds are still unmet.
+
+
+### Task 4 — Q4 expansion launch geometry
+
+`nsight-packed-host-fullprompt` traces three frozen 552-token requests with
+32 generated tokens, separately from all builds. Its approximate final
+decode window excludes prompt/startup time (last GPU-kernel end minus engine
+prediction time). The window contains 31 actual GPU decode steps for the
+32 output tokens. BF16-to-F32 conversion consumes 253 ms of summed kernel
+time, small explicit BF16 projections 150 ms, and Q4-to-F32 copies 205 ms
+across 744 copies. API waits overlap GPU work and are not additional costs.
+Raw traces, reports and `warm-decode-summary.json` are retained; traced
+throughput is excluded from qualification.
+
+The Q4 copy launch uses `num_blocks = ne` and one thread per CUDA block,
+while each thread handles QK4_0=32 values and immediately returns beyond
+`ne`. This dispatch launches roughly 32 times too many single-thread blocks.
+The revised launch uses 128 threads and ceil((ne/32)/128) blocks. The exact
+same per-thread packed-block routine, strides, output arithmetic, graph-copy
+function identity and destination-pointer indirection are retained. No
+precision or capture guard is relaxed.
+
+The cache-order suite now also changes a captured CPY destination within its
+existing allocation across three replays. Tests cover width 32 / one row
+(partial launch), width 256 / 17 and 2304 rows / two heads, padded/interleaved
+source and destination strides, exact independent CPU Q4 dequantization and
+untouched guards. These pass on CPU and all three cards, together with all
+packed-handoff and preceding gather cases (`q4-launch-copy-tests*.log/json`).
+The strict ubatch-128 / 1M model control and full workload follow.
+
+
+`q4-copy-launch-strict-reference33` matches all 8,194,560 logits, routes
+and IDs bitwise with the ubatch-128 / 1M reference. The separately timed
+`workload-1m-q4-copy-launch-passive4` completes 552/128 twice at 13.630 /
+18.408 tok/s, versus the preceding 12.491 / 16.364. Both output hashes remain
+unchanged. This remains a one-start/two-request diagnostic; the three-start
+qualification and speed thresholds remain open. The launch fix preserves
+existing precision and applies to Q4_0->F32 copies without an experiment
+flag; the host-cache handoff and native model policies remain opt-in.
