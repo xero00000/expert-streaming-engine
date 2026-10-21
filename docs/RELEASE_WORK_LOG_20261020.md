@@ -1044,3 +1044,66 @@ KQ/softmax/VQ attention onto the CPU. The next opt-in experiment explicitly
 places those computations on each layer GPU while retaining bounded host row
 gathers. It has not yet been built or qualified in this entry. All speed and
 publication holds remain active.
+
+
+### Task 4 — GPU attention and native top-10 CUDA capture
+
+- Explicit layer-GPU placement of KQ, softmax, VQ and their merged output
+  retains host row gathering. With the opt-in disabled, behavior is unchanged.
+  `gpu-attention-strict-reference33` reproduces all 8,194,560 logits, 1,584
+  routes and IDs exactly against the strict Q4/1M occupied-cell control.
+- `workload-1m-gpu-attention-passive4` completes 552/128 twice at 12.535 /
+  13.672 tok/s and 12.06 / 8.25 seconds TTFT. Outputs replay exactly within
+  this runtime, but their hash differs from the CPU-attention full workload.
+  The short strict replay does not qualify the longer native-policy output.
+  This remains well below the agreed speed thresholds.
+- A separate short Nsight run identifies substantial launch/synchronization
+  overhead. In its approximate final-request window, BF16-to-F32 weight
+  conversion consumes 130.7 ms across 4,096 kernels; explicit BF16 projections
+  consume 78.4 ms. The runtime makes 37,457 individual kernel launch calls and
+  4,720 stream synchronizations. These are trace diagnostics, not acceptance
+  timings. Commands and the window query result are retained in
+  `nsight-gpu-attention/`.
+- An old indexed-node capture restriction rejects top-10 routes even though
+  the recently optimized single-token Q2_0 path now routes entirely on-device.
+  An opt-in capture exception checks that exact geometry, input contiguity,
+  types, original precision policy, CUDA buffer ownership and same-device
+  operands. Other indexed geometries keep the old capture restriction.
+- The top-10 oracle now changes both inputs and IDs through six replays for
+  each of two output dimensions (including the actual 640→2560 projection).
+  All twelve rounds pass exactly against independent single-route calls on
+  each of the 2080 SUPER, 3060 Ti and 3080. Sparse negative IDs also remain
+  exactly zero. Each backend reports an instantiated cached CUDA graph.
+  The matched full-model workload follows these checks separately.
+
+Runtime identities, source diffs, raw SSE and commands remain under
+`task4/qwen4exp-iq2-restore/`. Native activation arithmetic, GPU attention and
+indexed capture remain explicit experiments. No result qualifies release.
+
+
+The initial Q2_0-only capture diagnostic completes 552/128 twice at 13.035 /
+13.773 tok/s and preserves both output hashes from the preceding GPU-attention
+runtime. Its first TTFT is 21.73 seconds and repeat TTFT 8.37 seconds. The small
+speed difference is not a qualification result. Inspection finds a second
+legacy restriction on the broadcast IQ up/gate nodes, which can disable the
+same graph before reaching its Q2_0 down projection. The next bounded capture
+exception covers only the selected IQ2_S/IQ2_XXS/IQ1_M broadcast inputs, with
+matching real-shape replay controls; it does not change their arithmetic or
+extend the per-route activation dispatch to those formats.
+
+
+The extended capture controls pass on all three GPUs: 30 changing-input/route
+rounds are byte identical to the same indexed operations on a second backend
+with CUDA graphs disabled, and all 12 Q2_0 rounds additionally retain exact
+single-route parity. Initial IQ up/gate comparisons to a differently tiled
+single-route operation fail both with capture enabled and disabled; those
+controls are retained. The capture oracle consequently compares the same
+pre-existing indexed geometry with/without capture, without changing the
+Q2_0 oracle or any model-reference tolerance.
+
+`workload-1m-capture-native-passive4` then completes 552/128 twice at 13.569 /
+13.940 tok/s, with 10.38 / 8.30 seconds TTFT. Both output hashes match the
+preceding GPU-attention and Q2_0-only capture workloads exactly. The effect is
+modest, and the 41.2 / 41.84 tok/s thresholds remain unmet. The bounded capture
+exception stays opt-in (`ESE_CUDA_CAPTURE_INDEXED_MMVQ=1`). The selected native
+arithmetic and long-context policies still require independent qualification.

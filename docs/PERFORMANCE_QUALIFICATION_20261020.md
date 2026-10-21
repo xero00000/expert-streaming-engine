@@ -526,3 +526,14 @@ without forced expert fallbacks or sampled process swap. These use opt-in native
 activation arithmetic and remain diagnostics below the unchanged 80% target.
 A separate strict F32-cache placement control is byte identical across all
 8,194,560 logits and 1,584 routes; it does not qualify the native arithmetic.
+
+
+Later bounded metadata scans, explicit GPU attention and opt-in selected
+native-expert CUDA graph capture complete the same 552/128 diagnostics at
+13.569 / 13.940 tok/s (10.38 / 8.30 s TTFT). Capture preserves the preceding
+native-policy output hashes, and 30 changing-route/input capture controls are
+byte identical to uncaptured execution on each GPU. GPU attention matches the
+strict 33-token Q4/1M control exactly but changes the longer native-policy
+output. These are intermediate diagnostics, below the unchanged target;
+shared-prefix snapshot isolation also fails on both the old and new runtimes.
+No filled-context, native-policy quality or release qualification is claimed.

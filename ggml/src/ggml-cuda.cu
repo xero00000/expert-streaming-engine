@@ -5349,6 +5349,40 @@ static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & 
     return graph.get();
 }
 
+// The single-token indexed MMVQ dispatch quantizes activations and reads
+// route IDs entirely on the GPU. Broadcast up/gate inputs and the Q2_0
+// top-10 down path need no host readback.
+// Keep the older capture restriction for every other indexed geometry.
+static bool ggml_cuda_capture_indexed_mmvq(const ggml_tensor * node) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("ESE_CUDA_CAPTURE_INDEXED_MMVQ");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled || node->op != GGML_OP_MUL_MAT_ID) return false;
+    const auto * w = node->src[0];
+    const auto * x = node->src[1];
+    const auto * ids = node->src[2];
+    if (!w || !x || !ids) return false;
+    const bool native_up = x->ne[1] == 1 &&
+            (w->type == GGML_TYPE_IQ2_S || w->type == GGML_TYPE_IQ2_XXS || w->type == GGML_TYPE_IQ1_M);
+    const bool native_down = w->type == GGML_TYPE_Q2_0 && x->ne[1] == ids->ne[0];
+    if ((!native_up && !native_down) || x->type != GGML_TYPE_F32 ||
+            ids->type != GGML_TYPE_I32 || node->type != GGML_TYPE_F32 ||
+            ids->ne[0] != 10 || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            x->ne[2] != 1 || x->ne[3] != 1 ||
+            x->ne[0] % QK8_1 != 0 || !ggml_is_contiguous(x) || node->ne[2] != 1 ||
+            ggml_expert_f32_enabled(node)) return false;
+    int device = -1;
+    for (const auto * tensor : {w, x, ids, node}) {
+        if (!tensor->buffer || !ggml_backend_buffer_is_cuda(tensor->buffer) ||
+                ggml_backend_buft_is_cuda_split(tensor->buffer->buft)) return false;
+        const auto * context = static_cast<const ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
+        if (device < 0) device = context->device;
+        else if (context->device != device) return false;
+    }
+    return true;
+}
+
 static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph * graph, ggml_cgraph * cgraph,
     bool use_cuda_graph, cudaStream_t stream) {
 
@@ -5382,7 +5416,8 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
             continue;
         }
 
-        if (node->op == GGML_OP_MUL_MAT_ID && (node->ne[2] != 1 || node->src[2]->ne[0] != 1)) {
+        if (node->op == GGML_OP_MUL_MAT_ID && (node->ne[2] != 1 || node->src[2]->ne[0] != 1) &&
+                !ggml_cuda_capture_indexed_mmvq(node)) {
             use_cuda_graph = false; // This node type is not supported by CUDA graph capture
 #ifndef NDEBUG
             GGML_CUDA_LOG_DEBUG("%s(%s): disabling CUDA graphs due to unsupported node type %ld %ld\n",
