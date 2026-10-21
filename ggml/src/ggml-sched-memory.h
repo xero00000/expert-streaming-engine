@@ -18,6 +18,7 @@ GGML_API bool ggml_backend_sched_set_graph_memory_budget(
 // Split and assign backends without allocating graph arenas, then commit that
 // prepared reservation. Used to admit backend-private workspace before arenas.
 GGML_API void ggml_backend_sched_prepare_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+GGML_API bool ggml_backend_sched_measure_prepared(ggml_backend_sched_t sched, uint64_t * bytes, size_t count);
 GGML_API bool ggml_backend_sched_reserve_prepared(ggml_backend_sched_t sched);
 
 #ifdef __cplusplus

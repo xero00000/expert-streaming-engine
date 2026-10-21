@@ -72,6 +72,16 @@ static void independent() {
     check(ggml_gallocr_reserve_n(alloc,old.graph,nodes,leaves) && ggml_gallocr_alloc_graph(alloc,old.graph),"initial reserve");
     old.initialize();check(old.exact(cpu),"initial exact");auto * old_buffer=old.input->buffer;auto * old_output=old.output->data;
     const auto a=stats(alloc,0),b=stats(alloc,1);const auto first_live=first.live,second_live=second.live;
+    const auto before_calls0=first.calls,before_calls1=second.calls;
+    uint64_t sizing[2]={0,0};
+    check(ggml_gallocr_measure_n(alloc,large.graph,nodes,leaves,sizing,2),"native arena measurement");
+    check(sizing[0]>a.allocated_bytes && sizing[1]>b.allocated_bytes,"native arena requirements missing");
+    check(first.calls==before_calls0 && second.calls==before_calls1 && first.live==first_live && second.live==second_live,
+          "measurement allocated buffer storage");
+    check(stats(alloc,0).required_bytes==a.required_bytes && stats(alloc,1).required_bytes==b.required_bytes,
+          "measurement changed committed diagnostics");
+    check(ggml_gallocr_alloc_graph(alloc,old.graph) && old.exact(cpu),"measurement changed retained layout/output");
+    check(!ggml_gallocr_measure_n(alloc,large.graph,nodes,leaves,sizing,1),"measurement accepted incomplete output array");
     second.fail_next=true;
     check(!ggml_gallocr_reserve_n(alloc,large.graph,nodes,leaves),"allocation failure ignored");
     check(second.failures==1 && first.live==first_live && second.live==second_live,"failed candidate/old arena ownership");
@@ -79,6 +89,7 @@ static void independent() {
     check(ggml_gallocr_alloc_graph(alloc,old.graph) && old.exact(cpu),"failed reservation replaced committed layout");
     check(!ggml_gallocr_alloc_graph(alloc,large.graph),"failed graph published oversized layout");
     const auto measured=stats(alloc,0);check(measured.required_bytes>a.allocated_bytes,"failed measurement missing");
+    check(measured.required_bytes==sizing[0] && stats(alloc,1).required_bytes==sizing[1],"measurement differs from actual reserve layout");
     check(!ggml_gallocr_set_buffer_budget(alloc,0,a.allocated_bytes-1) &&
           ggml_gallocr_set_buffer_budget(alloc,0,a.allocated_bytes+measured.required_bytes-1),"quota live bound");
     const auto calls0=first.calls,calls1=second.calls;

@@ -363,3 +363,12 @@ Focused CPU planner/recovery regressions and automatic 4 GiB CPU startup,
 two cold inference requests and exact probability replay pass in a working
 build. Final committed-source CPU/CUDA/sanitizer checks and the original GPU
 reproducer are next; task 3 remains open until those results are recorded.
+
+
+The first repair (`90cd89815`) clears the missing-context preflight rejection
+but the original GPU trial then exposed missing **host graph backing** in GPU
+plans. That failed trial remains in `task3/host-plan-fix/automatic-2080/`.
+The follow-up measures the allocator's actual native arena layout without
+allocating buffers or altering committed layouts, reserves host arena peaks
+separately from fixed metadata, and reconciles optional cache capacity during
+startup. No arbitrary margin or relaxed memory admission is introduced.

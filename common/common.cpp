@@ -4600,7 +4600,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         limits->ple_cache_reservation_bytes = plan.qwen4exp_ple_ram_bytes;
         limits->other_reservation_bytes = plan.expert_ram_bytes + plan.aux_ram_bytes + plan.io_staging_bytes;
         limits->weights_reservation_bytes = plan.ram_planned_bytes-limits->fixed_reservation_bytes-
-            limits->ple_cache_reservation_bytes-limits->other_reservation_bytes;
+            limits->ple_cache_reservation_bytes-limits->other_reservation_bytes-plan.host_graph_workspace_bytes;
         state.params.cache_ram_mib = int32_t(plan.aux_ram_bytes/(1024ULL*1024ULL));
         return true;
     };

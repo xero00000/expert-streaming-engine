@@ -1218,6 +1218,12 @@ void test_native_host_context_reservation() {
     REQUIRE(plan.aux_ram_bytes == 8*MiB);
     REQUIRE(plan.ram_planned_bytes == 15*MiB+123);
     REQUIRE(nlohmann::json::parse(common_resource_plan_json(plan)).at("host_context_metadata_bytes") == MiB+123);
+    auto graph_plan = plan;
+    required.graph_bytes = 3*MiB;
+    REQUIRE(common_resource_plan_reserve_host_context(graph_plan, required, error));
+    REQUIRE(graph_plan.host_graph_workspace_bytes == 3*MiB && graph_plan.aux_ram_bytes == 5*MiB);
+    REQUIRE(graph_plan.ram_planned_bytes == 15*MiB+123);
+    required.graph_bytes = 0;
     // Admission must account for host KV even when the plan has only GPU rows.
     required.kv_bytes = MiB;
     REQUIRE(common_resource_plan_reserve_host_context(plan, required, error));
@@ -1280,6 +1286,10 @@ void test_host_graph_metadata_reservation() {
     REQUIRE(common_resource_preparation_peak_json(report) == previous);
     changed = plan;
     changed.host_context_metadata_bytes++;
+    REQUIRE(!common_resource_rebalance_preparation_peak(plan, changed, report, error, false, false, &host));
+    REQUIRE(common_resource_preparation_peak_json(report) == previous);
+    changed = plan;
+    changed.host_graph_workspace_bytes++;
     REQUIRE(!common_resource_rebalance_preparation_peak(plan, changed, report, error, false, false, &host));
     REQUIRE(common_resource_preparation_peak_json(report) == previous);
     input.host_graph_metadata_bytes = UINT64_MAX;

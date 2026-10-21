@@ -638,7 +638,7 @@ bool common_resource_plan_reserve_host_context(common_resource_plan & plan,
     auto candidate = plan;
     uint64_t reserved = 0;
     for (uint64_t bytes : {plan.expert_ram_bytes, plan.aux_ram_bytes, plan.io_staging_bytes,
-            plan.qwen4exp_ple_ram_bytes, plan.host_graph_metadata_bytes, plan.host_context_metadata_bytes}) {
+            plan.qwen4exp_ple_ram_bytes, plan.host_graph_metadata_bytes, plan.host_context_metadata_bytes, plan.host_graph_workspace_bytes}) {
         if (!add_checked(reserved, bytes)) {
             error = "startup host reservations overflow"; return false;
         }
@@ -658,14 +658,18 @@ bool common_resource_plan_reserve_host_context(common_resource_plan & plan,
     }
     // Host graph and KV payloads live in the host device row rather than in
     // ram_planned_bytes. A GPU plan can still contain host-resident KV layers.
-    uint64_t host_workspace = 0, host_kv = 0;
+    uint64_t host_workspace = 0, host_graph = 0, host_kv = 0;
     for (const auto & device : plan.devices) if (device.id < 0) {
         for (uint64_t bytes : {device.graph_bytes, device.expert_cache_bytes,
                 device.expert_prefill_staging_bytes, device.transient_bytes}) {
             if (!add_checked(host_workspace, bytes)) { error = "host startup workspace overflows"; return false; }
         }
+        if (!add_checked(host_graph, device.graph_bytes)) { error = "host graph forecast overflows"; return false; }
         if (!add_checked(host_kv, device.kv_bytes)) { error = "host startup KV overflows"; return false; }
     }
+    const uint64_t measured_extra = required.graph_bytes > host_graph ? required.graph_bytes-host_graph : 0;
+    candidate.host_graph_workspace_bytes = std::max(plan.host_graph_workspace_bytes, measured_extra);
+    if (!add_checked(base, candidate.host_graph_workspace_bytes)) { error = "host graph workspace overflows"; return false; }
     uint64_t combined = base;
     if (!add_checked(combined, host_workspace) || !add_checked(combined, std::max(host_kv, required.kv_bytes)) ||
             combined > plan.ram_capacity_bytes) {
@@ -1315,12 +1319,14 @@ bool common_resource_rebalance_preparation_peak(
     if (current.ram_capacity_bytes != target.ram_capacity_bytes ||
             current.ram_planned_bytes != target.ram_planned_bytes ||
             current.host_graph_metadata_bytes != target.host_graph_metadata_bytes ||
-            current.host_context_metadata_bytes != target.host_context_metadata_bytes) {
+            current.host_context_metadata_bytes != target.host_context_metadata_bytes ||
+            current.host_graph_workspace_bytes != target.host_graph_workspace_bytes) {
         error = "runtime rebalance cannot change immutable RAM capacity or reservations";
         return false;
     }
     if (current.host_graph_metadata_bytes > current.ram_planned_bytes ||
-            current.host_context_metadata_bytes > current.ram_planned_bytes-current.host_graph_metadata_bytes) {
+            current.host_context_metadata_bytes > current.ram_planned_bytes-current.host_graph_metadata_bytes ||
+            current.host_graph_workspace_bytes > current.ram_planned_bytes-current.host_graph_metadata_bytes-current.host_context_metadata_bytes) {
         error = "host metadata exceeds the serialized RAM reservation";
         return false;
     }
@@ -1544,12 +1550,13 @@ bool common_resource_rebalance_preparation_peak(
                     current.aux_ram_bytes != target.aux_ram_bytes ||
                     current.io_staging_bytes != target.io_staging_bytes ||
                     current.host_graph_metadata_bytes != target.host_graph_metadata_bytes ||
-                    current.host_context_metadata_bytes != target.host_context_metadata_bytes) {
+                    current.host_context_metadata_bytes != target.host_context_metadata_bytes ||
+                    current.host_graph_workspace_bytes != target.host_graph_workspace_bytes) {
                 error = "tracked host preparation cannot change immutable RAM reservations";
                 return false;
             }
             for (const uint64_t bytes : {current.expert_ram_bytes, current.qwen4exp_ple_ram_bytes,
-                    current.aux_ram_bytes, current.io_staging_bytes, current.host_graph_metadata_bytes, current.host_context_metadata_bytes}) {
+                    current.aux_ram_bytes, current.io_staging_bytes, current.host_graph_metadata_bytes, current.host_context_metadata_bytes, current.host_graph_workspace_bytes}) {
                 if (!add_checked(other_reservations, bytes)) {
                     error = "host RAM reservations overflow 64-bit accounting";
                     return false;
@@ -1563,7 +1570,8 @@ bool common_resource_rebalance_preparation_peak(
             candidate.ram_host_weights_limit_bytes = std::max(weight_reservation, tracked_host->weights_bytes);
             uint64_t host_fixed_reservation = host_graph_forecast;
             if (!add_checked(host_fixed_reservation, current.host_graph_metadata_bytes) ||
-                    !add_checked(host_fixed_reservation, current.host_context_metadata_bytes)) {
+                    !add_checked(host_fixed_reservation, current.host_context_metadata_bytes) ||
+                    !add_checked(host_fixed_reservation, current.host_graph_workspace_bytes)) {
                 error = "host metadata reservation overflows fixed RAM accounting";
                 return false;
             }
@@ -1637,6 +1645,7 @@ std::string common_resource_plan_json(const common_resource_plan & plan) {
     out << ",\"ram_planned_bytes\":" << plan.ram_planned_bytes;
     out << ",\"host_graph_metadata_bytes\":" << plan.host_graph_metadata_bytes;
     out << ",\"host_context_metadata_bytes\":" << plan.host_context_metadata_bytes;
+    out << ",\"host_graph_workspace_bytes\":" << plan.host_graph_workspace_bytes;
     out << ",\"expert_ram_bytes\":" << plan.expert_ram_bytes;
     out << ",\"qwen4exp_ple_ram_bytes\":" << plan.qwen4exp_ple_ram_bytes;
     out << ",\"aux_ram_bytes\":" << plan.aux_ram_bytes;

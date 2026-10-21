@@ -66,6 +66,11 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// Measure the native arena layout without allocating buffers, charging quotas,
+// or changing the committed layout/diagnostics. One byte count per buffer ID.
+GGML_API bool ggml_gallocr_measure_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
+        const int * node_buffer_ids, const int * leaf_buffer_ids, uint64_t * bytes, size_t count);
+
 struct ggml_gallocr_buffer_stats {
     uint64_t allocated_bytes;
     uint64_t peak_allocated_bytes;

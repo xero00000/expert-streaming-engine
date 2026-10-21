@@ -1540,6 +1540,9 @@ static std::map<const llama_context *, llama_host_memory_control> llama_host_mem
 static bool llama_resource_get_memory_pools_impl(const llama_context * ctx,
         llama_resource_memory_pool * pools, uint32_t capacity, uint32_t * count);
 static bool llama_kv_tracked_metadata(const llama_kv_cache & cache, uint64_t cells, uint64_t & bytes);
+static bool llama_host_reconcile_startup(llama_context & ctx, uint64_t incoming_kv,
+        uint64_t incoming_fixed, uint64_t incoming_graph,
+        llama_context_host_planner planner, void * planner_data);
 static bool llama_host_preflight_context(llama_context & ctx, const llama_context_params & params,
         ggml_type type_k, ggml_type type_v, uint32_t kv_size,
         llama_context_host_planner planner, void * planner_data);
@@ -10509,6 +10512,19 @@ static struct llama_context * llama_init_from_model(
                                    __func__,i,workspace[i]/double(1024*1024));
                 }
 #endif
+                if (planner) {
+                    std::vector<uint64_t> measured(ctx->backends.size());
+                    if (!ggml_backend_sched_measure_prepared(ctx->sched, measured.data(), measured.size())) return false;
+                    uint64_t host_peak = 0;
+                    for (size_t i = 0; i < measured.size(); ++i) if (ggml_backend_is_cpu(ctx->backends[i])) {
+                        ggml_gallocr_buffer_stats stats = {};
+                        if (!ggml_backend_sched_get_graph_buffer_stats(ctx->sched, int(i), &stats)) return false;
+                        const uint64_t extra = measured[i] > stats.allocated_bytes ? measured[i] : 0;
+                        if (extra > UINT64_MAX-stats.allocated_bytes || stats.allocated_bytes+extra > UINT64_MAX-host_peak) return false;
+                        host_peak += stats.allocated_bytes+extra;
+                    }
+                    if (!llama_host_reconcile_startup(*ctx, 0, 0, host_peak, planner, planner_data)) return false;
+                }
                 // Pool backing and cuBLAS handles now consume real memory.
                 // Refresh arena/shared caps before committing any candidate.
                 if(!configure_graph_budgets()) return false;
@@ -10642,6 +10658,8 @@ static struct llama_context * llama_init_from_model(
     if (cparams.mtp && (hparams.nextn_predict_layers > 0 || model->arch == LLM_ARCH_DEEPSEEK4)) {
         if (llama_output_reserve(*ctx, cparams.n_batch) < cparams.n_batch) return nullptr;
     }
+    if (!llama_host_reconcile_startup(*ctx, 0, 0, 0, planner, planner_data) ||
+            !llama_host_refresh_graph_budget(*ctx)) return nullptr;
     uint64_t host_total = 0;
     if (!llama_host_projected_memory(*ctx, 0, 0, false, host_total)) return nullptr;
     return owner.release();
@@ -12401,6 +12419,47 @@ static bool llama_kv_tracked_metadata(const llama_kv_cache & cache, uint64_t cel
     return true;
 }
 
+static bool llama_host_reconcile_startup(llama_context & ctx, uint64_t incoming_kv,
+        uint64_t incoming_fixed, uint64_t incoming_graph,
+        llama_context_host_planner planner, void * planner_data) {
+    if (!planner) return true;
+    llama_host_memory_control control;
+    if (!llama_host_control(ctx, control)) return false;
+    uint64_t live_graph = 0;
+    llama_context_host_requirements required = {0, 0, incoming_fixed, incoming_kv, incoming_graph};
+    uint32_t count = 0;
+    if (!llama_resource_get_memory_pools_impl(&ctx, nullptr, 0, &count)) return false;
+    std::vector<llama_resource_memory_pool> pools(count);
+    if (!llama_resource_get_memory_pools_impl(&ctx, pools.data(), count, &count)) return false;
+    for (const auto & pool : pools) {
+        if (pool.backend_id != -1 || pool.category == LLAMA_RESOURCE_MEMORY_MAPPED_WEIGHTS) continue;
+        uint64_t * value = &required.fixed_bytes;
+        if (pool.category == LLAMA_RESOURCE_MEMORY_WEIGHTS) value = &required.weights_bytes;
+        else if (pool.category == LLAMA_RESOURCE_MEMORY_PLE_CACHE) value = &required.ple_cache_bytes;
+        else if (pool.category == LLAMA_RESOURCE_MEMORY_KV || pool.category == LLAMA_RESOURCE_MEMORY_KV_TRANSACTION)
+            value = &required.kv_bytes;
+        else if (pool.category == LLAMA_RESOURCE_MEMORY_GRAPH) {
+            if (pool.bytes > UINT64_MAX-live_graph) return false;
+            live_graph += pool.bytes; continue;
+        }
+        if (pool.bytes > UINT64_MAX-*value) return false;
+        *value += pool.bytes;
+    }
+    required.graph_bytes = std::max(required.graph_bytes, live_graph);
+    auto revised = control.limits;
+    if (!planner(&required, &revised, planner_data) || revised.capacity_bytes != control.limits.capacity_bytes) return false;
+    uint64_t reserved = 0;
+    for (uint64_t value : {revised.weights_reservation_bytes, revised.ple_cache_reservation_bytes,
+            revised.other_reservation_bytes, revised.fixed_reservation_bytes}) {
+        if (value > UINT64_MAX-reserved) return false;
+        reserved += value;
+    }
+    if (reserved > revised.capacity_bytes) return false;
+    std::lock_guard<std::mutex> lock(llama_host_memory_mutex);
+    llama_host_memory_controls.at(&ctx).limits = revised;
+    return true;
+}
+
 static bool llama_host_preflight_context(llama_context & ctx, const llama_context_params & params,
         ggml_type type_k, ggml_type type_v, uint32_t kv_size,
         llama_context_host_planner planner, void * planner_data) {
@@ -12436,37 +12495,7 @@ static bool llama_host_preflight_context(llama_context & ctx, const llama_contex
         const uint64_t output = (logits+embeddings)*outputs*sizeof(float);
         const uint64_t ids = uint64_t(normalized.n_batch)*sizeof(int32_t);
         if (ids > UINT64_MAX-metadata || output > UINT64_MAX-(metadata+ids)) return false;
-        if (planner) {
-            // Use the same native preparation and tracked inventory as admission,
-            // after placement and context normalization are known. No optional
-            // application cache has been allocated at this point.
-            llama_context_host_requirements required = {0, 0, metadata+ids+output, kv};
-            uint32_t count = 0;
-            if (!llama_resource_get_memory_pools_impl(&ctx, nullptr, 0, &count)) return false;
-            std::vector<llama_resource_memory_pool> pools(count);
-            if (!llama_resource_get_memory_pools_impl(&ctx, pools.data(), count, &count)) return false;
-            for (const auto & pool : pools) {
-                if (pool.backend_id != -1 || pool.category == LLAMA_RESOURCE_MEMORY_MAPPED_WEIGHTS) continue;
-                uint64_t * value = &required.fixed_bytes;
-                if (pool.category == LLAMA_RESOURCE_MEMORY_WEIGHTS) value = &required.weights_bytes;
-                else if (pool.category == LLAMA_RESOURCE_MEMORY_PLE_CACHE) value = &required.ple_cache_bytes;
-                else if (pool.category == LLAMA_RESOURCE_MEMORY_KV || pool.category == LLAMA_RESOURCE_MEMORY_KV_TRANSACTION)
-                    value = &required.kv_bytes;
-                if (pool.bytes > UINT64_MAX-*value) return false;
-                *value += pool.bytes;
-            }
-            auto revised = control.limits;
-            if (!planner(&required, &revised, planner_data) || revised.capacity_bytes != control.limits.capacity_bytes) return false;
-            uint64_t reserved = 0;
-            for (uint64_t value : {revised.weights_reservation_bytes, revised.ple_cache_reservation_bytes,
-                    revised.other_reservation_bytes, revised.fixed_reservation_bytes}) {
-                if (value > UINT64_MAX-reserved) return false;
-                reserved += value;
-            }
-            if (reserved > revised.capacity_bytes) return false;
-            std::lock_guard<std::mutex> lock(llama_host_memory_mutex);
-            llama_host_memory_controls.at(&ctx).limits = revised;
-        }
+        if (!llama_host_reconcile_startup(ctx, kv, metadata+ids+output, 0, planner, planner_data)) return false;
         uint64_t total = 0;
         return llama_host_projected_memory(ctx, kv, metadata+ids+output, false, total);
     } catch (...) { return false; }

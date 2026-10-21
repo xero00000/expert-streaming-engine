@@ -676,15 +676,17 @@ extern "C" {
             struct llama_context_params params,
             const struct llama_context_host_limits * limits);
 
-    // Called once with native startup requirements, before allocating KV,
-    // outputs or computation graphs. May resize application reservations;
-    // the original capacity remains an immutable ceiling. Returning false
-    // rejects initialization. The ordinary admission checks still apply.
+    // Called during startup before KV allocation, for measured graph layouts,
+    // and at final reconciliation. Application caches must remain unallocated
+    // until initialization returns. May resize their reservations; the original
+    // capacity remains immutable. False rejects initialization. Native admission
+    // checks still apply. No callback runs during subsequent inference.
     struct llama_context_host_requirements {
         uint64_t weights_bytes;
         uint64_t ple_cache_bytes;
         uint64_t fixed_bytes;
         uint64_t kv_bytes;
+        uint64_t graph_bytes; // Host arena peak, separate from non-graph fixed storage.
     };
     typedef bool (*llama_context_host_planner)(
             const struct llama_context_host_requirements * requirements,

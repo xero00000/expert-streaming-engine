@@ -6897,6 +6897,11 @@ void ggml_backend_sched_prepare_reserve(ggml_backend_sched_t sched, struct ggml_
     ggml_backend_sched_split_graph(sched, measure_graph);
 }
 
+bool ggml_backend_sched_measure_prepared(ggml_backend_sched_t sched, uint64_t * bytes, size_t count) {
+    return sched && ggml_gallocr_measure_n(sched->galloc, &sched->graph,
+            sched->node_backend_ids, sched->leaf_backend_ids, bytes, count);
+}
+
 bool ggml_backend_sched_reserve_prepared(ggml_backend_sched_t sched) {
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;

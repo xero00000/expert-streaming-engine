@@ -599,7 +599,7 @@ static void run_host_planner(const fixture & file) {
         data = {}; data.mode = mode;
         std::unique_ptr<llama_context, decltype(&llama_free)> ctx(
             llama_init_from_model_with_host_planner(model.get(), cp, &limits, planner, &data), llama_free);
-        check(data.calls == 1, "host planner was not called exactly once");
+        check(data.calls >= 1 && (mode == 0 || data.calls == 1), "host planner callback phase count changed");
         check(data.required.fixed_bytes > 0 && data.required.weights_bytes > 0 && data.required.kv_bytes > 0,
             "host planner omitted native requirements");
         check(bool(ctx) == (mode == 0), "host planner admission/capacity/rejection boundary changed");

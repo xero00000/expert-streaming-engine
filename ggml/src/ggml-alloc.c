@@ -685,7 +685,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
-static bool ggml_gallocr_reserve_n_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+static bool ggml_gallocr_reserve_n_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool measure_only) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -769,6 +769,7 @@ static bool ggml_gallocr_reserve_n_impl(ggml_gallocr_t galloc, struct ggml_cgrap
         const uint64_t required = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i]);
         galloc->buffer_stats[i].required_bytes = required;
     }
+    if (measure_only) return true;
     for (int i = 0; i < galloc->n_buffers; ++i) {
         bool alias = false;
         for (int j = 0; j < i; ++j) if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) alias = true;
@@ -855,7 +856,7 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
         prepared->ledgers[i] = galloc->ledgers[i];
         ggml_memory_budget_retain(prepared->ledgers[i]);
     }
-    if (!ggml_gallocr_reserve_n_impl(prepared, graph, node_buffer_ids, leaf_buffer_ids)) {
+    if (!ggml_gallocr_reserve_n_impl(prepared, graph, node_buffer_ids, leaf_buffer_ids, false)) {
         // Diagnostics describe the failed measurement; committed plans and
         // arenas stay untouched and remain usable by the previously built graph.
         memcpy(galloc->buffer_stats, prepared->buffer_stats, galloc->n_buffers * sizeof(galloc->buffer_stats[0]));
@@ -876,6 +877,16 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
     ggml_gallocr_drop_shared_buffers(prepared, galloc);
     ggml_gallocr_free(prepared);
     return true;
+}
+
+bool ggml_gallocr_measure_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
+        const int * node_buffer_ids, const int * leaf_buffer_ids, uint64_t * bytes, size_t count) {
+    if (!galloc || !graph || !bytes || count != (size_t)galloc->n_buffers) return false;
+    ggml_gallocr_t measured = ggml_gallocr_new_n(galloc->bufts, galloc->n_buffers);
+    const bool ok = ggml_gallocr_reserve_n_impl(measured, graph, node_buffer_ids, leaf_buffer_ids, true);
+    if (ok) for (int i = 0; i < measured->n_buffers; ++i) bytes[i] = measured->buffer_stats[i].required_bytes;
+    ggml_gallocr_free(measured);
+    return ok;
 }
 
 bool ggml_gallocr_set_memory_budget(ggml_gallocr_t galloc,int buffer_id,ggml_memory_budget_t ledger) {

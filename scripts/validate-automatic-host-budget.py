@@ -92,7 +92,7 @@ def main() -> int:
             if plan.get('host_context_metadata_bytes', 0) <= 0:
                 raise RuntimeError('native context reservation is missing')
             reserved = sum(plan[key] for key in ('expert_ram_bytes', 'aux_ram_bytes', 'io_staging_bytes',
-                'qwen4exp_ple_ram_bytes', 'host_graph_metadata_bytes', 'host_context_metadata_bytes'))
+                'qwen4exp_ple_ram_bytes', 'host_graph_metadata_bytes', 'host_context_metadata_bytes', 'host_graph_workspace_bytes'))
             weights = plan['ram_planned_bytes']-reserved
             host = [p for p in snapshot['memory_inventory']['pools'] if p['device_id'] == -1]
             tracked_weights = sum(p['bytes'] for p in host if p['category'] == 0)

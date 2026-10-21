@@ -141,6 +141,7 @@ struct common_resource_plan {
     uint64_t host_graph_metadata_bytes = 0;
     // Native model/context/KV bookkeeping and initial output storage beyond graph metadata.
     uint64_t host_context_metadata_bytes = 0;
+    uint64_t host_graph_workspace_bytes = 0;
 };
 
 // Finalize optional host cache capacity from native startup requirements.
