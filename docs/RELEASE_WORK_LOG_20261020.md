@@ -125,3 +125,11 @@ pass. The social preview PNG is prepared; its repository setting is unchanged.
    the versioned GitHub release; verify the uploaded assets before publishing.
 5. Verify the public release, download links and updater feeds; record the
    exact merge/tag/release identities and any remaining qualification limits.
+
+
+Final publication identities and live status are recorded by
+[PR #23](https://github.com/xero00000/expert-streaming-engine/pull/23), the
+[versioned release](https://github.com/xero00000/expert-streaming-engine/releases/tag/v0.2.1)
+and its release provenance file. The release body and all updater feeds contain
+the ESE-focused update summary. Original package bytes, hashes and signatures
+are unchanged.

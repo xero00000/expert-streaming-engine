@@ -82,11 +82,12 @@ state; it is not a generated conversation or performance demonstration.
 The [beginner guide](docs/START_HERE.md) walks through your first launch and
 explains the unfamiliar terms along the way.
 
-**Release status:** the v0.2.1 desktop installers are prepared and locally
-checked; publication is pending. The latest published release may be older.
-Always use the instructions, package and checksums for the version you download.
+**Release:** the v0.2.1 desktop installers include ESE Studio, the launcher
+and matching native runtimes. Get the packages and checksums from the
+[versioned release page](https://github.com/xero00000/expert-streaming-engine/releases/tag/v0.2.1).
+Always use the instructions and checksums for the version you download.
 
-| Your system | v0.2.1 candidate package |
+| Your system | v0.2.1 package |
 | --- | --- |
 | Windows x64 | `ESE-Studio_0.2.1_windows-x64-setup.exe` or MSI; both include CPU and CUDA runtimes |
 | Linux x86_64, CPU | `ESE-Studio_0.2.1_linux-x86_64_cpu.AppImage`, DEB or RPM |
@@ -126,7 +127,7 @@ are deferred. [Current candidate scope](docs/RELEASE_CANDIDATE_REVIEW_20261021.m
 - **Start with the supported desktop path.** Linux and Windows x86_64 packages
   are prepared. Linux CUDA checks cover the recorded NVIDIA hardware; Windows
   GPU inference, AMD/Intel acceleration and macOS are not qualified by this
-  candidate. [Check your PC](docs/WHAT_CAN_MY_PC_RUN.md).
+  release. [Check your PC](docs/WHAT_CAN_MY_PC_RUN.md).
 
 ## Prefer the command line?
 

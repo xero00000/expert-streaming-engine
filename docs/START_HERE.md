@@ -7,13 +7,13 @@ helps you find it, launch it and start a conversation.
 ## 1. Install the right package
 
 Open the [releases page](https://github.com/xero00000/expert-streaming-engine/releases)
-and check the version. The v0.2.1 candidate is prepared but unpublished; an
-older published release has its own instructions and verified scope.
+and choose v0.2.1 for these instructions. Older releases have their own
+instructions and verified scope.
 
 Follow the [installation guide](install.md) for your system. Linux has separate
 CPU and NVIDIA CUDA packages. Windows installers contain both runtimes and can
 select the CPU runtime when NVIDIA hardware is unavailable. Physical Windows
-GPU inference remains unqualified for the current candidate.
+GPU inference remains unqualified for the current release.
 
 Download the checksum file for the same release and verify your package before
 running it. The installation guide includes the exact commands. Model files
@@ -75,7 +75,7 @@ commands and APIs, use the [engineering guide](ENGINEERING_GUIDE.md).
 | A model marked Validation gated | Use a supported model; experimental production gates remain in place |
 | Not enough memory | Close other GPU-heavy apps, select a smaller model file or lower context, then inspect the plan again |
 | Slow replies | Check model size, available RAM, SSD activity and actual GPU use; streaming trades memory for data movement |
-| A package is missing from a release | Check that the instructions match the published version; candidate filenames are not a published download |
+| A package is missing from a release | Check that the instructions match the published version; use the package list for that exact version |
 
 Model searches/downloads use Hugging Face and update checks use GitHub. Chat
 uses the local ESE endpoint. Any external agent apps you add have their own
