@@ -83,5 +83,11 @@ The toolchain component lock records its authoritative NVIDIA manifest; the
 archive installation approach follows NVIDIA's
 [binary archive documentation](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#tarball-and-zip-archive-deliverables).
 
-No publication occurs merely by preparing these files locally. The user's
-publication hold remains active.
+No publication occurs merely by preparing these files locally. The user
+authorized the 0.2.1 merge and release after qualification. Its original locally
+qualified package source is retained in every index and manifest; the final
+integration commit is recorded separately in release provenance. The difference
+must contain documentation/presentation only. A manual publication of these
+qualified bytes does not claim they were rebuilt from the integration commit
+or passed a separate hosted package build. Automated fresh tag builds still
+require their own exact source indices and complete package checks.

@@ -45,17 +45,16 @@ first conversation and common terms. [Installation](install.md) gives exact
 package commands. [The engineering guide](ENGINEERING_GUIDE.md) retains the
 former README's deeper commands, policies and historical measurements.
 
-The v0.2.1 candidate remains unpublished. The downloads link points to the
-release list rather than a candidate binary that is not publicly available.
+The downloads link points to the release list. Versioned release notes contain
+the exact package links; the work log records publication status.
 Windows GPU inference remains explicitly deferred/unqualified; production Qwen
 admission stays OFF. Signed updater checks and Authenticode status are separate.
 
 ## Publishing this presentation
 
-The user authorized pushing the checked update after this rebrand. The
-repository's protected `main` follows the [PR merge policy](BRANCH_POLICY.md),
-so push the consolidated review branch without bypassing protection. The
-README and new guides become the default repository presentation after merge.
+The user authorized merging the checked rebrand and publishing the update. The
+repository's protected `main` follows the [PR merge policy](BRANCH_POLICY.md).
+The README and new guides become the default presentation through PR integration.
 Update the repository About description/topics to match the copy above. The PNG
 is prepared for the social preview setting; creating the file does not mean
 that setting has been changed.

@@ -166,3 +166,15 @@ checked update. This supersedes the earlier source-push hold. The consolidated
 review branch can be pushed; protected `main` follows the PR merge policy.
 Release tagging and installer publication remain paused. Physical Windows GPU
 inference and long workload checks remain deferred and unqualified.
+
+
+### v0.2.1 publication authorization — 2026-10-22 UTC
+
+The user authorized merging and publishing the checked update after the release
+log review. This supersedes the earlier publication hold. Retain the original
+qualified package source, confirm unchanged product inputs at integration, and
+verify all uploaded packages, updater signatures and feeds before publication.
+Physical Windows NVIDIA inference and long workload tests remain deferred and
+unqualified. The duplicate hosted Windows rebuild is cancelled under the
+no-multi-hour-repeat scope; local acceptance and hosted merge checks are
+reported separately.

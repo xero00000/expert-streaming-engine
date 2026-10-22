@@ -1,11 +1,10 @@
 # ESE 0.2.1 candidate review — 21 October 2026
 
-Unpublished release candidate. The user subsequently authorized pushing the
-checked source update after the GitHub presentation rebrand. Release tags and
-installer publication remain paused; hosted CI has not run. All eight packages, their source indices, checksums and updater
-feeds are prepared and pass local software qualification. The user explicitly
-deferred physical Windows NVIDIA inference: it remains unqualified. The agreed
-local work list is complete, and work pauses here before release.
+The user authorized merging and publishing ESE 0.2.1 after the release-log
+review. All eight packages, source indices, checksums and updater feeds pass
+local software qualification. Physical Windows NVIDIA inference is explicitly
+deferred and remains unqualified. The release retains original package build
+identities and records the integration commit separately.
 
 Product/package source freeze:
 `2ff6389928fb701ad9331275682529cf5896645b` on
@@ -68,9 +67,10 @@ not claimed.
 The complete `SHA256SUMS` covers eight packages and three signature files.
 `release-manifest.json`, both variant feeds, the legacy CPU feed and Windows
 checksums are in `final-2ff638992-release-assets/`. All three artifact-set indices
-identify the same full source freeze. The directory is private and unpublished.
+identify the same full source freeze. The original local staging directory is retained; release publication uses its
+verified bytes and unchanged source indices.
 
-## Release hold and deferred qualification
+## Publication authorization and deferred qualification
 
 The user explicitly instructed **“Lets skip that test for now”** in response
 to the physical Windows NVIDIA test question. It is deferred for this candidate
@@ -79,12 +79,12 @@ storage, USB and Ethernet; no passthrough or host device change was attempted.
 This decision supersedes the earlier unresolved scope question.
 
 All agreed local qualification tasks are complete. The user subsequently
-requested a newcomer-focused GitHub rebrand and authorized a source push. The
-consolidated review branch can be pushed under that instruction; protected
-`main` still follows the PR merge policy. Release tags and installer publication
-remain paused. Hosted workflow execution is not claimed as passed.
-Long context/concurrency runs remain deferred and production Qwen admission
-stays OFF.
+authorized PR integration and publication. [PR #23](https://github.com/xero00000/expert-streaming-engine/pull/23)
+records the merge checks. The lengthy hosted Windows rebuild is redundant with
+the actual local package/install/update qualification and is cancelled under
+the user's instruction to avoid multi-hour repeat passes; it is not claimed
+as a hosted pass. Shorter merge checks are recorded separately. Long workload
+checks remain deferred and production Qwen admission stays OFF.
 
 ## Evidence
 
@@ -121,7 +121,7 @@ Paths are relative to the private evidence root
   verification; only its public signature is sent back to the clone.
 - `final-2ff638992-release-assets/`: complete eight-package staging, three
   original source indices, 11 package/signature digests and six metadata files.
-  No asset has been uploaded.
+  Original asset identities remain unchanged through release upload.
 
 See the [work log](RELEASE_WORK_LOG_20261020.md) for retained failures and the
 [package contract](RELEASE_PACKAGE_CONTRACT.md) for the required deliverable.
@@ -155,5 +155,5 @@ Prepared tag message:
 > Windows NVIDIA inference and extended workload qualification are deferred;
 > experimental Qwen admission remains disabled in production builds.
 
-These are local drafts only. No PR or tag has been created. The source-push
-authorization does not represent release tagging or installer publication.
+The user authorized using the reviewed content for PR integration and release
+publication. The work log records the actual PR, tag and release outcome.
