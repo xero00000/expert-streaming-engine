@@ -110,8 +110,8 @@ std::vector<float> run(ggml_backend_t backend,
     auto b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, T, H, 1);
     auto s = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, D * H, 1, 1);
     // The model graph normalizes Q/K before invoking the fused operator.  The
-    // CUDA kernel relies on that contract; the CPU fallback defensively
-    // normalizes again, which is numerically idempotent.
+    // CPU and CUDA kernels both preserve that caller-owned normalization;
+    // normalizing again is not idempotent for additive-epsilon small vectors.
     auto q_norm = ggml_l2_norm(ctx, q, 1.0e-12f);
     auto k_norm = ggml_l2_norm(ctx, k, 1.0e-12f);
     auto result = ggml_delta_net(ctx, q_norm, k_norm, v, g, b, s, nullptr);

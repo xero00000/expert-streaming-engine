@@ -87,6 +87,8 @@ static void test_normalize_quotes_with_embedded_quotes(testing & t);
 // TAG_WITH_TAGGED argument parsing tests
 static void test_tagged_args_with_embedded_quotes(testing & t);
 
+static void test_deepseek_v41_tools(testing & t);
+
 int main(int argc, char * argv[]) {
     testing t(std::cout);
     t.verbose = true;
@@ -97,6 +99,7 @@ int main(int argc, char * argv[]) {
         t.set_filter(argv[1]);
     }
 
+    t.test("deepseek_v41_tools", test_deepseek_v41_tools);
     t.test("diff_split", test_calculate_diff_split);
     t.test("common_prefix", test_until_common_prefix);
     t.test("common_suffix", test_after_common_suffix);
@@ -2312,5 +2315,34 @@ static void test_cohere2moe_parser(testing & t) {
         t.assert_equal("parallel : tool 0 id",   std::string("0"),                parallel_msg.tool_calls[0].id);
         t.assert_equal("parallel : tool 1 name", std::string("python"),           parallel_msg.tool_calls[1].name);
         t.assert_equal("parallel : tool 1 id",   std::string("1"),                parallel_msg.tool_calls[1].id);
+    }
+}
+
+static void test_deepseek_v41_tools(testing & t) {
+    std::ifstream file("models/templates/deepseek-ai-DeepSeek-V4.1-chat.jinja");
+    std::string source((std::istreambuf_iterator<char>(file)), {});
+    common_chat_templates_ptr tmpls(common_chat_templates_init(nullptr, source));
+    common_chat_templates_inputs inputs;
+    common_chat_msg user;
+    user.role = "user"; user.content = "Hello";
+    inputs.messages = {user}; inputs.enable_thinking = false;
+    inputs.tools = {{"lookup", "Look up a city", R"({"type":"object","properties":{"city":{"type":"string"},"count":{"type":"integer"}},"required":["city","count"]})"}};
+    auto params = common_chat_templates_apply(tmpls.get(), inputs);
+    common_peg_arena arena; arena.load(params.parser);
+    common_chat_parser_params pp(params); pp.parser = arena;
+    auto text = common_chat_parse("Hello!", false, pp);
+    t.assert_equal("greeting with tools", std::string("Hello!"), text.content);
+    const std::string output =
+        "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n"
+        "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n"
+        "<｜DSML｜ parameter name=\"count\" string=\"false\">1</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    auto tool = common_chat_parse(output, false, pp);
+    t.assert_equal("one parsed tool call", size_t(1), tool.tool_calls.size());
+    if (tool.tool_calls.size() == 1) {
+        t.assert_equal("tool name", std::string("lookup"), tool.tool_calls[0].name);
+        auto args = nlohmann::json::parse(tool.tool_calls[0].arguments);
+        t.assert_equal("string argument", std::string("Tokyo"), args.at("city").get<std::string>());
+        t.assert_equal("numeric argument", 1, args.at("count").get<int>());
     }
 }

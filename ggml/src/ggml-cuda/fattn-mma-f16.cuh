@@ -2,6 +2,16 @@
 #include "cp-async.cuh"
 #include "mma_new.cuh"
 #include "fattn-common.cuh"
+#include <cstdlib>
+#include <cstring>
+
+static inline bool ggml_cuda_fattn_stable_batch_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("ESE_CUDA_ATTENTION_STABLE_BATCH");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
 
 using namespace ggml_cuda_mma;
 
@@ -149,6 +159,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int ne01,
         const int ne02,
         const int stride_KV,
+        const int stride_V,
         const int stride_mask,
         const int jt,
         half2        * const __restrict__ tile_K,
@@ -176,7 +187,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #ifdef CP_ASYNC_AVAILABLE
     cp_async_wait_all();
     __syncthreads();
-    flash_attn_ext_f16_load_tile<D, nwarps, KQ_per_iter>(V_h2 + k_VKQ_0*stride_KV, tile_V, stride_KV);
+    flash_attn_ext_f16_load_tile<D, nwarps, KQ_per_iter>(V_h2 + k_VKQ_0*stride_V, tile_V, stride_V);
 #else
     if (ncols2 > 1 || mask_h2) {
         flash_attn_ext_f16_load_mask<ncols1, nwarps, KQ_per_iter>(mask_h2 + k_VKQ_0/2, tile_mask, stride_mask);
@@ -400,7 +411,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         flash_attn_ext_f16_load_tile<D, nwarps, KQ_per_iter>(K_h2 + (k_VKQ_0 + KQ_per_iter)*stride_KV, tile_K, stride_KV);
     }
 #else
-    flash_attn_ext_f16_load_tile<D, nwarps, KQ_per_iter>(V_h2 + k_VKQ_0*stride_KV, tile_V, stride_KV);
+    flash_attn_ext_f16_load_tile<D, nwarps, KQ_per_iter>(V_h2 + k_VKQ_0*stride_V, tile_V, stride_V);
     __syncthreads();
 #endif // CP_ASYNC_AVAILABLE
 
@@ -434,7 +445,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     GGML_UNUSED(Q_f2); GGML_UNUSED(K_h2); GGML_UNUSED(V_h2);
     GGML_UNUSED(mask_h2); GGML_UNUSED(dstk); GGML_UNUSED(dstk_fixup);
     GGML_UNUSED(scale); GGML_UNUSED(slope); GGML_UNUSED(logit_softcap);
-    GGML_UNUSED(ne01); GGML_UNUSED(ne02); GGML_UNUSED(stride_KV);
+    GGML_UNUSED(ne01); GGML_UNUSED(ne02); GGML_UNUSED(stride_KV); GGML_UNUSED(stride_V);
     GGML_UNUSED(stride_mask); GGML_UNUSED(jt); GGML_UNUSED(tile_K);
     GGML_UNUSED(stride_mask); GGML_UNUSED(jt); GGML_UNUSED(tile_K);
     GGML_UNUSED(tile_V); GGML_UNUSED(tile_mask); GGML_UNUSED(Q_B);
@@ -462,6 +473,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int stride_Q1,
         const int stride_Q2,
         const int stride_KV,
+        const int stride_V,
         const int stride_mask,
         const int jt,
         const int kb0_start,
@@ -580,13 +592,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr bool last_iter = false;
         flash_attn_ext_f16_iter<D, ncols1, ncols2, nwarps, KQ_per_iter, ntiles, use_logit_softcap, needs_fixup, is_fixup, last_iter>
             (Q_f2, K_h2, V_h2, mask_h2, dstk, dstk_fixup, scale, slope, logit_softcap, fa_offset,
-             ne01, ne02, stride_KV, stride_mask, jt, tile_K, tile_V, tile_mask, Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0);
+             ne01, ne02, stride_KV, stride_V, stride_mask, jt, tile_K, tile_V, tile_mask, Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0);
     }
     { // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
         constexpr bool last_iter = true;
         flash_attn_ext_f16_iter<D, ncols1, ncols2, nwarps, KQ_per_iter, ntiles, use_logit_softcap, needs_fixup, is_fixup, last_iter>
             (Q_f2, K_h2, V_h2, mask_h2, dstk, dstk_fixup, scale, slope, logit_softcap, fa_offset,
-             ne01, ne02, stride_KV, stride_mask, jt, tile_K, tile_V, tile_mask, Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0_stop-1);
+             ne01, ne02, stride_KV, stride_V, stride_mask, jt, tile_K, tile_V, tile_mask, Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0_stop-1);
     }
 
     // With cp_async there is no __syncthreads at the end of the iter,
@@ -883,7 +895,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     GGML_UNUSED(mask_h2); GGML_UNUSED(dstk); GGML_UNUSED(dstk_fixup);
     GGML_UNUSED(scale); GGML_UNUSED(slope); GGML_UNUSED(logit_softcap);
     GGML_UNUSED(ne01); GGML_UNUSED(ne02); GGML_UNUSED(stride_Q1);
-    GGML_UNUSED(stride_Q2); GGML_UNUSED(stride_KV); GGML_UNUSED(stride_mask);
+    GGML_UNUSED(stride_Q2); GGML_UNUSED(stride_KV); GGML_UNUSED(stride_V); GGML_UNUSED(stride_mask);
     GGML_UNUSED(jt); GGML_UNUSED(kb0_start); GGML_UNUSED(kb0_stop);
     NO_DEVICE_CODE;
 #endif // INT8_MMA_AVAILABLE
@@ -907,7 +919,7 @@ static __global__ void flash_attn_mma_ext_f16(
         const float logit_softcap,
         const float fa_offset,
         const uint32_t n_head_log2,
-        const int ne00, const int ne01, const int ne02, const int ne03,
+        const int ne00, const int ne01_full, const int ne02, const int ne03,
         const int ne10, const int ne11, const int ne12, const int ne13,
         const int ne31, const int nb31,
         const int nb01, const int nb02, const int nb03,
@@ -924,11 +936,22 @@ static __global__ void flash_attn_mma_ext_f16(
 
     static_assert(FATTN_KQ_STRIDE % KQ_per_iter == 0, "bad KQ_per_iter");
 
+    const int first_query = gridDim.y > 1 ? blockIdx.y*ncols1 : 0;
+    const int ne01 = gridDim.y > 1 ? min(ncols1, ne01_full - first_query) : ne01_full;
+    if (gridDim.y > 1) {
+        Q += int64_t(first_query)*nb01;
+        if (mask) mask += int64_t(first_query)*nb31;
+        if (bounds) bounds += blockIdx.y;
+        dst += int64_t(first_query)*ne02*D;
+        dst_meta += int64_t(blockIdx.y)*gridDim.x*(ncols1*ncols2)*(2 + D/2);
+    }
+
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
 
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
     const int stride_KV   = nb11 / sizeof(half2);
+    const int stride_V    = nb21 / sizeof(half2);
     const int stride_mask = nb31 / sizeof(half2);
 
     const int iter_k = ne11 / FATTN_KQ_STRIDE;
@@ -953,7 +976,7 @@ static __global__ void flash_attn_mma_ext_f16(
 
         const float2 * Q_f2    = (const float2 *) (Q + nb02* channel*ncols2);
         const half2  * K_h2    = (const half2  *) (K + nb12*(channel*ncols2 / gqa_ratio));
-        const half2  * V_h2    = (const half2  *) (V + nb12*(channel*ncols2 / gqa_ratio)); // K and V have same shape
+        const half2  * V_h2    = (const half2  *) (V + nb22*(channel*ncols2 / gqa_ratio));
         const half2  * mask_h2 = ncols2 > 1 || mask ? (const half2  *) mask + int64_t(nb31/sizeof(half2))*jt*ncols1 : nullptr;
         float2       * dstk    = ((float2 *) dst) + channel*(ncols2 * D/2);
         const float  * sinks_f = sinks ? (const float *) sinks + channel * ncols2 : nullptr;
@@ -973,12 +996,12 @@ static __global__ void flash_attn_mma_ext_f16(
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<D, ncols1, ncols2, nwarps, KQ_per_iter, ntiles, use_logit_softcap, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h2, sinks_f, dstk, dst_meta, scale, slope, logit_softcap, fa_offset,
-                 ne01, ne02, stride_Q1, stride_Q2, stride_KV, stride_mask, jt, kb0_start_kernel, kb0_stop_kernel);
+                 ne01, ne02, stride_Q1, stride_Q2, stride_KV, stride_V, stride_mask, jt, kb0_start_kernel, kb0_stop_kernel);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is working on the beginning of a tile.
             flash_attn_ext_f16_process_tile<D, ncols1, ncols2, nwarps, KQ_per_iter, ntiles, use_logit_softcap, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h2, sinks_f, dstk, dst_meta, scale, slope, logit_softcap, fa_offset,
-                 ne01, ne02, stride_Q1, stride_Q2, stride_KV, stride_mask, jt, kb0_start_kernel, kb0_stop_kernel);
+                 ne01, ne02, stride_Q1, stride_Q2, stride_KV, stride_V, stride_mask, jt, kb0_start_kernel, kb0_stop_kernel);
         }
 
         kbc += iter_k;
@@ -997,7 +1020,7 @@ static __global__ void flash_attn_mma_ext_f16(
 
     const float2 * Q_f2    = (const float2 *) (Q + nb02* channel*ncols2);
     const half2  * K_h2    = (const half2  *) (K + nb12*(channel*ncols2 / gqa_ratio));
-    const half2  * V_h2    = (const half2  *) (V + nb12*(channel*ncols2 / gqa_ratio)); // K and V have same shape
+    const half2  * V_h2    = (const half2  *) (V + nb22*(channel*ncols2 / gqa_ratio));
     const half2  * mask_h2 = ncols2 > 1 || mask ? (const half2  *) mask + (nb31/sizeof(half2))*jt*ncols1 : nullptr;
     float2       * dstk    = ((float2 *) dst) + channel*(ncols2 * D/2);
     const float  * sinks_f = sinks ? (const float *) sinks + channel*ncols2 : nullptr;
@@ -1015,13 +1038,13 @@ static __global__ void flash_attn_mma_ext_f16(
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<D, ncols1, ncols2, nwarps, KQ_per_iter, ntiles, use_logit_softcap, needs_fixup, is_fixup>
         (Q_f2, K_h2, V_h2, mask_h2, sinks_f, dstk, dst_meta, scale, slope, logit_softcap, fa_offset,
-         ne01, ne02, stride_Q1, stride_Q2, stride_KV, stride_mask, jt, kb0_start_kernel, kb0_stop_kernel);
+         ne01, ne02, stride_Q1, stride_Q2, stride_KV, stride_V, stride_mask, jt, kb0_start_kernel, kb0_stop_kernel);
 #else
     GGML_UNUSED(Q); GGML_UNUSED(K); GGML_UNUSED(V); GGML_UNUSED(mask); GGML_UNUSED(sinks);
     GGML_UNUSED(dst); GGML_UNUSED(dst_meta); GGML_UNUSED(scale);
     GGML_UNUSED(max_bias); GGML_UNUSED(m0); GGML_UNUSED(m1);
     GGML_UNUSED(n_head_log2); GGML_UNUSED(logit_softcap); GGML_UNUSED(ne00);
-    GGML_UNUSED(ne01); GGML_UNUSED(ne02); GGML_UNUSED(ne03); GGML_UNUSED(ne10);
+    GGML_UNUSED(ne01_full); GGML_UNUSED(ne02); GGML_UNUSED(ne03); GGML_UNUSED(ne10);
     GGML_UNUSED(ne11); GGML_UNUSED(ne12); GGML_UNUSED(ne13); GGML_UNUSED(ne31);
     GGML_UNUSED(nb31); GGML_UNUSED(nb01); GGML_UNUSED(nb02); GGML_UNUSED(nb03);
     GGML_UNUSED(nb11); GGML_UNUSED(nb12); GGML_UNUSED(nb13); GGML_UNUSED(nb21);
@@ -1034,12 +1057,19 @@ static __global__ void flash_attn_mma_ext_f16(
 template<int D, int ncols1, int ncols2, int KQ_stride> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_mma_stream_k_fixup(
-        float * __restrict__ dst, const float2 * __restrict__ dst_fixup, const int ne01, const int ne02, const int ne11) {
+        float * __restrict__ dst, const float2 * __restrict__ dst_fixup, const int ne01_full, const int ne02, const int ne11) {
     constexpr int ncols = ncols1*ncols2;
 
     const int bidx0 = blockIdx.x;
     const int j     = blockIdx.y;
-    const int c     = blockIdx.z;
+    const int query_group = blockIdx.z / ncols2;
+    const int c     = blockIdx.z % ncols2;
+    const int first_query = query_group*ncols1;
+    const int ne01 = gridDim.z > ncols2 ? min(ncols1, ne01_full - first_query) : ne01_full;
+    if (gridDim.z > ncols2) {
+        dst += int64_t(first_query)*ne02*D;
+        dst_fixup += int64_t(query_group)*gridDim.x*ncols*(2 + D/2);
+    }
     const int jc    = j*ncols2 + c;
     const int tid   = threadIdx.x;
 
@@ -1349,6 +1379,9 @@ void launch_fattn_mma(
 
     const int ntiles_x = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int ntiles_total = ntiles_x * (Q->ne[2] / ncols2) * Q->ne[3];
+    const bool stable_batch = stream_k && ncols == 8 && Q->ne[1] <= 32 &&
+                              n_swa == 0 && ggml_cuda_fattn_stable_batch_enabled();
+    const int partition_tiles = stable_batch ? Q->ne[2] / ncols2 : ntiles_total;
 
     if (mask && (Q->ne[1] >= 1024 || (n_swa > 0 && K->ne[1] >= FATTN_KQ_STRIDE + n_swa))) {
         const int s31 = mask->nb[1] / sizeof(half2);
@@ -1372,9 +1405,9 @@ void launch_fattn_mma(
     dim3 blocks_num;
     if (stream_k) {
         // For short contexts it can be faster to have the SMs work on whole tiles because this lets us skip the fixup.
-        const int max_blocks = Q->ne[1] > 1 ? 2*nsm : nsm;
-        const int tiles_nwaves = (ntiles_total + max_blocks - 1) / max_blocks;
-        const int tiles_efficiency_percent = 100 * ntiles_total / (max_blocks*tiles_nwaves);
+        const int max_blocks = !stable_batch && Q->ne[1] > 1 ? 2*nsm : nsm;
+        const int tiles_nwaves = (partition_tiles + max_blocks - 1) / max_blocks;
+        const int tiles_efficiency_percent = 100 * partition_tiles / (max_blocks*tiles_nwaves);
 
         const int nblocks_stream_k = max_blocks;
 
@@ -1382,11 +1415,13 @@ void launch_fattn_mma(
         //  On my RTX-4080 the above is slightly slower for PP. It would be useful to try and see what happens on Blackwell
         const bool use_stream_k = tiles_efficiency_percent < 75 || Q->ne[1] > 2048;
 
-        blocks_num.x = use_stream_k ? nblocks_stream_k : ntiles_total;
-        blocks_num.y = 1;
+        blocks_num.x = use_stream_k ? nblocks_stream_k : partition_tiles;
+        blocks_num.y = stable_batch ? ntiles_x : 1;
         blocks_num.z = 1;
 
-        dst_tmp_meta.alloc(blocks_num.x*ncols * (2*2 + D) * sizeof(float));
+        // alloc() takes float2 elements, not bytes. Each group owns two
+        // max/rowsum arrays followed by one partial-output array.
+        dst_tmp_meta.alloc(size_t(blocks_num.x)*blocks_num.y*ncols*(2 + D/2));
     } else {
         GGML_ASSERT(K->ne[1] % KQ_row_granularity == 0);
         const int ntiles_KQ = K->ne[1] / KQ_row_granularity; // Max. number of parallel blocks limited by tensor size.
@@ -1470,9 +1505,9 @@ void launch_fattn_mma(
     CUDA_CHECK(cudaGetLastError());
 
     if (stream_k) {
-        if (ntiles_total % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
+        if (partition_tiles % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
             const dim3 block_dim_combine(D, 1, 1);
-            const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
+            const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2*blocks_num.y};
 
             flash_attn_mma_stream_k_fixup<D, ncols1, ncols2, KQ_stride>
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>

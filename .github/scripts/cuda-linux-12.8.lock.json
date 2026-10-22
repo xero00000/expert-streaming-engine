@@ -1,0 +1,36 @@
+{
+  "cuda_version": "12.8.0",
+  "source_manifest": "https://developer.download.nvidia.com/compute/cuda/redist/redistrib_12.8.0.json",
+  "packages": [
+    {
+      "name": "cuda_cudart",
+      "url": "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-12.8.57-archive.tar.xz",
+      "sha256": "5bd3ac35ea8e8ab880e595d5054ee373abf6d9e53dcb8cef0a5c75358dbc0ae2",
+      "bytes": 1343152
+    },
+    {
+      "name": "cuda_nvcc",
+      "url": "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/linux-x86_64/cuda_nvcc-linux-x86_64-12.8.61-archive.tar.xz",
+      "sha256": "145f8779bd56bdfa214447e5cb1b3a206ec1b7398da460e257f2898fd8604c54",
+      "bytes": 79032992
+    },
+    {
+      "name": "cuda_cccl",
+      "url": "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cccl/linux-x86_64/cuda_cccl-linux-x86_64-12.8.55-archive.tar.xz",
+      "sha256": "dce4f2e7720d4432ab0861ede2243f9cbd46bc675008932bc9dcdb871fc7d60b",
+      "bytes": 925460
+    },
+    {
+      "name": "libcublas",
+      "url": "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/linux-x86_64/libcublas-linux-x86_64-12.8.3.14-archive.tar.xz",
+      "sha256": "d634d545a670a43337741e1672b63ef9b989aaba15823f27ee4b4c7f43d790bb",
+      "bytes": 961034640
+    },
+    {
+      "name": "nccl",
+      "url": "https://developer.download.nvidia.com/compute/redist/nccl/v2.25.1/nccl_2.25.1-1+cuda12.8_x86_64.txz",
+      "sha256": "71550c68ede7a23f2d132a7d7ce2c83dc5425efc7432e1c70e0f650e5eeb47b5",
+      "bytes": 347936140
+    }
+  ]
+}

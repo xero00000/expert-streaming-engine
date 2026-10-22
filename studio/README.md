@@ -1,6 +1,6 @@
 # ESE Studio
 
-ESE Studio is the Linux and Windows desktop control center for Expert Streaming Engine. It replaces the legacy launcher presentation while keeping ESE as the model-planning and serving authority.
+ESE Studio is the Linux and Windows desktop control center for Expert Streaming Engine. Use it to see what your PC can run, inspect a launch plan and measure the result. ESE remains the technical model-planning and serving authority.
 
 This foundation includes:
 
@@ -19,7 +19,7 @@ This foundation includes:
 - per-trial checkpoints, cancellation/resume, exclusive-GPU safety, and active-model restoration;
 - one-click promotion of verified context, KV, and batch settings into future model launches;
 - optional, off-by-default sharing of sanitized verified-sweep summaries through **Help improve ESE**;
-- a bundled ESE launcher/native runtime and signed in-app updates with visible progress;
+- a bundled ESE launcher/native runtime and an updater interface that verifies signed artifacts;
 - privacy-safe prefilled GitHub bug reports from visible errors;
 - versioned TOML configuration in the operating system's application-config
   directory, with the exact path shown in Settings.
@@ -29,6 +29,11 @@ Sweep previews only describe the search matrix and never count as evidence. A ve
 Concurrent serving currently requires a dense resident plan. ESE refuses
 parallel MoE, hybrid, cache, and stream plans until their multi-sequence output
 parity gate passes; those modes continue to use one session safely.
+
+Qwen4Exp models are discovered with an **Experimental** badge and
+**Validation gated** availability. Normal builds disable their text inference,
+and Studio prevents launching them. Their vision and MTP capabilities are
+unsupported.
 
 Before a measured sweep starts, Studio stops its managed model and checks for
 unmanaged `llama-server` instances and external CUDA processes using at least
@@ -53,9 +58,27 @@ are recognized rather than overwritten. Use `HF_TOKEN` or
 
 ## Linux install
 
-The v0.2.0 AppImage, DEB, and RPM packages contain both Studio and ESE. Use the
-AppImage for signed in-app updating, or use the distribution package and apply
-future package updates through APT/DNF.
+The AppImage, DEB and RPM packages contain both Studio and ESE, with separate
+CPU and CUDA variants. New users can follow the [first conversation guide](../docs/START_HERE.md).
+The v0.2.1 candidate AppImage signatures and local installation/recovery checks
+were verified before publication. AppImage and Windows NSIS packages use signed
+automatic updates; DEB/RPM use their package manager. See the
+[installation guide](../docs/install.md) for exact filenames and verification limits.
+
+The Linux ESE launcher requires Python 3.10 or newer and the system OpenMP
+runtime. DEB and RPM packages declare these dependencies. AppImage users must
+provide them on the host (`python3` and `libgomp1` on Ubuntu/Debian, or `python3`
+and `libgomp` on Fedora). The AppImage also uses the host's graphical session.
+
+The CPU package runs without an NVIDIA driver. A Linux CUDA package bundles
+the CUDA runtime, cuBLAS, and linked NCCL shared libraries and their license
+notices; it requires a compatible NVIDIA driver on the host. The CUDA toolkit
+is required to build that package from source. Select a CPU package for a
+system without an NVIDIA driver.
+
+Use `pnpm package:linux` when building the Linux release packages. This entry
+point preserves NVIDIA runtime files and keeps host driver libraries out of
+the AppImage. Linux release packaging currently targets x86_64.
 
 For a local source build from the repository root, run:
 
@@ -82,7 +105,8 @@ pnpm tauri dev
 ## Windows source install
 
 The Windows installer bundles a CUDA-enabled ESE runtime for NVIDIA GPUs and
-falls back to the CPU backend when CUDA hardware is unavailable. Users do not
+includes a separate driver-independent CPU runtime selected when CUDA hardware
+is unavailable. Users do not
 need CMake, a compiler, Python, or the CUDA toolkit to run the installed app.
 The CUDA toolkit is only required when building the Windows package from
 source.
@@ -159,20 +183,42 @@ to the model server started by Studio.
 
 ## Release validation
 
+Use Node.js 22.22.2 (`../.node-version`), pnpm 11.19.0 (the
+`packageManager` field) and Rust 1.96.0 (`../rust-toolchain.toml`). CI uses
+the same versions. Keep `node_modules` local to this checkout; replacing a
+symlinked dependency tree can modify another worktree. Corepack users can
+run `corepack pnpm` in place of `pnpm`.
+
 ```bash
 pnpm install --frozen-lockfile
 pnpm build
 cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
-pnpm tauri build --bundles deb,rpm --config src-tauri/tauri.unsigned.conf.json       # Linux source package
+cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+cargo test --locked --manifest-path src-tauri/Cargo.toml
+pnpm package:linux --bundles appimage,deb,rpm --config src-tauri/tauri.unsigned.conf.json # Linux source packages
 pnpm tauri build --bundles nsis,msi --config src-tauri/tauri.unsigned.conf.json      # Windows source package
 ```
 
 GitHub Actions repeats these checks on Ubuntu and Windows and publishes the DEB,
 RPM, NSIS, and MSI packages as CI artifacts. The protected tagged-release
-workflow additionally builds the Linux AppImage, signs updater artifacts with
-`TAURI_SIGNING_PRIVATE_KEY`, generates `latest.json`, and attaches all packages,
-signatures, and platform checksum files to the GitHub release. The maintainer's
+workflow has separate Linux CPU/CUDA jobs, builds all six Linux packages and
+both Windows installers, and signs updater artifacts with
+`TAURI_SIGNING_PRIVATE_KEY`. Collection uses explicit platform/runtime names
+and records each package set's source commit, SHA-256 and byte count. Release
+preparation requires all eight packages from the tagged source commit before
+generating checksums or updater metadata.
+
+`pnpm package:linux` selects `latest-cpu.json` or `latest-cuda.json` from the
+native build's CMake configuration; an explicit mismatched
+`ESE_PACKAGE_VARIANT` is rejected before staging replaces an existing runtime.
+`ESE_RUNTIME_BUILD_DIR` selects exactly that build directory, without falling
+back to a different runtime. These feeds preserve the installed Linux variant.
+The legacy `latest.json` uses the CPU AppImage for older CPU installations and
+the dual-runtime Windows installer. AppImage automatic updates require signed
+artifacts; DEB/RPM users install the matching variant manually.
+
+The workflow attaches packages, signatures, provenance and checksum files to
+the GitHub release. Its implementation/local checks do not establish that new
+installers have been built, signed or qualified. The maintainer's
 recoverable private-key backup is stored outside the repository with mode
 `0600`; only the public key is committed.

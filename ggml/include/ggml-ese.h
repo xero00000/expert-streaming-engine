@@ -39,6 +39,14 @@ enum ggml_ese_route_role {
     GGML_ESE_ROUTE_CPU  = 2,
 };
 
+// Apply one shared I32 0/1 GPU-choice mask to the original route positions.
+// IDs and their weights retain their order; the CPU mask is its complement.
+GGML_API struct ggml_tensor * ggml_ese_route_partition_masked(
+        struct ggml_context * ctx,
+        struct ggml_tensor * ids,
+        struct ggml_tensor * gpu_mask,
+        enum ggml_ese_route_role role);
+
 // Identifies which heterogeneous branch consumes a partition tensor.
 GGML_API enum ggml_ese_route_role ggml_ese_route_get_role(
         const struct ggml_tensor * ids);

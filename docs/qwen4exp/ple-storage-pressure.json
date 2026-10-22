@@ -1,0 +1,69 @@
+{
+  "architecture": "qwen4exp",
+  "backend": "io_uring",
+  "cache_mib": 256,
+  "cache_state": "cold",
+  "elapsed_ns": 576051234565,
+  "iterations": 1,
+  "logical_quantized_bytes": 23592960,
+  "os_cache_control": "posix_fadvise_dontneed",
+  "page_cache": {
+    "admissions": 266528,
+    "capacity_bytes": 134217728,
+    "evictions": 233760,
+    "hits": 1164,
+    "misses": 266529,
+    "peak_resident_bytes": 134217728,
+    "pinned_capacity_failures": 0,
+    "resident_bytes": 134217728
+  },
+  "ple_wait_ns": {
+    "p50": 36212678,
+    "p95": 57560490,
+    "p99": 59639480
+  },
+  "pressure_seed": 1251732529,
+  "pressure_tokens_per_session": 4096,
+  "reads": {
+    "coalesced_reads": 1,
+    "failed_reads": 0,
+    "logical_bytes": 1091702784,
+    "logical_reads": 266529,
+    "peak_queue_depth": 70,
+    "peak_source_batch_width": 20,
+    "source_batches": 16384,
+    "source_bytes": 1091698688,
+    "source_reads": 266528,
+    "staging_capacity_bytes": 134217728,
+    "staging_peak_resident_bytes": 286720,
+    "staging_rejected_batches": 0,
+    "staging_resident_bytes": 0,
+    "submit_to_ready_p50_ns": 1122075,
+    "submit_to_ready_p95_ns": 1617057,
+    "submit_to_ready_p99_ns": 1710167
+  },
+  "row_cache": {
+    "admissions": 262047,
+    "capacity_bytes": 134217720,
+    "evictions": 0,
+    "hits": 97,
+    "misses": 262047,
+    "peak_resident_bytes": 23584230,
+    "pinned_capacity_failures": 0,
+    "resident_bytes": 23584230
+  },
+  "schema_version": 1,
+  "sessions": 4,
+  "storage_mode": "two-tier",
+  "synthetic_overlap_us": 0,
+  "token_latency_ns": {
+    "p50": 78975754,
+    "p95": 202444691,
+    "p99": 232806163
+  },
+  "tokens": 16384,
+  "tokens_per_second": 28.441914567498902,
+  "workers": 8,
+  "workload": "deterministic-pressure",
+  "evidence_sha256": "0327066e9d874f41d70ce12cedd7ad9c2101c189a370541786552952d6bf2c46"
+}

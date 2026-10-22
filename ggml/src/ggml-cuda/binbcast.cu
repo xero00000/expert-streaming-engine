@@ -292,8 +292,35 @@ static void ggml_cuda_op_bin_bcast(
     }
 }
 
+// Integer payloads cannot pass through half conversion: low/high halves may
+// encode NaNs, whose payload canonicalization changes valid row IDs.
+static __global__ void repeat_i32(const uint32_t * src, uint32_t * dst, int64_t count,
+        int64_t ne0, int64_t ne1, int64_t ne2,
+        int64_t se0, int64_t se1, int64_t se2, int64_t se3,
+        size_t sb1, size_t sb2, size_t sb3) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+            i < count; i += int64_t(gridDim.x) * blockDim.x) {
+        int64_t rest = i;
+        const int64_t x0 = rest % ne0; rest /= ne0;
+        const int64_t x1 = rest % ne1; rest /= ne1;
+        const int64_t x2 = rest % ne2; rest /= ne2;
+        dst[i] = src[x0 % se0 + (x1 % se1) * sb1 + (x2 % se2) * sb2 + (rest % se3) * sb3];
+    }
+}
+
 void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->type == dst->src[0]->type);
+    if (dst->type == GGML_TYPE_I32) {
+        const auto * src = dst->src[0];
+        GGML_ASSERT(src->nb[0] == sizeof(uint32_t) && ggml_is_contiguous(dst));
+        const int64_t count = ggml_nelements(dst);
+        const int blocks = int(std::min<int64_t>((count + 255) / 256, 65535));
+        repeat_i32<<<blocks, 256, 0, ctx.stream()>>>((const uint32_t *)src->data, (uint32_t *)dst->data, count,
+                dst->ne[0], dst->ne[1], dst->ne[2], src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                src->nb[1] / sizeof(uint32_t), src->nb[2] / sizeof(uint32_t), src->nb[3] / sizeof(uint32_t));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16) {
         ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_repeat>>(dst, dst->src[0], dst, nullptr, dst->src[0]->data, dst->data, ctx.stream());
         return;

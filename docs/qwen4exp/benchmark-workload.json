@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "architecture": "qwen4exp",
+  "date": "2026-10-05",
+  "purpose": "Canonical, engine-neutral workload for the Strata-comparable Qwen4Exp baseline (roadmap A6). tools/qwen4exp_benchmark_replay.py builds each engine's exact command line from this spec so a single feature toggle changes exactly one variable. Diagnostic only: the production loader gate stays closed and ESE Qwen4Exp output logits are not yet verified.",
+  "workload": {
+    "prompt_text": "Hi",
+    "prompt_token_ids": [
+      12675
+    ],
+    "context_length": 131072,
+    "n_predict": 128,
+    "decoding": "greedy",
+    "temperature": 0.0,
+    "seed": 1,
+    "logical_batch": 1024,
+    "ubatch": 128,
+    "devices": [
+      "CUDA0",
+      "CUDA2"
+    ],
+    "split_mode": "layer",
+    "tensor_split": "1,1",
+    "kv_precision_ese": "q8_0",
+    "kv_precision_strata": "int8"
+  },
+  "toggles": {
+    "phase": [
+      "prefill",
+      "decode"
+    ],
+    "cache_state": [
+      "cold",
+      "warm"
+    ],
+    "mtp": [
+      "on",
+      "off"
+    ],
+    "kv_policy": [
+      "resident",
+      "host"
+    ]
+  },
+  "ese": {
+    "binary": "/home/xero/Desktop/test/ESE-v0.2.1-qwen4exp-plan/build_qwen4exp_probe/bin/llama-cli",
+    "model": "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+    "probe_gate_env": "ESE_QWEN4EXP_PROBE_GATE",
+    "requires_probe_gate_opt_in": true,
+    "ple_mode": "async",
+    "ple_cache_mib": 256,
+    "ple_queue_depth": 32,
+    "moe_placement": "cpu",
+    "expert_vram_cache_mib": 0,
+    "supports_mtp": false,
+    "cache_files": [
+      "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+      "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
+    ]
+  },
+  "strata": {
+    "service": "/home/xero/Desktop/test/strata/strata_service.sh",
+    "python": "/home/xero/Desktop/test/strata/Strata-main/.venv/bin/python",
+    "server": "/home/xero/Desktop/test/strata/Strata-main/serve/server.py",
+    "config": "/home/xero/Desktop/test/strata/Strata-main/strata-coder-iq1_m.json",
+    "base_url": "http://127.0.0.1:8080/v1",
+    "benchmark_port": 8080,
+    "supports_mtp": true,
+    "kv_resident_cells": 32768,
+    "prefill_chunk": 1024,
+    "spec_depth": 4,
+    "cache_files": [
+      "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+      "/home/xero/Desktop/strata/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+      "/home/xero/Desktop/strata/Strata-data/packs/coder-iq1_m/dense.bin",
+      "/home/xero/Desktop/strata/Strata-data/mtp/rt/dense.bin",
+      "/home/xero/Desktop/strata/Strata-data/mtp/rt/experts.bin"
+    ]
+  },
+  "notes": [
+    "Measured 2026-10-05: this shard holds 27,394 MiB of repeating-layer tensors (48 layers) plus a 510 MiB output layer; the 28.8 GB second shard is entirely the per_layer_token_embd PLE table and is not a resident model tensor. Row 'Memory required for model tensors + cache: 29750 MiB' versus 'Memory available on all devices - compute: 14854 MiB' for CUDA0+CUDA2: a full (-ngl 99, no MoE placement flag) offload cannot fit two 8/10 GiB cards and dies in ggml_backend_cuda_buffer_type_alloc_buffer (14254.41 MiB on device 0).",
+    "ese.moe_placement=cpu therefore adds --cpu-moe: the ~24.3 GiB of expert tensors stay in host RAM (CUDA_Host buffer 24303 MiB) while 1867 MiB + 2056 MiB of dense weights land on CUDA0/CUDA2. Adaptive expert GPU residency (separate VRAM cache) is roadmap D1, so the baseline deliberately runs with expert_vram_cache_mib=0 rather than mixing an optimization into the baseline.",
+    "Devices CUDA0+CUDA2 match the Strata slot config (gpu [0,2]) so both engines select the same physical cards (18 GiB nominal combined VRAM, less available at runtime).",
+    "phase=prefill records prompt-eval cost (n_predict 1); phase=decode records steady-state decode (n_predict 128). mtp=on is only valid for Strata; the harness refuses it for ESE (no MTP/speculative path). kv_policy=resident means full GPU KV for ESE versus a bounded GPU window with host backing for Strata; these are not identical policies. kv_policy=host adds -nkvo for ESE and is explicitly unsupported for Strata: dropping --kv-resident makes Strata fully GPU-resident, not host-only. ESE has no bounded GPU-resident KV window yet (roadmap D2).",
+    "The Strata toggles are applied by writing a config derived from strata.config and launching serve/server.py directly with it (strata.python + strata.server + --port strata.benchmark_port). The launcher wrapper strata_service.sh always reads the on-disk config, so it cannot express a toggle; the benchmark never edits the on-disk config or runs while the launcher slot is up."
+  ],
+  "workload_sha256": "c9d295ec1aaf114d8fff06da62982e56ee7f0ef1a0039267bbb085a5a7584f93"
+}

@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include <cmath>
+#include <limits>
 
 #define FILENAME "jinja-runtime"
 
@@ -174,6 +175,27 @@ value binary_expression::execute_impl(context & ctx) {
             }
         }
         throw std::runtime_error("Cannot perform operation on null values");
+    }
+
+    // Integer arithmetic must not round through double or overflow signed storage.
+    if (is_val<value_int>(left_val) && is_val<value_int>(right_val) &&
+            (op.value == "+" || op.value == "-" || op.value == "*" || op.value == "%")) {
+        const int64_t a = left_val->as_int(), b = right_val->as_int();
+        const int64_t low = std::numeric_limits<int64_t>::min();
+        const int64_t high = std::numeric_limits<int64_t>::max();
+        bool overflow = false;
+        if (op.value == "+") overflow = (b > 0 && a > high-b) || (b < 0 && a < low-b);
+        if (op.value == "-") overflow = (b > 0 && a < low+b) || (b < 0 && a > high+b);
+        if (op.value == "*" && a && b) {
+            overflow = a > 0 ? (b > 0 ? a > high/b : b < low/a) :
+                               (b > 0 ? a < low/b : a < high/b);
+        }
+        if (overflow) throw std::runtime_error("Integer arithmetic result is outside the signed 64-bit range");
+        if (op.value == "+") return mk_val<value_int>(a+b);
+        if (op.value == "-") return mk_val<value_int>(a-b);
+        if (op.value == "*") return mk_val<value_int>(a*b);
+        if (!b) throw std::runtime_error("Modulo by zero");
+        return mk_val<value_int>(b == -1 ? 0 : a%b);
     }
 
     // Float operations

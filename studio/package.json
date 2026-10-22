@@ -1,11 +1,12 @@
 {
   "name": "ese-studio",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "stage-runtime": "node scripts/stage-runtime.mjs",
+    "package:linux": "node scripts/package-linux.mjs",
     "test": "node --test tests/*.test.mjs",
     "build": "pnpm stage-runtime && tsc && vite build",
     "preview": "vite preview",
@@ -29,5 +30,10 @@
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "~5.8.3",
     "vite": "^7.0.4"
+  },
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": "22.22.2",
+    "pnpm": "11.19.0"
   }
 }

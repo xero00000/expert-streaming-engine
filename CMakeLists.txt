@@ -83,6 +83,10 @@ option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 # 3rd party libs
 option(LLAMA_CURL "llama: use libcurl to download model from an URL" OFF)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+# Dedicated local parity/benchmark builds only: opens the qwen4exp loader gate
+# when combined with the per-run opt-in ESE_QWEN4EXP_PROBE_GATE=1. Release,
+# launcher, and default builds must leave this OFF (hard rejection stays).
+option(ESE_QWEN4EXP_PROBE_GATE "qwen4exp: open the loader gate in this build for local parity/benchmark probes (requires runtime ESE_QWEN4EXP_PROBE_GATE=1)" OFF)
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)

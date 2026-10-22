@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -22,11 +23,15 @@ def fail(errors: list[str], message: str) -> None:
 
 
 def maintained_markdown() -> list[Path]:
-    return sorted(
-        path
-        for path in ROOT.rglob("*.md")
-        if ".git" not in path.parts and "github-data" not in path.parts
-    )
+    documents = []
+    # Installed dependency trees contain upstream READMEs whose linked source
+    # files need not be shipped in npm/crate distributions. They are not ESE's
+    # maintained documentation. Prune them before walking large build trees.
+    excluded = {".git", "github-data", "node_modules", "target"}
+    for directory, children, files in os.walk(ROOT):
+        children[:] = [child for child in children if child not in excluded]
+        documents.extend(Path(directory) / name for name in files if name.endswith(".md"))
+    return sorted(documents)
 
 
 def check_links(errors: list[str]) -> None:
@@ -128,15 +133,15 @@ def check_versions(errors: list[str]) -> None:
         "README.md",
         [
             f"v{version} desktop installers",
-            f"ese-studio_{version}_amd64.AppImage",
-            f"ese-studio_{version}_x64-setup.exe",
+            f"ESE-Studio_{version}_linux-x86_64_cpu.AppImage",
+            f"ESE-Studio_{version}_windows-x64-setup.exe",
         ],
     )
-    require_text(errors, "studio/README.md", [f"v{version} AppImage"])
+    require_text(errors, "studio/README.md", [f"v{version} candidate"])
     require_text(
         errors,
         "docs/install.md",
-        [f"examples below use `{version}`", f"ese-studio_{version}_amd64.deb"],
+        [f"v{version} candidate", f"ESE-Studio_{version}_linux-x86_64_cpu.deb"],
     )
     require_text(errors, "CHANGELOG.md", [f"## [{version}] -"])
     if not (ROOT / f"docs/releases/v{version}.md").is_file():

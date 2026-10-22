@@ -102,6 +102,26 @@ if (LLAMA_BUILD_TESTS)
     )
     add_test(NAME test-server-tokens COMMAND test-server-tokens)
     set_property(TEST test-server-tokens PROPERTY LABELS main)
+
+    add_executable(test-server-decode-recovery
+        ../../tests/test-server-decode-recovery.cpp
+        server-common.cpp
+        server-chat.cpp
+        server-task.cpp
+        server-queue.cpp
+        server-context.cpp
+    )
+    target_include_directories(test-server-decode-recovery PRIVATE
+        ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ../mtmd
+    )
+    target_link_libraries(test-server-decode-recovery PRIVATE
+        common mtmd cpp-httplib ${CMAKE_THREAD_LIBS_INIT}
+    )
+    target_compile_features(test-server-decode-recovery PRIVATE cxx_std_17)
+    add_test(NAME test-server-decode-recovery COMMAND test-server-decode-recovery)
+    set_property(TEST test-server-decode-recovery PROPERTY LABELS model)
+    add_test(NAME test-server-slot-action-errors COMMAND test-server-decode-recovery --slot-action-errors-only)
+    set_property(TEST test-server-slot-action-errors PROPERTY LABELS main)
 endif()
 
 if (LLAMA_SERVER_SSL)

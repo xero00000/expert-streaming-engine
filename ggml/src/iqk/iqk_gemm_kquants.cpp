@@ -604,12 +604,15 @@ struct DequantizerQ6K final : public BaseDequantizer<block_q6_K> {
 };
 
 struct DequantizerIQ4XS final : public BaseDequantizer<block_iq4_xs> {
-    DequantizerIQ4XS(const void * vx, size_t bx) : BaseDequantizer(vx, bx), values(load_iq4nl_values_256()) {}
+    // The +128 lookup can reach 241: VPMADDUBSW would saturate its signed
+    // 16-bit pair sum before the bias correction. Use signed IQ4 values and
+    // the abs/sign dot helper, whose pair sums fit for Q8_K's [-127, 127].
+    DequantizerIQ4XS(const void * vx, size_t bx) : BaseDequantizer(vx, bx),
+        values(_mm256_xor_si256(load_iq4nl_values_256(), _mm256_set1_epi8(-128))) {}
     template <typename Q8>
-    inline __m256i new_block(int i, const Q8& q8, __m256 * accd) {
+    inline __m256i new_block(int i, const Q8&, __m256 *) {
         d = GGML_FP16_TO_FP32(x[i].d);
         auto scales128 = siq4.make_scales(*(const uint32_t *)x[i].scales_l, x[i].scales_h);
-        s8k.accum_mins(scales128, q8, i, -128.f*d, accd);
         return MM256_SET1_M128I(scales128);
     }
     inline void prepare(int i, int j) {
@@ -621,7 +624,6 @@ struct DequantizerIQ4XS final : public BaseDequantizer<block_iq4_xs> {
     }
 
     Q4Bits bits;
-    Scales8K s8k;
     ScaleIQ4XS siq4;
     const __m256i values;
 };
@@ -656,7 +658,11 @@ static void mul_mat_qX_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
 
                 set_scales_8(all_scales, j, scales);
 
-                multiply_add(deq.bits, scales, j, i, q8, sumi);
+                if constexpr (std::is_same_v<Dequantizer, DequantizerIQ4XS>) {
+                    multiply_add_avx2(deq.bits, scales, j, i, q8, sumi);
+                } else {
+                    multiply_add(deq.bits, scales, j, i, q8, sumi);
+                }
 
             }
 

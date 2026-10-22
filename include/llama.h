@@ -66,6 +66,7 @@ extern "C" {
     //
 
     struct llama_model;
+    struct llama_kv_size_profile;
     struct llama_context;
     struct llama_kv_cache_transaction;
 
@@ -293,6 +294,13 @@ extern "C" {
         LLAMA_EXPERT_STORAGE_IO_URING = 2,
     };
 
+    enum llama_qwen4exp_ple_mode {
+        LLAMA_QWEN4EXP_PLE_AUTO = 0,
+        LLAMA_QWEN4EXP_PLE_MMAP = 1,
+        LLAMA_QWEN4EXP_PLE_ASYNC = 2,
+        LLAMA_QWEN4EXP_PLE_RAM = 3,
+    };
+
     enum llama_mtp_op_type {
         MTP_OP_NONE             = 0,
         MTP_OP_WARMUP           = 1,
@@ -446,6 +454,10 @@ extern "C" {
         uint64_t expert_ram_cache_bytes;   // bounded resident expert bytes, 0 disables the RAM tier
         uint64_t expert_ram_staging_bytes; // reusable miss staging bound, 0 selects a bounded default
         enum llama_expert_storage_backend expert_storage_backend;
+        uint32_t expert_load_workers; // 0: synchronous; 1..8: bounded GPU-route load workers
+        uint64_t qwen4exp_ple_cache_bytes; // total bounded PLE page/row cache; 0 selects 256 MiB
+        uint32_t qwen4exp_ple_queue_depth; // maximum PLE source batch width; 0 selects 32
+        enum llama_qwen4exp_ple_mode qwen4exp_ple_mode;
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -545,6 +557,10 @@ extern "C" {
         uint64_t expert_hybrid_upload_ns_per_expert; // conservative calibrated upload cost used by runtime guard
         uint32_t expert_hybrid_maximum_drift_ppm; // one-way runtime revocation threshold
         uint32_t expert_hybrid_minimum_cpu_calls; // minimum rolling-window CPU samples
+        // Per-backend graph arena cap, including old+replacement during growth.
+        // 0 uses current CUDA free memory minus expert_vram_reserve_bytes;
+        // CPU/other backends remain unlimited. This is not a total context cap.
+        uint64_t compute_buffer_budget_bytes;
     };
 
     enum llama_expert_hybrid_guard_status {
@@ -643,6 +659,43 @@ extern "C" {
                      struct llama_model * model,
             struct llama_context_params   params);
 
+    // Tracked host capacity for this context and its model. Zero capacity
+    // preserves unconstrained initialization. Reservations are copied and
+    // remain immutable; mapped weight spans do not count as allocated weights.
+    // Allocator/container bookkeeping, vendor memory and OS residency are not
+    // included. Other contexts and application-owned buffers are separate.
+    struct llama_context_host_limits {
+        uint64_t capacity_bytes;
+        uint64_t weights_reservation_bytes;
+        uint64_t ple_cache_reservation_bytes;
+        uint64_t other_reservation_bytes;
+        uint64_t fixed_reservation_bytes;
+    };
+    LLAMA_API struct llama_context * llama_init_from_model_with_host_limits(
+                     struct llama_model * model,
+            struct llama_context_params params,
+            const struct llama_context_host_limits * limits);
+
+    // Called during startup before KV allocation, for measured graph layouts,
+    // and at final reconciliation. Application caches must remain unallocated
+    // until initialization returns. May resize their reservations; the original
+    // capacity remains immutable. False rejects initialization. Native admission
+    // checks still apply. No callback runs during subsequent inference.
+    struct llama_context_host_requirements {
+        uint64_t weights_bytes;
+        uint64_t ple_cache_bytes;
+        uint64_t fixed_bytes;
+        uint64_t kv_bytes;
+        uint64_t graph_bytes; // Host arena peak, separate from non-graph fixed storage.
+    };
+    typedef bool (*llama_context_host_planner)(
+            const struct llama_context_host_requirements * requirements,
+            struct llama_context_host_limits * limits, void * user_data);
+    LLAMA_API struct llama_context * llama_init_from_model_with_host_planner(
+            struct llama_model * model, struct llama_context_params params,
+            const struct llama_context_host_limits * limits,
+            llama_context_host_planner planner, void * user_data);
+
     LLAMA_API void llama_set_offload_policy(struct llama_context * lctx, int op, bool on_or_off);
 
     // Frees all allocated memory
@@ -721,14 +774,27 @@ extern "C" {
 
     // Metadata-only resource estimates used by the native global planner.
     // `llama_model_resource_bytes` separates routed expert source bytes from
-    // dense weights. `llama_model_kv_bytes` returns the complete KV allocation
-    // for the requested context and slot count without creating a context.
+    // resident dense weight payloads. Skipped Qwen4-Exp PLE source bytes are
+    // excluded; its bounded cache and other context owners are budgeted
+    // separately. `llama_model_kv_bytes` estimates cache tensor payloads
+    // for the requested context and slot count without creating a context;
+    // allocator overhead and other context owners are excluded.
     LLAMA_API void llama_model_resource_bytes(
             const struct llama_model * model,
             uint64_t * dense_bytes,
             uint64_t * expert_bytes);
     LLAMA_API uint64_t llama_model_largest_expert_component(const struct llama_model * model);
     LLAMA_API uint64_t llama_model_largest_expert_layer(const struct llama_model * model);
+
+    // Conservative computation graph/tensor metadata arena bound for these
+    // context settings, including iterative MLA nodes before placement is fitted.
+    // Uses native node sizing without creating a context or allocating buffers.
+    // Does not include tensor data, scheduler bookkeeping or other host owners.
+    // Invalid inputs leave bytes unchanged.
+    LLAMA_API bool llama_model_graph_metadata_bytes(
+            const struct llama_model * model,
+            struct llama_context_params params,
+            uint64_t * bytes);
 
     LLAMA_API uint64_t llama_model_kv_bytes(
             const struct llama_model * model,
@@ -739,6 +805,16 @@ extern "C" {
             int32_t mla_attention,
             uint32_t slots,
             bool flash_attention);
+
+    // Copy immutable cache geometry without retaining weights, backend buffers
+    // or the model. Queries remain valid after the model is freed. These return
+    // tensor-payload estimates, excluding allocator and other context storage.
+    LLAMA_API struct llama_kv_size_profile * llama_model_kv_size_profile_create(const struct llama_model * model);
+    LLAMA_API void llama_kv_size_profile_free(struct llama_kv_size_profile * profile);
+    LLAMA_API uint64_t llama_kv_size_profile_bytes(
+            const struct llama_kv_size_profile * profile,
+            enum ggml_type type_k, enum ggml_type type_v, enum ggml_type indexer_type_k,
+            uint32_t context, int32_t mla_attention, uint32_t slots, bool flash_attention);
 
     LLAMA_API size_t llama_model_device_count(const struct llama_model * model);
     LLAMA_API bool llama_model_device_memory(
@@ -928,6 +1004,9 @@ extern "C" {
     LLAMA_API bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id);
 
     // Restore the recurrent state after speculative decode.
+    // V4.1 supports bounded per-step checkpoints (up to eight tokens): n_past
+    // is the checkpoint position and accepted_step is the last retained index
+    // within the verified batch (-1 retains none).
     LLAMA_API bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,
                                             llama_pos n_past, int accepted_step);
 
@@ -935,7 +1014,12 @@ extern "C" {
             struct llama_context * ctx, llama_seq_id seq_id,
             llama_pos n_past, int accepted_step);
 
-    // Discard the saved checkpoint and reset internal mode state.
+    // Generic GPU/CPU fallback holds one checkpoint per configured sequence slot.
+    // Discard only this sequence's fallback checkpoint; other windows remain live.
+    // Architecture-private/per-step journals retain single-window discard semantics.
+    LLAMA_API void llama_spec_ckpt_discard_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
+    // Discard all saved checkpoints and reset internal mode state.
     LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx);
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
@@ -1135,6 +1219,88 @@ extern "C" {
             struct llama_resource_device_snapshot * devices,
             uint32_t device_capacity);
 
+    enum llama_resource_memory_category {
+        LLAMA_RESOURCE_MEMORY_WEIGHTS = 0,
+        LLAMA_RESOURCE_MEMORY_MAPPED_WEIGHTS = 1,
+        LLAMA_RESOURCE_MEMORY_KV = 2,
+        LLAMA_RESOURCE_MEMORY_CHECKPOINT = 3,
+        LLAMA_RESOURCE_MEMORY_GRAPH = 4,
+        LLAMA_RESOURCE_MEMORY_OUTPUT = 5,
+        LLAMA_RESOURCE_MEMORY_KV_TRANSACTION = 6,
+        LLAMA_RESOURCE_MEMORY_HOST_METADATA = 7,
+        LLAMA_RESOURCE_MEMORY_HOST_JOURNAL = 8,
+        LLAMA_RESOURCE_MEMORY_EXPERT_CACHE = 9,
+        LLAMA_RESOURCE_MEMORY_EXPERT_PREFILL = 10,
+        LLAMA_RESOURCE_MEMORY_PLE_CACHE = 11,
+        LLAMA_RESOURCE_MEMORY_PLE_STAGING = 12,
+        LLAMA_RESOURCE_MEMORY_HANDOFF = 13,
+        LLAMA_RESOURCE_MEMORY_CUDA_POOL = 14,
+    };
+
+    struct llama_resource_memory_pool {
+        // Scheduler backend index for device storage; -1 host, -2 unknown.
+        int32_t backend_id;
+        enum llama_resource_memory_category category;
+        uint64_t bytes;
+    };
+
+    // Owner-thread, read-only inventory of tracked native storage capacities.
+    // MAPPED_WEIGHTS is virtual mapped span, not resident/allocated RAM.
+    // Explicit buffers/metadata contexts are deduplicated. Excludes OS page
+    // cache, vendor-library/driver workspaces and untracked
+    // provider heaps/bookkeeping. PLE cache arenas/slots/index requests are tracked.
+    // CUDA_POOL includes active and cached physical backing, excluding its
+    // virtual reservation. Its bytes must not also be counted as graph buffers.
+    // Query with pools=nullptr/capacity=0. Insufficient capacity returns false,
+    // publishes the required count, and leaves every pool element untouched.
+    LLAMA_API bool llama_resource_get_memory_pools(
+            const struct llama_context * ctx,
+            struct llama_resource_memory_pool * pools,
+            uint32_t capacity,
+            uint32_t * count);
+
+    // Translate a memory-pool scheduler backend to a resource-plan device ID.
+    // Host storage maps to -1; CUDA storage maps to its physical device ID.
+    // Unknown locations and unsupported accelerator types return false and
+    // leave device_id untouched. Call from the context owner thread.
+    LLAMA_API bool llama_resource_backend_device_id(
+            const struct llama_context * ctx, int32_t backend_id, int32_t * device_id);
+
+    struct llama_kv_preparation_memory {
+        uint64_t host_metadata_bytes;
+        uint64_t host_staging_bytes;
+        uint32_t device_count;
+    };
+
+    struct llama_kv_preparation_device {
+        // Resource-plan device ID: -1 host, nonnegative physical CUDA ID.
+        int32_t device_id;
+        uint64_t kv_bytes;
+    };
+
+    // Owner-thread read-only replacement sizing for supported resize layouts.
+    // Builds bounded tensor metadata, never KV buffers or migration payloads.
+    // Reported metadata is tracked array/context capacity; excludes allocator
+    // bookkeeping and untracked container nodes. Staging is a bounded request.
+    // Query with devices=nullptr/capacity=0. Insufficient capacity publishes
+    // device_count only and leaves caller rows untouched; invalid input leaves
+    // both outputs untouched. Existing allocations/state remain unchanged.
+    LLAMA_API bool llama_kv_cache_resize_memory(
+            const struct llama_context * ctx, uint32_t target_size,
+            struct llama_kv_preparation_memory * memory,
+            struct llama_kv_preparation_device * devices, uint32_t capacity);
+    LLAMA_API bool llama_kv_cache_retier_memory(
+            const struct llama_context * ctx,
+            const enum ggml_type * type_k_layers, const enum ggml_type * type_v_layers,
+            uint32_t n_layers, struct llama_kv_preparation_memory * memory,
+            struct llama_kv_preparation_device * devices, uint32_t capacity);
+    // Alternate storage currently retained by a transaction and its measured
+    // migration staging peak. Uses the same count/capacity output contract.
+    LLAMA_API bool llama_kv_cache_transaction_memory(
+            llama_kv_cache_transaction_t transaction,
+            struct llama_kv_preparation_memory * memory,
+            struct llama_kv_preparation_device * devices, uint32_t capacity);
+
     // Apply the KV cache updates (such as K-shifts, defragmentation, etc.)
     // Positive return values does not mean a fatal error, but rather a warning.
     //    0 - success
@@ -1282,15 +1448,27 @@ extern "C" {
     // Positive return values does not mean a fatal error, but rather a warning.
     //   0 - success
     //   1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)
+    //  -4 - graph aborted (LLAMA_DECODE_ERROR_ABORTED)
     // < 0 - error
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // An aborted graph may have written state. Restore a checkpoint or clear
+    // before replay; shrinking the batch is not recovery from this error.
+    enum llama_decode_error {
+        LLAMA_DECODE_ERROR_ABORTED = -4,
+    };
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
     LLAMA_API void llama_set_n_threads(struct llama_context * ctx, uint32_t n_threads, uint32_t n_threads_batch);
+
+    // Explicit all-expert warmup mode. Disabled by default. Transitions
+    // synchronize and invalidate reusable graphs; token IDs/timings never
+    // select this mode implicitly. Clear warmup KV before real inference.
+    LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
 
     // Get the number of threads used for generation of a single token.
     LLAMA_API uint32_t llama_n_threads(struct llama_context * ctx);

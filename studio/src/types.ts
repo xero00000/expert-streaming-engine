@@ -7,6 +7,17 @@ export interface ChatStatus {
   modelPath?: string;
 }
 
+export type ModelCapabilityState = "supported" | "experimental" | "validation-pending" | "unsupported";
+
+export interface RuntimeSupport {
+  tier: "stable" | "experimental" | "unsupported";
+  launchable: boolean;
+  text: ModelCapabilityState;
+  vision: ModelCapabilityState;
+  mtp: ModelCapabilityState;
+  note: string;
+}
+
 export interface ModelProfile {
   id: string;
   name: string;
@@ -20,7 +31,10 @@ export interface ModelProfile {
   batchSize?: number;
   ubatchSize?: number;
   tensorSplit?: string;
+  memoryPolicy?: "auto" | "resident" | "hybrid" | "cache" | "stream";
+  gpuLayers?: number;
   slots?: number;
+  runtimeSupport?: RuntimeSupport;
   source: string;
 }
 

@@ -7,10 +7,19 @@
 #include "llama-kv-padding.h"
 
 #include "ggml.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 #include "ggml-ese.h"
+#include "../ggml/src/ggml-qat.h"
+#include "../ggml/src/ggml-expert-loader.h"
+#include "../ggml/src/ggml-expert-f32.h"
+#include "llama-qwen4exp-ops.h"
 
 #include <unordered_set>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 uint32_t llm_build_context::llama_kv_qnext_state_slots(const llama_kv_cache & kv_self) {
     uint32_t n_slots = 0;
@@ -29,6 +38,16 @@ uint32_t llm_build_context::llama_kv_qnext_state_slots(const llama_kv_cache & kv
     }
 
     return n_slots;
+}
+
+static uint32_t qwen4exp_initial_compute_rows(const llama_context & lctx, uint32_t tokens) {
+    const char * lazy = std::getenv("ESE_QWEN4EXP_LAZY_GRAPH_RESERVE");
+    if (lctx.model.arch != LLM_ARCH_QWEN4EXP || !lazy || std::strcmp(lazy, "1") != 0)
+        return lctx.kv_self.size;
+    // Reserve a 32K working graph initially, retaining the complete KV capacity.
+    // Existing history and the requested batch can only grow this reservation;
+    // runtime graphs continue to use their actual full chronological history.
+    return std::min(lctx.kv_self.size, std::max({32768u, lctx.kv_self.n, tokens}));
 }
 
 llm_build_context::llm_build_context(
@@ -71,10 +90,10 @@ llm_build_context::llm_build_context(
         norm_eps         (hparams.f_norm_eps),
         norm_rms_eps     (hparams.f_norm_rms_eps),
         n_tokens         (batch.n_tokens),
-        n_kv             (worst_case ? kv_self.size : kv_self.n),
+        n_kv             (worst_case ? qwen4exp_initial_compute_rows(lctx, batch.n_tokens) : kv_self.n),
         n_outputs        (worst_case ? n_outputs_ > 0 ? n_outputs_ : n_tokens : lctx.n_outputs),
         n_outputs_enc    (worst_case ? n_tokens : lctx.embd_enc.size() / hparams.n_embd),
-        kv_head          (worst_case ? (kv_self.recurrent ? 0 : kv_self.size - n_tokens) : kv_self.head),
+        kv_head          (worst_case ? (kv_self.recurrent ? 0 : n_kv - n_tokens) : kv_self.head),
         n_ctx_orig       (cparams.n_ctx_orig_yarn),
         flash_attn       (cparams.flash_attn),
         mla_attn         (cparams.mla_attn),
@@ -106,6 +125,7 @@ void llm_build_context::init() {
     ctx0 = ggml_init(params);
 
     if (clear_lctx_inputs) {
+        lctx.dsv41_row_inputs.clear();
         lctx.inp_tokens      = nullptr;
         lctx.inp_embd        = nullptr;
         lctx.inp_pos         = nullptr;
@@ -125,6 +145,14 @@ void llm_build_context::init() {
         lctx.inp_embd_enc      = nullptr;
         lctx.inp_KQ_mask_cross = nullptr;
         lctx.inp_dsa_sink      = nullptr;
+        lctx.inp_qwen4exp_ple = nullptr;
+        lctx.inp_qwen4exp_prefix_columns = nullptr;
+        lctx.inp_qwen4exp_qsa_tail = nullptr;
+        lctx.inp_qwen4exp_qsa_tail_enabled = nullptr;
+        lctx.inp_qwen4exp_qsa_block_pos = nullptr;
+        lctx.inp_qwen4exp_qsa_block_end = nullptr;
+        lctx.inp_qwen4exp_qsa_block_map = nullptr;
+        lctx.qwen4exp_attention_inputs.clear();
         lctx.inp_mtp_carry     = nullptr;
         lctx.dflash.inputs.target_features = nullptr;
         lctx.dflash.inputs.pos_ctx = nullptr;
@@ -167,7 +195,12 @@ ggml_cgraph * llm_build_context::build_k_shift() {
         ? LLAMA_ROPE_TYPE_NEOX
         : hparams.rope_type;
 
-    const float yarn_attn_factor_shift = model.arch == LLM_ARCH_DEEPSEEK2 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_MISTRAL4
+    // Qwen keys already contain their original attention magnitude. A delta
+    // rotation must have unit magnitude, including zero-delta rows belonging
+    // to other sessions. Cancel the gain added inside YaRN when enabled.
+    const float yarn_attn_factor_shift = model.arch == LLM_ARCH_QWEN4EXP
+        ? (ext_factor != 0.0f ? 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale)) : 1.0f)
+        : model.arch == LLM_ARCH_DEEPSEEK2 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_MISTRAL4
         ? 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale))
         : cparams.yarn_attn_factor;
 
@@ -346,7 +379,9 @@ ggml_cgraph * llm_build_context::build_s_copy() {
         }
 
         if (kv_self.s_l.size() > (size_t) il && kv_self.s_l[il] != nullptr) {
-            struct ggml_tensor * qnext_states_all = ggml_reshape_2d(ctx0, kv_self.s_l[il], hparams.n_embd_v_s(), kv_self.s_l[il]->ne[1]);
+            // Qwen4Exp rows include layer-specific PLE state in addition to
+            // the base delta-net state. Copy the entire stored row.
+            struct ggml_tensor * qnext_states_all = ggml_reshape_2d(ctx0, kv_self.s_l[il], kv_self.s_l[il]->ne[0], kv_self.s_l[il]->ne[1]);
             GGML_ASSERT((uint32_t) qnext_states_all->ne[1] == qnext_state_slots);
             struct ggml_tensor * qnext_state_copy = ggml_view_1d(ctx0, state_copy, qnext_state_slots, 0);
             struct ggml_tensor * qnext_states = ggml_get_rows(ctx0, qnext_states_all, qnext_state_copy);
@@ -400,8 +435,9 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
 
             if (kv_self.v_l.size() > il && kv_self.v_l[il] != nullptr) {
                 // Note: with MLA the V cache may not be present.
-                if (flash_attn) {
-                    // NOTE: the V cache is not transposed when using flash attention
+                if (!kv_self.v_trans) {
+                    // Hybrid caches also use token-major values when Flash
+                    // Attention is disabled. Follow the stored layout.
                     const int64_t cache_v_gqa = kv_self.v_l[il]->ne[0] / kv_self.size;
                     view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
                             cache_v_gqa, nm,
@@ -870,6 +906,65 @@ ggml_tensor * llm_build_context::llm_build_inp_embd(
     return inpL;
 }
 
+static bool qwen4exp_explicit_arithmetic(const llama_context & lctx) {
+    const char * value = std::getenv("ESE_QWEN4EXP_EXPERT_F32");
+    return lctx.model.arch == LLM_ARCH_QWEN4EXP && value && std::strcmp(value, "1") == 0;
+}
+
+static ggml_tensor * qwen4exp_encode_host_q4(
+        llama_context & lctx, ggml_context * ctx, ggml_tensor * value,
+        ggml_tensor * cache, int64_t layer) {
+    if (!qwen4exp_explicit_arithmetic(lctx) || cache->type != GGML_TYPE_Q4_0 ||
+            !ggml_backend_buffer_is_host(cache->buffer)) return value;
+    for (auto * backend : lctx.backends) {
+        if (ggml_backend_is_cpu(backend) ||
+                !ggml_backend_supports_buft(backend, lctx.model.buft_layer[layer].buft)) continue;
+        // CPU IQK and CUDA Q4 encoders use different rounding/reduction rules.
+        // Encode on the layer's device, then transfer the packed row unchanged,
+        // so moving KV to host memory does not change model arithmetic.
+        auto * encoded = ggml_cast(ctx, value, GGML_TYPE_Q4_0);
+        if (ggml_backend_supports_op(backend, encoded)) {
+            ggml_backend_sched_set_tensor_backend(lctx.sched, encoded, backend);
+            return encoded;
+        }
+    }
+    return value;
+}
+
+static ggml_tensor * qwen4exp_gather_attention_rows(
+        llama_context & lctx, ggml_context * ctx, ggml_cgraph * graph, ggml_tensor * cache,
+        ggml_tensor * ids, bool host, int64_t layer) {
+#ifdef GGML_USE_CUDA
+    const char * flag = std::getenv("ESE_QWEN4EXP_PACKED_HOST_KV");
+    if (host && flag && std::strcmp(flag, "1") == 0 && lctx.cparams.offload_kqv &&
+            qwen4exp_explicit_arithmetic(lctx) && cache->type == GGML_TYPE_Q4_0) {
+        // Copy selected packed rows verbatim on CPU, rather than expanding
+        // them before the handoff. The ordinary F32 attention path receives
+        // the same rows after device dequantization. Full history and physical
+        // row ownership stay in the existing host cache.
+        auto * packed = ggml_get_rows_ext(ctx, cache, ids, true, false);
+        auto * expanded = ggml_cast(ctx, packed, GGML_TYPE_F32);
+        for (auto * backend : lctx.backends) {
+            if (ggml_backend_is_cuda(backend) &&
+                    ggml_backend_supports_buft(backend, lctx.model.buft_layer[layer].buft) &&
+                    ggml_backend_supports_op(backend, expanded)) {
+                ggml_backend_sched_set_tensor_backend(lctx.sched, packed, lctx.backend_cpu);
+                ggml_backend_sched_set_tensor_backend(lctx.sched, expanded, backend);
+                // Gather K and V before expanding either on the device. During
+                // compact batched prefill this also groups host gathers ahead
+                // of the per-query attention graphs, avoiding one extra backend
+                // split for each cast while keeping F32 scratch per query.
+                ggml_build_forward_expand(graph, packed);
+                return expanded;
+            }
+        }
+    }
+#endif
+    auto * rows = qwen4exp_build_cache_rows(ctx, cache, ids);
+    if (host) ggml_backend_sched_set_tensor_backend(lctx.sched, rows, lctx.backend_cpu);
+    return rows;
+}
+
 void llm_build_context::llm_build_kv_store(
        struct llama_context & lctx,
         struct ggml_context * ctx,
@@ -912,6 +1007,7 @@ void llm_build_context::llm_build_kv_store(
         ggml_tensor * k_cache_view = ggml_view_2d(ctx, kv.k_l[il], cache_head_k, n_tokens*n_head_kv,
                 k_row_size, k_row_size*n_head_kv*kv_head);
 
+        k_cur = qwen4exp_encode_host_q4(lctx, ctx, k_cur, kv.k_l[il], il);
         lctx.cache_copies[2*il+0].cpy  = ggml_cpy(ctx, k_cur, k_cache_view);
         lctx.cache_copies[2*il+0].step = k_row_size*n_head_kv;
 
@@ -946,17 +1042,28 @@ void llm_build_context::llm_build_kv_store(
         }
         cb(v_cache_view, "v_cache_view", il);
 
+        if (!kv.v_trans) v_cur = qwen4exp_encode_host_q4(lctx, ctx, v_cur, kv.v_l[il], il);
         lctx.cache_copies[2*il+1].cpy  = ggml_cpy(ctx, v_cur, v_cache_view);
         ggml_build_forward_expand(graph, lctx.cache_copies[2*il+1].cpy);
     }
 }
 
+
+
 ggml_tensor * llm_build_context::llm_build_lora_mm(
         struct llama_context & lctx,
          struct ggml_context * ctx0,
           struct ggml_tensor * w,
-          struct ggml_tensor * cur) {
+          struct ggml_tensor * cur, enum ggml_prec precision) {
+    const char * quantized_flag = std::getenv("ESE_QWEN4EXP_QUANTIZED_PROJECTIONS");
+    if (qwen4exp_explicit_arithmetic(lctx) && ggml_is_quantized(w->type) &&
+            quantized_flag && std::strcmp(quantized_flag, "1") == 0) {
+        // Opt-in native Q8 activation codecs for packed projections. Retain
+        // explicit precision for BF16/F16/F32 weights and the reference mode.
+        precision = GGML_PREC_DEFAULT;
+    }
     struct ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_mul_mat_set_prec(res, precision);
     for (auto & it : lctx.lora_adapters) {
         struct llama_lora_weight * lora = it.first->get_weight(w);
         if (lora == nullptr) {
@@ -965,10 +1072,10 @@ ggml_tensor * llm_build_context::llm_build_lora_mm(
         const float alpha = it.first->alpha;
         const float rank  = (float) lora->b->ne[0];
         const float scale = alpha ? it.second * alpha / rank : it.second;
-        struct ggml_tensor * ab_cur = ggml_mul_mat(
-            ctx0, lora->b,
-            ggml_mul_mat(ctx0, lora->a, cur)
-        );
+        struct ggml_tensor * a_cur = ggml_mul_mat(ctx0, lora->a, cur);
+        ggml_mul_mat_set_prec(a_cur, precision);
+        struct ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lora->b, a_cur);
+        ggml_mul_mat_set_prec(ab_cur, precision);
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
     }
@@ -1099,6 +1206,16 @@ ggml_tensor * llm_build_context::llm_build_ffn(
          const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input,
          bool is_norm, ggml_tensor * add_extra, ggml_tensor * post_norm) {
 
+    const char * explicit_env = std::getenv("ESE_QWEN4EXP_EXPERT_F32");
+    const bool explicit_shared = lctx.model.arch == LLM_ARCH_QWEN4EXP &&
+            explicit_env && std::strcmp(explicit_env, "1") == 0;
+    const ggml_prec shared_precision = explicit_shared ? GGML_PREC_F32 : GGML_PREC_DEFAULT;
+    if (explicit_shared) {
+        GGML_ASSERT(up && gate && down && !up->extra && !gate->extra && !down->extra);
+        GGML_ASSERT(!up_b && !up_s && !gate_b && !gate_s && !down_b && !down_s);
+        GGML_ASSERT(type_op == LLM_FFN_SILU && type_gate == LLM_FFN_PAR && lctx.lora_adapters.empty());
+    }
+
     if (!up_b && !up_s && !gate_b && !gate_s && !down_b && !down_s &&
         up->extra && gate->extra && down->extra && type_gate == LLM_FFN_PAR &&
         (type_op == LLM_FFN_SILU || type_op == LLM_FFN_RELU || type_op == LLM_FFN_SWIGLU_OAI || (type_op == LLM_FFN_GELU && !act_scales))) {
@@ -1178,7 +1295,7 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
     }
 
-    if (lctx.cparams.fused_up_gate &&
+    if (!explicit_shared && lctx.cparams.fused_up_gate &&
         up && gate && !up_b && !up_s && !gate_b && !gate_s && type_gate == LLM_FFN_PAR &&
         (type_op == LLM_FFN_SILU || type_op == LLM_FFN_RELU || type_op == LLM_FFN_SWIGLU_OAI || (type_op == LLM_FFN_GELU && !act_scales))) {
         auto unary_op = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
@@ -1220,7 +1337,7 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         return cur;
     }
 
-    struct ggml_tensor * tmp = up ? llm_build_lora_mm(lctx, ctx, up, cur) : cur;
+    struct ggml_tensor * tmp = up ? llm_build_lora_mm(lctx, ctx, up, cur, shared_precision) : cur;
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -1237,12 +1354,12 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         switch (type_gate) {
             case LLM_FFN_SEQ:
                 {
-                    cur = llm_build_lora_mm(lctx, ctx, gate, tmp);
+                    cur = llm_build_lora_mm(lctx, ctx, gate, tmp, shared_precision);
                     cb(cur, "ffn_gate", il);
                 } break;
             case LLM_FFN_PAR:
                 {
-                    cur = llm_build_lora_mm(lctx, ctx, gate, cur);
+                    cur = llm_build_lora_mm(lctx, ctx, gate, cur, shared_precision);
                     cb(cur, "ffn_gate", il);
                 } break;
         }
@@ -1329,7 +1446,7 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     }
 
     if (down) {
-        cur = llm_build_lora_mm(lctx, ctx, down, cur);
+        cur = llm_build_lora_mm(lctx, ctx, down, cur, shared_precision);
         if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
             // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
@@ -1395,7 +1512,20 @@ llm_expert_gating_func_type   gating_op,
     int64_t n_tokens = cur->ne[1];
     bool weight_before_ffn = lctx.model.arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    const char * expert_f32_env = std::getenv("ESE_QWEN4EXP_EXPERT_F32");
+    const bool explicit_qwen = lctx.model.arch == LLM_ARCH_QWEN4EXP &&
+            expert_f32_env && std::strcmp(expert_f32_env, "1") == 0;
+    // Separate the original-input arithmetic control from native quantized
+    // expert decoding. Dense/indexer/router precision and route ordering stay
+    // fixed while the opt-in exercises the ordinary ggml activation codecs.
+    const char * quantized_flag = std::getenv("ESE_QWEN4EXP_QUANTIZED_EXPERTS");
+    const bool quantized_experts = quantized_flag && std::strcmp(quantized_flag, "1") == 0;
+    const bool expert_f32 = explicit_qwen && !quantized_experts;
     ggml_tensor * logits = gate_inp ? llm_build_lora_mm(lctx, ctx, gate_inp, cur) : input_logits; // [n_expert, n_tokens]
+    // BF16 output rounding can turn distinct cutoff scores into a tie and
+    // change the routed expert set. Preserve F32 activations/results under
+    // the same explicit arithmetic policy used for expert projections.
+    if (explicit_qwen && gate_inp) ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
     cb(logits, "ffn_moe_logits", il);
 
     if (gate_inp_b) {
@@ -1478,7 +1608,8 @@ llm_expert_gating_func_type   gating_op,
         if (lctx.model.arch == LLM_ARCH_LAGUNA) {
             weights_sum = ggml_clamp(ctx, weights_sum, 6.103515625e-5f, INFINITY);
             cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
-        } else if (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_STEP35) {
+        } else if (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_STEP35 ||
+                   lctx.model.arch == LLM_ARCH_DEEPSEEK41) {
             weights_sum = ggml_scale_bias(ctx, weights_sum, 1.0, 1e-20);
             cb(weights_sum, "ffn_moe_weights_sum_biased", il);
         }
@@ -1497,9 +1628,54 @@ llm_expert_gating_func_type   gating_op,
         ggml_build_forward_expand(graph, weights);
     }
 
-    auto build_expert_branch = [&](ggml_tensor * branch_ids, bool branch_add_input) {
-        ggml_tensor * branch_cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
-        ggml_tensor * branch_weights = weights;
+    if (expert_f32) {
+        // Experimental placement-independent expert arithmetic. Refuse an
+        // unsupported requested contract rather than substitute legacy math.
+        GGML_ASSERT(type_op == LLM_FFN_SILU && lctx.lora_adapters.empty());
+        GGML_ASSERT(!up_gate_exps_b && !up_exps_b && !gate_exps_b && !down_exps_b);
+        GGML_ASSERT(down_exps && ggml_expert_f32_type(down_exps->type));
+        GGML_ASSERT(up_gate_exps ? ggml_expert_f32_type(up_gate_exps->type) :
+                up_exps && gate_exps && up_exps->type == gate_exps->type && ggml_expert_f32_type(up_exps->type));
+    }
+
+    bool preserve_expert_routes = false;
+    auto build_expert_branch = [&](ggml_tensor * branch_ids, bool branch_add_input,
+            ggml_tensor * branch_input = nullptr, ggml_tensor * route_weights = nullptr) {
+        ggml_tensor * branch_cur = ggml_reshape_3d(ctx, branch_input ? branch_input : cur, n_embd, 1, n_tokens);
+        ggml_tensor * branch_weights = route_weights ? route_weights : weights;
+
+        if (lctx.model.arch == LLM_ARCH_DEEPSEEK41) {
+            // The released Expert applies the routing weight inside the FFN,
+            // before rounding and quantizing the down projection's input.
+            // Fused generic MoE operations weight the projected output instead.
+            GGML_ASSERT(type_op == LLM_FFN_SILU && up_exps && gate_exps && down_exps);
+            GGML_ASSERT(!up_gate_exps && !up_gate_exps_b && !up_exps_b && !gate_exps_b &&
+                        !down_exps_b && !down_exps_s);
+            const auto bf16 = [&](ggml_tensor * x) {
+                return ggml_cast(ctx, ggml_cast(ctx, x, GGML_TYPE_BF16), GGML_TYPE_F32);
+            };
+            branch_cur = ggml_qat(ctx, ggml_cont(ctx, branch_cur), GGML_QAT_FP8_E8M0);
+            auto up = llm_build_lora_mm_id(lctx, ctx, up_exps, branch_cur, branch_ids);
+            auto gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, branch_cur, branch_ids);
+            cb(up, "ffn_moe_up", il);
+            cb(gate, "ffn_moe_gate", il);
+            up = ggml_clamp(ctx, bf16(up), -10.0f, 10.0f);
+            gate = ggml_clamp(ctx, bf16(gate), -INFINITY, 10.0f);
+            auto hidden = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+            hidden = ggml_mul(ctx, hidden, branch_weights);
+            hidden = ggml_qat(ctx, ggml_cont(ctx, bf16(hidden)), GGML_QAT_FP8_E8M0);
+            cb(hidden, "ffn_moe_gate_par", il);
+            auto experts = llm_build_lora_mm_id(lctx, ctx, down_exps, hidden, branch_ids);
+            cb(experts, "ffn_moe_down", il);
+            experts = bf16(experts);
+            auto result = ggml_multi_add(ctx,
+                    ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0), n_expert_used);
+            if (branch_add_input) {
+                result = ggml_add(ctx, result, input);
+                cb(result, "ffn_out_with_inp", il);
+            }
+            return result;
+        }
 
         if (weight_before_ffn) {
             // TODO: this is a workaround as we don't yet have a repeat op that takes custom dim (ggml_repeat_4d)
@@ -1532,7 +1708,15 @@ llm_expert_gating_func_type   gating_op,
         } else {
             GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
 
-            if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
+            // Compact cache operations remap only their own weight IDs. Keep
+            // expert bias gathers on the original routing IDs; fusing them
+            // would index the logical bias table with physical cache slots.
+            ggml_backend_sched_expert_cache_policy cache_policy = {};
+            const bool cache_bias_lookup = lctx.active_expert_decode && (up_exps_b || gate_exps_b) &&
+                    ggml_backend_sched_expert_cache_get_policy(lctx.sched, &cache_policy) && cache_policy.slots > 0 &&
+                    ((up_exps->buffer && ggml_backend_buffer_is_host(up_exps->buffer)) ||
+                     (gate_exps->buffer && ggml_backend_buffer_is_host(gate_exps->buffer)));
+            if (can_use_fmoe && (lctx.cparams.fused_moe_up_gate || expert_f32) && !cache_bias_lookup && up_exps->type == gate_exps->type) {
                 if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
                     par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, branch_cur, branch_ids, up_exps_b, gate_exps_b,
                             type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
@@ -1584,9 +1768,17 @@ llm_expert_gating_func_type   gating_op,
 
             }
         }
+        if (expert_f32) {
+            ggml_mul_mat_set_prec(par, GGML_PREC_F32);
+            GGML_ASSERT(ggml_expert_f32_supported(par));
+        }
         cb(par, "ffn_moe_gate_par", il);
 
         ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, branch_ids); // [n_embd, n_expert_used, n_tokens]
+        if (expert_f32) {
+            ggml_mul_mat_set_prec(experts, GGML_PREC_F32);
+            GGML_ASSERT(ggml_expert_f32_supported(experts));
+        }
         cb(experts, "ffn_moe_down", il);
 
         if (down_exps_b) {
@@ -1594,7 +1786,7 @@ llm_expert_gating_func_type   gating_op,
             cb(experts, "ffn_moe_down_biased", il);
         }
 
-        if (down_exps_s && !lctx.cparams.fused_mmad) {
+        if (down_exps_s && (!lctx.cparams.fused_mmad || expert_f32)) {
             GGML_ASSERT(!weight_before_ffn);
             auto s = ggml_reshape_3d(ctx, down_exps_s, 1, n_expert, 1);
             s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tokens, 1);
@@ -1606,7 +1798,7 @@ llm_expert_gating_func_type   gating_op,
         }
 
         if (!weight_before_ffn) {
-            if (lctx.cparams.fused_mmad) {
+            if (lctx.cparams.fused_mmad && !expert_f32) {
                 experts = ggml_mul_multi_add(ctx, experts, branch_weights);
                 cb(experts, "ffn_moe_weighted", il);
                 if (down_exps_s) {
@@ -1622,6 +1814,9 @@ llm_expert_gating_func_type   gating_op,
             experts = ggml_mul(ctx, experts, branch_weights);
             cb(experts, "ffn_moe_weighted", il);
         }
+        // Retain router-position outputs for the common arithmetic policy.
+        // Reducing each CPU/GPU subset first changes the F32 addition order.
+        if (preserve_expert_routes) return experts;
 
         ggml_tensor * result;
         if (n_expert_used == 1) {
@@ -1643,24 +1838,53 @@ llm_expert_gating_func_type   gating_op,
             lctx.cparams.expert_hybrid_gpu_experts, n_expert_used);
     const int64_t graph_tokens = lctx.inp_tokens ? lctx.inp_tokens->ne[0] :
             lctx.inp_embd ? lctx.inp_embd->ne[1] : n_tokens;
-    const bool use_hybrid = graph_tokens == 1 && n_tokens == 1 && hybrid_gpu_experts > 0 &&
-            hybrid_gpu_experts < n_expert_used && lctx.cparams.expert_vram_cache_bytes > 0 &&
+    // CPU branches consume leased host weights. Fully resident GPU experts
+    // already avoid uploads; splitting them would copy their entire weight
+    // tensors back to the host instead of overlapping a bounded lease.
+    const auto host_experts = [](const ggml_tensor * weight) {
+        return weight && weight->buffer && ggml_backend_buffer_is_host(weight->buffer);
+    };
+    const bool hybrid_host_weights = host_experts(down_exps) &&
+            (up_gate_exps ? host_experts(up_gate_exps) : host_experts(up_exps) && host_experts(gate_exps));
+    const bool use_hybrid = lctx.active_expert_decode && graph_tokens == 1 && n_tokens == 1 && hybrid_gpu_experts > 0 &&
+            hybrid_gpu_experts < n_expert_used && hybrid_host_weights && lctx.cparams.expert_vram_cache_bytes > 0 &&
             ggml_backend_sched_get_expert_hybrid_guard_status(lctx.sched) ==
                     GGML_BACKEND_EXPERT_HYBRID_GUARD_MONITORING;
     if (!use_hybrid) {
         return build_expert_branch(selected_experts, add_input);
     }
 
-    ggml_tensor * gpu_ids = ggml_ese_route_partition(
-            ctx, selected_experts, 0, (int) hybrid_gpu_experts);
-    ggml_tensor * cpu_ids = ggml_ese_route_partition(
-            ctx, selected_experts, (int) hybrid_gpu_experts,
-            (int) (n_expert_used - hybrid_gpu_experts));
+    const char * residency = std::getenv("ESE_EXPERT_RESIDENT_PARTITION");
+    ggml_tensor * choice = residency && std::strcmp(residency, "1") == 0 ?
+            ggml_backend_sched_expert_route_choice(ctx, lctx.sched, selected_experts, il,
+                    int(hybrid_gpu_experts), up_gate_exps ? up_gate_exps : up_exps,
+                    up_gate_exps ? nullptr : gate_exps, down_exps) : nullptr;
+    ggml_tensor * gpu_ids = choice ? ggml_ese_route_partition_masked(ctx, selected_experts, choice, GGML_ESE_ROUTE_GPU) :
+            ggml_ese_route_partition(ctx, selected_experts, 0, int(hybrid_gpu_experts));
+    ggml_tensor * cpu_ids = choice ? ggml_ese_route_partition_masked(ctx, selected_experts, choice, GGML_ESE_ROUTE_CPU) :
+            ggml_ese_route_partition(ctx, selected_experts, int(hybrid_gpu_experts), int(n_expert_used - hybrid_gpu_experts));
     cb(gpu_ids, "ffn_moe_topk_gpu", il);
     cb(cpu_ids, "ffn_moe_topk_cpu", il);
+    ggml_tensor * cpu_input = nullptr;
+    ggml_tensor * cpu_weights = nullptr;
+    const char * precopy = std::getenv("ESE_EXPERT_HYBRID_PRECOPY");
+    if (graph && precopy && std::strcmp(precopy, "1") == 0) {
+        // Move the CPU inputs before queuing the GPU expert branch. Otherwise
+        // its late input copy synchronizes that GPU stream, waiting for the
+        // very work intended to overlap with CPU expert computation.
+        cpu_input = ggml_cont(ctx, cur);
+        cpu_weights = ggml_cont(ctx, weights);
+        ggml_backend_sched_set_tensor_backend(lctx.sched, cpu_input, lctx.backend_cpu);
+        ggml_backend_sched_set_tensor_backend(lctx.sched, cpu_weights, lctx.backend_cpu);
+        cb(cpu_input, "ffn_moe_hybrid_cpu_input", il);
+        cb(cpu_weights, "ffn_moe_hybrid_cpu_weights", il);
+        ggml_build_forward_expand(graph, cpu_input);
+        ggml_build_forward_expand(graph, cpu_weights);
+    }
+    preserve_expert_routes = explicit_qwen;
     ggml_tensor * branches[] = {
         build_expert_branch(gpu_ids, false),
-        build_expert_branch(cpu_ids, false),
+        build_expert_branch(cpu_ids, false, cpu_input, cpu_weights),
     };
     // Keep each heterogeneous branch attributable after the scheduler has
     // split the graph.  The live hybrid guard times CPU branch completion by
@@ -1670,7 +1894,14 @@ llm_expert_gating_func_type   gating_op,
     cb(branches[1], "ffn_moe_hybrid_cpu", il);
     ggml_ese_tensor_set_role(branches[0], GGML_ESE_ROUTE_GPU);
     ggml_ese_tensor_set_role(branches[1], GGML_ESE_ROUTE_CPU);
+    if (choice) ggml_backend_sched_expert_route_bind_gpu_output(choice, branches[0]);
     ggml_tensor * result = ggml_ese_reduce_to(ctx, branches, 2, GGML_OP_ADD, 0);
+    if (preserve_expert_routes) {
+        // Weight products were rounded to F32 separately in each branch.
+        // Merge exclusive route positions, then add in original router order.
+        result = ggml_multi_add(ctx,
+                ggml_view_2d(ctx, result, n_embd, n_tokens, result->nb[2], 0), n_expert_used);
+    }
     cb(result, "ffn_moe_hybrid", il);
     if (add_input) {
         result = ggml_add(ctx, result, input);
@@ -1784,7 +2015,8 @@ llm_expert_gating_func_type   gating_op,
                     if (shexp_gate) {
                         auto split_shexp_gate = (ggml_split_tensor_t *)shexp_gate->extra;
                         GGML_ASSERT(split_shexp_gate && split_shexp_gate->splits[id]);
-                        auto gate = llm_build_lora_mm(lctx, ctx, split_shexp_gate->splits[id], this_input);
+                        auto gate = llm_build_lora_mm(lctx, ctx, split_shexp_gate->splits[id], this_input,
+                            lctx.model.arch == LLM_ARCH_QWEN4EXP ? GGML_PREC_F32 : GGML_PREC_DEFAULT);
                         if (gate->ne[1] == 1) {
                             shared_out = ggml_fused_mul_unary(ctx, gate, shared_out, GGML_UNARY_OP_SIGMOID);
                         } else {
@@ -1821,7 +2053,8 @@ llm_expert_gating_func_type   gating_op,
                         nullptr, type_op_shexp, LLM_FFN_PAR, cb, il, graph);
                 cb(shared_out, "ffn_shexp_out", il);
                 if (shexp_gate) {
-                    auto shared_gate = llm_build_lora_mm(lctx, ctx, shexp_gate, cur);
+                    auto shared_gate = llm_build_lora_mm(lctx, ctx, shexp_gate, cur,
+                            lctx.model.arch == LLM_ARCH_QWEN4EXP ? GGML_PREC_F32 : GGML_PREC_DEFAULT);
                     cb(shared_gate, "shared_expert_gate", il);
                     if (shared_gate->ne[1] == 1) {
                         shared_out = ggml_fused_mul_unary(ctx, shared_gate, shared_out, GGML_UNARY_OP_SIGMOID);
@@ -1913,7 +2146,8 @@ llm_expert_gating_func_type   gating_op,
             if (shexp_gate) {
                 auto split_shexp_gate = (ggml_split_tensor_t *)shexp_gate->extra;
                 GGML_ASSERT(split_shexp_gate && split_shexp_gate->splits[id]);
-                auto gate = llm_build_lora_mm(lctx, ctx, split_shexp_gate->splits[id], cur);
+                auto gate = llm_build_lora_mm(lctx, ctx, split_shexp_gate->splits[id], cur,
+                            lctx.model.arch == LLM_ARCH_QWEN4EXP ? GGML_PREC_F32 : GGML_PREC_DEFAULT);
                 if (gate->ne[1] == 1) {
                     shared_out = ggml_fused_mul_unary(ctx, gate, shared_out, GGML_UNARY_OP_SIGMOID);
                 } else {
@@ -1974,7 +2208,8 @@ static ggml_tensor * llm_build_kqv(
          const llm_build_cb & cb,
                     int       il,
                 ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
-                ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr) {
+                ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr,
+                bool force_f32_attention = false) {
     const llama_model   & model   = lctx.model;
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
@@ -2000,6 +2235,83 @@ static ggml_tensor * llm_build_kqv(
 
     GGML_ASSERT(k_cache != nullptr && "k_cache is null in llm_build_kqv");
     GGML_ASSERT(v_cache != nullptr && "v_cache is null in llm_build_kqv");
+
+    if (model.arch == LLM_ARCH_QWEN4EXP && !k_cache_view && !lctx.qwen4exp_attention_inputs.empty()) {
+        ggml_tensor * result = nullptr;
+        const int64_t key_width = k_cache->ne[0];
+        const int64_t value_width = v_cache->ne[0] / n_ctx / n_head_kv;
+        auto * physical_k = ggml_view_3d(ctx, k_cache, key_width, n_kv, n_head_kv,
+                ggml_row_size(k_cache->type, key_width) * n_head_kv,
+                ggml_row_size(k_cache->type, key_width), 0);
+        ggml_tensor * physical_v;
+        if (kv.v_trans) {
+            physical_v = ggml_view_3d(ctx, v_cache, n_kv, n_embd_head_v, n_head_kv,
+                    ggml_element_size(v_cache) * n_ctx,
+                    ggml_element_size(v_cache) * n_ctx * n_embd_head_v, 0);
+            physical_v = ggml_cont(ctx, ggml_transpose(ctx, physical_v));
+        } else {
+            physical_v = ggml_view_3d(ctx, v_cache, value_width, n_kv, n_head_kv,
+                    ggml_row_size(v_cache->type, value_width) * n_head_kv,
+                    ggml_row_size(v_cache->type, value_width), 0);
+        }
+        for (const auto & input : lctx.qwen4exp_attention_inputs) {
+            const int64_t ratio = hparams.qwen4exp_compress_ratios[il];
+            // QSA exposes at most top_k complete-block tokens plus one tail.
+            // Gather that bounded set before dequantization. Gathering the full
+            // 1M cache first needs roughly 4 GiB of temporary F32 K/V per layer.
+            const int64_t kept = GGML_PAD(hparams.indexer_top_k + ratio - 1, 256);
+            if (cparams.flash_attn && qwen4exp_explicit_arithmetic(lctx) && n_swa == 0 && input.key_count > kept) {
+                auto * mask = input.layer_masks.at(il);
+                mask = ggml_view_2d(ctx, mask, input.key_count, input.query_count, mask->nb[1], 0);
+                if (mask->type != GGML_TYPE_F32) mask = ggml_cast(ctx, mask, GGML_TYPE_F32);
+                mask = ggml_cont(ctx, mask);
+                // Explicit row ranks preserve visible key order across backends
+                // and retain each logical row once, including tails.
+                auto * selected = qwen4exp_build_compact_attention_indices(ctx, mask, kept);
+                auto * row_map = ggml_view_2d(ctx, input.rows, input.key_count, n_head_kv, input.rows->nb[1], 0);
+                for (int64_t query = 0; query < input.query_count; ++query) {
+                    const auto compact = qwen4exp_build_compact_attention_rows(ctx, row_map, mask, selected, query);
+                    auto * compact_k = qwen4exp_gather_attention_rows(lctx, ctx, graph, physical_k, compact.rows,
+                            ggml_backend_buffer_is_host(k_cache->buffer), il);
+                    auto * compact_v = qwen4exp_gather_attention_rows(lctx, ctx, graph, physical_v, compact.rows,
+                            ggml_backend_buffer_is_host(v_cache->buffer), il);
+                    const bool f32_rows = compact_k->type == GGML_TYPE_F32 && compact_v->type == GGML_TYPE_F32;
+                    if (f32_rows) compact_v = ggml_cont(ctx, ggml_transpose(ctx, compact_v));
+                    auto * queries = ggml_view_3d(ctx, q_cur, q_cur->ne[0], q_cur->ne[1], 1,
+                            q_cur->nb[1], q_cur->nb[2], (input.first_query + query) * q_cur->nb[2]);
+                    auto * output = llm_build_kqv(ctx, lctx, kv, graph, nullptr, nullptr, queries,
+                            compact.mask, 1, int32_t(kept), kq_scale, cb, il,
+                            sinks, n_swa, kv_il, &compact_k, &compact_v, f32_rows);
+                    result = result ? ggml_concat(ctx, result, output, 1) : output;
+                }
+                continue;
+            }
+            auto * ids = ggml_view_2d(ctx, input.rows, input.key_count, n_head_kv, input.rows->nb[1], 0);
+            // Gather only selected rows before the backend handoff. Never
+            // transfer the complete persistent allocation during decode.
+            auto * ordered_k = qwen4exp_gather_attention_rows(lctx, ctx, graph, physical_k, ids,
+                    ggml_backend_buffer_is_host(k_cache->buffer), il);
+            auto * ordered_v = qwen4exp_gather_attention_rows(lctx, ctx, graph, physical_v, ids,
+                    ggml_backend_buffer_is_host(v_cache->buffer), il);
+            // The CUDA FA implementations for gathered F32 rows can convert
+            // them to half despite GGML_PREC_F32. Preserve explicit arithmetic
+            // through the ordinary F32 KQ/softmax/VQ path for these rows.
+            const bool f32_rows = qwen4exp_explicit_arithmetic(lctx) &&
+                    ordered_k->type == GGML_TYPE_F32 && ordered_v->type == GGML_TYPE_F32;
+            if (!cparams.flash_attn || f32_rows) ordered_v = ggml_cont(ctx, ggml_transpose(ctx, ordered_v));
+            auto * queries = ggml_view_3d(ctx, q_cur, q_cur->ne[0], q_cur->ne[1], input.query_count,
+                    q_cur->nb[1], q_cur->nb[2], input.first_query * q_cur->nb[2]);
+            auto * sequence_output = llm_build_kqv(ctx, lctx, kv, graph, nullptr, nullptr, queries,
+                    input.layer_masks.at(il), input.query_count, input.key_count, kq_scale, cb, il,
+                    sinks, n_swa, kv_il, &ordered_k, &ordered_v, f32_rows);
+            result = result ? ggml_concat(ctx, result, sequence_output, 1) : sequence_output;
+        }
+        GGML_ASSERT(result && result->ne[1] == n_tokens);
+        ggml_build_forward_expand(graph, result);
+        if (wo) result = llm_build_context::llm_build_lora_mm(lctx, ctx, wo, result);
+        if (wo_b) result = ggml_add(ctx, result, wo_b);
+        return result;
+    }
 
     struct ggml_tensor * k = k_cache_view ? *k_cache_view : nullptr;
     if (!k) {
@@ -2033,12 +2345,13 @@ static ggml_tensor * llm_build_kqv(
                                   || model.arch == LLM_ARCH_GLM4
                                   || model.arch == LLM_ARCH_GLM4_MOE
                                   || model.arch == LLM_ARCH_LAGUNA
-                                  || model.arch == LLM_ARCH_MIMO2;
+                                  || model.arch == LLM_ARCH_MIMO2
+                                  || qwen4exp_explicit_arithmetic(lctx);
                                // || (model.arch == LLM_ARCH_DEEPSEEK2 && q->ne[1] <= 8);
 
     struct ggml_tensor * cur;
 
-    if (cparams.flash_attn) {
+    if (cparams.flash_attn && !force_f32_attention) {
         GGML_UNUSED(model);
         GGML_UNUSED(n_ctx);
 
@@ -2163,6 +2476,10 @@ static ggml_tensor * llm_build_kqv(
             GGML_ASSERT(kv.size == n_ctx);
 
             struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
+            if (qwen4exp_explicit_arithmetic(lctx)) {
+                // Keep value aggregation independent of the query batch size.
+                ggml_mul_mat_set_prec(kqv, GGML_PREC_F32);
+            }
             cb(kqv, "kqv", il);
 
             struct ggml_tensor * kqv_merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
@@ -2352,11 +2669,12 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_buil
 
 std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_build_mul_mat_qkv_gated(ggml_cgraph * gf, ggml_tensor * cur,
             ggml_tensor * wq, ggml_tensor * wk, ggml_tensor * wv, ggml_tensor * q_norm, ggml_tensor * k_norm, int il) const {
-    auto Qaux = llm_build_lora_mm(lctx, ctx0, wq, cur);
+    const auto precision = qwen4exp_explicit_arithmetic(lctx) ? GGML_PREC_F32 : GGML_PREC_DEFAULT;
+    auto Qaux = llm_build_lora_mm(lctx, ctx0, wq, cur, precision);
     cb(Qaux, "Qaux", il);
-    auto Kcur = llm_build_lora_mm(lctx, ctx0, wk, cur);
+    auto Kcur = llm_build_lora_mm(lctx, ctx0, wk, cur, precision);
     cb(Kcur, "Kcur", il);
-    auto Vcur = llm_build_lora_mm(lctx, ctx0, wv, cur);
+    auto Vcur = llm_build_lora_mm(lctx, ctx0, wv, cur, precision);
     cb(Vcur, "Vcur", il);
     ggml_build_forward_expand(gf, Qaux);
     ggml_build_forward_expand(gf, Kcur);
@@ -2487,6 +2805,10 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_buil
 ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
         ggml_tensor * output, const llm_build_cb & cb) {
     // lm_head
+    if (qwen4exp_explicit_arithmetic(lctx)) {
+        GGML_ASSERT(!output->extra && output->type == GGML_TYPE_Q6_K && lctx.lora_adapters.empty());
+        return llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur, GGML_PREC_F32);
+    }
     if (output->extra) {
         auto split_output = (ggml_split_tensor_t *)output->extra;
         std::vector<ggml_tensor *> o;
@@ -2511,6 +2833,10 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
 ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
         ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name) {
     // lm_head
+    const bool explicit_head = qwen4exp_explicit_arithmetic(lctx);
+    if (explicit_head) GGML_ASSERT(!output->extra &&
+            (output->type == GGML_TYPE_Q6_K || output->type == GGML_TYPE_IQ4_XS) &&
+            lctx.lora_adapters.empty());
     if (output->extra) {
         auto split_output = (ggml_split_tensor_t *)output->extra;
         auto split_output_norm = output_norm && output_norm->extra ? (ggml_split_tensor_t *)output_norm->extra : nullptr;
@@ -2561,7 +2887,8 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
                 cb(cur, "result_norm", -1);
             }
         }
-        cur = llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);
+        cur = llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur,
+                explicit_head ? GGML_PREC_F32 : GGML_PREC_DEFAULT);
     }
     return cur;
 }
@@ -2665,6 +2992,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     auto tim1 = ggml_time_us();
 #endif
 
+    const char * gpu_attention_flag = std::getenv("ESE_QWEN4EXP_GPU_ATTENTION");
+    const bool gpu_attention = model.arch == LLM_ARCH_QWEN4EXP && lctx.cparams.offload_kqv &&
+            gpu_attention_flag && std::strcmp(gpu_attention_flag, "1") == 0;
+
     // this callback allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
     llm_build_cb cb = [&](struct ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
@@ -2693,6 +3024,22 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             }
         }
 
+        if (gpu_attention && il >= 0 &&
+                (std::strcmp(name, "kq") == 0 || std::strcmp(name, "kq_soft_max_ext") == 0 ||
+                 std::strcmp(name, "kqv") == 0 || std::strcmp(name, "kqv_merged_cont") == 0)) {
+            // Host placement applies to persistent storage and row gathering.
+            // Explicitly place attention compute on the layer GPU so host
+            // gathers do not pull KQ/softmax/VQ and their queries onto the CPU.
+            for (auto * backend : lctx.backends) {
+                if (backend != lctx.backend_cpu &&
+                        ggml_backend_supports_buft(backend, model.buft_layer[il].buft) &&
+                        ggml_backend_supports_op(backend, cur)) {
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend);
+                    break;
+                }
+            }
+        }
+
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = lctx.model.n_gpu_layers > (int)lctx.model.hparams.n_layer;
@@ -2711,10 +3058,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
 
     struct ggml_cgraph * result = NULL;
 
-    const llama_vocab * vocab = &lctx.model.vocab; //llama_get_vocab(&lctx);
-    llama_token bos = vocab->token_bos();
-    llama_token eos = vocab->token_eos();
-    bool is_warming_up = lctx.n_eval == 0 && (batch.n_tokens == 1 && (batch.token[0] == ((bos != -1) ? bos : eos)));
+    // A first BOS token is ordinary input, including inside a one-token
+    // prompt microbatch. Only explicit warmup may execute every expert.
+    // Preserve conservative single-token allocation-only reservation.
+    const bool is_warming_up = lctx.warming_up || (worst_case && batch.n_tokens == 1);
     struct llm_build_context llm(lctx, batch, cb, worst_case, is_warming_up, n_outputs);
 
     llm.init();
@@ -2804,6 +3151,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         case LLM_ARCH_QWEN3NEXT:
             {
                 result = llm.build_qwen3next();
+            } break;
+        case LLM_ARCH_QWEN4EXP:
+            {
+                result = llm.build_qwen4exp();
             } break;
         case LLM_ARCH_QWEN35MOE:
             {
@@ -2928,6 +3279,8 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_deepseek4();
             } break;
+        case LLM_ARCH_DEEPSEEK41:
+            { result = llm.build_deepseek41(); } break;
         case LLM_ARCH_OPENPANGU:
             {
                 result = llm.build_openpangu();
@@ -3146,7 +3499,8 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 auto the_k_norm = model.layers[il].attn_k_norm ? model.layers[il].attn_k_norm->extra ?
                     ((ggml_split_tensor_t *)model.layers[il].attn_k_norm->extra)->splits[id] : model.layers[il].attn_k_norm : nullptr;
                 ggml_tensor *Qcur, *Kcur, *Vcur, *gate = nullptr;
-                if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
+                if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 ||
+                        model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN4EXP) {
                     auto [Q, K, V, G] = llm_build_mul_mat_qkv_gated(gf, cur, split_wq, split_wk, split_wv,
                             the_q_norm, the_k_norm, il);
                     Qcur = Q; Kcur = K; Vcur = V; gate = G;
@@ -3407,7 +3761,8 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
     auto input_normed = cur;
 
     ggml_tensor *Qcur, *Kcur, *Vcur, *gate = nullptr;
-    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
+    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 ||
+            model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN4EXP) {
         auto [Q, K, V, G] = llm_build_mul_mat_qkv_gated(gf, cur, model.layers[il].wq, model.layers[il].wk, model.layers[il].wv,
                 model.layers[il].attn_q_norm, model.layers[il].attn_k_norm, il);
         Qcur = Q; Kcur = K; Vcur = V; gate = G;
@@ -3500,7 +3855,8 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 cur = ggml_mul(ctx0, cur, gate);
             }
             cb(cur, "qkv_gated", il);
-            cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur);
+            cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur,
+                    qwen4exp_explicit_arithmetic(lctx) ? GGML_PREC_F32 : GGML_PREC_DEFAULT);
             if (model.layers[il].bo) {
                 cur = ggml_add(ctx0, cur, model.layers[il].bo);
             }
@@ -3541,4 +3897,26 @@ int32_t llama_model_n_nextn_layer(const llama_model * model) {
 ggml_cgraph * llm_build_context::new_graph_custom() {
     int max_nodes = lctx.max_nodes(n_tokens, n_kv);
     return ggml_new_graph_custom(ctx0, max_nodes, false);
+}
+
+
+ggml_cgraph * llm_build_context::build_deepseek41() {
+    if (!lctx.dsv41_runtime || n_tokens < 1 || n_tokens > deepseek_v41::attention_forward_state::max_batch || batch.embd) {
+        throw std::runtime_error("DeepSeek V4.1 requires initialized assets and a bounded text microbatch");
+    }
+    auto graph = ggml_new_graph_custom(ctx0, model.max_nodes(1), false);
+    lctx.inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    lctx.inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(lctx.inp_tokens); ggml_set_input(lctx.inp_pos);
+    ggml_set_name(lctx.inp_tokens, "inp_tokens"); ggml_set_name(lctx.inp_pos, "inp_pos");
+    for (auto layer : model.dsv41_config.engram_layers) {
+        auto rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 6144, n_tokens);
+        ggml_set_input(rows); ggml_format_name(rows, "engram_rows-%u", layer);
+        lctx.dsv41_row_inputs[layer] = rows;
+    }
+    build_inp_out_ids();
+    lctx.dsv41_runtime->forward().build_chunk(ctx0, lctx, model.dsv41_tensors,
+            lctx.inp_tokens, lctx.inp_pos, lctx.dsv41_row_inputs, graph,
+            lctx.dsv41_runtime->active() ? UINT32_MAX : cparams.n_ctx - n_tokens, lctx.inp_out_ids);
+    return graph;
 }

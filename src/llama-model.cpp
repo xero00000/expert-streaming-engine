@@ -556,6 +556,58 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        LLM_ARCH_QWEN4EXP,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,                    "token_embd" },
+            { LLM_TENSOR_OUTPUT,                        "output" },
+            { LLM_TENSOR_PER_LAYER_TOKEN_EMBD,          "per_layer_token_embd" },
+            { LLM_TENSOR_HC_OUTPUT_DOWN,                "output_hc_down" },
+            { LLM_TENSOR_HC_OUTPUT_NORM,                "output_hc_norm" },
+            { LLM_TENSOR_HC_OUTPUT_UP,                  "output_hc_up" },
+            { LLM_TENSOR_ATTN_Q,                        "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,                        "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,                        "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,                      "blk.%d.attn_output" },
+            { LLM_TENSOR_ATTN_Q_NORM,                   "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K_NORM,                   "blk.%d.attn_k_norm" },
+            { LLM_TENSOR_ATTN_QKV,                      "blk.%d.attn_qkv" },
+            { LLM_TENSOR_ATTN_GATE,                     "blk.%d.attn_gate" },
+            { LLM_TENSOR_INDEXER_Q_PROJ,                "blk.%d.indexer.q_proj" },
+            { LLM_TENSOR_INDEXER_K_PROJ,                "blk.%d.indexer.k_proj" },
+            { LLM_TENSOR_INDEXER_Q_NORM,                "blk.%d.indexer.q_norm" },
+            { LLM_TENSOR_INDEXER_K_NORM_QWEN4EXP,       "blk.%d.indexer.k_norm" },
+            { LLM_TENSOR_SSM_CONV1D,                    "blk.%d.ssm_conv1d" },
+            { LLM_TENSOR_SSM_DT,                        "blk.%d.ssm_dt" },
+            { LLM_TENSOR_SSM_A_NOSCAN,                  "blk.%d.ssm_a" },
+            { LLM_TENSOR_SSM_ALPHA,                     "blk.%d.ssm_alpha" },
+            { LLM_TENSOR_SSM_BETA,                      "blk.%d.ssm_beta" },
+            { LLM_TENSOR_SSM_NORM,                      "blk.%d.ssm_norm" },
+            { LLM_TENSOR_SSM_OUT,                       "blk.%d.ssm_out" },
+            { LLM_TENSOR_FFN_GATE_INP,                  "blk.%d.ffn_gate_inp" },
+            { LLM_TENSOR_FFN_GATE_EXPS,                 "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_DOWN_EXPS,                 "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS,                   "blk.%d.ffn_up_exps" },
+            { LLM_TENSOR_FFN_GATE_INP_SHEXP,            "blk.%d.ffn_gate_inp_shexp" },
+            { LLM_TENSOR_FFN_GATE_SHEXP,                "blk.%d.ffn_gate_shexp" },
+            { LLM_TENSOR_FFN_DOWN_SHEXP,                "blk.%d.ffn_down_shexp" },
+            { LLM_TENSOR_FFN_UP_SHEXP,                  "blk.%d.ffn_up_shexp" },
+            { LLM_TENSOR_PLE_CONV1D,                    "blk.%d.ple_conv1d" },
+            { LLM_TENSOR_PLE_KEY,                       "blk.%d.ple_key" },
+            { LLM_TENSOR_PLE_VALUE,                     "blk.%d.ple_value" },
+            { LLM_TENSOR_PLE_NORM_QUERY,                "blk.%d.ple_norm_query" },
+            { LLM_TENSOR_PLE_NORM_KEY,                  "blk.%d.ple_norm_key" },
+            { LLM_TENSOR_PLE_NORM_CONV,                 "blk.%d.ple_norm_conv" },
+            { LLM_TENSOR_HC_ATTN_DOWN_QWEN4EXP,         "blk.%d.hc_attn_down" },
+            { LLM_TENSOR_HC_ATTN_NORM_QWEN4EXP,         "blk.%d.hc_attn_norm" },
+            { LLM_TENSOR_HC_ATTN_UP_QWEN4EXP,           "blk.%d.hc_attn_up" },
+            { LLM_TENSOR_HC_ATTN_INJECT_QWEN4EXP,       "blk.%d.hc_attn_inject" },
+            { LLM_TENSOR_HC_FFN_DOWN_QWEN4EXP,          "blk.%d.hc_ffn_down" },
+            { LLM_TENSOR_HC_FFN_NORM_QWEN4EXP,          "blk.%d.hc_ffn_norm" },
+            { LLM_TENSOR_HC_FFN_UP_QWEN4EXP,            "blk.%d.hc_ffn_up" },
+            { LLM_TENSOR_HC_FFN_INJECT_QWEN4EXP,        "blk.%d.hc_ffn_inject" },
+        },
+    },
+    {
         LLM_ARCH_QWEN35MOE,
         {
             { LLM_TENSOR_TOKEN_EMBD,         "token_embd" },
@@ -2281,14 +2333,16 @@ bool llama_model_is_split_mode_graph(const struct llama_model * model) {
 
 bool llama_model_supports_ctx_shift(const struct llama_model * model) {
     // openPangu and DeepSeek4 keep position-dependent private state outside the generic KV cache.
-    return model && model->arch != LLM_ARCH_OPENPANGU && model->arch != LLM_ARCH_DEEPSEEK4;
+    return model && model->arch != LLM_ARCH_OPENPANGU && model->arch != LLM_ARCH_DEEPSEEK4 &&
+        model->arch != LLM_ARCH_QWEN4EXP;
 }
 
 bool llama_model_supports_partial_kv_reuse(const struct llama_model * model) {
-    return model != nullptr;
+    return model != nullptr && model->arch != LLM_ARCH_QWEN4EXP;
 }
 
 llm_tensor llm_tensor_type(llm_arch arch, const std::string & tensor_name, int il) {
+    if (arch == LLM_ARCH_DEEPSEEK41) arch = LLM_ARCH_DEEPSEEK4; // shared backbone names, not execution semantics
     auto it = LLM_TENSOR_NAMES.find(arch);
     if (it == LLM_TENSOR_NAMES.end()) {
         printf("%s: Oops, did not find arch\n", __func__);
@@ -2319,11 +2373,14 @@ llm_tensor llm_tensor_type(llm_arch arch, const std::string & tensor_name, int i
     return LLM_TENSOR_UNKNOWN;
 }
 
-size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_type idx_type_k, uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const {
+static size_t cache_size_for_metadata(llm_arch arch, const llama_hparams & hparams,
+        int il, ggml_type type_k, ggml_type type_v, ggml_type idx_type_k,
+        uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) {
     if (il < 0 || il >= hparams.n_layer) return 0;
     if (hparams.recurrent_layer_arr[il]) {
         auto state_sots = std::min<uint32_t>(std::max<uint32_t>(1, n_seq_max), kv_size);
-        return hparams.n_embd_v_s() * state_sots * sizeof(float);
+        const size_t state_width = size_t(hparams.n_embd_v_s()) + hparams.qwen4exp_ple_conv_state_size(il);
+        return state_width * state_sots * sizeof(float);
     }
     if (arch == LLM_ARCH_OPENPANGU) {
         // MLA-latent cache: K row [ckv | roped k_pe]. The value-side latent is
@@ -2383,5 +2440,19 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
         : hparams.n_embd_head_v(il);
     const size_t k_size = ggml_row_size(type_k, head_k) * n_head_kv * kv_size;
     const size_t v_size = ggml_row_size(type_v, head_v * n_head_kv) * kv_size;
-    return k_size + v_size;
+    // Every Qwen4Exp full-attention layer retains one raw indexer key per
+    // position in addition to its ordinary K/V tensors.
+    const size_t indexer_size = arch == LLM_ARCH_QWEN4EXP
+        ? ggml_row_size(idx_type_k, hparams.indexer_head_size) * kv_size : 0;
+    return k_size + v_size + indexer_size;
+}
+
+size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_type idx_type_k,
+        uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const {
+    return cache_size_for_metadata(arch,hparams,il,type_k,type_v,idx_type_k,kv_size,mla_attn,n_seq_max,flash_attn);
+}
+
+size_t llama_kv_size_profile::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_type idx_type_k,
+        uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const {
+    return cache_size_for_metadata(arch,hparams,il,type_k,type_v,idx_type_k,kv_size,mla_attn,n_seq_max,flash_attn);
 }

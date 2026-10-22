@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getVersion } from "@tauri-apps/api/app";
+import { getBundleType, getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { Activity, AppWindow, Bot, Box, Bug, ChevronDown, ChevronRight, ChevronUp, CloudDownload, Download, Gauge, HardDrive, Heart, Library, MessageSquare, Play, Plus, RefreshCw, RotateCcw, Search, Send, Settings, ShieldCheck, SlidersHorizontal, Sparkles, SquareTerminal, StopCircle, Trash2, User, X } from "lucide-react";
 import { TerminalPane } from "./components/TerminalPane";
 import { privacySafeError } from "./privacy";
+import { checkPackageUpdate, manualUpdateInstructions } from "./update-policy";
 import type { AppProfile, ChatStatus, DownloadStatus, HubModel, HubModelDetails, ModelProfile, StudioSnapshot, SweepPlan, SweepStatus, TerminalTab, View } from "./types";
 import "./App.css";
 
@@ -44,7 +45,7 @@ interface ChatEntry {
   reasoning?: string;
 }
 
-type UpdateState = "idle" | "checking" | "available" | "downloading" | "current" | "error";
+type UpdateState = "idle" | "checking" | "available" | "downloading" | "current" | "manual" | "error";
 
 function storedChat(): ChatEntry[] {
   try {
@@ -103,11 +104,12 @@ function formatSpeed(bytesPerSecond: number) {
 }
 
 const familyOrder = [
-  "Qwen 3.8 · 27B", "Qwen 3.6 · 27B", "Qwen 3.6 · 35B", "Qwen", "Qwopus Coder",
+  "Qwen 3.8 · Flash Next", "Qwen 3.8 · 27B", "Qwen 3.6 · 27B", "Qwen 3.6 · 35B", "Qwen", "Qwopus Coder",
   "Gemma 4", "Agents-A1", "AgentWorld", "Ornith", "Falcon", "Mamba", "MoE experiments", "Other",
 ];
 
 function modelFamily(model: ModelProfile) {
+  if (model.architecture?.toLowerCase() === "qwen4exp") return "Qwen 3.8 · Flash Next";
   const name = model.name.toLowerCase();
   const compact = name.replace(/[^a-z0-9]+/g, "");
   if (compact.includes("agentworld")) return "AgentWorld";
@@ -123,6 +125,14 @@ function modelFamily(model: ModelProfile) {
   if (compact.includes("mamba")) return "Mamba";
   if (compact.includes("moe")) return "MoE experiments";
   return "Other";
+}
+
+function modelCanLaunch(model?: ModelProfile) {
+  return Boolean(model?.available && model.runtimeSupport?.launchable !== false);
+}
+
+function capabilityLabel(value: string) {
+  return value === "validation-pending" ? "validation pending" : value;
 }
 
 function groupModelsByFamily(models: ModelProfile[]) {
@@ -141,14 +151,15 @@ function groupModelsByFamily(models: ModelProfile[]) {
 }
 
 function ModelRow({ model, selected, onSelect }: { model: ModelProfile; selected: boolean; onSelect: () => void }) {
+  const launchable = modelCanLaunch(model);
   return (
     <button className={`model-row ${selected ? "selected" : ""}`} onClick={onSelect} aria-pressed={selected}>
       <span className="model-icon"><Box size={16} /></span>
-      <span className="model-primary"><strong>{model.name}</strong><small title={model.path}>{model.path}</small></span>
+      <span className="model-primary"><strong>{model.name}{model.runtimeSupport?.tier === "experimental" && <span className="support-badge">Experimental</span>}</strong><small title={model.path}>{model.path}</small></span>
       <span className="model-cell"><small>Architecture</small>{model.architecture ?? "Unknown"}</span>
       <span className="model-cell"><small>Quant</small>{model.quantization ?? "—"}</span>
       <span className="model-cell"><small>Size</small>{formatBytes(model.sizeBytes)}</span>
-      <span className={`availability ${model.available ? "ready" : "missing"}`}><i />{model.available ? "Ready" : "Missing"}</span>
+      <span className={`availability ${launchable ? "ready" : model.available ? "gated" : "missing"}`}><i />{launchable ? "Ready" : model.available ? "Validation gated" : "Missing"}</span>
     </button>
   );
 }
@@ -208,7 +219,7 @@ function App() {
   const [chatDraft, setChatDraft] = useState("");
   const [chatRunning, setChatRunning] = useState(false);
   const [chatRequestId, setChatRequestId] = useState<string>();
-  const [appVersion, setAppVersion] = useState("0.2.0");
+  const [appVersion, setAppVersion] = useState("0.2.1");
   const [pendingUpdate, setPendingUpdate] = useState<Update>();
   const [updateState, setUpdateState] = useState<UpdateState>("idle");
   const [updateDetail, setUpdateDetail] = useState("Check GitHub Releases for a signed ESE Studio and runtime update.");
@@ -265,6 +276,13 @@ function App() {
     void refresh();
     if (!("__TAURI_INTERNALS__" in window)) return;
     void getVersion().then(setAppVersion).catch(() => undefined);
+    void getBundleType().then((bundleType) => {
+      const instructions = manualUpdateInstructions(bundleType);
+      if (instructions) {
+        setUpdateState("manual");
+        setUpdateDetail(instructions);
+      }
+    }).catch(() => undefined);
     const cleanups: Array<() => void> = [];
     let disposed = false;
     const register = (listener: Promise<() => void>) => void listener.then((cleanup) => {
@@ -311,7 +329,14 @@ function App() {
     setUpdateDetail("Contacting the signed GitHub release channel…");
     setUpdateProgress(0);
     try {
-      const availableUpdate = await check({ timeout: 30_000 });
+      const result = await checkPackageUpdate(getBundleType, () => check({ timeout: 30_000 }));
+      if (result.kind === "manual") {
+        setPendingUpdate(undefined);
+        setUpdateState("manual");
+        setUpdateDetail(result.instructions);
+        return;
+      }
+      const availableUpdate = result.update;
       setPendingUpdate(availableUpdate ?? undefined);
       if (availableUpdate) {
         setUpdateState("available");
@@ -376,8 +401,9 @@ function App() {
   const available = useMemo(() => availableModels.filter((model) => `${model.name} ${model.path} ${modelFamily(model)}`.toLowerCase().includes(query.toLowerCase()) && (!familyFilter || modelFamily(model) === familyFilter) && (!quantFilter || model.quantization === quantFilter)), [availableModels, query, familyFilter, quantFilter]);
   const unavailable = useMemo(() => snapshot.models.filter((model) => !model.available && `${model.name} ${model.path}`.toLowerCase().includes(query.toLowerCase())), [snapshot.models, query]);
   const groupedAvailable = useMemo(() => groupModelsByFamily(available), [available]);
-  const groupedSweepModels = useMemo(() => groupModelsByFamily(availableModels), [availableModels]);
+  const groupedSweepModels = useMemo(() => groupModelsByFamily(availableModels.filter((model) => modelCanLaunch(model))), [availableModels]);
   const selected = snapshot.models.find((model) => model.id === selectedId);
+  const selectedLaunchable = modelCanLaunch(selected);
   const currentTab = tabs.find((tab) => tab.id === activeTab);
   const visibleDownloadStatus = downloadStatus && (downloadStatus.state === "downloading" || downloadStatus.repoId === hubDetails?.model.id) ? downloadStatus : undefined;
   useEffect(() => {
@@ -429,7 +455,7 @@ function App() {
   };
 
   const previewSweep = async () => {
-    if (!selected) return;
+    if (!selected || !selectedLaunchable) return;
     const request = { modelPath: selected.path, preset, objective: advanced ? objective : "max-safe-context", maxContext, safeMargin: 0.9 };
     try {
       const plan = native ? await invoke<SweepPlan>("plan_sweep", { request }) : { ...request, candidateContexts: [4096, 32768, 65536, 98304, 131072], kvTypes: ["q4_0", "q8_0", "f16"], batchSizes: [256, 512], slotCounts: objective === "max-concurrency" ? [1, 2, 4] : [1], promotedContext: 117760, trialCount: 11, requiresExclusiveGpu: true, safeMargin: 0.9 };
@@ -438,7 +464,7 @@ function App() {
   };
 
   const runSweep = async () => {
-    if (!selected || !native) return;
+    if (!selected || !selectedLaunchable || !native) return;
     const request = { modelPath: selected.path, preset, objective: advanced ? objective : "max-safe-context", maxContext, safeMargin: 0.9 };
     try {
       const status = await invoke<SweepStatus>("start_sweep", { request, confirmed: true });
@@ -528,9 +554,11 @@ function App() {
   };
 
   const launchEse = (mode: "plan" | "serve") => {
-    if (!selected) return;
+    if (!selected || !selectedLaunchable) return;
     const args = [mode, selected.path, "--slots", String(concurrentSessions)];
     if (mode === "serve" && selected.source === "sweep") {
+      if (selected.memoryPolicy) args.push("--policy", selected.memoryPolicy);
+      if (selected.gpuLayers !== undefined) args.push("--gpu-layers", String(selected.gpuLayers));
       if (selected.context) args.push("-c", String(selected.context));
       if (selected.kvType) args.push("--kv", selected.kvType);
       if (selected.batchSize) args.push("--batch-size", String(selected.batchSize));
@@ -668,7 +696,7 @@ function App() {
               })}</div> : <EmptyState title="No models found" detail="Add a model folder in Settings to begin discovery." />}
               {!!unavailable.length && <div className="unavailable"><button onClick={() => setShowUnavailable(!showUnavailable)}>{showUnavailable ? <ChevronDown size={15} /> : <ChevronRight size={15} />}Unavailable profiles <span>{unavailable.length}</span></button>{showUnavailable && <div className="model-list">{unavailable.map((model) => <ModelRow key={model.id} model={model} selected={model.id === selectedId} onSelect={() => setSelectedId(model.id)} />)}</div>}</div>}
             </div>
-            {selected && <div className="selection-bar"><div><span className={`availability ${selected.available ? "ready" : "missing"}`}><i />{selected.available ? "Selected" : "Missing"}</span><strong>{selected.name}</strong><small>{selected.available ? selected.context ? `${Math.floor(selected.context / concurrentSessions).toLocaleString()} context per session · ${selected.context.toLocaleString()} total` : `Context will be planned across ${concurrentSessions} ${concurrentSessions === 1 ? "session" : "sessions"}` : "The configured GGUF file could not be found."}</small></div><label className="session-control"><span>Concurrent sessions</span><select value={concurrentSessions} onChange={(event) => setConcurrentSessions(Number(event.target.value))} aria-label="Concurrent local AI sessions" disabled={!selected.available}><option value={1}>1 · Maximum context</option><option value={2}>2 · Dense resident</option><option value={4}>4 · Dense resident</option></select></label><button onClick={() => launchEse("plan")} disabled={!selected.available}>Inspect plan</button><button className="primary" onClick={() => launchEse("serve")} disabled={!selected.available}><Play size={14} fill="currentColor" />{selected.available ? chatStatus.active ? chatStatus.modelPath === selected.path ? "Restart model" : "Switch model" : "Start model" : "Model file missing"}</button></div>}
+            {selected && <div className={`selection-bar ${selected.runtimeSupport?.tier === "experimental" ? "experimental" : ""}`}><div><span className={`availability ${selectedLaunchable ? "ready" : selected.available ? "gated" : "missing"}`}><i />{selectedLaunchable ? "Selected" : selected.available ? "Validation gated" : "Missing"}</span><strong>{selected.name}</strong><small>{selected.runtimeSupport ? `Text ${capabilityLabel(selected.runtimeSupport.text)} · Vision ${capabilityLabel(selected.runtimeSupport.vision)} · MTP ${capabilityLabel(selected.runtimeSupport.mtp)}` : selected.available ? selected.context ? `${Math.floor(selected.context / concurrentSessions).toLocaleString()} context per session · ${selected.context.toLocaleString()} total` : `Context will be planned across ${concurrentSessions} ${concurrentSessions === 1 ? "session" : "sessions"}` : "The configured GGUF file could not be found."}</small>{selected.runtimeSupport && <small className="support-note">{selected.runtimeSupport.note}</small>}</div><label className="session-control"><span>Concurrent sessions</span><select value={concurrentSessions} onChange={(event) => setConcurrentSessions(Number(event.target.value))} aria-label="Concurrent local AI sessions" disabled={!selectedLaunchable}><option value={1}>1 · Maximum context</option><option value={2}>2 · Dense resident</option><option value={4}>4 · Dense resident</option></select></label><button onClick={() => launchEse("plan")} disabled={!selectedLaunchable}>Inspect plan</button><button className="primary" onClick={() => launchEse("serve")} disabled={!selectedLaunchable}><Play size={14} fill="currentColor" />{!selected.available ? "Model file missing" : !selectedLaunchable ? "Validation gated" : chatStatus.active ? chatStatus.modelPath === selected.path ? "Restart model" : "Switch model" : "Start model"}</button></div>}
           </div>}
 
           {view === "apps" && <><div className="apps-grid">{snapshot.apps.map((app) => <article className="app-card" key={app.id}><span className="app-icon"><SquareTerminal size={20} /></span><div><h2>{app.name}</h2><code>{app.command} {app.args.join(" ")}</code><p>{app.endpointAware ? chatStatus.ready ? "Receives the active model endpoint, identity, context, and tuning details in its terminal session." : "Requires a ready local model so Studio can pass its endpoint and tuning details." : "Runs in a persistent terminal tab. The session stays alive when models change."}</p></div><button className="primary" onClick={() => void launchApp(app)} disabled={app.endpointAware && !chatStatus.ready}><Play size={14} fill="currentColor" />{app.endpointAware && !chatStatus.ready ? "Start a model first" : "Launch"}</button></article>)}<button className="add-card" onClick={() => setShowAppEditor(true)}><Plus size={18} />Add a custom app<span>Command, arguments, and optional working directory</span></button></div>{showAppEditor && <section className="panel inline-editor"><div className="panel-heading"><div><h2>Custom terminal app</h2><p>The command runs directly in a native PTY. Arguments are stored in portable TOML.</p></div><button className="icon-button" onClick={() => setShowAppEditor(false)} aria-label="Close"><X size={14} /></button></div><div className="editor-grid"><label className="field"><span>Name</span><input value={appDraft.name} onChange={(event) => setAppDraft({ ...appDraft, name: event.target.value })} placeholder="My coding agent" /></label><label className="field"><span>Command</span><input value={appDraft.command} onChange={(event) => setAppDraft({ ...appDraft, command: event.target.value })} placeholder="agent-command" /></label><label className="field"><span>Arguments</span><input value={appDraft.args} onChange={(event) => setAppDraft({ ...appDraft, args: event.target.value })} placeholder="--optional flags" /></label><label className="field"><span>Working directory</span><input value={appDraft.workingDirectory} onChange={(event) => setAppDraft({ ...appDraft, workingDirectory: event.target.value })} placeholder="/home/me/project" /></label></div><button className="primary" onClick={() => void addApp()} disabled={!native || !appDraft.name.trim() || !appDraft.command.trim()}>Save app</button></section>}</>}
@@ -718,11 +746,11 @@ function App() {
                 <div className="privacy-note" id="telemetry-settings-detail"><ShieldCheck size={17} /><span><strong>{snapshot.helpImproveEse ? "Community sharing is on" : "Community sharing is off"}</strong>Raw results stay in the private collector. Public GitHub data is grouped and never includes prompts, responses, usernames, hostnames, local paths, or logs.</span></div>
               </section>
               <section className="panel settings-updates">
-                <div className="panel-heading"><div><h2>Updates</h2><p>Signed updates replace Studio and the bundled ESE runtime together.</p></div><span className="version-badge">v{appVersion}</span></div>
-                <div className={`update-state ${updateState}`} aria-live="polite"><Sparkles size={17} /><span><strong>{updateState === "available" ? `ESE Studio ${pendingUpdate?.version}` : updateState === "downloading" ? "Installing update" : updateState === "current" ? "You’re up to date" : updateState === "error" ? "Couldn’t update" : updateState === "checking" ? "Checking for updates" : "Stable release channel"}</strong>{updateDetail}</span></div>
+                <div className="panel-heading"><div><h2>Updates</h2><p>{updateState === "manual" ? "Install a matching release package to update Studio and its bundled runtime." : "Signed updates replace Studio and the bundled ESE runtime together."}</p></div><span className="version-badge">v{appVersion}</span></div>
+                <div className={`update-state ${updateState}`} aria-live="polite"><Sparkles size={17} /><span><strong>{updateState === "available" ? `ESE Studio ${pendingUpdate?.version}` : updateState === "downloading" ? "Installing update" : updateState === "current" ? "You’re up to date" : updateState === "manual" ? "Manual updates" : updateState === "error" ? "Couldn’t update" : updateState === "checking" ? "Checking for updates" : "Stable release channel"}</strong>{updateDetail}</span></div>
                 {updateState === "error" && <button className="report-error error-card-action" onClick={() => void reportError("updater", updateDetail)}><Bug size={13} />Report error</button>}
                 {updateState === "downloading" && <><div className="progress-track" role="progressbar" aria-label="Update download" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(updateProgress)}><span style={{ width: `${Math.max(3, updateProgress)}%` }} /></div><div className="progress-meta"><span>Downloading and verifying</span><span>{updateProgress ? `${Math.round(updateProgress)}%` : "Preparing…"}</span></div></>}
-                <button className={updateState === "available" ? "primary wide update-action" : "wide update-action"} onClick={() => void (updateState === "available" ? installUpdate() : checkForUpdate())} disabled={!native || updateState === "checking" || updateState === "downloading"}>{updateState === "available" ? <><Download size={14} />Download, install & restart</> : <><RefreshCw size={14} className={updateState === "checking" ? "spin" : ""} />{updateState === "checking" ? "Checking…" : "Check for updates"}</>}</button>
+                <button className={updateState === "available" ? "primary wide update-action" : "wide update-action"} onClick={() => void (updateState === "available" ? installUpdate() : checkForUpdate())} disabled={!native || updateState === "checking" || updateState === "downloading" || updateState === "manual"}>{updateState === "manual" ? "Use your package installer" : updateState === "available" ? <><Download size={14} />Download, install & restart</> : <><RefreshCw size={14} className={updateState === "checking" ? "spin" : ""} />{updateState === "checking" ? "Checking…" : "Check for updates"}</>}</button>
               </section>
               <section className="panel settings-about">
                 <div className="panel-heading"><div><h2>About ESE Studio</h2><p>{snapshot.platform === "windows" ? "Windows" : snapshot.platform === "linux" ? "Linux" : snapshot.platform} control center for Expert Streaming Engine · v{appVersion}</p></div></div>

@@ -1,0 +1,549 @@
+# ESE performance qualification — 20 October 2026
+
+Task 4 starts after the local inference/recovery checks in task 3. The user's
+publication hold remains in force. A benchmark result does not authorize a
+push, hosted workflow, tag or publication.
+
+## Acceptance contract
+
+The user initially selected **match Strata in speed**, then explicitly revised
+the minimum to **80% of Strata** when requesting restoration of the old model
+loading path. For the first direct comparison,
+freeze one common supported model and prompt on this machine; compare repeated
+sustained decode medians (the then-required ESE / Strata ratio was at least 0.8). Record every sample and
+cold/repeated behavior; retain startup, prefill and first-response separately.
+This does not lift the publication hold or qualify other models/context sizes.
+
+On 21 October the user clarified that qualification should depend on the model
+and requested the existing Strata launcher profile. The following 35B results
+remain scoped to that model. The Flash-Next launcher reference and its current
+ESE model-support blocker are recorded at the end of this document.
+The selected reference is **Flash-Next IQ2_XS, 1M experimental**, with all three
+GPUs and the saved launcher settings. Its repeated-request reference is
+52.3 tok/s (51.5 overall). The 80% ESE thresholds are **41.84 tok/s on repeats
+and 41.2 overall**. The default release build rejects the model; the existing
+dedicated loading path is now being restored and tested with the current fixes.
+
+The user subsequently accepted the observed current speed: **“ill take 19
+tokens for now we can continue to improve speeds in later updates.”** For this
+version, the earlier 80% minimum is superseded by that explicit acceptance.
+The retained one-start/three-request ESE diagnostic is 13.968 / 19.841 /
+19.664 tok/s (first / repeat / repeat), all with the same native output hash.
+Further speed optimization is deferred. This does not establish Strata parity,
+three-start reproducibility, numerical acceptance, long-context qualification
+or public model admission. Those checks remain independent. Historical targets
+and failures below are retained without relabelling them as passes.
+
+Record the following before collecting qualification measurements:
+
+- Exact model and quantization, local path and SHA-256; any conversion or
+  upstream reference needed for the claimed model support.
+- Selected GPU UUIDs, CPU thread count, RAM and per-GPU VRAM ceilings/reserves,
+  model/expert placement, KV types, cache/staging capacities and storage path.
+- Exact prompt/token IDs, filled prompt length, generated token count, seed,
+  sampling settings and supported concurrency.
+- Required minimum sustained decode rate and any startup, prefill or first
+  response limits; state whether these apply per request or in aggregate.
+- Comparison baseline: exact ESE and, if requested, Strata source/binary hashes
+  and equivalent operating conditions. Compilation or unlike configurations
+  cannot establish a performance comparison.
+
+## Local inventory already available
+
+The host has RTX 3060 Ti (8 GB), RTX 2080 SUPER (8 GB), and RTX 3080 (10 GB)
+GPUs. UUIDs and compiler/driver records are retained in task 3's evidence.
+The TinyMoE fixture is a regression workload; its speed does not qualify a
+larger user model. Local model candidates include
+`/home/xero/Desktop/test/models/Qwen3.8-35B-A3B-Q4_K_M.gguf` (21,713,462,944
+bytes). Availability does not imply model selection or numerical qualification.
+The models remain on their existing storage; no downloads or moves are needed
+to define the contract.
+
+## Ordered measurements once the contract is filled
+
+1. Freeze the native candidate, exact commands, model/prompt hashes and resource
+   settings. Confirm no unrelated load is using the selected devices.
+2. Run a bounded correctness and memory-budget check on the selected model and
+   settings before timing. Retain failures, untruncated token counts and output.
+3. Measure at least three fresh-process starts and three repeated requests per
+   configuration. Record OS page-cache state and distinguish process-cold from
+   storage-cold starts. Do not label an already cached file storage-cold or
+   globally drop caches shared by other work.
+4. Retain startup-to-ready, prompt prefill, first response and sustained decode
+   timings separately, along with raw responses, actual token counts and
+   RAM/VRAM/cache/queue/lease snapshots. Measure performance without tracing,
+   sanitizer builds or concurrent compilation; diagnose bottlenecks separately.
+5. Compare matched resident/cache/stream settings and requested ESE/Strata
+   baseline only when their placement and resource conditions are equivalent.
+   Report individual samples and median/range, including failed trials.
+6. Profile the measured bottleneck, make one change, and rerun the affected
+   correctness/recovery checks before repeating the same timing protocol.
+7. Apply the Strata reference without changing it after seeing results. Record
+   task 4's outcome and proceed to task 5's filled-64K/concurrency qualification.
+
+Existing tools include `llama-bench`, `scripts/compare-llama-bench.py`, the
+phase-2 cache runner and the retained HTTP/resource evidence wrappers. Select
+the runner that records the agreed workload; the present fixture timings have
+no production acceptance threshold.
+
+## Direct comparison preparation
+
+The saved 5 October Strata benchmark failed before readiness and has no speed
+metrics. Its gated Qwen4Exp workload is different from the supported qwen35moe
+35B model used in the preliminary resident/cache smoke tests. Those smoke
+timings cannot establish Strata parity.
+
+The installed Strata 0.1.45 also supports qwen35moe, using a single GPU for this
+family. The common comparison therefore selects the RTX 3080, 8 CPU threads,
+8,192 context cells, a frozen 512-token prompt, 128 greedy generated tokens and
+no MTP. The Q4_K_M candidate is rejected by Strata's F32 projection loader.
+The existing Qwen3.6-35B-A3B-UD-IQ4_XS model has suitable tensor formats but
+omits the explicit zero-MTP metadata that Strata requires. A separate benchmark
+copy adds only `qwen35moe.nextn_predict_layers = 0`; all original metadata and
+every tensor's type, shape and SHA-256 must verify unchanged. Both engines use
+that identical copy. Original files and running-service configs are preserved.
+
+The prompt includes reasoning output; rates are generated-token rates, not
+answer-only rates. Initial measurements retain the shared desktop's ambient
+GPU load, so quiet-system qualification remains distinct. Engine-protocol
+Strata first-token latency excludes HTTP; compare it separately from ESE HTTP
+latency. Both runners reject missing/invalid timing receipts, prompt reuse,
+wrong actual token counts, early stops and truncation. They retain raw logs,
+commands, model/binary/runner identities and sampled process/driver memory.
+
+## First completed measurements
+
+Both completed baselines use the identical comparison file (SHA-256
+`2b442ab092f23747224e62b74b8a14a45e777629d28aa97427d0c1b62a49010e`).
+Its original IQ4_XS file hashes to
+`649d7508507b84638732c4f52c24c8b15843c6dca2f3ff793ae07c14a67ebbb3`;
+the model-preparation manifest verifies all 733 tensors unchanged. Native ESE
+remains source `9e55c4925`; only benchmark tooling has changed.
+
+| Measurement | Strata 0.1.45 | ESE mapped cache, unfused control |
+| --- | ---: | ---: |
+| Fresh processes / requests each | 3 / 3 | 3 / 3 |
+| Decode median, all nine requests | 45.29 tok/s | 31.18 tok/s |
+| Decode median, six repeated requests | 45.75 tok/s | 31.38 tok/s |
+| First request decode, each fresh process | 44.04 / 41.90 / 42.28 | 2.28 / 2.12 / 23.13 |
+| Startup to ready, seconds | 191.98 / 82.31 / 13.01 | 1.53 / 5.91 / 4.76 |
+| Median prompt prefill | 623.40 tok/s | 123.77 tok/s |
+| Median first token | 0.82 s (engine protocol) | 4.14 s (HTTP) |
+| Process high-water RSS | 32.53 GiB | 25.48 GiB |
+| Sampled process swap peak | 1.19 GiB | 0 |
+| Sampled total RTX 3080 usage | 9,431 MiB | 8,236 MiB |
+
+ESE has not met the target: its overall ratio is 0.688 and its repeated-request
+ratio is 0.686. These were sequential runs on a shared desktop, not randomized
+quiet-system pairs. Strata and ESE have different actual placements/footprints:
+Strata uses adaptive CPU/GPU expert execution and ESE uses bounded expert
+uploads. ESE's 32 GiB tracked-capacity ceiling and 1 GiB VRAM reserve do not
+assert an equivalent Strata host limit or a process-RSS cap. Device samples
+include desktop allocations and are not exact driver peaks.
+
+All completed requests process 512 prompt tokens, generate 128 tokens, and
+report no reuse/early stop/truncation. Each engine independently repeats its
+output exactly across nine requests and exits normally after each process.
+This is bounded workload evidence, not upstream full-model numerical acceptance.
+
+The initial ESE pinned-model control was stopped during its first request:
+startup took 218.46 s and process high-water RSS reached 35.89 GiB before a
+complete token receipt. The failed trial and operator-abort note are retained.
+The successful ESE run changes only `GGML_CUDA_NO_MODEL_PINNED=1`: expert
+weights remain mapped/deferred, avoiding a duplicate 14.63 GiB pinned model
+copy. The bounded cache is 16 GiB RAM / 4 GiB VRAM, with native automatic
+two-lane prefill staging (860 MiB), 64 MiB host staging and a 1 GiB GPU reserve.
+RAM-cache leases and worker queues drain to zero; no forced host-tensor fallback
+occurs in completed trials. Fresh-process cache loading affects early decode
+and is retained, not averaged into a warm-only claim.
+
+A three-request pilot using production fused reduction preserves the unfused
+output exactly but gives about 31.29 tok/s on repeated requests: no demonstrated
+speedup. Current tuning targets the observed upload work; the unfused baseline's
+first process records 102,135 lease-backed component uploads across three
+requests. Cache-capacity/prefill pilots must retain the same model, prompt,
+counts and independent replay checks before any passing configuration is
+repeated over three fresh processes.
+
+Evidence lives under
+`/home/xero/Desktop/test/results/ese-release-work-20261020/task4/`:
+`comparison-model-manifest.json`, `comparison-summary.json`,
+`strata-iq4-3080/`, `ese-iq4-3080-cache/`,
+`ese-iq4-3080-cache-mapped/` and `ese-iq4-3080-cache-fused-pilot/`.
+Raw protocol/SSE responses, exact commands, timing receipts, memory samples,
+resources and failed controls remain available. No publication action occurred.
+
+### Failures exposed during tuning
+
+The 4,864 MiB VRAM-cache pilot completes its first 512/128 request but aborts
+on the second prefill with `sidecar-only prefill staging refused original-tensor
+fallback`. The cache clamps itself to about 4,715 MiB on this run; subsequent
+live free memory falls below the 1 GiB prefill reserve. The process exits by
+SIGABRT. This configuration is rejected; neither its timing nor relaxed
+reserve/fallback settings qualify it. Retain `ese-iq4-3080-cache-475g-pilot/`
+as a startup-versus-repeated-request admission/recovery issue requiring follow-up.
+
+Hardware calibration also rejects the IQ4_XS CPU matrix path against the
+independent scalar oracle (NRMSE 0.127736). An isolated diagnostic keeps the
+same weights/activations but uses the direct row-dot path: NRMSE 0.003938.
+Matching activation precision does not explain the matrix discrepancy.
+A deterministic synthetic IQ4_XS case reproduces saturation: 8.03149 is returned
+where scalar dequantization requires 904. The AVX2 matrix path's unsigned
+lookup reaches 241, overflowing its saturating 16-bit pair sum before offset
+correction. A narrow signed-lookup/abs-sign repair and regression are under
+validation. The independent 0.08 calibration limit remains unchanged; mixed
+routing remains disabled until calibration and its separate workload gate pass.
+
+Native source `f1c381c5f` completes the signed AVX2 repair: all 27 synthetic
+cases pass, and full model-backed calibration is planner-ready with CPU oracle
+errors below 0.004 for each of the three expert formats. Its qualification
+passes 95 CPU tests, 100 CUDA tests plus one expected NCCL skip per GPU, and
+five strict sanitizer targets. The table above still describes the earlier
+`9e55c4925` native benchmark; no speed improvement is inferred from a correctness
+repair or a cache-hot calibration result.
+
+The initial calibrated hybrid A/B trial is invalid and retained in
+`3080-iq4-hybrid-gate-f1c381c5f.log` and `hybrid-gate-f1c381c5f-raw/`.
+The existing validator appended text after the chat generation prefix and
+accepted early EOS as a timing sample. It has been repaired to preserve the
+supplied prompt, force the requested generation length, verify actual/timing
+counts and duration arithmetic, and reject truncation. Four new regression
+tests fail before the repair and pass after it; the complete 160-test Python
+suite passes. Verification schema 4 rejects earlier measurement receipts.
+`validate-hybrid --evidence-dir NEW_DIRECTORY` now preserves both native logs
+on success or failure. A new full-token trial is required before any mixed
+configuration can qualify for the matched Strata comparison.
+
+The full-token retry passes output parity but is rejected: its established-path
+median is 29.16 tok/s and candidate median after guard fallback is 26.13 tok/s
+(0.896x). The live guard revokes the mixed route at 6.108x predicted upload cost
+on its first decode. This is a failed candidate, not evidence of sustained mixed
+execution. All eight requests (one warmup plus three samples per configuration)
+retain full 512/128 counts. Its first hybrid prefill/decode takes 197.13/78.14 s.
+The A/B uses `pread` and two-observation cache admission as its calibration
+contract requires; its control is distinct from the table's `mmap` control.
+See `3080-iq4-hybrid-verification-full128-f1c381c5f.json` and
+`hybrid-gate-full128-f1c381c5f-raw/` for receipts and native telemetry.
+
+Native source `8cd98995a` adds a strict prefill request-boundary CUDA reserve
+check before graph execution. Its focused staged-graph regression reproduces
+the old abort, then verifies recoverable allocation failure, unchanged output,
+zero outstanding leases and exact retry with retained staging buffers. This
+does not relax the reserve or claim recovery from external mid-graph exhaustion.
+Larger-cache performance remains unqualified pending its full-model control.
+
+The reserve repair's final checks pass: 95 CPU tests, 100 CUDA passes plus one
+expected NCCL skip per card, five strict sanitizer targets and 160 Python tests.
+See `prefill-reserve-fix/qualification.json` for identities and raw log paths.
+The full-model larger-cache control completes all three 512/128 requests with
+exact replay, idle resources, zero active leases and normal shutdown. In this
+run the GPU component preflight refuses the allocation and falls back to CPU,
+leaving actual GPU cache capacity zero. The former reserve abort is not
+reproduced; this control does not qualify the larger cache or substitute for
+driver-boundary recovery evidence. The synthetic staged test deterministically
+verifies rejection and exact retry without exhausting the driver.
+
+The 4 GiB layout-packing pilot holds 2,900 expert slots versus 2,437 in the
+earlier uniform layout, with 32.85/33.15 tok/s on its two repeated requests.
+All three outputs repeat exactly within the pilot, leases/queues drain and
+the process exits normally. The first request takes 203.76 s to first token
+and decodes at 1.80 tok/s; file residency before startup is only 21.9% on the
+FUSE-backed comparison volume. This is not storage-cold certification.
+See `ese-iq4-3080-cache-packed-pilot/` for raw receipts. The pilot's output hash
+differs from the older `9e55c4925` uniform-cache control, so neither cross-build
+numerical parity nor a packing-only speedup is accepted. A uniform-cache
+control on repaired source `8cd98995a` is required to separate those changes.
+
+Further tuning will use a byte-identical copy on local NVMe/btrfs, preserving
+the existing comparison copy and every earlier trial. Both engines must be
+rerun against that same new path before making a new matched performance claim.
+The model SHA, frozen prompt, 512/128 counts, RTX 3080, eight CPU threads and
+memory limits remain unchanged. The copy manifest is
+`nvme-comparison-model.json`; native and Strata baselines on the new storage
+will be recorded separately from the table above.
+
+### NVMe follow-up — 21 October
+
+Both engines now use the same byte-identical NVMe/btrfs copy (SHA-256 still
+`2b442ab092f23747224e62b74b8a14a45e777629d28aa97427d0c1b62a49010e`).
+The frozen 512-token prompt, 128 generated tokens, eight CPU threads, 8,192
+context, zero-temperature sampler and no prompt reuse are unchanged.
+
+| Configuration | GPUs | Fresh starts × requests | Decode median | Repeated-request median |
+| --- | ---: | ---: | ---: | ---: |
+| Strata 0.1.45 | one RTX 3080 | 3 × 3 | 45.51 tok/s | 45.66 tok/s |
+| ESE uniform cache control | one RTX 3080 | 1 × 3 pilot | 30.60 tok/s | 30.93 tok/s |
+| ESE stable-reduction control | one RTX 3080 | 1 × 3 pilot | 29.25 tok/s | 29.56 tok/s |
+| ESE fully resident | RTX 3060 Ti + 2080 SUPER + 3080 | 3 × 3 | 81.03 tok/s | 81.24 tok/s |
+
+The three-GPU profile is 1.78x Strata's single-GPU decode rate on this workload.
+This meets an absolute-speed target using the available machine; it does not
+establish parity with equal GPU allocation. Single-3080 parity remains unmet.
+Those results remain scoped to this 35B model; the subsequent launcher profile
+selection below now defines the active performance reference.
+
+Both nine-request runs independently repeat their output exactly and preserve
+full counts with normal shutdown. Each engine uses different arithmetic, so
+this is not cross-engine/full-model numerical acceptance. Native resident
+startup is 12.59–12.98 s; Strata's is 12.63–17.88 s. Native median prefill/TTFT
+is about 416 tok/s / 1.23 s versus Strata's 611 tok/s / 0.84 s. Native process
+high-water RSS is 17.28 GiB versus Strata's 32.55 GiB; sampled process swap is
+zero for both. GPU-driver measurements include desktop allocations.
+
+The apparent packing output discrepancy is resolved: packing automatically
+enables the existing `ESE_CUDA_STABLE_EXPERT_REDUCTION` mode, while the legacy
+control did not. An unpacked full-model control with that same mode enabled
+has exactly the packed output hash (`941a650f…`); legacy uniform output remains
+`acc68310…`. Disabling CUDA graphs does not change the packed result. There is
+no packing-only parity failure demonstrated by those comparisons. The 36 new
+IQ3_S/IQ4_XS/Q6_K geometry cases cover one/two/five/eight tokens and relocated
+physical slots; all pass in stable mode on every card. The synthetic default-
+mode discrepancy demonstrates legacy reduction-order sensitivity. The new
+CTest supplies the stable-mode environment explicitly.
+
+Frequency retention is rejected at roughly 24.3 tok/s on repeats. The native
+residency-index experiment (`9c25eee77`) preserves output and all hit/miss/upload
+counts but shows no speedup in its pilot (28.64/29.09 tok/s); it was reverted
+at `d3bd3fa48`. No causal regression is inferred from one shared-desktop trial.
+Current production source content matches the fully tested `8cd98995a` native
+implementation; only test/documentation/tooling changes remain beyond it.
+
+Raw records: `strata-iq4-3080-nvme/`, `ese-iq4-3080-nvme-control/`,
+`ese-iq4-3080-nvme-stable-control/`, `packing-parity-diagnostic/`,
+`cache-residency-index/` and `ese-iq4-three-gpu-nvme-resident/`.
+`nvme-comparison-summary.json` keeps allocations, pilots and acceptance limits
+explicit. Shared desktop load and sequential run order remain limitations.
+The staged Studio runtime is still older; publication remains on hold.
+
+A 4.375 GiB packed-cache pilot keeps the 1 GiB reserve and completes three
+requests with exact stable-mode replay, clean lease drain and normal exit.
+Its repeated requests reach 33.37/33.47 tok/s, still below the single-3080
+target. See `ese-iq4-3080-nvme-packed-4375g-pilot/`; it remains tuning evidence.
+
+### Launcher reference requested — 21 October
+
+The launcher has three Strata profiles. Its documented daily profile is
+`strata-iq2-xs-ablit`, backed by `strata/Strata-main/strata-iq2_xs.json`.
+The user was asked to distinguish it from Coder IQ1_M 128K and the experimental
+IQ2_XS 1M entry, then explicitly selected **Flash-Next IQ2_XS, 1M experimental**.
+The saved Coder configuration references two missing GGUF files. Both daily
+IQ2_XS shards are present. Their metadata names `Qwen3.8-Flash-Next GSQ-RCO`
+and architecture `qwen4exp` (48 layers, 512 experts, top ten).
+
+The daily profile selects physical GPUs `1,0,2`, explicit layer boundaries
+`6,14`, 262,144 context cells, K8V4 KV, resident experts, two pipeline windows,
+MTP depth four with the installed draft head, vision, and its installed runtime
+control vector. The daily run retains those settings. An isolated
+HTTP service changes only the port and log destination; it does not switch or
+rewrite the user's launcher. Actual prompt lengths and conversation reuse must
+be taken from this model's receipts rather than assumed from the 35B tokenizer.
+
+The current release ESE binary fails a direct load of the same IQ2_XS model
+with `unsupported architecture: qwen4exp`, exit 1, before inference. Its
+configure-time probe gate is OFF and has not been opened. Therefore there is
+no valid ESE speed result for this model and no eligible same-model comparison.
+Strata's selected launcher baseline is recorded separately; a measured Strata
+rate cannot close ESE's model-support gap. Earlier 35B three-GPU throughput
+does not satisfy this model's target.
+
+Raw profile snapshots, file inventory, ESE binary identity and rejection log
+are in `task4/launcher-profile-comparison/`. Task 4 remains in progress and
+publication remains on hold.
+
+The selected `strata-iq2_xs-1m.json` uses the same models, GPUs, layer split,
+MTP, control vector and vision as the daily profile, with 1,048,576 context
+cells, Q4 KV, 32,768 resident KV cells and YaRN scaling of four. The selected
+baseline uses this complete configuration. It completes three starts with three
+short maintenance requests each; actual token counts, prompt reuse and full
+128-token generations are recorded from receipts. Configured 1M capacity
+does not establish a filled-1M context qualification.
+
+The initial daily-profile run is retained separately and superseded by the
+explicit choice: three requests completed on its first process, then the
+second startup was interrupted. `selection.json` records the user steering.
+Full model hashes are shared because the two profiles use the same unchanged
+files; the selected run rechecks their stat identities before using those hashes.
+
+Selected-profile measurements (Strata 0.1.45):
+
+| Fresh start | Startup to ready | First request | Repeat 1 | Repeat 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 121.92 s | 45.5 tok/s | 52.9 tok/s | 50.6 tok/s |
+| 2 | 119.80 s | 45.2 tok/s | 51.5 tok/s | 52.1 tok/s |
+| 3 | 107.06 s | 45.4 tok/s | 56.4 tok/s | 52.5 tok/s |
+
+Median decode is **51.5 tok/s overall**, **52.3 on the six repeats**, and
+**45.4 on the three first requests**. First-request TTFT median is 2.46 s;
+repeat TTFT median is 0.148 s. Each request generates the full 128 tokens,
+including reasoning, and reports 552 total prompt tokens. First requests read
+all 552; repeats reuse 547 and read five. Prefill work is not conflated.
+This is short-request measurement under the saved 1M allocation, not a filled
+million-token run, completed-answer quality, or long-context acceptance.
+
+All three services return zero on graceful shutdown with no owned processes
+remaining. Largest monitored-process HWM is 33.52 GiB; largest sampled process
+swap is 1.42 GiB. Sampled driver-memory peaks, including the desktop, are
+7,329 MiB on the 3060 Ti, 7,121 MiB on the 2080 SUPER, and 9,620 MiB on the
+3080. Strata is not constrained by ESE's 32 GiB tracked-capacity setting.
+The engine reports 15 pool workers, Q4 KV, 32,768 resident KV cells,
+three prefill stages, installed control-vector projection on layers 4–44,
+and MTP maximum four. These profile-specific allocations/features remain
+part of the reference, unlike the earlier eight-thread/no-MTP 35B comparison.
+
+Nine distinct output sequences are retained despite requested temperature
+zero and seed 4242. Their cause is not established. This supplies an observed
+speed reference, not deterministic replay or numerical acceptance. Shared
+desktop load, sequential process order, retained OS caches and Strata's
+internal file-cache trimming remain limits on the timing evidence.
+
+ESE is retested with the selected 1,048,576 context request and rejects the
+model before KV, YaRN or speculation admission. Its probe gate remains OFF.
+At that point no ESE speed or eligible ratio existed for this model. A later
+inventory recovered `ese-iq2-xs-selected-model-20261013`, which contains
+references for this exact 512-expert artifact with the same complete GGUF
+hashes and six passing historical 33-token GPU comparisons against full and
+cached pinned references. The earlier Coder-only reference statement was
+incomplete. Current-build replay and the remaining admission gates still need
+qualification before a supported ESE performance comparison can satisfy task 4.
+
+`launcher-profile-comparison/selected-profile-summary.json` records the
+selected configuration, both complete model hashes, medians, resources,
+output variation and ESE rejection. Its summarizer independently checks all
+counts, timing arithmetic, unchanged original profile hashes, current model
+file identities and clean process drain. Raw responses and metrics are in
+`launcher-profile-comparison/strata-iq2-xs-1m/`. The interrupted daily run is
+preserved separately. No production launcher or engine source was changed.
+`auxiliary-inputs.json` records post-run hashes for pack/tokenizer files,
+MTP, routing profile, control vector, vision and service code; the complete
+GGUF hashes were obtained before timing.
+
+The user then requested restoring the old loading branch and revised the speed
+minimum to 80% of Strata: 41.2 tok/s overall and 41.84 on repeats for this saved
+reference. A private loading runtime uses current candidate objects with the
+existing probe-enabled loader and leaves the standard library/launcher intact.
+Its initial eight-token `Hi` control loads this model and reproduces the saved
+explicit-precision output exactly. That cold smoke is not a speed pass. The
+normal-policy eight-token pilot also repeats its own output exactly, but uses
+different arithmetic and reaches only 11.49 tok/s on its repeat. Both raw pilots
+are retained in `task4/qwen4exp-iq2-restore/`; numerical replay and performance
+profiling are in progress.
+
+
+### Restored selected-model evidence and optimization controls
+
+The current dedicated loader passes both recovered 33-token full/cached
+references: 8,194,560 logits per reference, unchanged relative/absolute bound
+`2e-5 * (1 + abs(reference))`, all 1,584 ordered expert-route rows and 33 top-one
+choices. After the exact F32-to-F64 PTX conversion change, logits, teachers and
+routes remain byte-identical to that passing current-build replay. This uses
+explicit arithmetic and F32 caches at 4K context on the 3080; it does not
+qualify normal quantized arithmetic or the 1M profile.
+
+The top-10 indexed dispatch optimization is limited to contiguous Q2_0 inputs;
+other quantizations retain their prior limit. Dense/sparse controls at short
+and actual down-projection dimensions pass with exact single-route parity on
+all three GPUs. Exhaustive signed-zero/subnormal conversion tests and eighteen
+real IQ2_XXS/IQ1_M expert, graph and cache regressions also pass on all cards.
+
+| 4K raw-Hi diagnostic | Before, warm tok/s | After, warm tok/s |
+| --- | ---: | ---: |
+| Normal arithmetic, Q2_0 indexed dispatch | 11.49 | 13.31 / 13.26 |
+| Explicit arithmetic, exact conversion | 5.58 / 5.60 | 7.09 / 7.40 |
+
+These are eight-token optimization controls, not selected-profile acceptance
+measurements. They remain below the required 41.2 overall / 41.84 repeat tok/s.
+The saved Nsight diagnoses run separately and are excluded from these timings.
+The first 1M startup tests fail allocation/reservation; one cause under
+investigation is the planner replacing requested Q4 cache with Q8. Exact Q4
+admission, profile-specific features and the complete workload remain open.
+
+
+### 1M allocation now serves short requests
+
+With explicit Qwen arithmetic, Q4_0 K/V, F32 indexer and YaRN scale four, the
+dedicated runtime now starts at 1,048,576 context cells and completes two
+8-token raw-Hi requests with exit zero. Compact sparse attention reduces the
+GPU compute reservation from about 5.2 GB per card to 842–904 MiB. Persistent
+cache payload remains 6,912 MiB K/V plus 6,144 MiB indexer. This establishes
+allocation/readiness and bounded serving, not filled-1M or throughput parity.
+
+The row compaction retains all visible rows exactly once and preserves their
+order. Operator controls cover F32, Q4 and F16 at the model's real head shape,
+with the unchanged numerical bound. Million-row maps and explicit integer
+payload checks caught and correct CUDA I32 repeat corruption. Eleven focused
+CTests pass on each of the three cards.
+
+An initial host-KV trial with a 6 GiB expert cache and no reserve aborts with
+CUDA OOM; a 4 GiB / 1 GiB reserve control completes cleanly. Moving Q4 encoding
+to the host initially changes model outputs at token 24. Encoding on the
+layer's GPU before transferring packed host rows restores byte identity:
+8,194,560 logits and 1,584 ordered expert-route rows match GPU-KV placement in
+the same 33-token/1M-allocation control. It does not qualify Q4 against the
+upstream F32-cache reference or fill the context.
+
+The 1M GPU-KV raw-Hi repeat measures 6.02 tok/s; the reserved host-KV control
+measures 3.60. These eight-token diagnostics still fail the 41.2 overall /
+41.84 repeated target and are not the selected 552/128 workload. Empty host-KV
+residency and remaining decode costs are the next performance boundaries.
+Installed Strata configuration, model shards, production loader gate and
+publication hold remain unchanged.
+
+
+Empty host-KV physical residency is now reduced without changing cache capacity
+or contents: the same 1M readiness control falls from 18.25 GB RSS / 14.63 GB
+anonymous to 4.44 GB RSS / 0.824 GB anonymous, with zero sampled swap. Large
+owned Linux CPU buffers discard pages on zero clear; external buffers keep
+their previous memset behavior. Five focused allocation/clear/graph tests and
+the complete byte-identical Q4/1M 33-token placement replay pass. These numbers
+measure readiness, not peak memory or decode speed; the 80% speed requirement
+remains open.
+
+
+### Strata source comparison and current decode blocker
+
+Read-only local source and saved runtime logs identify native quantized
+activation dots, grouped CPU/GPU expert execution, a resident RAM complement,
+profile-filled/adaptive GPU caches, streamed KV and pipelined MTP windows.
+The selected machine's saved H2D probes are 0.7 / 2.8 / 20.6 GB/s in selected
+GPU order, so placement and upload avoidance matter. An isolated no-MTP,
+no-suffix/lookup, no-pipeline copy runs the same 552/128 requests at
+35.9 / 42.1 / 43.6 tok/s with zero draft tokens. Its changed memory footprint
+and variable outputs prevent interpreting this as a pure fixed-memory causal
+estimate. The frozen 51.5 overall / 52.3 repeat baseline remains unchanged.
+
+Current ESE experiments retain 1M Q4 KV allocation and add opt-in native
+quantized expert/projection arithmetic; they are distinct from the existing
+original-input reference policy. Full request diagnostics remain below target.
+Correctly sized two-lane staging and larger prefill batches improve prompt
+processing, but physical allocation overhead caused GPU expert-cache preflight
+to discard entire caches. A bounded smaller-cache retry now preserves the
+physical reserve and passes the selected-model 33-token exact replay after
+triggering retries on all three GPUs, with zero forced fallbacks. This does
+not constitute throughput acceptance or filled-context qualification.
+
+The associated commands, failures, raw receipts, library identities and
+checks are under `task4/qwen4exp-iq2-restore/`; the work log records each
+intermediate result. The next full workload is measured separately without
+concurrent compilation or tracing. Publication remains on hold.
+
+
+A subsequent full request with active caches reaches 5.585 tok/s, but repeat
+prefill fails the physical reserve guard after workspace growth; its failed
+report is retained. Reserving additional headroom and fully placing the first
+13 expert layers on the two slower PCIe cards completes both 552/128 requests
+at 7.535 / 8.000 tok/s (23.57 / 25.17 prompt tok/s, 23.44 / 21.94 s TTFT),
+without forced expert fallbacks or sampled process swap. These use opt-in native
+activation arithmetic and remain diagnostics below the unchanged 80% target.
+A separate strict F32-cache placement control is byte identical across all
+8,194,560 logits and 1,584 routes; it does not qualify the native arithmetic.
+
+
+Later bounded metadata scans, explicit GPU attention and opt-in selected
+native-expert CUDA graph capture complete the same 552/128 diagnostics at
+13.569 / 13.940 tok/s (10.38 / 8.30 s TTFT). Capture preserves the preceding
+native-policy output hashes, and 30 changing-route/input capture controls are
+byte identical to uncaptured execution on each GPU. GPU attention matches the
+strict 33-token Q4/1M control exactly but changes the longer native-policy
+output. These are intermediate diagnostics, below the unchanged target;
+shared-prefix snapshot isolation also fails on both the old and new runtimes.
+No filled-context, native-policy quality or release qualification is claimed.

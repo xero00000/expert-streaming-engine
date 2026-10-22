@@ -1,0 +1,9 @@
+{
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/xero00000/expert-streaming-engine/releases/latest/download/latest-cpu.json"
+      ]
+    }
+  }
+}

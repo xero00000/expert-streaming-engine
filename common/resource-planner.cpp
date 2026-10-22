@@ -1,4 +1,5 @@
 #include "resource-planner.h"
+#include <numeric>
 
 #include <algorithm>
 #include <cctype>
@@ -132,11 +133,11 @@ bool allocate_context(
         uint32_t context,
         common_kv_quality quality) {
     const uint64_t per_token = input.kv_bytes_per_token[quality];
-    if (per_token == 0 || input.devices.empty()) {
+    if ((!input.kv_bytes_for_context && per_token == 0) || input.devices.empty()) {
         return false;
     }
-    const uint64_t kv_total = mul_saturated(per_token, context);
-    if (kv_total == std::numeric_limits<uint64_t>::max()) {
+    const uint64_t kv_total = input.kv_bytes_for_context ? input.kv_bytes_for_context(quality,context) : mul_saturated(per_token, context);
+    if (kv_total == 0 || kv_total == std::numeric_limits<uint64_t>::max()) {
         return false;
     }
 
@@ -198,6 +199,9 @@ bool allocate_context(
         device.headroom_bytes = source.free_bytes - source.reserve_bytes - device.planned_bytes;
         plan.devices.push_back(device);
     }
+    plan.kv_native_sizing=bool(input.kv_bytes_for_context);
+    if (input.kv_bytes_for_context)
+        plan.kv_bytes_for_context=[query=input.kv_bytes_for_context,quality](uint32_t value) { return query(quality,value); };
     return true;
 }
 
@@ -412,6 +416,8 @@ bool common_resource_plan_solve(
     candidate.backend = input.requested_backend;
     candidate.slots = input.slots;
     candidate.ram_capacity_bytes = input.max_ram_bytes;
+    candidate.host_graph_metadata_bytes = input.host_graph_metadata_bytes;
+    candidate.qwen4exp_ple_ram_bytes = input.qwen4exp_ple_ram_bytes;
     candidate.io_staging_bytes = candidate.policy == COMMON_MEMORY_POLICY_STREAM ? input.io_staging_bytes : 0;
     candidate.expert_prefill_staging_enabled = candidate.policy != COMMON_MEMORY_POLICY_RESIDENT &&
         input.requested_expert_prefill_staging_bytes_per_device != 0;
@@ -421,7 +427,9 @@ bool common_resource_plan_solve(
     }
 
     uint64_t ram_fixed = input.dense_ram_bytes;
-    if (!add_checked(ram_fixed, candidate.io_staging_bytes) ||
+    if (!add_checked(ram_fixed, candidate.host_graph_metadata_bytes) ||
+            !add_checked(ram_fixed, candidate.io_staging_bytes) ||
+            !add_checked(ram_fixed, candidate.qwen4exp_ple_ram_bytes) ||
             (input.max_ram_bytes != 0 && ram_fixed > input.max_ram_bytes)) {
         error = "fixed RAM allocations exceed --max-ram";
         return false;
@@ -450,7 +458,12 @@ bool common_resource_plan_solve(
         : std::min(input.requested_context, input.max_context);
     const uint32_t alignment = std::max(1U, input.context_alignment);
     const uint32_t aligned_ceiling = ceiling/alignment*alignment;
-    const uint32_t aligned_minimum = ((input.min_context + alignment - 1)/alignment)*alignment;
+    const uint64_t minimum_units=(uint64_t(std::max(input.min_context,input.slots))+alignment-1)/alignment;
+    if (minimum_units*alignment > UINT32_MAX) {
+        error="minimum context cannot be represented at the requested alignment";
+        return false;
+    }
+    const uint32_t aligned_minimum = uint32_t(minimum_units*alignment);
     if (aligned_ceiling < aligned_minimum) {
         error = "requested context is below the minimum context";
         return false;
@@ -459,7 +472,7 @@ bool common_resource_plan_solve(
     auto find_context = [&](const common_resource_plan & base, common_resource_plan & best_candidate) {
         bool context_found = false;
         for (const auto quality : qualities_descending(input.min_kv_quality)) {
-            if (input.kv_bytes_per_token[quality] == 0) continue;
+            if (!input.kv_bytes_for_context && input.kv_bytes_per_token[quality] == 0) continue;
             uint32_t low = aligned_minimum/alignment;
             uint32_t high = aligned_ceiling/alignment;
             uint32_t best = 0;
@@ -615,6 +628,56 @@ bool common_resource_plan_solve(
     if (optional_prefill_staging_dropped) {
         candidate.reason += "; optional expert prefill staging disabled to preserve the context/KV floor";
     }
+    plan = std::move(candidate);
+    return true;
+}
+
+bool common_resource_plan_reserve_host_context(common_resource_plan & plan,
+        const llama_context_host_requirements & required, std::string & error) {
+    error.clear();
+    auto candidate = plan;
+    uint64_t reserved = 0;
+    for (uint64_t bytes : {plan.expert_ram_bytes, plan.aux_ram_bytes, plan.io_staging_bytes,
+            plan.qwen4exp_ple_ram_bytes, plan.host_graph_metadata_bytes, plan.host_context_metadata_bytes, plan.host_graph_workspace_bytes}) {
+        if (!add_checked(reserved, bytes)) {
+            error = "startup host reservations overflow"; return false;
+        }
+    }
+    if (reserved > plan.ram_planned_bytes || !plan.ram_capacity_bytes) {
+        error = "invalid startup host reservation total"; return false;
+    }
+    const uint64_t weights = std::max(required.weights_bytes, plan.ram_planned_bytes-reserved);
+    uint64_t fixed = plan.host_graph_metadata_bytes;
+    if (!add_checked(fixed, plan.host_context_metadata_bytes)) return false;
+    fixed = std::max(fixed, required.fixed_bytes);
+    candidate.host_context_metadata_bytes = fixed-plan.host_graph_metadata_bytes;
+    candidate.qwen4exp_ple_ram_bytes = std::max(plan.qwen4exp_ple_ram_bytes, required.ple_cache_bytes);
+    uint64_t base = weights;
+    for (uint64_t bytes : {fixed, candidate.qwen4exp_ple_ram_bytes, plan.expert_ram_bytes, plan.io_staging_bytes}) {
+        if (!add_checked(base, bytes)) { error = "native startup RAM overflows"; return false; }
+    }
+    // Host graph and KV payloads live in the host device row rather than in
+    // ram_planned_bytes. A GPU plan can still contain host-resident KV layers.
+    uint64_t host_workspace = 0, host_graph = 0, host_kv = 0;
+    for (const auto & device : plan.devices) if (device.id < 0) {
+        for (uint64_t bytes : {device.graph_bytes, device.expert_cache_bytes,
+                device.expert_prefill_staging_bytes, device.transient_bytes}) {
+            if (!add_checked(host_workspace, bytes)) { error = "host startup workspace overflows"; return false; }
+        }
+        if (!add_checked(host_graph, device.graph_bytes)) { error = "host graph forecast overflows"; return false; }
+        if (!add_checked(host_kv, device.kv_bytes)) { error = "host startup KV overflows"; return false; }
+    }
+    const uint64_t measured_extra = required.graph_bytes > host_graph ? required.graph_bytes-host_graph : 0;
+    candidate.host_graph_workspace_bytes = std::max(plan.host_graph_workspace_bytes, measured_extra);
+    if (!add_checked(base, candidate.host_graph_workspace_bytes)) { error = "host graph workspace overflows"; return false; }
+    uint64_t combined = base;
+    if (!add_checked(combined, host_workspace) || !add_checked(combined, std::max(host_kv, required.kv_bytes)) ||
+            combined > plan.ram_capacity_bytes) {
+        error = "native context, weights, KV and workspace exceed --max-ram"; return false;
+    }
+    constexpr uint64_t mib = 1024ULL*1024ULL;
+    candidate.aux_ram_bytes = std::min(plan.aux_ram_bytes, plan.ram_capacity_bytes-combined)/mib*mib;
+    candidate.ram_planned_bytes = base+candidate.aux_ram_bytes;
     plan = std::move(candidate);
     return true;
 }
@@ -970,6 +1033,23 @@ bool common_resource_rebalance_target(
         target.draft_resident = request.transient_policy == COMMON_TRANSIENT_POLICY_SHARED ||
             request.transient_policy == COMMON_TRANSIENT_POLICY_MTP_ONLY;
     }
+    uint64_t current_kv_total=0,native_target_kv=0;
+    if (current.kv_native_sizing) {
+        if (!current.kv_bytes_for_context) {
+            error="native cache sizing requires a bound metadata query";
+            return false;
+        }
+        native_target_kv=current.kv_bytes_for_context(context);
+        if (!native_target_kv || native_target_kv==UINT64_MAX) {
+            error="target native cache allocation is unavailable or overflows";
+            return false;
+        }
+        for (const auto & device:current.devices) if (!add_checked(current_kv_total,device.kv_bytes)) {
+            error="current cache allocation overflows";
+            return false;
+        }
+        if (!current_kv_total) { error="current cache allocation is empty";return false; }
+    }
     bool has_accelerator = false;
     bool has_transient_device = false;
     for (auto & device : target.devices) {
@@ -978,7 +1058,12 @@ bool common_resource_rebalance_target(
             return false;
         }
         uint64_t kv_bytes = 0;
-        if (!mul_div_ceil_checked(device.kv_bytes, context, current.context, kv_bytes)) {
+        if (current.kv_native_sizing) {
+            // Preserve the current proportional device forecast; round each
+            // share upward so the sum cannot understate the native total.
+            kv_bytes=mul_div_floor(device.kv_bytes,native_target_kv,current_kv_total);
+            if (native_target_kv%(current_kv_total/std::gcd(device.kv_bytes,current_kv_total))) ++kv_bytes;
+        } else if (!mul_div_ceil_checked(device.kv_bytes, context, current.context, kv_bytes)) {
             error = "target KV allocation overflows 64-bit accounting";
             return false;
         }
@@ -1036,7 +1121,97 @@ bool common_resource_rebalance_target(
         error = "serialized transient device is not present in the resource plan";
         return false;
     }
+    const auto host=std::find_if(target.devices.begin(),target.devices.end(),
+        [](const common_resource_device_plan & device){return device.id<0;});
+    if (host!=target.devices.end() && target.ram_capacity_bytes) {
+        uint64_t combined=target.ram_planned_bytes;
+        const uint64_t host_non_weight=host->planned_bytes-std::min(host->planned_bytes,host->dense_bytes);
+        if (!add_checked(combined,host_non_weight) || combined>target.ram_capacity_bytes) {
+            error="target host weights, caches, KV and workspace exceed the RAM budget";
+            return false;
+        }
+    }
     target.reason = "validated runtime KV/expert/transient rebalance target; no resources mutated";
+    return true;
+}
+
+bool common_resource_reconcile_device_memory(
+        common_resource_plan & current,
+        common_resource_plan & target,
+        const std::vector<common_resource_device_memory> & memory,
+        std::string & error) {
+    std::set<int> ids;
+    for (const auto & observed : memory) {
+        if (observed.id < 0 || !ids.insert(observed.id).second) {
+            error = "tracked accelerator memory has an invalid or duplicate device ID";
+            return false;
+        }
+    }
+    auto next_current = current;
+    auto next_target = target;
+    std::set<int> planned;
+    for (auto & live : next_current.devices) {
+        if (live.id < 0) continue;
+        if (!planned.insert(live.id).second) {
+            error = "resource plan contains duplicate accelerator IDs";
+            return false;
+        }
+        const auto observed = std::find_if(memory.begin(), memory.end(),
+                [&](const common_resource_device_memory & row) { return row.id == live.id; });
+        auto next = std::find_if(next_target.devices.begin(), next_target.devices.end(),
+                [&](const common_resource_device_plan & row) { return row.id == live.id; });
+        if (observed == memory.end() || next == next_target.devices.end()) {
+            error = "tracked accelerator memory omitted a planned device";
+            return false;
+        }
+        if (live.dense_bytes != next->dense_bytes || live.graph_bytes != next->graph_bytes) {
+            error = "tracked memory reconciliation cannot change immutable forecasts";
+            return false;
+        }
+        for (auto * device : {&live, &*next}) {
+            uint64_t old_total = 0;
+            for (const uint64_t bytes : {device->dense_bytes, device->graph_bytes,
+                    device->kv_bytes, device->expert_cache_bytes,
+                    device->expert_prefill_staging_bytes, device->transient_bytes}) {
+                if (!add_checked(old_total, bytes)) {
+                    error = "tracked memory reconciliation received overflowing device accounting";
+                    return false;
+                }
+            }
+            if (old_total != device->planned_bytes) {
+                error = "tracked memory reconciliation received stale device accounting";
+                return false;
+            }
+            device->dense_bytes = std::max(device->dense_bytes, observed->weights_bytes);
+            device->graph_bytes = std::max(device->graph_bytes, observed->fixed_bytes);
+            uint64_t total = 0;
+            for (const uint64_t bytes : {device->dense_bytes, device->graph_bytes,
+                    device->kv_bytes, device->expert_cache_bytes,
+                    device->expert_prefill_staging_bytes, device->transient_bytes}) {
+                if (!add_checked(total, bytes)) {
+                    error = "tracked live device memory overflows preparation accounting";
+                    return false;
+                }
+            }
+            device->planned_bytes = total;
+            const uint64_t usable = device->capacity_bytes >= device->reserve_bytes
+                ? device->capacity_bytes - device->reserve_bytes : 0;
+            device->headroom_bytes = total <= usable ? usable - total : 0;
+        }
+    }
+    std::set<int> target_ids;
+    for (const auto & device : next_target.devices) {
+        if (device.id >= 0 && !target_ids.insert(device.id).second) {
+            error = "target resource plan contains duplicate accelerator IDs";
+            return false;
+        }
+    }
+    if (ids != planned || target_ids != planned) {
+        error = "tracked accelerator memory and preparation topology differ";
+        return false;
+    }
+    current = std::move(next_current);
+    target = std::move(next_target);
     return true;
 }
 
@@ -1047,9 +1222,112 @@ bool common_resource_rebalance_preparation_peak(
         std::string & error,
         bool force_expert_cache_preparation,
         bool force_transient_preparation) {
+    return common_resource_rebalance_preparation_peak(current, target, report, error,
+            force_expert_cache_preparation, force_transient_preparation, nullptr);
+}
+
+bool common_resource_rebalance_preparation_peak(
+        const common_resource_plan & current,
+        const common_resource_plan & target,
+        common_resource_preparation_peak & report,
+        std::string & error,
+        bool force_expert_cache_preparation,
+        bool force_transient_preparation,
+        const common_resource_host_memory * tracked_host) {
+    return common_resource_rebalance_preparation_peak(current, target, report, error,
+            force_expert_cache_preparation, force_transient_preparation, tracked_host, nullptr);
+}
+
+bool common_resource_rebalance_preparation_peak(
+        const common_resource_plan & input_current,
+        const common_resource_plan & input_target,
+        common_resource_preparation_peak & report,
+        std::string & error,
+        bool force_expert_cache_preparation,
+        bool force_transient_preparation,
+        const common_resource_host_memory * tracked_host,
+        const common_resource_kv_preparation * native_kv) {
     error.clear();
+    auto realized_current = input_current;
+    auto realized_target = input_target;
+    uint64_t extra_host_current = 0;
+    uint64_t extra_host_target = 0;
+    if (native_kv != nullptr) {
+        const auto realize = [&](common_resource_plan & plan,
+                const std::vector<llama_kv_preparation_device> & rows, uint64_t & host) {
+            std::set<int32_t> ids;
+            for (const auto & row : rows) {
+                if (row.device_id < -1 || !ids.insert(row.device_id).second) {
+                    error = "native KV receipt has an invalid or duplicate device ID";
+                    return false;
+                }
+            }
+            std::set<int32_t> planned;
+            for (auto & device : plan.devices) {
+                if (device.id < -1 || !planned.insert(device.id).second) {
+                    error = "native KV receipt received invalid resource-plan topology";
+                    return false;
+                }
+                uint64_t old_bytes = 0;
+                for (uint64_t part : {device.dense_bytes, device.graph_bytes, device.kv_bytes,
+                        device.expert_cache_bytes, device.expert_prefill_staging_bytes, device.transient_bytes}) {
+                    if (!add_checked(old_bytes, part)) {
+                        error = "native KV receipt received overflowing device accounting";
+                        return false;
+                    }
+                }
+                if (old_bytes != device.planned_bytes) {
+                    error = "native KV receipt received stale device accounting";
+                    return false;
+                }
+                const auto row = std::find_if(rows.begin(), rows.end(),
+                    [&](const llama_kv_preparation_device & value) { return value.device_id == device.id; });
+                device.kv_bytes = row == rows.end() ? 0 : row->kv_bytes;
+                if (row != rows.end()) ids.erase(device.id);
+                uint64_t bytes = 0;
+                for (uint64_t part : {device.dense_bytes, device.graph_bytes, device.kv_bytes,
+                        device.expert_cache_bytes, device.expert_prefill_staging_bytes, device.transient_bytes}) {
+                    if (!add_checked(bytes, part)) {
+                        error = "native KV receipt overflows device accounting";
+                        return false;
+                    }
+                }
+                device.planned_bytes = bytes;
+                const uint64_t usable = device.capacity_bytes >= device.reserve_bytes
+                    ? device.capacity_bytes-device.reserve_bytes : 0;
+                device.headroom_bytes = bytes <= usable ? usable-bytes : 0;
+            }
+            if (ids.erase(-1)) {
+                host = std::find_if(rows.begin(), rows.end(),
+                    [](const llama_kv_preparation_device & value) { return value.device_id == -1; })->kv_bytes;
+            }
+            if (!ids.empty()) {
+                error = "native KV receipt contains an accelerator outside the resource plan";
+                return false;
+            }
+            return true;
+        };
+        if (!realize(realized_current, native_kv->current, extra_host_current) ||
+                !realize(realized_target, native_kv->target, extra_host_target)) return false;
+    }
+    const auto & current = realized_current;
+    const auto & target = realized_target;
     if (current.devices.empty() || current.devices.size() != target.devices.size()) {
         error = "current and target resource plans have different device topologies";
+        return false;
+    }
+    if (current.ram_capacity_bytes != target.ram_capacity_bytes ||
+            current.ram_planned_bytes != target.ram_planned_bytes ||
+            current.host_graph_metadata_bytes != target.host_graph_metadata_bytes ||
+            current.host_context_metadata_bytes != target.host_context_metadata_bytes ||
+            current.host_graph_workspace_bytes != target.host_graph_workspace_bytes) {
+        error = "runtime rebalance cannot change immutable RAM capacity or reservations";
+        return false;
+    }
+    if (current.host_graph_metadata_bytes > current.ram_planned_bytes ||
+            current.host_context_metadata_bytes > current.ram_planned_bytes-current.host_graph_metadata_bytes ||
+            current.host_graph_workspace_bytes > current.ram_planned_bytes-current.host_graph_metadata_bytes-current.host_context_metadata_bytes) {
+        error = "host metadata exceeds the serialized RAM reservation";
         return false;
     }
 
@@ -1086,7 +1364,7 @@ bool common_resource_rebalance_preparation_peak(
     }
 
     uint64_t transient_additional_peak = 0;
-    if (candidate.prepares_transient && current.transient_device >= 0) {
+    if (candidate.prepares_transient) {
         enum transient_owner {
             TRANSIENT_OWNER_NONE,
             TRANSIENT_OWNER_MTP,
@@ -1238,6 +1516,118 @@ bool common_resource_rebalance_preparation_peak(
         candidate.devices.push_back(device);
     }
 
+    if (current.ram_capacity_bytes != 0 || tracked_host != nullptr || native_kv != nullptr) {
+        candidate.ram_capacity_bytes = current.ram_capacity_bytes;
+        candidate.ram_usable_bytes = current.ram_capacity_bytes != 0
+            ? current.ram_capacity_bytes : UINT64_MAX;
+        candidate.ram_current_bytes = current.ram_planned_bytes;
+        candidate.ram_target_bytes = target.ram_planned_bytes;
+        candidate.ram_peak_bytes = current.ram_planned_bytes;
+        uint64_t host_graph_forecast = 0;
+        for (size_t index = 0; index < candidate.devices.size(); ++index) {
+            const auto & device = candidate.devices[index];
+            const auto & live = current.devices[index];
+            if (device.id >= 0) continue;
+            if (!add_checked(host_graph_forecast, live.graph_bytes)) {
+                error = "host fixed forecast overflows 64-bit accounting";
+                return false;
+            }
+            // The RAM reservation already includes host weights and RAM caches.
+            // Only the host's other live/prepared allocations are additional.
+            candidate.ram_usable_bytes = std::min(candidate.ram_usable_bytes,
+                device.capacity_bytes - device.reserve_bytes);
+            if (!add_checked(candidate.ram_current_bytes, device.current_live_bytes - live.dense_bytes) ||
+                    !add_checked(candidate.ram_target_bytes, device.target_live_bytes - live.dense_bytes) ||
+                    !add_checked(candidate.ram_peak_bytes, device.peak_bytes - live.dense_bytes)) {
+                error = "RAM preparation peak overflows 64-bit accounting";
+                return false;
+            }
+        }
+        if (tracked_host != nullptr) {
+            uint64_t other_reservations = 0;
+            if (current.expert_ram_bytes != target.expert_ram_bytes ||
+                    current.qwen4exp_ple_ram_bytes != target.qwen4exp_ple_ram_bytes ||
+                    current.aux_ram_bytes != target.aux_ram_bytes ||
+                    current.io_staging_bytes != target.io_staging_bytes ||
+                    current.host_graph_metadata_bytes != target.host_graph_metadata_bytes ||
+                    current.host_context_metadata_bytes != target.host_context_metadata_bytes ||
+                    current.host_graph_workspace_bytes != target.host_graph_workspace_bytes) {
+                error = "tracked host preparation cannot change immutable RAM reservations";
+                return false;
+            }
+            for (const uint64_t bytes : {current.expert_ram_bytes, current.qwen4exp_ple_ram_bytes,
+                    current.aux_ram_bytes, current.io_staging_bytes, current.host_graph_metadata_bytes, current.host_context_metadata_bytes, current.host_graph_workspace_bytes}) {
+                if (!add_checked(other_reservations, bytes)) {
+                    error = "host RAM reservations overflow 64-bit accounting";
+                    return false;
+                }
+            }
+            if (other_reservations > current.ram_planned_bytes) {
+                error = "host RAM reservations exceed the serialized total";
+                return false;
+            }
+            const uint64_t weight_reservation = current.ram_planned_bytes - other_reservations;
+            candidate.ram_host_weights_limit_bytes = std::max(weight_reservation, tracked_host->weights_bytes);
+            uint64_t host_fixed_reservation = host_graph_forecast;
+            if (!add_checked(host_fixed_reservation, current.host_graph_metadata_bytes) ||
+                    !add_checked(host_fixed_reservation, current.host_context_metadata_bytes) ||
+                    !add_checked(host_fixed_reservation, current.host_graph_workspace_bytes)) {
+                error = "host metadata reservation overflows fixed RAM accounting";
+                return false;
+            }
+            candidate.ram_host_fixed_limit_bytes = std::max(host_fixed_reservation, tracked_host->fixed_bytes);
+            candidate.ram_host_ple_cache_limit_bytes = std::max(current.qwen4exp_ple_ram_bytes, tracked_host->ple_cache_bytes);
+            for (const uint64_t extra : {
+                    candidate.ram_host_weights_limit_bytes - weight_reservation,
+                    candidate.ram_host_fixed_limit_bytes - host_fixed_reservation,
+                    candidate.ram_host_ple_cache_limit_bytes - current.qwen4exp_ple_ram_bytes}) {
+                if (!add_checked(candidate.ram_tracked_extra_bytes, extra)) {
+                    error = "tracked host floors overflow 64-bit accounting";
+                    return false;
+                }
+            }
+            if (!add_checked(candidate.ram_current_bytes, candidate.ram_tracked_extra_bytes) ||
+                    !add_checked(candidate.ram_target_bytes, candidate.ram_tracked_extra_bytes) ||
+                    !add_checked(candidate.ram_peak_bytes, candidate.ram_tracked_extra_bytes)) {
+                error = "tracked host preparation peak overflows 64-bit accounting";
+                return false;
+            }
+        }
+        if (native_kv != nullptr) {
+            if (!add_checked(candidate.ram_current_bytes, extra_host_current) ||
+                    !add_checked(candidate.ram_target_bytes, extra_host_target) ||
+                    !add_checked(candidate.ram_peak_bytes, extra_host_current)) {
+                error = "native host KV accounting overflows the RAM budget";
+                return false;
+            }
+            if (candidate.prepares_kv) {
+                candidate.prepared_host_metadata_bytes = native_kv->host_metadata_bytes;
+                candidate.prepared_host_staging_bytes = native_kv->host_staging_bytes;
+                if (!add_checked(candidate.ram_peak_bytes, extra_host_target) ||
+                        !add_checked(candidate.ram_peak_bytes, native_kv->host_metadata_bytes) ||
+                        !add_checked(candidate.ram_peak_bytes, native_kv->host_staging_bytes)) {
+                    error = "native preparation scratch or metadata overflows the RAM budget";
+                    return false;
+                }
+            } else if (native_kv->host_metadata_bytes || native_kv->host_staging_bytes ||
+                    extra_host_current != extra_host_target) {
+                error = "unchanged KV receipt contains replacement allocations";
+                return false;
+            }
+        }
+        if (candidate.ram_current_bytes > candidate.ram_usable_bytes ||
+                candidate.ram_target_bytes > candidate.ram_usable_bytes) {
+            error = "current or target combined RAM allocations exceed the usable RAM budget";
+            return false;
+        }
+        if (candidate.ram_peak_bytes > candidate.ram_usable_bytes) {
+            error = "RAM preparation peak crosses --max-ram or the host reserve: requires " +
+                std::to_string(candidate.ram_peak_bytes) + " bytes with " +
+                std::to_string(candidate.ram_usable_bytes) + " usable";
+            return false;
+        }
+        candidate.ram_peak_headroom_bytes = candidate.ram_usable_bytes - candidate.ram_peak_bytes;
+    }
     report = std::move(candidate);
     return true;
 }
@@ -1248,11 +1638,16 @@ std::string common_resource_plan_json(const common_resource_plan & plan) {
     out << "\"policy\":"; json_string(out, common_memory_policy_name(plan.policy));
     out << ",\"backend\":"; json_string(out, common_resource_backend_name(plan.backend));
     out << ",\"kv_quality\":"; json_string(out, common_kv_quality_name(plan.kv_quality));
+    out << ",\"kv_native_sizing\":" << (plan.kv_native_sizing ? "true" : "false");
     out << ",\"context\":" << plan.context << ",\"slots\":" << plan.slots;
     out << ",\"batch\":" << plan.batch << ",\"ubatch\":" << plan.ubatch;
     out << ",\"ram_capacity_bytes\":" << plan.ram_capacity_bytes;
     out << ",\"ram_planned_bytes\":" << plan.ram_planned_bytes;
+    out << ",\"host_graph_metadata_bytes\":" << plan.host_graph_metadata_bytes;
+    out << ",\"host_context_metadata_bytes\":" << plan.host_context_metadata_bytes;
+    out << ",\"host_graph_workspace_bytes\":" << plan.host_graph_workspace_bytes;
     out << ",\"expert_ram_bytes\":" << plan.expert_ram_bytes;
+    out << ",\"qwen4exp_ple_ram_bytes\":" << plan.qwen4exp_ple_ram_bytes;
     out << ",\"aux_ram_bytes\":" << plan.aux_ram_bytes;
     out << ",\"io_staging_bytes\":" << plan.io_staging_bytes;
     out << ",\"transient_device\":" << plan.transient_device;
@@ -1291,6 +1686,15 @@ std::string common_resource_preparation_peak_json(const common_resource_preparat
     out << "\"prepares_kv\":" << (report.prepares_kv ? "true" : "false");
     out << ",\"prepares_expert_cache\":" << (report.prepares_expert_cache ? "true" : "false");
     out << ",\"prepares_transient\":" << (report.prepares_transient ? "true" : "false");
+    out << ",\"ram_capacity_bytes\":" << report.ram_capacity_bytes;
+    out << ",\"ram_usable_bytes\":" << report.ram_usable_bytes;
+    out << ",\"ram_current_bytes\":" << report.ram_current_bytes;
+    out << ",\"ram_target_bytes\":" << report.ram_target_bytes;
+    out << ",\"ram_peak_bytes\":" << report.ram_peak_bytes;
+    out << ",\"ram_peak_headroom_bytes\":" << report.ram_peak_headroom_bytes;
+    out << ",\"ram_tracked_extra_bytes\":" << report.ram_tracked_extra_bytes;
+    out << ",\"prepared_host_metadata_bytes\":" << report.prepared_host_metadata_bytes;
+    out << ",\"prepared_host_staging_bytes\":" << report.prepared_host_staging_bytes;
     out << ",\"devices\":[";
     for (size_t i = 0; i < report.devices.size(); ++i) {
         if (i != 0) out << ',';

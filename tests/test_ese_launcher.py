@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -20,6 +22,7 @@ from tools.ese import (
     HostMemory,
     ModelInfo,
     auto_tensor_split,
+    detect_nvidia_gpus,
     build_launch_plan,
     discover_model_shards,
     inspect_expert_geometry,
@@ -33,9 +36,15 @@ from tools.ese import (
     _baseline_hybrid_plan,
     _parse_expert_cache_telemetry,
     _plan_from_args,
+    _make_parser,
     _doctor,
     _hardware_for_server,
     _server_supports_cuda,
+    _select_packaged_windows_binary,
+    _resolve_binary,
+    _native_placement,
+    _placement_hardware_identity,
+    _NATIVE_VALUE_FLAGS,
     _repo_root,
     _save_hybrid_verification,
     _solve_calibrated_hybrid,
@@ -132,6 +141,294 @@ def verified_telemetry_summary() -> dict[str, int]:
 
 
 class LauncherTests(unittest.TestCase):
+    def test_native_device_order_controls_hardware_and_automatic_split(self) -> None:
+        for device, expected, split in [
+            ("CUDA2,CUDA0", [2, 0], "75,25"),
+            ("CUDA2", [2], None),
+            ("none", [], None),
+            ("CPU", [], None),
+        ]:
+            with self.subTest(device=device):
+                plan = build_launch_plan(
+                    model=dense_model(), hardware=hardware(8, 16, 24),
+                    binary=Path("/server"), policy="resident",
+                    extra_args=("--device", device),
+                )
+                self.assertEqual([gpu.index for gpu in plan.hardware.gpus], expected)
+                self.assertEqual(plan.hardware.free_vram, sum(hardware(8, 16, 24).gpus[i].free_bytes for i in expected))
+                if split is None:
+                    self.assertNotIn("--tensor-split", plan.arguments)
+                else:
+                    self.assertEqual(plan.arguments[plan.arguments.index("--tensor-split") + 1], split)
+
+    def test_native_single_gpu_uses_local_index_in_selected_order(self) -> None:
+        plan = build_launch_plan(
+            model=dense_model(), hardware=hardware(8, 16, 24),
+            binary=Path("/server"), policy="resident",
+            extra_args=("-dev", "CUDA2,CUDA0", "-sm", "none", "-mg", "1"),
+        )
+        self.assertEqual([gpu.index for gpu in plan.hardware.gpus], [0])
+        self.assertEqual(plan.hardware.free_vram, 8 * GIB)
+        self.assertNotIn("--tensor-split", plan.arguments)
+        self.assertEqual(plan.arguments[-6:], ("--device", "CUDA2,CUDA0", "--split-mode", "none", "--main-gpu", "1"))
+
+    def test_non_cuda_device_passthrough_keeps_nvidia_budgets_empty(self) -> None:
+        for device in ("Metal", "Vulkan0", "ROCm0", "localhost:9000|0"):
+            with self.subTest(device=device):
+                selected = _native_placement(hardware(), ("--device", device))
+                self.assertEqual(selected.hardware.gpus, ())
+                self.assertEqual(selected.extra_args, ("--device", device))
+
+    def test_native_gpu_layers_and_split_override_launcher_values(self) -> None:
+        for alias in ("-ngl", "--gpu-layers", "--n-gpu-layers", "--n_gpu_layers"):
+            with self.subTest(alias=alias):
+                plan = build_launch_plan(
+                    model=dense_model(), hardware=hardware(8, 16, 24),
+                    binary=Path("/server"), policy="resident", gpu_layers=18,
+                    tensor_split="1,1,1", extra_args=(alias, "0", "-ts", "0/0/100"),
+                )
+                self.assertEqual(plan.arguments.count("-ngl"), 1)
+                self.assertEqual(plan.arguments[plan.arguments.index("-ngl") + 1], "0")
+                self.assertEqual(plan.hardware.gpus, ())
+                self.assertNotIn("--memory-policy", plan.arguments)
+                self.assertNotIn("--fit", plan.arguments)
+                self.assertEqual(plan.arguments.count("--tensor-split"), 1)
+                self.assertEqual(plan.arguments[plan.arguments.index("--tensor-split") + 1], "0/0/100")
+        automatic = _native_placement(hardware(8), ("-ngl", "-1"))
+        self.assertIsNone(automatic.gpu_layers)
+        cpu = build_launch_plan(
+            model=dense_model(), hardware=hardware(2, 24), binary=Path("/server"),
+            policy="resident", context=4096, extra_args=("--device", "CUDA0", "-ngl", "0"),
+        )
+        self.assertEqual(cpu.arguments[cpu.arguments.index("-ctk") + 1], "q8_0")
+
+    def test_native_placement_rejects_unavailable_or_invalid_overrides(self) -> None:
+        for extra, reason in [
+            (("--device", "CUDA3"), "unavailable CUDA"),
+            (("--device", "CUDA0,CUDA0"), "duplicate"),
+            (("--device", "CUDA0,"), "unavailable CUDA"),
+            (("--device", "CUDA0", "--main-gpu", "1"), "outside"),
+            (("--main-gpu", "-1"), "negative"),
+            (("-ngl", "NaN"), "integer"),
+            (("--split-mode", "row"), "split-mode"),
+            (("--tensor-split", "nan,1"), "finite"),
+            (("--tensor-split", "inf,1"), "finite"),
+            (("--tensor-split", "-1,1"), "nonnegative"),
+            (("--tensor-split", "1,1,1,1"), "more weights"),
+            (("--tensor-split", "1,"), "numbers"),
+            (("--device",), "requires a value"),
+        ]:
+            with self.subTest(extra=extra), self.assertRaisesRegex(ESEError, reason):
+                _native_placement(hardware(8, 16, 24), extra)
+        with self.assertRaisesRegex(ESEError, "unavailable CUDA"):
+            _native_placement(hardware(), ("--device", "CUDA0"))
+        zero = _native_placement(hardware(8, 16), ("--tensor-split", "0,0"))
+        self.assertEqual(zero.tensor_split, "0,0")
+
+    def test_native_value_arguments_do_not_become_placement_flags(self) -> None:
+        placement_flags = {"--device", "-dev", "--main-gpu", "-mg", "--split-mode", "-sm", "--tensor-split", "-ts", "--gpu-layers", "--n-gpu-layers", "-ngl"}
+        for option in sorted(_NATIVE_VALUE_FLAGS - placement_flags):
+            with self.subTest(option=option):
+                selected = _native_placement(hardware(8, 16, 24), (option, "--device", "--no-mmap", "--device", "CUDA2"))
+                self.assertEqual([gpu.index for gpu in selected.hardware.gpus], [2])
+                self.assertEqual(selected.extra_args[:3], (option, "--device", "--no-mmap"))
+
+    def test_native_value_argument_table_matches_the_current_parser(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "common/common.cpp").read_text()
+        mask = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', lambda match: " " * len(match.group()), source, flags=re.S)
+        flags = set()
+        for match in re.finditer(r"\bif\s*\(\s*arg\s*==", mask):
+            start = mask.find("{", match.end())
+            end, depth = start + 1, 1
+            while depth and end < len(mask):
+                depth += (mask[end] == "{") - (mask[end] == "}")
+                end += 1
+            if "CHECK_ARG" in mask[start:end]:
+                flags.update(re.findall(r'arg\s*==\s*"([^"\n]+)"', source[match.start():start]))
+        self.assertEqual(_NATIVE_VALUE_FLAGS, flags)
+
+    def test_native_selected_uuid_order_binds_calibration_identity(self) -> None:
+        detected = dataclasses.replace(hardware(8, 16, 24), gpus=tuple(
+            dataclasses.replace(gpu, uuid=f"GPU-{gpu.index}") for gpu in hardware(8, 16, 24).gpus
+        ))
+        original = {"cuda_devices": ["GPU-0", "GPU-1", "GPU-2"], "cpu": {}, "gpus": []}
+        selected = _native_placement(detected, ("--device", "CUDA2,CUDA0"))
+        identity = _placement_hardware_identity(selected.hardware, original)
+        self.assertEqual(identity["cuda_devices"], ["GPU-2", "GPU-0"])
+        self.assertEqual(original["cuda_devices"], ["GPU-0", "GPU-1", "GPU-2"])
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "model.gguf"
+            write_minimal_gguf(path, {"general.architecture": "gpt-oss", "gpt-oss.expert_count": 8, "gpt-oss.expert_used_count": 3, "gpt-oss.block_count": 4})
+            args = _make_parser().parse_args(["plan", str(path), "--policy", "cache"])
+            args.extra = ("--device", "CUDA2,CUDA0")
+            with (
+                mock.patch("tools.ese._resolve_binary", return_value=Path("/server")),
+                mock.patch("tools.ese._hardware_for_server", return_value=detected),
+                mock.patch("tools.ese.collect_hardware_identity", return_value=original),
+                mock.patch("tools.ese.calibrated_hybrid_gpu_experts", return_value=(0, "automatic hybrid routing disabled: fixture")) as calibrate,
+            ):
+                plan = _plan_from_args(args)
+            self.assertEqual(calibrate.call_args.args[2]["cuda_devices"], ["GPU-2", "GPU-0"])
+            self.assertEqual([gpu.index for gpu in plan.hardware.gpus], [2, 0])
+
+    def test_native_cpu_or_component_split_skips_incompatible_calibration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "model.gguf"
+            write_minimal_gguf(path, {"general.architecture": "gpt-oss", "gpt-oss.expert_count": 8, "gpt-oss.expert_used_count": 3, "gpt-oss.block_count": 4})
+            for extra, reason in [
+                (("--device", "none"), "no CUDA device"),
+                (("--split-mode", "graph"), "component layouts"),
+                (("--split-mode", "attn"), "component layouts"),
+            ]:
+                with self.subTest(extra=extra):
+                    args = _make_parser().parse_args(["plan", str(path), "--policy", "cache"])
+                    args.extra = extra
+                    with (
+                        mock.patch("tools.ese._resolve_binary", return_value=Path("/server")),
+                        mock.patch("tools.ese._hardware_for_server", return_value=hardware(8, 16, 24)),
+                        mock.patch("tools.ese.collect_hardware_identity") as identity,
+                        mock.patch("tools.ese.calibrated_hybrid_gpu_experts") as calibrate,
+                    ):
+                        plan = _plan_from_args(args)
+                    self.assertEqual(plan.hybrid_gpu_experts, 0)
+                    self.assertIn(reason, plan.hybrid_selection)
+                    identity.assert_not_called()
+                    calibrate.assert_not_called()
+
+    def test_gpu_detection_matches_cuda_visible_uuid_order(self) -> None:
+        def capture(command):
+            if "uuid" in command[1]:
+                return "0, GPU-a, Card A, 8192, 6144\n1, GPU-b, Card B, 10240, 9216\n2, GPU-c, Card C, 8192, 7168"
+            return "0, Card A, 8192, 6144\n1, Card B, 10240, 9216\n2, Card C, 8192, 7168"
+
+        for visible, names, nvml_indices, split in [
+            (("GPU-b", "GPU-a", "GPU-c"), ["Card B", "Card A", "Card C"], [1, 0, 2], "41,27,32"),
+            (("GPU-b", "GPU-a"), ["Card B", "Card A"], [1, 0], "60,40"),
+            (("GPU-c",), ["Card C"], [2], None),
+            ((), [], [], None),
+        ]:
+            with (
+                self.subTest(visible=visible),
+                mock.patch("tools.ese._run_capture", side_effect=capture),
+                mock.patch("tools.ese.cuda_device_uuids", return_value=visible, create=True),
+            ):
+                detected = detect_nvidia_gpus()
+                self.assertEqual([gpu.name for gpu in detected], names)
+                self.assertEqual([gpu.index for gpu in detected], list(range(len(visible))))
+                self.assertEqual([gpu.nvml_index for gpu in detected], nvml_indices)
+                self.assertEqual([gpu.uuid for gpu in detected], list(visible))
+                self.assertEqual(auto_tensor_split(detected), split)
+
+    def test_gpu_detection_rejects_unknown_cuda_mapping(self) -> None:
+        for visible, reason in [(None, "cannot discover CUDA"), (("GPU-missing",), "memory telemetry")]:
+            with (
+                self.subTest(visible=visible),
+                mock.patch("tools.ese._run_capture", return_value="0, GPU-a, Card A, 8192, 6144"),
+                mock.patch("tools.ese.cuda_device_uuids", return_value=visible),
+            ):
+                with self.assertRaisesRegex(ESEError, reason):
+                    detect_nvidia_gpus()
+
+    def test_gpu_detection_rejects_duplicate_telemetry_uuid(self) -> None:
+        with mock.patch("tools.ese._run_capture", return_value=(
+            "0, GPU-a, Card A, 8192, 6144\n1, GPU-a, Card A, 8192, 6144"
+        )):
+            with self.assertRaisesRegex(ESEError, "duplicate GPU identities"):
+                detect_nvidia_gpus()
+
+    def test_gpu_detection_without_telemetry_remains_empty(self) -> None:
+        with (
+            mock.patch("tools.ese._run_capture", return_value=None),
+            mock.patch("tools.ese.cuda_device_uuids") as discover,
+        ):
+            self.assertEqual(detect_nvidia_gpus(), ())
+            discover.assert_not_called()
+
+    def test_cpu_runtime_does_not_require_cuda_discovery(self) -> None:
+        with (
+            mock.patch("tools.ese._server_supports_cuda", return_value=False),
+            mock.patch("tools.ese.detect_hardware", side_effect=ESEError("bad CUDA driver")) as detect,
+            mock.patch("tools.ese.detect_host_memory", return_value=HostMemory(128 * GIB, 100 * GIB)),
+        ):
+            detected = _hardware_for_server(Path("/cpu-server"))
+            self.assertEqual(detected.gpus, ())
+            self.assertEqual(detected.host.available_bytes, 100 * GIB)
+            detect.assert_not_called()
+
+    def test_calibrated_cpu_endpoint_disables_decode_gpu_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            model_path = Path(temp) / "model.gguf"
+            write_minimal_gguf(model_path, {
+                "general.architecture": "gpt-oss", "gpt-oss.expert_count": 8,
+                "gpt-oss.expert_used_count": 3, "gpt-oss.block_count": 4,
+            })
+            key = {
+                "ggml_type_id": 1, "input_width": 32,
+                "expert_width": 32, "bytes_per_expert_component": 64,
+            }
+            for policy, cache_args in [
+                ("cache", []), ("cache", ["--expert-vram-cache", "256MiB"]),
+                ("stream", []), ("stream", ["--expert-vram-cache", "256MiB"]),
+            ]:
+                args = _make_parser().parse_args([
+                    "plan", str(model_path), "--policy", policy,
+                    "--expert-storage-backend", "pread", *cache_args,
+                ])
+                args.extra = ()
+                for cpu_cost, upload_cost, expected_cache in [
+                    (1.0, 1_000_000.0, False),
+                    (1_000_000.0, 1.0, True),
+                ]:
+                    with self.subTest(policy=policy, cache_args=cache_args, cpu_cost=cpu_cost):
+                        profile = {"measurements": {"cpu_cache_contention": {"devices": [{
+                            "backend": "CUDA0", "profiles": [{
+                                **key, "cpu_ns_per_expert_component": cpu_cost,
+                                "upload_ns_per_expert_component": upload_cost,
+                            }],
+                        }]}}}
+                        choice = _solve_calibrated_hybrid(profile, [(tuple(key.values()),)], 3)
+                        self.assertEqual(choice[0], 0)
+                        with (
+                            mock.patch("tools.ese._resolve_binary", return_value=Path("/server")),
+                            mock.patch("tools.ese._hardware_for_server", return_value=hardware(20)),
+                            mock.patch("tools.ese.collect_hardware_identity", return_value={"cpu": {}, "gpus": []}),
+                            mock.patch("tools.ese.calibrated_hybrid_gpu_experts", return_value=choice),
+                        ):
+                            plan = _plan_from_args(args)
+                        self.assertEqual("--expert-vram-cache-mib" in plan.arguments, expected_cache)
+                        self.assertIn("--cpu-moe", plan.arguments)
+                        self.assertEqual(plan.hybrid_gpu_experts, 0)
+                        self.assertEqual(plan.hybrid_selection, choice[1])
+
+    def test_cpu_endpoint_allows_explicit_mixed_candidate_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            model_path = Path(temp) / "model.gguf"
+            write_minimal_gguf(model_path, {
+                "general.architecture": "gpt-oss", "gpt-oss.expert_count": 8,
+                "gpt-oss.expert_used_count": 3, "gpt-oss.block_count": 4,
+            })
+            args = _make_parser().parse_args([
+                "plan", str(model_path), "--policy", "cache",
+                "--expert-storage-backend", "pread",
+                "--expert-vram-cache", "256MiB", "--hybrid-candidate", "1",
+            ])
+            args.extra = ()
+            with (
+                mock.patch("tools.ese._resolve_binary", return_value=Path("/server")),
+                mock.patch("tools.ese._hardware_for_server", return_value=hardware(20)),
+                mock.patch("tools.ese.collect_hardware_identity", return_value={"cpu": {}, "gpus": []}),
+                mock.patch("tools.ese.calibrated_hybrid_gpu_experts", return_value=(
+                    0, "calibration selected the established all-CPU expert path",
+                )),
+                mock.patch("tools.ese._calibrated_expert_cost_bounds", return_value=(100.0, 200.0)),
+            ):
+                plan = _plan_from_args(args, require_hybrid_verification=False)
+            self.assertEqual(plan.hybrid_gpu_experts, 1)
+            position = plan.arguments.index("--expert-vram-cache-mib")
+            self.assertEqual(plan.arguments[position + 1], "256")
+            position = plan.arguments.index("--expert-hybrid-gpu-experts")
+            self.assertEqual(plan.arguments[position + 1], "1")
+
     def test_automatic_plan_requires_matching_workload_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -155,7 +452,7 @@ class LauncherTests(unittest.TestCase):
             )
             identity = {"cpu": {"model": "test"}, "gpus": [{"uuid": "GPU-test"}]}
             with (
-                mock.patch("tools.ese.detect_hardware", return_value=hardware(20)),
+                mock.patch("tools.ese._hardware_for_server", return_value=hardware(20)),
                 mock.patch("tools.ese.collect_hardware_identity", return_value=identity),
                 mock.patch(
                     "tools.ese.calibrated_hybrid_gpu_experts",
@@ -498,6 +795,47 @@ class LauncherTests(unittest.TestCase):
             binary.with_name("ese-runtime.json").write_text('{"cuda": true}')
             self.assertTrue(_server_supports_cuda(binary))
 
+    def test_packaged_windows_cpu_selection_before_cuda_binary_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "build"
+            cuda = root / "bin" / "llama-server.exe"
+            cpu = root / "cpu" / "bin" / "llama-server.exe"
+            for path, enabled in ((cuda, True), (cpu, False)):
+                path.parent.mkdir(parents=True)
+                path.touch()
+                path.with_name("ese-runtime.json").write_text(json.dumps({"cuda": enabled}))
+            with mock.patch.dict(os.environ, {}, clear=True):
+                for devices in (None, (), ("GPU-visible",)):
+                    with self.subTest(devices=devices), mock.patch("tools.ese.cuda_device_uuids", return_value=devices):
+                        self.assertEqual(_select_packaged_windows_binary(cuda, root), cuda if devices else cpu.resolve())
+                with mock.patch.dict(os.environ, {"ESE_SERVER_BACKEND": "cpu"}), mock.patch("tools.ese.cuda_device_uuids", side_effect=AssertionError("CPU must not initialize CUDA")):
+                    self.assertEqual(_select_packaged_windows_binary(cuda, root), cpu.resolve())
+                with mock.patch.dict(os.environ, {"ESE_SERVER_BACKEND": "cuda"}), mock.patch("tools.ese.cuda_device_uuids", side_effect=AssertionError("CUDA override remains explicit")):
+                    self.assertEqual(_select_packaged_windows_binary(cuda, root), cuda)
+                cpu.unlink()
+                with mock.patch("tools.ese.cuda_device_uuids", side_effect=AssertionError("No CPU bundle means unchanged behavior")):
+                    self.assertEqual(_select_packaged_windows_binary(cuda, root), cuda)
+
+    def test_packaged_windows_cpu_selection_preserves_explicit_binary_overrides(self) -> None:
+        from types import SimpleNamespace
+        windows_os = SimpleNamespace(name="nt", environ=os.environ)
+        with tempfile.TemporaryDirectory() as temp, mock.patch("tools.ese.os", windows_os), mock.patch("tools.ese._select_packaged_windows_binary", side_effect=AssertionError("Explicit binary must win")):
+            explicit = Path(temp) / "explicit-server.exe"
+            environment = Path(temp) / "environment-server.exe"
+            self.assertEqual(_resolve_binary(str(explicit)), explicit.resolve())
+            with mock.patch.dict(os.environ, {"ESE_SERVER": str(environment)}):
+                self.assertEqual(_resolve_binary(None), environment.resolve())
+
+    def test_packaged_windows_cpu_selection_rejects_cuda_payload_in_cpu_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "build"
+            cpu = root / "cpu" / "bin" / "llama-server.exe"
+            cpu.parent.mkdir(parents=True)
+            cpu.touch()
+            cpu.with_name("ese-runtime.json").write_text('{"cuda": true}')
+            with self.assertRaisesRegex(ESEError, "CPU-only runtime marker"):
+                _select_packaged_windows_binary(root / "bin" / "llama-server.exe", root)
+
     def test_json_doctor_is_a_runtime_probe_without_build_tools(self) -> None:
         output = StringIO()
         with (
@@ -699,6 +1037,57 @@ class LauncherTests(unittest.TestCase):
                 prefetch_tail=1,
             )
 
+    def test_expert_load_workers_preserve_bounded_cache_plan(self) -> None:
+        for policy in ("cache", "stream"):
+            for workers in (0, 1, 4, 8):
+                with self.subTest(policy=policy, workers=workers):
+                    plan = build_launch_plan(
+                        model=moe_model(), hardware=hardware(20),
+                        binary=Path("/server"), policy=policy,
+                        expert_load_workers=workers,
+                        expert_ram_cache=768 * 1024**2,
+                        expert_ram_staging=32 * 1024**2,
+                    )
+                    for flag, value in (("--expert-ram-cache-mib", "768"),
+                                        ("--expert-ram-staging-mib", "32")):
+                        self.assertEqual(plan.arguments[plan.arguments.index(flag) + 1], value)
+                    if workers:
+                        self.assertEqual(plan.arguments.count("--expert-load-workers"), 1)
+                        self.assertEqual(
+                            plan.arguments[plan.arguments.index("--expert-load-workers") + 1],
+                            str(workers),
+                        )
+                    else:
+                        self.assertNotIn("--expert-load-workers", plan.arguments)
+                    self.assertEqual("--defer-experts" in plan.arguments, policy == "stream")
+
+    def test_expert_load_workers_reject_unavailable_policies_and_counts(self) -> None:
+        for policy, workers in (("resident", 1), ("hybrid", 4), ("cache", -1), ("stream", 9)):
+            with self.subTest(policy=policy, workers=workers), self.assertRaisesRegex(
+                ESEError, "--expert-load-workers"
+            ):
+                build_launch_plan(
+                    model=moe_model(), hardware=hardware(20),
+                    binary=Path("/server"), policy=policy, expert_load_workers=workers,
+                )
+
+    def test_expert_load_worker_cli_option_reaches_native_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "model.gguf"
+            write_minimal_gguf(path, {
+                "general.architecture": "gpt-oss", "gpt-oss.expert_count": 128,
+                "gpt-oss.expert_used_count": 4, "gpt-oss.block_count": 36,
+            })
+            args = _make_parser().parse_args([
+                "plan", str(path), "--policy", "stream", "--expert-load-workers", "4",
+                "--no-auto-hybrid",
+            ])
+            args.extra = ()
+            with mock.patch("tools.ese._hardware_for_server", return_value=hardware(20)), \
+                    mock.patch("tools.ese._resolve_binary", return_value=Path("/server")):
+                plan = _plan_from_args(args)
+            self.assertEqual(plan.arguments[plan.arguments.index("--expert-load-workers") + 1], "4")
+
     def test_parallel_slots_are_enabled_for_resident_models(self) -> None:
         plan = build_launch_plan(
             model=dense_model(),
@@ -802,6 +1191,21 @@ class LauncherTests(unittest.TestCase):
             policy="resident",
         )
         self.assertIn("--fit", plan.arguments)
+
+    def test_fixed_resident_gpu_layers_disable_native_fit(self) -> None:
+        plan = build_launch_plan(
+            model=dense_model(40 * GIB),
+            hardware=hardware(20),
+            binary=Path("/server"),
+            policy="resident",
+            gpu_layers=18,
+        )
+        self.assertNotIn("--fit", plan.arguments)
+        self.assertNotIn("--memory-policy", plan.arguments)
+        self.assertNotIn("--max-ram", plan.arguments)
+        self.assertNotIn("--resource-preference", plan.arguments)
+        index = plan.arguments.index("-ngl")
+        self.assertEqual(plan.arguments[index + 1], "18")
 
 
 if __name__ == "__main__":

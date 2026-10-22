@@ -32,14 +32,13 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
-static llama_context           ** g_ctx;
-static llama_model             ** g_model;
 static gpt_params               * g_params;
-static std::vector<llama_token> * g_input_tokens;
-static std::ostringstream       * g_output_ss;
-static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
+static volatile sig_atomic_t g_sigint_requests = 0;
+#endif
 
 static bool file_exists(const std::string & path) {
     std::ifstream f(path.c_str());
@@ -100,16 +99,7 @@ static void write_logfile(
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
 static void sigint_handler(int signo) {
     if (signo == SIGINT) {
-        if (!is_interacting && g_params->interactive) {
-            is_interacting  = true;
-            need_insert_eot = true;
-        } else {
-            console::cleanup();
-            printf("\n");
-            llama_print_timings(*g_ctx);
-            write_logfile(*g_ctx, *g_params, *g_model, *g_input_tokens, g_output_ss->str(), *g_output_tokens);
-            _exit(130);
-        }
+        g_sigint_requests = g_sigint_requests == 0 ? 1 : 2;
     }
 }
 #endif
@@ -206,9 +196,6 @@ int main(int argc, char ** argv) {
     common_speculative * spec = nullptr;
     common_sampler * ctx_sampling = nullptr;
     std::vector<common_chat_msg> chat_msgs;
-    g_model = &model;
-    g_ctx = &ctx;
-
     // load the model and apply lora adapter, if any
     LOG("%s: load the model and apply lora adapter, if any\n", __func__);
     llama_init_result llama_init = llama_init_from_gpt_params(params);
@@ -627,9 +614,9 @@ int main(int argc, char ** argv) {
     int n_session_consumed = 0;
     int n_past_guidance    = 0;
 
-    std::vector<int>   input_tokens;  g_input_tokens  = &input_tokens;
-    std::vector<int>   output_tokens; g_output_tokens = &output_tokens;
-    std::ostringstream output_ss;     g_output_ss     = &output_ss;
+    std::vector<int>   input_tokens;
+    std::vector<int>   output_tokens;
+    std::ostringstream output_ss;
     std::ostringstream assistant_ss; // for storing current assistant message, used in conversation mode
 
     const int64_t t_start_process_prompt_us = ggml_time_us();
@@ -689,7 +676,23 @@ int main(int argc, char ** argv) {
     bool have_speculative_sampled = false;
     llama_token speculative_sampled = LLAMA_TOKEN_NULL;
 
+    bool interrupted = false;
+
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
+        const sig_atomic_t sigint_requests = g_sigint_requests;
+        if (sigint_requests != 0) {
+            if (sigint_requests == 1 && params.interactive && !is_interacting) {
+                g_sigint_requests = 0;
+                is_interacting = true;
+                need_insert_eot = true;
+            } else {
+                interrupted = true;
+                break;
+            }
+        }
+#endif
+
         // predict
         if (!embd.empty()) {
             // Note: (n_ctx - 4) here is to match the logic for commandline prompt handling via
@@ -1412,5 +1415,5 @@ int main(int argc, char ** argv) {
     LOG_TEE("Log end\n");
 #endif // LOG_DISABLE_LOGS
 
-    return 0;
+    return interrupted ? 130 : 0;
 }

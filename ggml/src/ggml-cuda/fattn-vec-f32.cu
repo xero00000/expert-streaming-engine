@@ -17,6 +17,10 @@ void ggml_cuda_flash_attn_ext_vec_f32(ggml_backend_cuda_context & ctx, ggml_tens
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
+    if (Q->ne[0] == 512 && V->ne[0] == 512 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+        ggml_cuda_flash_attn_ext_vec_f32_512(ctx, dst);
+        return;
+    }
 
 #ifdef GGML_CUDA_FA_ALL_QUANTS
     FATTN_VEC_F32_CASE( 64, GGML_TYPE_F16, GGML_TYPE_Q4_0)
@@ -111,6 +115,13 @@ void ggml_cuda_flash_attn_ext_vec_f32(ggml_backend_cuda_context & ctx, ggml_tens
 bool ggml_cuda_fattn_vec_f32_is_supported([[maybe_unused]] ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     auto K = dst->src[1];
     auto V = dst->src[2];
+    float softcap;
+    memcpy(&softcap, &dst->op_params[2], sizeof(softcap));
+    if (softcap != 0.f && K->ne[0] != 128 && K->ne[0] != 256 &&
+            !(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16)) return false;
+    if (K->ne[0] == 512 && V->ne[0] == 512) {
+        return K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+    }
     if (K->ne[0] != V->ne[0]) {
         const bool is_192_128 = K->ne[0] == 192 && V->ne[0] == 128;
         const bool is_576_512 = K->ne[0] == 576 && V->ne[0] == 512;

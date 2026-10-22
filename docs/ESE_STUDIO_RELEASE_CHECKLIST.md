@@ -117,3 +117,64 @@ substitute for the unchecked physical NVIDIA sweep above.
   public `main` without missing public-main commits.
 - [ ] The `v0.2.0` tag workflow publishes signed Linux/Windows updater assets,
   installers, checksums, and release notes.
+
+## v0.2.1 local candidate — 2026-10-21
+
+- [x] Final eight actual packages, three source indices, all 11 asset digests,
+  checksums and correctly routed CPU/CUDA/legacy updater feeds pass locally.
+- [x] All six Linux packages pass current native identity, dependency, license,
+  bundle-type, compiled-feed and key checks; installed behavior evidence and
+  exact unchanged-code proofs are linked in the candidate review.
+- [x] Both real final AppImage signatures and replacements pass; updated Settings
+  views retain the correct automatic action while DEB/RPM use manual updates.
+- [x] Windows CPU/CUDA and Studio builds pass; MSI/NSIS install, app-local
+  Microsoft runtime closure, CPU fallback and exact top-32 inference pass.
+- [x] Real NSIS signature, seven updater failure/download controls and actual
+  signed installer completion/file repair pass; final runtime identities, CPU
+  inference and interactive post-update Settings startup pass.
+- [ ] Physical Windows NVIDIA inference. The spare GPUs share host IOMMU group
+  15 with mounted storage; no device is detached and no waiver is assumed.
+- [ ] Lift the user's publication hold before push, hosted CI, PR/tag creation
+  or release upload/publication.
+
+The accepted experimental speed remains approximately 19 tok/s, further long
+passes are deferred, and production Qwen admission stays OFF. Windows installers
+lack Authenticode signatures; the NSIS updater signature is verified separately.
+See the [current review](RELEASE_CANDIDATE_REVIEW_20261021.md) and
+[work log](RELEASE_WORK_LOG_20261020.md) for source, scope, failures and evidence.
+
+
+### v0.2.1 scope decision — Windows GPU test deferred
+
+The user subsequently instructed **“Lets skip that test for now”** in response
+to the physical Windows NVIDIA inference question. The unchecked hardware test
+above remains unperformed and **Windows GPU inference remains unqualified**;
+it is explicitly deferred for this candidate rather than a current release gate.
+This decision supersedes the preceding “no waiver is assumed” status.
+
+All agreed local preparation is complete. Work pauses before release as
+requested. The publication hold is unchanged: no push, hosted CI dispatch,
+PR/tag creation or upload/publication. Hosted workflow execution has not run.
+See the [candidate review](RELEASE_CANDIDATE_REVIEW_20261021.md) for the final
+local PR/tag drafts, unchanged product source freeze and evidence.
+
+
+### Subsequent authorization — GitHub source update
+
+After requesting the newcomer-facing rebrand, the user authorized pushing the
+checked update. This supersedes the earlier source-push hold. The consolidated
+review branch can be pushed; protected `main` follows the PR merge policy.
+Release tagging and installer publication remain paused. Physical Windows GPU
+inference and long workload checks remain deferred and unqualified.
+
+
+### v0.2.1 publication authorization — 2026-10-22 UTC
+
+The user authorized merging and publishing the checked update after the release
+log review. This supersedes the earlier publication hold. Retain the original
+qualified package source, confirm unchanged product inputs at integration, and
+verify all uploaded packages, updater signatures and feeds before publication.
+Physical Windows NVIDIA inference and long workload tests remain deferred and
+unqualified. The duplicate hosted Windows rebuild is cancelled under the
+no-multi-hour-repeat scope; local acceptance and hosted merge checks are
+reported separately.

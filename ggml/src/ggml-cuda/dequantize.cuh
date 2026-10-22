@@ -1,5 +1,19 @@
 #include "common.cuh"
 
+static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, dfloat2 & v) {
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+    const float d = __half2float(x[ib].d);
+    const int c0 = (x[ib].qs[iqs / 4] >> (2 * (iqs % 4))) & 3;
+    const int c1 = (x[ib].qs[(iqs + 1) / 4] >> (2 * ((iqs + 1) % 4))) & 3;
+#ifdef GGML_CUDA_F16
+    v.x = __float2half(d * (c0 - 1));
+    v.y = __float2half(d * (c1 - 1));
+#else
+    v.x = d * (c0 - 1);
+    v.y = d * (c1 - 1);
+#endif
+}
+
 static __device__ __forceinline__ void dequantize_tq2_0(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
     const block_tq2_0 * x = (const block_tq2_0 *) vx;
     const float d = __half2float(x[ib].d);

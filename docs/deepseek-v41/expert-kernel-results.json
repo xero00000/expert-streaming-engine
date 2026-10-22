@@ -1,0 +1,127 @@
+{
+  "scope": "Two real expert projections, batches 1 and 8; not end-to-end model quality or throughput",
+  "relative_rms_limit": 0.01,
+  "cosine_minimum": 0.999,
+  "results": [
+    {
+      "backend": "CPU",
+      "results": [
+        {
+          "cosine": 0.9999905328726558,
+          "relative_rms": 0.004353055762993858,
+          "tokens": 1,
+          "type": "IQ2_XXS"
+        },
+        {
+          "cosine": 0.9999908870682128,
+          "relative_rms": 0.0042693928179790355,
+          "tokens": 8,
+          "type": "IQ2_XXS"
+        },
+        {
+          "cosine": 0.9999907550565982,
+          "relative_rms": 0.004302030543453867,
+          "tokens": 1,
+          "type": "Q2_K"
+        },
+        {
+          "cosine": 0.9999908722394417,
+          "relative_rms": 0.004272668442591518,
+          "tokens": 8,
+          "type": "Q2_K"
+        }
+      ],
+      "scope": "real expert MUL_MAT_ID parity only"
+    },
+    {
+      "backend": "CUDA0",
+      "results": [
+        {
+          "cosine": 0.999991780815657,
+          "relative_rms": 0.004054426385039518,
+          "tokens": 1,
+          "type": "IQ2_XXS"
+        },
+        {
+          "cosine": 0.999991664720741,
+          "relative_rms": 0.004082953497735242,
+          "tokens": 8,
+          "type": "IQ2_XXS"
+        },
+        {
+          "cosine": 0.9999918169330656,
+          "relative_rms": 0.0040456384457680525,
+          "tokens": 1,
+          "type": "Q2_K"
+        },
+        {
+          "cosine": 0.9999683332441817,
+          "relative_rms": 0.007958549364696966,
+          "tokens": 8,
+          "type": "Q2_K"
+        }
+      ],
+      "scope": "real expert MUL_MAT_ID parity only"
+    },
+    {
+      "backend": "CUDA1",
+      "results": [
+        {
+          "cosine": 0.999991780815657,
+          "relative_rms": 0.004054426385039518,
+          "tokens": 1,
+          "type": "IQ2_XXS"
+        },
+        {
+          "cosine": 0.999991664723982,
+          "relative_rms": 0.00408295270014924,
+          "tokens": 8,
+          "type": "IQ2_XXS"
+        },
+        {
+          "cosine": 0.9999918169330656,
+          "relative_rms": 0.0040456384457680525,
+          "tokens": 1,
+          "type": "Q2_K"
+        },
+        {
+          "cosine": 0.9999683332412044,
+          "relative_rms": 0.007958549732578013,
+          "tokens": 8,
+          "type": "Q2_K"
+        }
+      ],
+      "scope": "real expert MUL_MAT_ID parity only"
+    },
+    {
+      "backend": "CUDA2",
+      "results": [
+        {
+          "cosine": 0.999991780815657,
+          "relative_rms": 0.004054426385039518,
+          "tokens": 1,
+          "type": "IQ2_XXS"
+        },
+        {
+          "cosine": 0.999991664720198,
+          "relative_rms": 0.0040829536291388585,
+          "tokens": 8,
+          "type": "IQ2_XXS"
+        },
+        {
+          "cosine": 0.9999918169330656,
+          "relative_rms": 0.0040456384457680525,
+          "tokens": 1,
+          "type": "Q2_K"
+        },
+        {
+          "cosine": 0.9999683332442553,
+          "relative_rms": 0.007958549352859983,
+          "tokens": 8,
+          "type": "Q2_K"
+        }
+      ],
+      "scope": "real expert MUL_MAT_ID parity only"
+    }
+  ]
+}

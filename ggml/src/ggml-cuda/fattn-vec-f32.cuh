@@ -43,7 +43,8 @@ static __global__ void flash_attn_vec_ext_f32(
 
     // Skip unused kernel variants for faster compilation:
     if constexpr (Dk == Dv || (Dk == 192 && Dv == 128) || (Dk == 576 && Dv == 512)) {
-    if (use_logit_softcap && !(Dk == 128 || Dk == 256)) {
+    if (use_logit_softcap && !(Dk == 128 || Dk == 256) &&
+            !(type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16)) {
         NO_DEVICE_CODE;
         return;
     }

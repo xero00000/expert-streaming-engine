@@ -217,6 +217,17 @@ class BF16(__Quant, qtype=GGMLQuantizationType.BF16):
         return (blocks.view(np.int16).astype(np.int32) << 16).view(np.float32)
 
 
+class Q2_0(__Quant, qtype=GGMLQuantizationType.Q2_0):
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        # Native block_q2_0: FP16 scale followed by 16 bytes, each storing
+        # four adjacent 2-bit values. The codebook is {-1, 0, 1, 2} * scale.
+        d = np.ascontiguousarray(blocks[:, :2]).view(np.float16).astype(np.float32)
+        codes = (blocks[:, 2:, None] >> np.array([0, 2, 4, 6], dtype=np.uint8)) & np.uint8(3)
+        codes = codes.reshape((-1, cls.block_size)).astype(np.int8) - np.int8(1)
+        return d * codes.astype(np.float32)
+
+
 class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
     @classmethod
     def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:

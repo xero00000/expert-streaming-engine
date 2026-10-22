@@ -96,7 +96,7 @@ The mapped head is enabled only when all of the following GGUF/model facts agree
 - `*.centroid_count` and `*.centroid_top_k` are positive and shape-compatible;
 - `mtp_centroids.weight` has `[hidden, centroid_count]` logical dimensions; and
 - `mtp_token_ordering.weight` is an I32 permutation containing one explicit
-draft-to-target token id for every target-vocabulary entry.
+  draft-to-target token id for every target-vocabulary entry.
 
 The ordering comes from the model publisher's frequency/centroid analysis; ESE
 does not silently synthesize or reorder it. The graph selects the best centroids,
@@ -133,4 +133,5 @@ selection, profitable depth selection, mapped-id scatter, and greedy full-target
 verification. End-to-end testing used a Qwen 3.6 image request followed by
 text/MTP generation on Turing and Ampere hardware with no stale state. Five
 workload panels recorded a 12.9% aggregate decode gain and 80.8% draft
-acceptance
+acceptance. The consolidated status and remaining boundaries are retained in
+the [port roadmap](PORT_ROADMAP.md#phase-3--transient-modules-and-speculation).

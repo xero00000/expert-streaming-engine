@@ -7,6 +7,14 @@
 #include <climits>
 #include <cstdint>
 
+// Virtual experts have no payload or routed rows. Padding their bounds to a
+// multiple of the SM count makes every stream-K partition end on a complete
+// output tile, so relocating a real expert cannot change its reduction order.
+static __global__ void pad_empty_expert_bounds(int32_t * bounds, int64_t real, int64_t padded) {
+    const int64_t index = real + 1 + blockIdx.x*blockDim.x + threadIdx.x;
+    if (index <= padded) bounds[index] = bounds[real];
+}
+
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
 struct mmq_ids_helper_store {
     uint32_t data;
@@ -33,7 +41,8 @@ template <int n_expert_used_template>
 __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mmq_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1) {
+        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1,
+        const bool write_inverse) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
@@ -50,7 +59,7 @@ static __global__ void mmq_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                nex_prev += expert_used >= 0 && expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -75,7 +84,7 @@ static __global__ void mmq_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            nex_prev += expert_used >= 0 && expert_used < expert;
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -104,8 +113,12 @@ static __global__ void mmq_ids_helper(
         const mmq_ids_helper_store store_it = store[itc];
         const int it       = store_it.it();
         const int iex_used = store_it.iex_used();
-        ids_src1[nex_prev + itc] = it*sis1          + iex_used % nchannels_y;
-        ids_dst [nex_prev + itc] = it*n_expert_used + iex_used;
+        ids_dst[nex_prev + itc] = it*n_expert_used + iex_used;
+        if (write_inverse) {
+            ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
+        } else {
+            ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
+        }
     }
 
     if (threadIdx.x != 0) {
@@ -124,7 +137,8 @@ static __global__ void mmq_ids_helper(
 template <int n_expert_used_template>
 static void launch_mmq_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
+        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1,
+        const bool write_inverse, cudaStream_t stream) {
     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mmq_ids_helper_store");
     GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mmq_ids_helper_store");
 
@@ -137,7 +151,7 @@ static void launch_mmq_ids_helper(
     const dim3 block_size(warp_size, 1, 1);
     const size_t nbytes_shared = n_tokens*sizeof(mmq_ids_helper_store);
     mmq_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
-        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1);
+        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
 static void ggml_cuda_mul_mat_q_switch_type_id(ggml_backend_cuda_context & ctx, const mmq_args_id & args, cudaStream_t stream) {
@@ -276,7 +290,7 @@ static void ggml_cuda_mul_mat_q_switch_type_id(ggml_backend_cuda_context & ctx, 
 
 void compute_row_ids(const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
         int64_t ne02, int64_t ne12, int64_t n_expert_used, int64_t ne11, int64_t nb11, int64_t nb12, int64_t nb21,
-        cudaStream_t stream) {
+        bool write_inverse, cudaStream_t stream) {
 
     const int si1  = nb21 / sizeof(int);
     const int sis1 = nb12 / nb11;
@@ -284,31 +298,31 @@ void compute_row_ids(const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst,
     switch (n_expert_used) {
         case  2:
             launch_mmq_ids_helper< 2> (ids, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, write_inverse, stream);
             break;
         case  4:
             launch_mmq_ids_helper< 4> (ids, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, write_inverse, stream);
             break;
         case  6:
             launch_mmq_ids_helper< 6> (ids, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, write_inverse, stream);
             break;
         case  8:
             launch_mmq_ids_helper< 8> (ids, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, write_inverse, stream);
             break;
         case 16:
             launch_mmq_ids_helper<16> (ids, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, write_inverse, stream);
             break;
         case 32:
             launch_mmq_ids_helper<32> (ids, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, write_inverse, stream);
             break;
         default:
             launch_mmq_ids_helper< 0> (ids, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, write_inverse, stream);
             break;
     }
     CUDA_CHECK(cudaGetLastError());
@@ -416,37 +430,42 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
         ids_dst  = ids_dst_local.get();
         expert_bounds = expert_bounds_local.get();
 
+        // Sparse hybrid routes leave unused compact rows after the valid
+        // experts. The quantizer still visits the allocated top-k width;
+        // give those rows a safe activation index rather than pool garbage.
+        CUDA_CHECK(cudaMemsetAsync(ids_src1, 0, ne_get_rows*sizeof(int32_t), stream));
+
         const int si1  = ids_tensor->nb[1] / ggml_element_size(ids_tensor);
         const int sis1 = nb12 / nb11;
 
         switch (n_expert_used) {
             case  2:
                 launch_mmq_ids_helper< 2> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, false, stream);
                 break;
             case  4:
                 launch_mmq_ids_helper< 4> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, false, stream);
                 break;
             case  6:
                 launch_mmq_ids_helper< 6> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, false, stream);
                 break;
             case  8:
                 launch_mmq_ids_helper< 8> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, false, stream);
                 break;
             case 16:
                 launch_mmq_ids_helper<16> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, false, stream);
                 break;
             case 32:
                 launch_mmq_ids_helper<32> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, false, stream);
                 break;
             default:
                 launch_mmq_ids_helper< 0> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
-                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, false, stream);
                 break;
         }
         CUDA_CHECK(cudaGetLastError());
@@ -481,11 +500,33 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const int64_t s12 = ne11*ne10_padded * sizeof(block_q8_1)/(QK8_1*sizeof(int));
     const int64_t s13 = ne12*s12;
 
+    ggml_cuda_pool_alloc<int32_t> stable_bounds(ctx.pool());
+    int64_t physical_experts = ne02;
+    static const bool stable_reduction = [] {
+        const char * stable = getenv("ESE_CUDA_STABLE_EXPERT_REDUCTION");
+        const char * packing = getenv("ESE_EXPERT_CACHE_PACKING");
+        return (stable && strcmp(stable, "1") == 0) || (packing && strcmp(packing, "1") == 0);
+    }();
+    if (stable_reduction && use_stream_k && ne12 <= 8) {
+        const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+        const int64_t padded = (ne02 + nsm - 1)/nsm*nsm;
+        if (padded > ne02 && padded < INT_MAX) {
+            stable_bounds.alloc(padded + 1);
+            CUDA_CHECK(cudaMemcpyAsync(stable_bounds.get(), expert_bounds,
+                    size_t(ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+            pad_empty_expert_bounds<<<(padded - ne02 + 127)/128, 128, 0, stream>>>(
+                    stable_bounds.get(), ne02, padded);
+            CUDA_CHECK(cudaGetLastError());
+            expert_bounds = stable_bounds.get();
+            physical_experts = padded;
+        }
+    }
+
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args_id args = {
         src0_d, src0->type, (const int *) src1_q8_1, ids_dst, expert_bounds, dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
-        ne02, ne02, s02, s12, s2,
+        physical_experts, physical_experts, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         use_stream_k, ne12};
 

@@ -55,6 +55,55 @@ MoE outputs at TinyMoE's real matrix dimensions. LeakSanitizer
 also passed in an unrestricted run; the managed sandbox cannot run LSAN under
 its ptrace policy.
 
+## October 9 continuation: bounded CPU lease groups
+
+`ESE_CPU_EXPERT_LEASE_CHUNKING=1` enables ordinary CPU `MUL_MAT_ID` scheduling
+across groups of at most four leased expert components when IQK and expert
+chunking are compiled in. One thread acquires the group; workers share its
+weights until every output-row chunk completes. Admission pressure reduces the
+group, including to one expert, and all leases are released before advancing.
+This avoids the old per-thread acquisition pattern in which workers can advance
+to different experts and exhaust a tiny cache. Required leases still prohibit
+using the original model tensor as a fallback. The option is experimental and
+does not change launcher defaults.
+
+The option now rejects graph execution when either required build feature is
+compiled out. `ESE_CPU_EXPERT_LEASE_TRACE=1` records actual grouped calls for
+qualification. The existing Qwen diagnostic backend has chunking OFF; its first
+timing sweep therefore did not exercise this feature and is excluded. The
+enabled lane uses the normal Release GGML backend as a per-run preload into the
+gated probe executable/libllama. Both ablation modes use that same backend. No
+existing build setting or production architecture gate was changed.
+
+The candidate preserves the leased path's row partitions and its IQK/GEMV/vec-dot
+arithmetic. Independent tests poison the original weights and check exact output
+with one- and four-component RAM capacities, repeated nodes, forced eviction,
+padding and broadcast activations. They cover F32 and production-shaped IQ3_S,
+IQ4_NL and decode-only Q2_0. Successful acquisition counts fall from per-worker
+requests to one per active expert; this alone is not a throughput claim.
+
+A separate correctness fix replaces the unleased chunk path's negative work
+counter sentinel with an independent atomic failure flag. Remaining workers
+cannot increment away failure, and resetting the counter cannot change the
+verdict observed by slower threads. The old code hung in sanitizer and Release
+fallback checks; the final CPU, three-GPU cache suites and strict ASAN/UBSAN
+checks pass.
+
+Matched real-model probes preserve all 3,973,120 captured logits and MoE/QSA
+routes, both for the ordinary control and for fixed 5/5 hybrid execution with a
+64 MiB RAM cache and 4 MiB staging allowance. This is a bounded 16-step diagnostic,
+not upstream model or long-context qualification. Evidence, rejected GPU-quota
+trial and timing details: `/home/xero/Desktop/test/results/ese-resident-quota-20261009/`.
+
+The enabled-backend ablation uses three repeats each of raw Hi (32 predictions)
+and Logs256 (16 predictions), fixed 5/5 placement, the same 64 MiB RAM / 4 MiB
+staging and 2680 MiB expert VRAM per GPU. Shared leases improve median decode
+`3.252 -> 4.093` and `2.736 -> 3.024` tokens/s, with all six paired outputs
+matching. Both modes have identical RAM misses and logical source/GPU bytes;
+duplicate worker acquisition hits decrease. OS reuse and clocks are uncontrolled,
+and these short local results do not promote a new general default. The enabled
+TinyMoE CPU-only lane also matches 32 generated tokens and traces actual calls.
+
 ## GPU matrix
 
 The CUDA build compiles for both locally available architecture families:
@@ -93,6 +142,14 @@ driver version through `nvidia-smi`, then selects devices by UUID so the
 evidence is not ambiguous under CUDA device reordering. It also records the
 Git commit and SHA-256 hashes of the CLI and model. GPU acceptance refuses a
 dirty source tree, so the result identifies the exact candidate under test.
+
+The current TinyMoE churn lane uses 6 MiB per GPU: two usable expert triplets,
+one triplet of allocation headroom and the route arena. The older 4 MiB setting
+leaves only one usable slot after padding headroom and therefore retains the
+CPU expert path for top-2 routing. The runner checks that case separately
+against the CPU-expert placement reference, requiring no GPU admissions or
+uploads and fully drained, bounded RAM leases. It does not compare that CPU
+path's rounding against the fully resident CUDA reference.
 
 The cache uses one dedicated CUDA transfer stream per participating device.
 Upload events make new slots visible to compute; compute-completion events make

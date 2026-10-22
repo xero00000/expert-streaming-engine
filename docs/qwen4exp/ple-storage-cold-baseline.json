@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "evidence_sha256": "d4da41f2cd9819ebeaddc777fcd8f61722662b871f55df3d01c0f2e9a7f33050",
+  "date": "2026-08-26",
+  "architecture": "qwen4exp",
+  "model_tensor_inventory_sha256": "b2a4a7007fa239de1f6654700bc7506f8c54daa60f9c32dcda623edbfff372e7",
+  "trace_sha256": "302548e2a4ad224e730dcaa195572d15960cf3a6731c4dffc39a44fe3c68a4ef",
+  "cache_state": {
+    "os_page_cache": "PLE tensor range passed to POSIX_FADV_DONTNEED after source identity validation",
+    "ple_page_cache": "empty at benchmark construction",
+    "cold_cache_control_succeeded": true,
+    "physical_device_cache_claim": false
+  },
+  "configuration": {
+    "backend": "io_uring",
+    "storage_mode": "page",
+    "cache_mib": 1,
+    "workers": 4,
+    "iterations": 1,
+    "sessions": 1,
+    "tokens": 18,
+    "logical_quantized_bytes": 25920,
+    "os_cache_control": "posix_fadvise_dontneed"
+  },
+  "result": {
+    "elapsed_ns": 10268209,
+    "tokens_per_second": 1752.9834073303339,
+    "token_latency_ns": {
+      "p50": 561161,
+      "p95": 1317013,
+      "p99": 1317013
+    },
+    "reads": {
+      "logical_reads": 251,
+      "logical_bytes": 1028096,
+      "source_reads": 251,
+      "source_bytes": 1028096,
+      "source_batches": 16,
+      "peak_source_batch_width": 17,
+      "coalesced_reads": 0,
+      "failed_reads": 0,
+      "peak_queue_depth": 17,
+      "staging_capacity_bytes": 1048576,
+      "staging_resident_bytes": 0,
+      "staging_peak_resident_bytes": 69632,
+      "staging_rejected_batches": 0,
+      "submit_to_ready_p50_ns": 444701,
+      "submit_to_ready_p95_ns": 920821,
+      "submit_to_ready_p99_ns": 928771
+    },
+    "page_cache": {
+      "capacity_bytes": 1048576,
+      "resident_bytes": 1028096,
+      "peak_resident_bytes": 1028096,
+      "hits": 40,
+      "misses": 251,
+      "admissions": 251,
+      "evictions": 0,
+      "pinned_capacity_failures": 0
+    }
+  }
+}

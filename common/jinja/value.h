@@ -215,7 +215,7 @@ struct value_int_t : public value_t {
     value_int_t(int64_t v) {
         val_int = v;
         val_flt = static_cast<double>(v);
-        if (static_cast<int64_t>(val_flt) != v) {
+        if (val_flt >= 0x1p63 || static_cast<int64_t>(val_flt) != v) {
             val_flt = v < 0 ? -INFINITY : INFINITY;
         }
     }
@@ -249,12 +249,17 @@ struct value_float_t : public value_t {
     value val;
     value_float_t(double v) {
         val_flt = v;
-        val_int = std::isfinite(v) ? static_cast<int64_t>(v) : 0;
+        val_int = std::isfinite(v) && v >= -0x1p63 && v < 0x1p63 ? static_cast<int64_t>(v) : 0;
         val = mk_val<value_int>(val_int);
     }
     virtual std::string type() const override { return "Float"; }
     virtual double as_float() const override { return val_flt; }
-    virtual int64_t as_int() const override { return val_int; }
+    virtual int64_t as_int() const override {
+        if (std::isfinite(val_flt) && (val_flt < -0x1p63 || val_flt >= 0x1p63)) {
+            throw std::runtime_error("Float value is outside the signed 64-bit range");
+        }
+        return val_int;
+    }
     virtual string as_string() const override {
         std::string out = std::to_string(val_flt);
         out.erase(out.find_last_not_of('0') + 1, std::string::npos); // remove trailing zeros

@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">ESE — Bigger AI. The PC you already own.</title>
+  <desc id="desc">Local AI with SSD storage, system memory and graphics memory working together for supported sparse models.</desc>
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#242b2b" stroke-width="1"/></pattern>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto"><path d="M0 0L5 3L0 6" fill="none" stroke="#a7f3ce" stroke-width="1.4"/></marker>
+  </defs>
+  <rect width="1280" height="640" rx="24" fill="#171b1b"/>
+  <rect x="704" y="24" width="552" height="592" rx="12" fill="url(#grid)"/>
+  <path d="M704 24V616" stroke="#303b38"/>
+  <g transform="translate(56 48)">
+    <rect width="52" height="52" rx="13" fill="#dededf"/>
+    <path d="M15 12H38V19H23V23H36V29H23V33H39V40H15Z" fill="#1d1e20"/>
+    <text x="70" y="24" fill="#f4f6f4" font-family="DejaVu Sans, sans-serif" font-size="26" font-weight="700">ESE</text>
+    <text x="70" y="45" fill="#b6c4bd" font-family="DejaVu Sans, sans-serif" font-size="13" letter-spacing="1.5">EXPERT STREAMING ENGINE</text>
+  </g>
+  <g font-family="DejaVu Sans, sans-serif">
+    <text x="56" y="224" fill="#f4f6f4" font-size="78" font-weight="700" letter-spacing="-4">Bigger AI.</text>
+    <text x="56" y="318" fill="#a7f3ce" font-size="78" font-weight="700" letter-spacing="-4">Your PC.</text>
+    <text x="60" y="379" fill="#d0dad4" font-size="23">Put your whole PC to work.</text>
+    <text x="60" y="414" fill="#b6c4bd" font-size="21">Explore supported models beyond GPU memory.</text>
+    <path d="M60 470H638" stroke="#34413b"/>
+    <text x="60" y="509" fill="#f4f6f4" font-size="16" font-weight="700" letter-spacing="1">FIND A MODEL</text>
+    <path d="M214 504H244" stroke="#a7f3ce" marker-end="url(#arrow)"/>
+    <text x="265" y="509" fill="#f4f6f4" font-size="16" font-weight="700" letter-spacing="1">CHAT LOCALLY</text>
+    <text x="60" y="579" fill="#b6c4bd" font-size="15">OPEN SOURCE  /  DESKTOP APP  /  LOCAL AI</text>
+    <text x="748" y="108" fill="#b6c4bd" font-size="13" letter-spacing="2.3">ONE LOCAL WORKFLOW</text>
+  </g>
+  <g fill="none" stroke="#a7f3ce" stroke-width="3">
+    <path d="M948 503H850V422" marker-end="url(#arrow)"/>
+    <path d="M850 326V245H920" marker-end="url(#arrow)"/>
+  </g>
+  <g font-family="DejaVu Sans, sans-serif">
+    <g transform="translate(920 179)">
+      <path d="M24-12V0M48-12V0M72-12V0M96-12V0M120-12V0M144-12V0M168-12V0M192-12V0M216-12V0M24 126V138M48 126V138M72 126V138M96 126V138M120 126V138M144 126V138M168 126V138M192 126V138M216 126V138" stroke="#667c70" stroke-width="4"/>
+      <rect width="232" height="126" rx="12" fill="#a7f3ce"/>
+      <text x="24" y="46" fill="#14251b" font-size="30" font-weight="700">GPU</text>
+      <text x="24" y="78" fill="#243e2d" font-size="15">Run the active experts</text>
+      <path d="M24 101H208" stroke="#557c63" stroke-width="2"/>
+    </g>
+    <g transform="translate(740 326)">
+      <rect width="220" height="96" rx="12" fill="#222c27" stroke="#627b6b" stroke-width="2"/>
+      <text x="24" y="38" fill="#f4f6f4" font-size="27" font-weight="700">RAM</text>
+      <text x="24" y="68" fill="#c3d1c9" font-size="14">Keep useful parts close</text>
+    </g>
+    <g transform="translate(948 455)">
+      <rect width="220" height="96" rx="12" fill="#202725" stroke="#627b6b" stroke-width="2"/>
+      <text x="24" y="38" fill="#f4f6f4" font-size="27" font-weight="700">SSD</text>
+      <text x="24" y="68" fill="#c3d1c9" font-size="14">Store the model</text>
+      <circle cx="190" cy="30" r="4" fill="#a7f3ce"/>
+    </g>
+  </g>
+</svg>

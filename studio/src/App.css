@@ -124,6 +124,13 @@ nav button > svg { width: 16px; min-width: 16px; flex: 0 0 16px; }
 .settings-updates .progress-meta { margin-bottom: 0; }
 .update-action { margin-top: 10px; }
 
+.model-primary strong { display: flex; align-items: center; gap: 6px; }
+.support-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid #66553d; border-radius: 8px; color: #d5b584; background: #332d24; font-size: 7px; font-weight: 600; letter-spacing: .035em; text-transform: uppercase; }
+.availability.gated { color: #d5b584; }
+.availability.gated i { background: #c79a58; }
+.selection-bar.experimental { border-color: #66553d; }
+.selection-bar .support-note { grid-column: 2; max-width: 680px; color: #b9a98e; line-height: 1.35; }
+
 @media (max-width: 1100px) {
   .settings-layout { grid-template-columns: minmax(0, 1fr); }
 }

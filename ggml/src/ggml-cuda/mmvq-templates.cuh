@@ -21,6 +21,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q5_1   : return vec_dot_q5_1_q8_1;
         case GGML_TYPE_Q6_0   : return vec_dot_q6_0_q8_1;
         case GGML_TYPE_Q8_0   : return vec_dot_q8_0_q8_1;
+        case GGML_TYPE_Q2_0   : return vec_dot_q2_0_q8_1;
         case GGML_TYPE_TQ2_0  : return vec_dot_tq2_0_q8_1;
         case GGML_TYPE_Q2_K   : return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K   : return vec_dot_q3_K_q8_1;
@@ -49,6 +50,7 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q5_1    : return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_Q6_0    : return VDR_Q6_0_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0    : return VDR_Q8_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q2_0    : return VDR_Q2_0_Q8_1_MMVQ;
         case GGML_TYPE_TQ2_0   : return VDR_TQ2_0_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K    : return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K    : return VDR_Q3_K_Q8_1_MMVQ;
@@ -445,7 +447,12 @@ template <ggml_type type>
 static void mul_mat_vec_q_cuda(const mmvq_args & args, cudaStream_t stream) {
     int nwarps = 1;
     int id = ggml_cuda_get_device();
-    if (args.ne2 < 2 && ggml_cuda_info().devices[id].cc < CC_RDNA2) { // NVIDIA and AMD older than RDNA2
+    // Broadcast-weight fused vectors represent independent dense tokens, not
+    // expert channels. Preserve the scalar decode reduction for every token.
+    const bool scalar_fused_batch = args.ne2 > 1 && args.nb02 == 0 &&
+            !args.ids_data && args.vx_g && args.ncols_y == 1 &&
+            args.unary_op != GGML_UNARY_OP_COUNT;
+    if ((args.ne2 < 2 || scalar_fused_batch) && ggml_cuda_info().devices[id].cc < CC_RDNA2) { // NVIDIA and AMD older than RDNA2
         nwarps = args.ncols_y <= 4 ? 4 : 2;
     }
     switch (nwarps) {

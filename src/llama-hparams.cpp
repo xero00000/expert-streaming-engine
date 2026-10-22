@@ -4,6 +4,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
 
@@ -158,6 +159,10 @@ void llm_load_hparams(
     if (hparams.vocab_only) {
         return;
     }
+    if (!hparams.n_layer || hparams.n_layer > hparams.n_head_arr.size()) {
+        throw std::runtime_error(format("block_count=%u is outside supported range 1..%zu",
+                hparams.n_layer, hparams.n_head_arr.size()));
+    }
 
     ml.get_key(LLM_KV_CONTEXT_LENGTH,    hparams.n_ctx_train);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,  hparams.n_embd);
@@ -168,12 +173,10 @@ void llm_load_hparams(
     ml.get_key(LLM_KV_EXPERT_COUNT,      hparams.n_expert,      false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used, false);
 
-    GGML_ASSERT(hparams.n_expert <= LLAMA_MAX_EXPERTS);
-    GGML_ASSERT(hparams.n_expert_used <= hparams.n_expert);
-    if (hparams.n_expert > 0) {
-        GGML_ASSERT(hparams.n_expert_used > 0);
-    } else {
-        GGML_ASSERT(hparams.n_expert_used == 0);
+    if (hparams.n_expert > LLAMA_MAX_EXPERTS || hparams.n_expert_used > hparams.n_expert ||
+            (hparams.n_expert > 0 && hparams.n_expert_used == 0)) {
+        throw std::runtime_error(format("invalid expert_count=%u/expert_used_count=%u (maximum experts %u)",
+                hparams.n_expert, hparams.n_expert_used, LLAMA_MAX_EXPERTS));
     }
 
     // zero-out the per-layer hparams
@@ -659,6 +662,157 @@ void llm_load_hparams(
                     case 48: model.type = e_model::MODEL_80B_A3B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
+            } break;
+        case LLM_ARCH_QWEN4EXP:
+            {
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+                if (!std::isfinite(hparams.f_norm_rms_eps) || hparams.f_norm_rms_eps <= 0.0f) {
+                    throw std::runtime_error("Qwen4Exp RMS epsilon must be finite and positive");
+                }
+                ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
+
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
+                ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
+                ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
+                ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
+
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+                ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL,      hparams.qwen4exp_full_attention_interval);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,       hparams.qwen4exp_hc_count);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK,    hparams.qwen4exp_hc_low_rank);
+                ml.get_key(LLM_KV_QWEN4EXP_EMBEDDING_LENGTH_PER_LAYER_INPUT,
+                    hparams.qwen4exp_embd_per_layer_input);
+                if (!hparams.n_layer || !hparams.n_vocab || !hparams.n_ctx_train || !hparams.n_embd ||
+                        !hparams.n_expert || !hparams.n_ff_exp || !hparams.n_ff_shexp ||
+                        !hparams.ssm_d_conv || !hparams.ssm_d_state || !hparams.ssm_d_inner ||
+                        !hparams.ssm_dt_rank || !hparams.ssm_n_group) {
+                    throw std::runtime_error("Qwen4Exp text/recurrent dimensions must be positive");
+                }
+                if (hparams.ssm_dt_rank % hparams.ssm_n_group != 0 ||
+                        hparams.ssm_d_inner % hparams.ssm_dt_rank != 0 ||
+                        hparams.ssm_d_inner / hparams.ssm_dt_rank != hparams.ssm_d_state) {
+                    throw std::runtime_error("Qwen4Exp recurrent heads require divisible grouping and equal key/value widths");
+                }
+                // The current recurrent-state API stores row widths as u32.
+                // Check each product before evaluating the existing helpers.
+                constexpr uint64_t state_limit = std::numeric_limits<uint32_t>::max();
+                const uint64_t conv_width = 2 * uint64_t(hparams.ssm_d_state) * hparams.ssm_n_group + hparams.ssm_d_inner;
+                if (conv_width > state_limit || uint64_t(hparams.ssm_d_conv - 1) > state_limit / conv_width) {
+                    throw std::runtime_error("Qwen4Exp convolution state exceeds supported row width");
+                }
+                const uint64_t conv_state = conv_width * (hparams.ssm_d_conv - 1);
+                const uint64_t recurrent_state = uint64_t(hparams.ssm_d_state) * hparams.ssm_d_inner;
+                if (recurrent_state > state_limit - conv_state) {
+                    throw std::runtime_error("Qwen4Exp recurrent state exceeds supported row width");
+                }
+
+                uint32_t ratio_count = 0;
+                ml.get_arr_n(LLM_KV_ATTENTION_COMPRESS_RATIOS, ratio_count, true);
+                if (ratio_count != hparams.n_layer || hparams.qwen4exp_full_attention_interval == 0) {
+                    throw std::runtime_error("Qwen4Exp compress_ratios must exactly match block_count");
+                }
+                std::vector<uint32_t> ratios;
+                ml.get_arr(ml.llm_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS), ratios);
+                for (uint32_t layer = 0; layer < hparams.n_layer; ++layer) {
+                    const uint32_t expected = (layer + 1) % hparams.qwen4exp_full_attention_interval == 0 ? 4 : 0;
+                    if (ratios[layer] != expected) {
+                        throw std::runtime_error(format(
+                            "Qwen4Exp layer %u has compress_ratio=%u, expected %u",
+                            layer, ratios[layer], expected));
+                    }
+                    hparams.qwen4exp_compress_ratios[layer] = ratios[layer];
+                    hparams.recurrent_layer_arr[layer] = ratios[layer] == 0;
+                    if (ratios[layer] != 0 && (!hparams.n_head(layer) || !hparams.n_head_kv(layer) ||
+                            hparams.n_head(layer) % hparams.n_head_kv(layer) != 0 ||
+                            !hparams.n_embd_head_k_full || !hparams.n_embd_head_v_full ||
+                            !hparams.indexer_n_head || !hparams.indexer_head_size || !hparams.indexer_top_k)) {
+                        throw std::runtime_error(format("Qwen4Exp layer %u has invalid sparse attention geometry", layer));
+                    }
+                }
+
+                ml.get_key(LLM_KV_QWEN4EXP_PLE_CONV_KERNEL,     hparams.qwen4exp_ple_conv_kernel);
+                ml.get_key(LLM_KV_QWEN4EXP_PLE_EOS_TOKEN_ID,    hparams.qwen4exp_ple_eos_token_id);
+                ml.get_key(LLM_KV_QWEN4EXP_PLE_IMAGE_TOKEN_ID,  hparams.qwen4exp_ple_image_token_id);
+                ml.get_key(LLM_KV_QWEN4EXP_PLE_HEADS_PER_NGRAM, hparams.qwen4exp_ple_heads_per_ngram);
+                ml.get_key(LLM_KV_QWEN4EXP_PLE_NGRAM_SIZE,      hparams.qwen4exp_ple_ngram_size);
+                // The PLE state/view and accepted-prefix checkpoint paths
+                // require a nonempty convolution history.
+                if (hparams.qwen4exp_ple_conv_kernel < 2) {
+                    throw std::runtime_error("Qwen4Exp PLE convolution kernel must be at least 2");
+                }
+
+                auto load_u64_array = [&](llm_kv key, auto & destination, const char * label) {
+                    uint32_t count = 0;
+                    ml.get_arr_n(key, count, true);
+                    if (count != destination.size()) {
+                        throw std::runtime_error(format(
+                            "Qwen4Exp %s has %u entries, expected %zu",
+                            label, count, destination.size()));
+                    }
+                    std::vector<uint64_t> values;
+                    ml.get_arr(ml.llm_kv(key), values);
+                    std::copy(values.begin(), values.end(), destination.begin());
+                };
+                load_u64_array(LLM_KV_QWEN4EXP_PLE_HEAD_OFFSETS,
+                    hparams.qwen4exp_ple_head_offsets, "PLE head_offsets");
+                load_u64_array(LLM_KV_QWEN4EXP_PLE_HEAD_VOCAB_SIZES,
+                    hparams.qwen4exp_ple_head_vocab_sizes, "PLE head_vocab_sizes");
+                load_u64_array(LLM_KV_QWEN4EXP_PLE_LAYER_MULTIPLIERS,
+                    hparams.qwen4exp_ple_layer_multipliers, "PLE layer_multipliers");
+
+                uint64_t populated_rows = 0;
+                for (size_t head = 0; head < hparams.qwen4exp_ple_head_offsets.size(); ++head) {
+                    if (hparams.qwen4exp_ple_head_offsets[head] != populated_rows ||
+                            hparams.qwen4exp_ple_head_vocab_sizes[head] == 0 ||
+                            hparams.qwen4exp_ple_head_vocab_sizes[head] >
+                                std::numeric_limits<uint64_t>::max() - populated_rows) {
+                        throw std::runtime_error("Qwen4Exp PLE head ranges are not contiguous and valid");
+                    }
+                    populated_rows += hparams.qwen4exp_ple_head_vocab_sizes[head];
+                }
+
+                uint32_t ple_layer_count = 0;
+                ml.get_arr_n(LLM_KV_QWEN4EXP_PLE_LAYERS, ple_layer_count, true);
+                if (ple_layer_count == 0) throw std::runtime_error("Qwen4Exp requires a PLE layer");
+                std::vector<uint32_t> ple_layers;
+                ml.get_arr(ml.llm_kv(LLM_KV_QWEN4EXP_PLE_LAYERS), ple_layers);
+                for (uint32_t layer : ple_layers) {
+                    if (layer >= hparams.n_layer || hparams.qwen4exp_ple_layers[layer]) {
+                        throw std::runtime_error("Qwen4Exp PLE layers contain an invalid or duplicate index");
+                    }
+                    hparams.qwen4exp_ple_layers[layer] = true;
+                }
+
+                const auto * table = ml.get_tensor_meta("per_layer_token_embd.weight");
+                if (table == nullptr || table->ne[0] != hparams.qwen4exp_embd_per_layer_input ||
+                        table->ne[1] < 0 || uint64_t(table->ne[1]) < populated_rows) {
+                    throw std::runtime_error("Qwen4Exp PLE table shape does not cover configured head ranges");
+                }
+                if (hparams.qwen4exp_ple_ngram_size != hparams.qwen4exp_ple_layer_multipliers.size() ||
+                        uint64_t(hparams.qwen4exp_ple_heads_per_ngram) * (hparams.qwen4exp_ple_ngram_size - 1) !=
+                            hparams.qwen4exp_ple_head_offsets.size() ||
+                        hparams.qwen4exp_hc_count == 0 || hparams.qwen4exp_hc_low_rank == 0 ||
+                        hparams.qwen4exp_ple_conv_kernel == 0) {
+                    throw std::runtime_error("Qwen4Exp PLE or hyper-connection geometry is invalid");
+                }
+                uint64_t ple_state = uint64_t(hparams.n_embd) * hparams.qwen4exp_hc_count;
+                for (uint64_t factor : {uint64_t(hparams.qwen4exp_ple_conv_kernel - 1),
+                                        uint64_t(hparams.qwen4exp_ple_ngram_size)}) {
+                    if (ple_state > state_limit || (factor && ple_state > state_limit / factor)) {
+                        throw std::runtime_error("Qwen4Exp PLE state exceeds supported row width");
+                    }
+                    ple_state *= factor;
+                }
+                if (ple_state > state_limit - conv_state - recurrent_state) {
+                    throw std::runtime_error("Qwen4Exp complete state exceeds supported row width");
+                }
+
+                model.type = e_model::MODEL_UNKNOWN;
             } break;
         case LLM_ARCH_QWEN35MOE:
             {
@@ -1728,6 +1882,37 @@ void llm_load_hparams(
                     case 40: model.type = e_model::MODEL_33B_A3B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
+            } break;
+        case LLM_ARCH_DEEPSEEK41:
+            {
+                std::string source_config;
+                ml.get_key("deepseek41.config", source_config);
+                ml.get_key("deepseek41.assets", model.dsv41_assets_json, false);
+                model.dsv41_config = deepseek_v41::model_config::from_json(source_config);
+                const auto & c = model.dsv41_config;
+                if (hparams.n_layer != c.attention.compress_ratios.size() || hparams.n_embd != c.hidden || hparams.n_ctx_train != c.context ||
+                    hparams.n_vocab != c.vocabulary || hparams.n_head() != c.heads || hparams.n_head_kv() != 1 ||
+                    hparams.n_embd_head_k_full != c.attention.head_dim || hparams.n_embd_head_v_full != c.attention.head_dim ||
+                    hparams.n_rot != c.rotary || hparams.n_expert != c.experts || hparams.n_expert_used != c.active_experts) {
+                    throw std::runtime_error("DeepSeek V4.1 metadata disagrees with its explicit source configuration");
+                }
+                hparams.f_norm_rms_eps = hparams.f_norm_eps = c.norm_eps;
+                hparams.n_lora_q = c.query_rank; hparams.n_lora_kv = c.attention.head_dim;
+                hparams.n_ff_exp = c.expert_hidden; hparams.n_expert_shared = c.shared_experts;
+                hparams.n_ff_shexp = c.expert_hidden * c.shared_experts;
+                hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS;
+                hparams.expert_weights_norm = true; hparams.expert_weights_scale = c.expert_scale;
+                hparams.n_expert_groups = hparams.n_group_used = 0;
+                hparams.indexer_n_head = c.index_heads; hparams.indexer_head_size = c.attention.index_head_dim;
+                hparams.indexer_top_k = c.index_topk;
+                std::fill_n(hparams.swiglu_limits.begin(), hparams.n_layer, c.swiglu_limit);
+                std::fill_n(hparams.swiglu_limits_shared.begin(), hparams.n_layer, c.swiglu_limit);
+                hparams.nextn_predict_layers = 0; // text backbone package excludes DSpark
+                hparams.rope_freq_base_train = c.rope_theta;
+                hparams.n_ctx_orig_yarn = c.original_context;
+                hparams.rope_freq_scale_train = 1.0f / c.rope_factor;
+                hparams.n_layer_kv_from_start = 0; // dedicated packed state, no ordinary per-layer KV planes
+                model.type = MODEL_UNKNOWN;
             } break;
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GLM_DSA:

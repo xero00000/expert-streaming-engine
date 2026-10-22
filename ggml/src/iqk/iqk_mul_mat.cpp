@@ -1469,8 +1469,14 @@ void iqk_fused_delta_net_neon_impl(int n_heads, int gqa_ratio, int repeat_type, 
         const int out_token_stride    = head_dim * n_heads;
 
         float * state = state_out + state_head_offset;
-        for (int i = 0; i < head_dim * head_dim; ++i) {
-            state[i] = state_in[state_head_offset + i];
+        // Public DeltaNet state is key-contiguous, matching scalar/CUDA.
+        // SIMD math below keeps values contiguous for vector loads. Copy first
+        // so an aliased state_in/state_out is safe, then transpose internally.
+        std::memmove(state, state_in + state_head_offset, head_dim * head_dim * sizeof(float));
+        for (int key = 0; key < head_dim; ++key) {
+            for (int value = key + 1; value < head_dim; ++value) {
+                std::swap(state[key + value * head_dim], state[value + key * head_dim]);
+            }
         }
 
         for (int t = 0; t < n_tokens; ++t) {
@@ -1542,7 +1548,17 @@ void iqk_fused_delta_net_neon_impl(int n_heads, int gqa_ratio, int repeat_type, 
 
             if (saved_steps && t + 1 < n_tokens) {
                 float * this_state = saved_steps + state_head_offset + t * state_step_stride;
-                std::memcpy(this_state, state, head_dim * head_dim * sizeof(float));
+                for (int key = 0; key < head_dim; ++key) {
+                    for (int value = 0; value < head_dim; ++value) {
+                        this_state[key + value * head_dim] = state[value + key * head_dim];
+                    }
+                }
+            }
+        }
+        // Publish the same canonical layout used by CUDA, fallback and checkpoints.
+        for (int key = 0; key < head_dim; ++key) {
+            for (int value = key + 1; value < head_dim; ++value) {
+                std::swap(state[key + value * head_dim], state[value + key * head_dim]);
             }
         }
     }
@@ -1589,8 +1605,14 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
         const int out_token_stride = head_dim * n_heads;
 
         float * state = state_out + state_head_offset;
-        for (int i = 0; i < head_dim * head_dim; ++i) {
-            state[i] = state_in[state_head_offset + i];
+        // Public DeltaNet state is key-contiguous, matching scalar/CUDA.
+        // SIMD math below keeps values contiguous for vector loads. Copy first
+        // so an aliased state_in/state_out is safe, then transpose internally.
+        std::memmove(state, state_in + state_head_offset, head_dim * head_dim * sizeof(float));
+        for (int key = 0; key < head_dim; ++key) {
+            for (int value = key + 1; value < head_dim; ++value) {
+                std::swap(state[key + value * head_dim], state[value + key * head_dim]);
+            }
         }
 
         for (int t = 0; t < n_tokens; ++t) {
@@ -1715,7 +1737,17 @@ void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n
 
             if (saved_steps && t + 1 < n_tokens) {
                 float * this_state = saved_steps + state_head_offset + t * state_step_stride;
-                std::memcpy(this_state, state, head_dim * head_dim * sizeof(float));
+                for (int key = 0; key < head_dim; ++key) {
+                    for (int value = 0; value < head_dim; ++value) {
+                        this_state[key + value * head_dim] = state[value + key * head_dim];
+                    }
+                }
+            }
+        }
+        // Publish the same canonical layout used by CUDA, fallback and checkpoints.
+        for (int key = 0; key < head_dim; ++key) {
+            for (int value = key + 1; value < head_dim; ++value) {
+                std::swap(state[key + value * head_dim], state[value + key * head_dim]);
             }
         }
     }

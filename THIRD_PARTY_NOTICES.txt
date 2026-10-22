@@ -16,6 +16,26 @@ ik_llama.cpp are distributed under the MIT License. The complete MIT License
 and upstream copyright notices are in LICENSE at the repository root and are
 bundled with ESE Studio as licenses/ESE-MIT-LICENSE.txt.
 
+Microsoft Visual C++ runtime components (Windows packages only)
+---------------------------------------------------------------
+
+Windows packages include unmodified release x64 Microsoft Visual C++ CRT and
+OpenMP DLLs from the build toolchain's Microsoft.VC143.CRT and
+Microsoft.VC143.OpenMP redistributable folders. These Microsoft components are
+not covered by ESE's MIT License. Their redistribution is governed by the
+Microsoft Software License Terms for the Visual Studio installation.
+
+The native server and separate CPU fallback include their required transitive
+MSVC imports. Studio's CRT files are installed beside its executable. Each
+directory retains an ese-msvc-runtime.json inventory with exact sizes and
+SHA-256 hashes. Debug runtimes, developer tools and System32 copies are not
+redistribution sources. Updates to these app-local libraries are delivered in
+ESE package updates.
+
+Microsoft redistribution and deployment references:
+https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files
+https://learn.microsoft.com/en-us/cpp/windows/choosing-a-deployment-method
+
 NVIDIA CUDA runtime components (Windows packages only)
 -------------------------------------------------------
 
@@ -45,3 +65,57 @@ e2c71babfd18a8e69542dd7e9ca018f9caa438094001a58e6bc4d8c999bf0d07
 
 CUDA 12.4.1 EULA reference:
 https://docs.nvidia.com/cuda/archive/12.4.1/pdf/EULA.pdf
+
+NVIDIA CUDA runtime components (Linux CUDA packages only)
+---------------------------------------------------------
+
+Linux packages staged from a CUDA-enabled native build include unmodified
+shared libraries resolved from that build's dependencies:
+
+  * libcudart.so.12 from NVIDIA cuda_cudart 12.8.57
+  * libcublas.so.12 and libcublasLt.so.12 from NVIDIA libcublas 12.8.3.14
+  * libnccl.so.2 from NVIDIA NCCL 2.25.1, when the build links NCCL
+
+CPU-only Linux packages do not include these shared libraries. The NVIDIA
+driver library libcuda.so.1 is not bundled; CUDA packages require a compatible
+NVIDIA driver supplied by the host system.
+
+CUDA runtime and cuBLAS components are not licensed under ESE's MIT License.
+Their official, unmodified license text is included as
+licenses/NVIDIA-CUDA-12.8-LICENSE.txt. The CUDA 12.8.0 redistributable manifest
+identifies the versions above and their license locations:
+https://developer.download.nvidia.com/compute/cuda/redist/redistrib_12.8.0.json
+
+The license extracted from the SHA-256-verified official cuda_cudart 12.8.57
+archive matches both official component license downloads listed above.
+License SHA-256:
+e2c71babfd18a8e69542dd7e9ca018f9caa438094001a58e6bc4d8c999bf0d07
+
+cuda_cudart archive:
+https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-12.8.57-archive.tar.xz
+Archive SHA-256:
+5bd3ac35ea8e8ab880e595d5054ee373abf6d9e53dcb8cef0a5c75358dbc0ae2
+
+CUDA 12.8.0 EULA reference:
+https://docs.nvidia.com/cuda/archive/12.8.0/eula/index.html
+
+NVIDIA NCCL and NVTX notices (Linux CUDA packages only)
+-------------------------------------------------------
+
+NCCL is distributed under its BSD license, included unchanged as
+licenses/NVIDIA-NCCL-LICENSE.txt from the exact upstream v2.25.1-1 tag:
+https://raw.githubusercontent.com/NVIDIA/nccl/v2.25.1-1/LICENSE.txt
+License SHA-256:
+0f0174a6b4e0b33ac26375bf729533075b32f4c51a5b6802a3d742d7dcdc9a76
+
+NCCL includes NVIDIA Tools Extension (NVTX) code with this copyright notice:
+Copyright 2009-2022 NVIDIA Corporation. All rights reserved.
+Its source headers at the same NCCL tag identify the Apache License v2.0
+with LLVM Exceptions:
+https://raw.githubusercontent.com/NVIDIA/nccl/v2.25.1-1/src/include/nvtx3/nvToolsExt.h
+
+The complete NVTX license is included unchanged as
+licenses/NVIDIA-NVTX-LICENSE.txt from:
+https://raw.githubusercontent.com/NVIDIA/NVTX/release-v3/LICENSE.txt
+License SHA-256:
+abdfd8a6738b27cd1504e091f77b682dbae928339f040b8a6f59a548245991a0

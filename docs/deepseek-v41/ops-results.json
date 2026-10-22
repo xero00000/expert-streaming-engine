@@ -1,0 +1,647 @@
+{
+  "scope": "Graph primitives and diagnostic linear sublayers, not full-model inference",
+  "absolute_tolerance": 2e-05,
+  "relative_tolerance": 0.0002,
+  "results": [
+    {
+      "backend": "CPU",
+      "results": [
+        {
+          "case": "random-1",
+          "max_absolute_errors": {
+            "after_attention": 1.7881393432617188e-07,
+            "attn_comb": 8.940696716308594e-08,
+            "attn_input": 5.960464477539063e-08,
+            "attn_post": 5.960464477539063e-08,
+            "attn_pre": 5.960464477539063e-08,
+            "block_output": 2.384185791015625e-07,
+            "engram_gate": 0.0,
+            "engram_output": 5.960464477539063e-08,
+            "ffn_input": 1.1920928955078125e-07,
+            "next_pre": 0.0
+          }
+        },
+        {
+          "case": "random-3",
+          "max_absolute_errors": {
+            "after_attention": 1.341104507446289e-07,
+            "attn_comb": 8.940696716308594e-08,
+            "attn_input": 5.960464477539063e-08,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 5.960464477539063e-08,
+            "block_output": 1.7881393432617188e-07,
+            "engram_gate": 0.0,
+            "engram_output": 5.960464477539063e-08,
+            "ffn_input": 2.384185791015625e-07,
+            "next_pre": 5.960464477539063e-08
+          }
+        },
+        {
+          "case": "random-8",
+          "max_absolute_errors": {
+            "after_attention": 2.384185791015625e-07,
+            "attn_comb": 1.7881393432617188e-07,
+            "attn_input": 8.940696716308594e-08,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 1.1920928955078125e-07,
+            "block_output": 4.172325134277344e-07,
+            "engram_gate": 1.1920928955078125e-07,
+            "engram_output": 1.1920928955078125e-07,
+            "ffn_input": 3.5762786865234375e-07,
+            "next_pre": 1.1920928955078125e-07
+          }
+        },
+        {
+          "case": "zero_gate-3",
+          "max_absolute_errors": {
+            "after_attention": 5.960464477539063e-08,
+            "attn_comb": 8.940696716308594e-08,
+            "attn_input": 4.470348358154297e-08,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 1.1920928955078125e-07,
+            "block_output": 1.6391277313232422e-07,
+            "engram_gate": 0.0,
+            "engram_output": 1.4901161193847656e-08,
+            "ffn_input": 1.1920928955078125e-07,
+            "next_pre": 2.9802322387695312e-08
+          }
+        },
+        {
+          "case": "all_masked-2",
+          "max_absolute_errors": {
+            "after_attention": 1.0058283805847168e-07,
+            "attn_comb": 5.960464477539063e-08,
+            "attn_input": 0.0,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 5.960464477539063e-08,
+            "block_output": 1.1920928955078125e-07,
+            "engram_gate": 0.0,
+            "engram_output": 0.0,
+            "ffn_input": 2.384185791015625e-07,
+            "next_pre": 5.960464477539063e-08
+          }
+        },
+        {
+          "case": "compression-r1-p0-n1",
+          "max_absolute_errors": {
+            "latent": 0.0
+          }
+        },
+        {
+          "case": "compression-r1-p0-n5",
+          "max_absolute_errors": {
+            "latent": 0.0
+          }
+        },
+        {
+          "case": "compression-r1-p5-n1",
+          "max_absolute_errors": {
+            "latent": 0.0
+          }
+        },
+        {
+          "case": "compression-r1-p6-n1",
+          "max_absolute_errors": {
+            "latent": 0.0
+          }
+        },
+        {
+          "case": "compression-r1-p7-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r2-p0-n1",
+          "max_absolute_errors": {
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p0-n5",
+          "max_absolute_errors": {
+            "latent": 4.76837158203125e-07,
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p5-n1",
+          "max_absolute_errors": {
+            "latent": 4.76837158203125e-07
+          }
+        },
+        {
+          "case": "compression-r2-p6-n1",
+          "max_absolute_errors": {
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p7-n1",
+          "max_absolute_errors": {
+            "latent": 3.5762786865234375e-07
+          }
+        },
+        {
+          "case": "rope-original-0",
+          "max_absolute_errors": {
+            "forward": 6.556510925292969e-07,
+            "inverse": 5.960464477539062e-07,
+            "restored": 1.7881393432617188e-07
+          }
+        },
+        {
+          "case": "rope-original-65536",
+          "max_absolute_errors": {
+            "forward": 8.046627044677734e-07,
+            "inverse": 8.344650268554688e-07,
+            "restored": 2.384185791015625e-07
+          }
+        }
+      ]
+    },
+    {
+      "backend": "CUDA0",
+      "results": [
+        {
+          "case": "random-1",
+          "max_absolute_errors": {
+            "after_attention": 1.1920928955078125e-07,
+            "attn_comb": 1.043081283569336e-07,
+            "attn_input": 5.960464477539063e-08,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 0.0,
+            "block_output": 1.341104507446289e-07,
+            "engram_gate": 2.9802322387695312e-08,
+            "engram_output": 5.960464477539063e-08,
+            "ffn_input": 1.043081283569336e-07,
+            "next_pre": 5.960464477539063e-08
+          }
+        },
+        {
+          "case": "random-3",
+          "max_absolute_errors": {
+            "after_attention": 1.825392246246338e-07,
+            "attn_comb": 1.1920928955078125e-07,
+            "attn_input": 1.1920928955078125e-07,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 8.940696716308594e-08,
+            "block_output": 1.7881393432617188e-07,
+            "engram_gate": 5.960464477539063e-08,
+            "engram_output": 5.960464477539063e-08,
+            "ffn_input": 2.384185791015625e-07,
+            "next_pre": 5.960464477539063e-08
+          }
+        },
+        {
+          "case": "random-8",
+          "max_absolute_errors": {
+            "after_attention": 2.980232238769531e-07,
+            "attn_comb": 1.7881393432617188e-07,
+            "attn_input": 1.1920928955078125e-07,
+            "attn_post": 3.5762786865234375e-07,
+            "attn_pre": 1.1920928955078125e-07,
+            "block_output": 3.5762786865234375e-07,
+            "engram_gate": 5.960464477539063e-08,
+            "engram_output": 1.1920928955078125e-07,
+            "ffn_input": 2.980232238769531e-07,
+            "next_pre": 1.4901161193847656e-07
+          }
+        },
+        {
+          "case": "zero_gate-3",
+          "max_absolute_errors": {
+            "after_attention": 5.960464477539063e-08,
+            "attn_comb": 1.1920928955078125e-07,
+            "attn_input": 7.450580596923828e-08,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 1.1920928955078125e-07,
+            "block_output": 1.1920928955078125e-07,
+            "engram_gate": 0.0,
+            "engram_output": 1.862645149230957e-08,
+            "ffn_input": 8.940696716308594e-08,
+            "next_pre": 8.940696716308594e-08
+          }
+        },
+        {
+          "case": "all_masked-2",
+          "max_absolute_errors": {
+            "after_attention": 1.7881393432617188e-07,
+            "attn_comb": 1.1920928955078125e-07,
+            "attn_input": 1.1920928955078125e-07,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 5.960464477539063e-08,
+            "block_output": 1.7881393432617188e-07,
+            "engram_gate": 0.0,
+            "engram_output": 0.0,
+            "ffn_input": 1.7881393432617188e-07,
+            "next_pre": 5.960464477539063e-08
+          }
+        },
+        {
+          "case": "compression-r1-p0-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r1-p0-n5",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r1-p5-n1",
+          "max_absolute_errors": {
+            "latent": 4.76837158203125e-07
+          }
+        },
+        {
+          "case": "compression-r1-p6-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r1-p7-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r2-p0-n1",
+          "max_absolute_errors": {
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p0-n5",
+          "max_absolute_errors": {
+            "latent": 4.76837158203125e-07,
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p5-n1",
+          "max_absolute_errors": {
+            "latent": 4.76837158203125e-07
+          }
+        },
+        {
+          "case": "compression-r2-p6-n1",
+          "max_absolute_errors": {
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p7-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "rope-original-0",
+          "max_absolute_errors": {
+            "forward": 2.4497509002685547e-05,
+            "inverse": 1.9073486328125e-05,
+            "restored": 8.344650268554688e-07
+          }
+        },
+        {
+          "case": "rope-original-65536",
+          "max_absolute_errors": {
+            "forward": 2.5898218154907227e-05,
+            "inverse": 2.6464462280273438e-05,
+            "restored": 7.152557373046875e-07
+          }
+        }
+      ]
+    },
+    {
+      "backend": "CUDA1",
+      "results": [
+        {
+          "case": "random-1",
+          "max_absolute_errors": {
+            "after_attention": 1.341104507446289e-07,
+            "attn_comb": 7.450580596923828e-08,
+            "attn_input": 5.960464477539063e-08,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 0.0,
+            "block_output": 1.1920928955078125e-07,
+            "engram_gate": 2.9802322387695312e-08,
+            "engram_output": 5.960464477539063e-08,
+            "ffn_input": 1.1920928955078125e-07,
+            "next_pre": 5.960464477539063e-08
+          }
+        },
+        {
+          "case": "random-3",
+          "max_absolute_errors": {
+            "after_attention": 1.6391277313232422e-07,
+            "attn_comb": 1.1920928955078125e-07,
+            "attn_input": 1.1920928955078125e-07,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 5.960464477539063e-08,
+            "block_output": 1.862645149230957e-07,
+            "engram_gate": 5.960464477539063e-08,
+            "engram_output": 5.960464477539063e-08,
+            "ffn_input": 2.384185791015625e-07,
+            "next_pre": 5.960464477539063e-08
+          }
+        },
+        {
+          "case": "random-8",
+          "max_absolute_errors": {
+            "after_attention": 2.980232238769531e-07,
+            "attn_comb": 1.7881393432617188e-07,
+            "attn_input": 1.1920928955078125e-07,
+            "attn_post": 3.5762786865234375e-07,
+            "attn_pre": 1.1920928955078125e-07,
+            "block_output": 3.5762786865234375e-07,
+            "engram_gate": 5.960464477539063e-08,
+            "engram_output": 1.1920928955078125e-07,
+            "ffn_input": 2.980232238769531e-07,
+            "next_pre": 1.1920928955078125e-07
+          }
+        },
+        {
+          "case": "zero_gate-3",
+          "max_absolute_errors": {
+            "after_attention": 7.450580596923828e-08,
+            "attn_comb": 1.4901161193847656e-07,
+            "attn_input": 7.450580596923828e-08,
+            "attn_post": 2.384185791015625e-07,
+            "attn_pre": 1.1920928955078125e-07,
+            "block_output": 8.940696716308594e-08,
+            "engram_gate": 0.0,
+            "engram_output": 1.862645149230957e-08,
+            "ffn_input": 1.1920928955078125e-07,
+            "next_pre": 8.940696716308594e-08
+          }
+        },
+        {
+          "case": "all_masked-2",
+          "max_absolute_errors": {
+            "after_attention": 1.4901161193847656e-07,
+            "attn_comb": 1.1920928955078125e-07,
+            "attn_input": 1.1920928955078125e-07,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 8.940696716308594e-08,
+            "block_output": 1.7881393432617188e-07,
+            "engram_gate": 0.0,
+            "engram_output": 0.0,
+            "ffn_input": 1.7881393432617188e-07,
+            "next_pre": 5.960464477539063e-08
+          }
+        },
+        {
+          "case": "compression-r1-p0-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r1-p0-n5",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r1-p5-n1",
+          "max_absolute_errors": {
+            "latent": 4.76837158203125e-07
+          }
+        },
+        {
+          "case": "compression-r1-p6-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r1-p7-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r2-p0-n1",
+          "max_absolute_errors": {
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p0-n5",
+          "max_absolute_errors": {
+            "latent": 4.76837158203125e-07,
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p5-n1",
+          "max_absolute_errors": {
+            "latent": 4.76837158203125e-07
+          }
+        },
+        {
+          "case": "compression-r2-p6-n1",
+          "max_absolute_errors": {
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p7-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "rope-original-0",
+          "max_absolute_errors": {
+            "forward": 2.4497509002685547e-05,
+            "inverse": 1.9073486328125e-05,
+            "restored": 8.344650268554688e-07
+          }
+        },
+        {
+          "case": "rope-original-65536",
+          "max_absolute_errors": {
+            "forward": 2.5898218154907227e-05,
+            "inverse": 2.6464462280273438e-05,
+            "restored": 7.152557373046875e-07
+          }
+        }
+      ]
+    },
+    {
+      "backend": "CUDA2",
+      "results": [
+        {
+          "case": "random-1",
+          "max_absolute_errors": {
+            "after_attention": 1.1920928955078125e-07,
+            "attn_comb": 1.043081283569336e-07,
+            "attn_input": 5.960464477539063e-08,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 0.0,
+            "block_output": 1.341104507446289e-07,
+            "engram_gate": 2.9802322387695312e-08,
+            "engram_output": 5.960464477539063e-08,
+            "ffn_input": 1.043081283569336e-07,
+            "next_pre": 5.960464477539063e-08
+          }
+        },
+        {
+          "case": "random-3",
+          "max_absolute_errors": {
+            "after_attention": 1.825392246246338e-07,
+            "attn_comb": 1.1920928955078125e-07,
+            "attn_input": 1.1920928955078125e-07,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 8.940696716308594e-08,
+            "block_output": 1.7881393432617188e-07,
+            "engram_gate": 5.960464477539063e-08,
+            "engram_output": 5.960464477539063e-08,
+            "ffn_input": 2.384185791015625e-07,
+            "next_pre": 5.960464477539063e-08
+          }
+        },
+        {
+          "case": "random-8",
+          "max_absolute_errors": {
+            "after_attention": 2.980232238769531e-07,
+            "attn_comb": 1.7881393432617188e-07,
+            "attn_input": 1.1920928955078125e-07,
+            "attn_post": 3.5762786865234375e-07,
+            "attn_pre": 1.1920928955078125e-07,
+            "block_output": 3.5762786865234375e-07,
+            "engram_gate": 5.960464477539063e-08,
+            "engram_output": 1.1920928955078125e-07,
+            "ffn_input": 2.980232238769531e-07,
+            "next_pre": 1.4901161193847656e-07
+          }
+        },
+        {
+          "case": "zero_gate-3",
+          "max_absolute_errors": {
+            "after_attention": 5.960464477539063e-08,
+            "attn_comb": 1.1920928955078125e-07,
+            "attn_input": 7.450580596923828e-08,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 1.1920928955078125e-07,
+            "block_output": 1.1920928955078125e-07,
+            "engram_gate": 0.0,
+            "engram_output": 1.862645149230957e-08,
+            "ffn_input": 8.940696716308594e-08,
+            "next_pre": 8.940696716308594e-08
+          }
+        },
+        {
+          "case": "all_masked-2",
+          "max_absolute_errors": {
+            "after_attention": 1.7881393432617188e-07,
+            "attn_comb": 1.1920928955078125e-07,
+            "attn_input": 1.1920928955078125e-07,
+            "attn_post": 1.1920928955078125e-07,
+            "attn_pre": 5.960464477539063e-08,
+            "block_output": 1.7881393432617188e-07,
+            "engram_gate": 0.0,
+            "engram_output": 0.0,
+            "ffn_input": 1.7881393432617188e-07,
+            "next_pre": 5.960464477539063e-08
+          }
+        },
+        {
+          "case": "compression-r1-p0-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r1-p0-n5",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r1-p5-n1",
+          "max_absolute_errors": {
+            "latent": 4.76837158203125e-07
+          }
+        },
+        {
+          "case": "compression-r1-p6-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r1-p7-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "compression-r2-p0-n1",
+          "max_absolute_errors": {
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p0-n5",
+          "max_absolute_errors": {
+            "latent": 4.76837158203125e-07,
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p5-n1",
+          "max_absolute_errors": {
+            "latent": 4.76837158203125e-07
+          }
+        },
+        {
+          "case": "compression-r2-p6-n1",
+          "max_absolute_errors": {
+            "tail_scores": 0.0,
+            "tail_values": 0.0
+          }
+        },
+        {
+          "case": "compression-r2-p7-n1",
+          "max_absolute_errors": {
+            "latent": 2.384185791015625e-07
+          }
+        },
+        {
+          "case": "rope-original-0",
+          "max_absolute_errors": {
+            "forward": 2.4497509002685547e-05,
+            "inverse": 1.9073486328125e-05,
+            "restored": 8.344650268554688e-07
+          }
+        },
+        {
+          "case": "rope-original-65536",
+          "max_absolute_errors": {
+            "forward": 2.5898218154907227e-05,
+            "inverse": 2.6464462280273438e-05,
+            "restored": 7.152557373046875e-07
+          }
+        }
+      ]
+    }
+  ]
+}

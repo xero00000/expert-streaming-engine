@@ -10,6 +10,35 @@
 
 #include "ggml-quants.h"
 #include "ggml-impl.h"
+#include <assert.h>
+
+void dequantize_row_q2_0(const void * restrict vx, float * restrict y, int64_t k) {
+    assert(k % QK2_0 == 0);
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+    for (int64_t b = 0; b < k / QK2_0; ++b) {
+        const float d = GGML_FP16_TO_FP32(x[b].d);
+        for (int j = 0; j < QK2_0; ++j) {
+            y[b * QK2_0 + j] = d * (((x[b].qs[j / 4] >> (2 * (j % 4))) & 3) - 1);
+        }
+    }
+}
+
+void ggml_vec_dot_q2_0_f32(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+    assert(nrc == 1 && n % QK2_0 == 0);
+    (void) bs; (void) bx; (void) by; (void) nrc;
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+    const float * y = (const float *) vy;
+    float sum = 0.0f;
+    for (int b = 0; b < n / QK2_0; ++b) {
+        const float d = GGML_FP16_TO_FP32(x[b].d);
+        for (int j = 0; j < QK2_0; ++j) {
+            const int code = (x[b].qs[j / 4] >> (2 * (j % 4))) & 3;
+            sum += (d * (code - 1)) * y[b * QK2_0 + j];
+        }
+    }
+    *s = sum;
+}
+#include "ggml-impl.h"
 #if GGML_USE_IQK_MULMAT
 #include "iqk/iqk_config.h"
 #include "iqk/iqk_mul_mat.h"
@@ -4092,6 +4121,52 @@ static inline __m128i get_scale_shuffle(int i) {
     return __lsx_vld((const __m128i*)k_shuffle + i, 0);
 }
 #endif
+
+// Opt-in native CPU Q2 path. Decode unsigned two-bit codes, multiply by
+// signed Q8 activations, then subtract activation pair sums. The pair sums
+// stay within int16 bounds, including -128 activations and code 3; no signed
+// byte negation or saturating intermediate can corrupt those cases.
+void ggml_vec_dot_q2_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx,
+        size_t bx, const void * restrict vy, size_t by, int nrc) {
+    assert(nrc == 1 && n % QK2_0 == 0 && QK2_0 == 2*QK8_0);
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+    const block_q8_0 * y = (const block_q8_0 *) vy;
+    float sum = 0;
+#if defined(__AVX2__)
+    const __m128i mask = _mm_set1_epi8(3);
+    const __m256i ones8 = _mm256_set1_epi8(1), ones16 = _mm256_set1_epi16(1);
+#endif
+    for (int b = 0; b < n/QK2_0; ++b) {
+        const float dx = GGML_FP16_TO_FP32(x[b].d);
+        for (int half = 0; half < 2; ++half) {
+            const block_q8_0 * q8 = y + 2*b+half;
+            int dot;
+#if defined(__AVX2__)
+            const __m128i packed = _mm_loadl_epi64((const __m128i *)(x[b].qs+half*8));
+            const __m128i c0 = _mm_and_si128(packed, mask);
+            const __m128i c1 = _mm_and_si128(_mm_srli_epi16(packed, 2), mask);
+            const __m128i c2 = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
+            const __m128i c3 = _mm_and_si128(_mm_srli_epi16(packed, 6), mask);
+            const __m128i low = _mm_unpacklo_epi8(c0, c1), high = _mm_unpacklo_epi8(c2, c3);
+            const __m256i codes = _mm256_inserti128_si256(
+                    _mm256_castsi128_si256(_mm_unpacklo_epi16(low, high)), _mm_unpackhi_epi16(low, high), 1);
+            const __m256i activation = _mm256_loadu_si256((const __m256i *)q8->qs);
+            const __m256i products = _mm256_sub_epi16(_mm256_maddubs_epi16(codes, activation),
+                                                     _mm256_maddubs_epi16(ones8, activation));
+            dot = hsum_i32_8(_mm256_madd_epi16(products, ones16));
+#else
+            dot = 0;
+            for (int j = 0; j < QK8_0; ++j) {
+                const int code = (x[b].qs[half*8+j/4] >> (2*(j%4))) & 3;
+                dot += (code-1)*q8->qs[j];
+            }
+#endif
+            sum += (dx*GGML_FP16_TO_FP32(q8->d))*dot;
+        }
+    }
+    *s = sum;
+}
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT

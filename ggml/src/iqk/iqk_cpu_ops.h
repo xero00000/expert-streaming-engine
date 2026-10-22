@@ -16,7 +16,8 @@ struct ggml_tensor;
 
 bool iqk_has_fancy_simd(void);
 
-void iqk_sumrows_div(struct ggml_tensor * div, int ith, int nth);
+void iqk_sumrows_div(struct ggml_tensor * div, int ith, int nth,
+        void (*sum_f32)(int, float *, const float *));
 
 void iqk_grouped_top_k(struct ggml_tensor * dst, int ith, int nth);
 
@@ -48,5 +49,4 @@ void iqk_mask_topk(struct ggml_tensor * dst, int ith, int nth);
 #ifdef __cplusplus
 }
 #endif
-
 

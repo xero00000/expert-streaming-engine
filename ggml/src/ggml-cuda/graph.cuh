@@ -20,6 +20,9 @@ struct ggml_cuda_graph {
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        if (dest_ptrs_d != nullptr) {
+            CUDA_CHECK(cudaFree(dest_ptrs_d));
+        }
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
@@ -29,15 +32,15 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool disable_due_to_too_many_updates = false;
     bool disable_due_to_failed_graph_capture = false;
+    int64_t last_used_time = 0;
     int number_consecutive_updates = 0;
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
     bool use_cpy_indirection = false;
     std::vector<char *> cpy_dest_ptrs;
-    char ** dest_ptrs_d;
+    char ** dest_ptrs_d = nullptr;
     int dest_ptrs_size = 0;
     // Index to allow each cpy kernel to be aware of it's position within the graph
     // relative to other cpy nodes.
     int graph_cpynode_index = -1;
 #endif
 };
-

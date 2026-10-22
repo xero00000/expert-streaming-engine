@@ -1,0 +1,827 @@
+{
+  "date": "2026-09-12",
+  "scope": "Serialized local timing runs. OS page cache and desktop device usage uncontrolled. CLI generation counters and actual trace forward calls are recorded separately. No hardware-maximum, broad-quality or speculative-speedup claim.",
+  "recommended_profile": {
+    "dense_projection_device": "CUDA0",
+    "sensitive_projection_and_expert_device": "CUDA2",
+    "output_device": "CUDA1",
+    "expert_ram_mib": 512,
+    "pinned_ram": true,
+    "expert_vram_requested_mib": 7168,
+    "expert_vram_reserve_mib": 768,
+    "expert_ram_staging_mib": 256,
+    "load_workers": 8,
+    "ubatch": 8,
+    "ram_retention": "frequency",
+    "vram_retention": "frequency",
+    "direct_bf16_head": true,
+    "early_router": "off",
+    "file_advice": "normal"
+  },
+  "recommended_run": "speed4-pinned-repeat",
+  "longer_workload_repeats": [
+    "speed4-holdout-pinned",
+    "speed4-holdout-pinned-repeat"
+  ],
+  "runs": [
+    {
+      "name": "speed3-grouped0",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed3-grouped0/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 20982.71,
+        "tokens": 38,
+        "tokens_per_second": 1.811014878440392
+      },
+      "prompt": {
+        "milliseconds": 8389.57,
+        "tokens": 15,
+        "tokens_per_second": 1.7879343041419287
+      },
+      "wall_seconds": 35.63841223716736,
+      "peak_rss_bytes": 18904694784,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0
+    },
+    {
+      "name": "speed4-trace-baseline",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-trace-baseline/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-trace-baseline/trace.jsonl",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 20928.46,
+        "tokens": 38,
+        "tokens_per_second": 1.8157093259609165
+      },
+      "prompt": {
+        "milliseconds": 8026.3,
+        "tokens": 15,
+        "tokens_per_second": 1.8688561354546926
+      },
+      "wall_seconds": 35.65087866783142,
+      "peak_rss_bytes": 18787602432,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-trace-baseline/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 554903556.8648648,
+        "physical_read_bytes": 474519275.2432432,
+        "stage_elapsed_ns": 442917910.4054054,
+        "stage_route_wait_ns": 502578.5945945946,
+        "stage_lease_wait_ns": 353336246.7027027,
+        "stage_transfer_submit_ns": 78596423.2972973,
+        "stage_transfer_wait_ns": 87159.8918918919,
+        "stage_h2d_bytes": 1012813491.8918918
+      }
+    },
+    {
+      "name": "speed4-ram8-control",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-ram8-control/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-ram8-control/trace.jsonl",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 20310.06,
+        "tokens": 38,
+        "tokens_per_second": 1.8709939803230515
+      },
+      "prompt": {
+        "milliseconds": 8025.39,
+        "tokens": 15,
+        "tokens_per_second": 1.8690680452912567
+      },
+      "wall_seconds": 34.672943115234375,
+      "peak_rss_bytes": 18807099392,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-ram8-control/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 538010947.2972972,
+        "physical_read_bytes": 425652666.8108108,
+        "stage_elapsed_ns": 421559138.5945946,
+        "stage_route_wait_ns": 496399.75675675675,
+        "stage_lease_wait_ns": 327967226.8918919,
+        "stage_transfer_submit_ns": 83251464.91891892,
+        "stage_transfer_wait_ns": 72907.16216216216,
+        "stage_h2d_bytes": 1012813491.8918918
+      }
+    },
+    {
+      "name": "speed4-os-cache",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-os-cache/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-os-cache/trace.jsonl",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 18565.46,
+        "tokens": 38,
+        "tokens_per_second": 2.0468116599319384
+      },
+      "prompt": {
+        "milliseconds": 7661.34,
+        "tokens": 15,
+        "tokens_per_second": 1.9578820415227622
+      },
+      "wall_seconds": 32.556321144104004,
+      "peak_rss_bytes": 10767093760,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-os-cache/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 490631384.3783784,
+        "physical_read_bytes": 392355397.1891892,
+        "stage_elapsed_ns": 376006244.027027,
+        "stage_route_wait_ns": 500733.86486486485,
+        "stage_lease_wait_ns": 289231933.6486486,
+        "stage_transfer_submit_ns": 75954431.8918919,
+        "stage_transfer_wait_ns": 76182.78378378379,
+        "stage_h2d_bytes": 1012813491.8918918
+      }
+    },
+    {
+      "name": "speed4-os-cache-repeat",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-os-cache-repeat/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-os-cache-repeat/trace.jsonl",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 18057.53,
+        "tokens": 38,
+        "tokens_per_second": 2.104385261993196
+      },
+      "prompt": {
+        "milliseconds": 7371.94,
+        "tokens": 15,
+        "tokens_per_second": 2.0347425508075214
+      },
+      "wall_seconds": 31.55258822441101,
+      "peak_rss_bytes": 10762133504,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-os-cache-repeat/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 477157154.8918919,
+        "physical_read_bytes": 364209345.7297297,
+        "stage_elapsed_ns": 365781670.6756757,
+        "stage_route_wait_ns": 490242.4324324324,
+        "stage_lease_wait_ns": 276151278.4594595,
+        "stage_transfer_submit_ns": 79590099.4054054,
+        "stage_transfer_wait_ns": 68338.56756756757,
+        "stage_h2d_bytes": 1012813491.8918918
+      }
+    },
+    {
+      "name": "speed4-early-router-probe",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-early-router-probe/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-early-router-probe/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "probe",
+        "ESE_EXPERT_FUTURES_MIB": "64",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 20510.84,
+        "tokens": 38,
+        "tokens_per_second": 1.8526788761454918
+      },
+      "prompt": {
+        "milliseconds": 9017.43,
+        "tokens": 15,
+        "tokens_per_second": 1.6634451279355646
+      },
+      "wall_seconds": 36.6843695640564,
+      "peak_rss_bytes": 10802032640,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-early-router-probe/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 541907693.945946,
+        "physical_read_bytes": 389527939.4594595,
+        "stage_elapsed_ns": 415586474.7297297,
+        "stage_route_wait_ns": 557252.6216216217,
+        "stage_lease_wait_ns": 301037227.1621622,
+        "stage_transfer_submit_ns": 100943565.35135135,
+        "stage_transfer_wait_ns": 106080.05405405405,
+        "stage_h2d_bytes": 1012813491.8918918
+      }
+    },
+    {
+      "name": "speed4-early-router-advice",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-early-router-advice/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-early-router-advice/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "advice",
+        "ESE_EXPERT_FUTURES_MIB": "256",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 19725.06,
+        "tokens": 38,
+        "tokens_per_second": 1.9264833668440045
+      },
+      "prompt": {
+        "milliseconds": 8526.44,
+        "tokens": 15,
+        "tokens_per_second": 1.7592336309174754
+      },
+      "wall_seconds": 34.652469873428345,
+      "peak_rss_bytes": 10801405952,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-early-router-advice/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 520721717.9459459,
+        "physical_read_bytes": 426161124.3243243,
+        "stage_elapsed_ns": 396468509.5405405,
+        "stage_route_wait_ns": 520033.8918918919,
+        "stage_lease_wait_ns": 281086173.027027,
+        "stage_transfer_submit_ns": 104242344.97297297,
+        "stage_transfer_wait_ns": 75807.5945945946,
+        "stage_h2d_bytes": 1012813491.8918918
+      }
+    },
+    {
+      "name": "speed4-pinned-ram",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pinned-ram/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pinned-ram/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "off",
+        "ESE_EXPERT_FUTURES_MIB": "64",
+        "ESE_EXPERT_RAM_PINNED": "1",
+        "ESE_V41_PREFETCH_CONFIDENCE": "0.85",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 19723.75,
+        "tokens": 38,
+        "tokens_per_second": 1.9266113188414982
+      },
+      "prompt": {
+        "milliseconds": 9695.69,
+        "tokens": 15,
+        "tokens_per_second": 1.5470791661037018
+      },
+      "wall_seconds": 35.69955921173096,
+      "peak_rss_bytes": 10769457152,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pinned-ram/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 521328907.3513514,
+        "physical_read_bytes": 401262425.9459459,
+        "stage_elapsed_ns": 392813833.8918919,
+        "stage_route_wait_ns": 490177.2702702703,
+        "stage_lease_wait_ns": 380975813.0810811,
+        "stage_transfer_submit_ns": 2115450.2972972975,
+        "stage_transfer_wait_ns": 78927.21621621621,
+        "stage_h2d_bytes": 1012813491.8918918
+      }
+    },
+    {
+      "name": "speed4-pageable-control",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pageable-control/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pageable-control/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "off",
+        "ESE_EXPERT_FUTURES_MIB": "64",
+        "ESE_EXPERT_RAM_PINNED": "0",
+        "ESE_V41_PREFETCH_CONFIDENCE": "0.85",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 23594.97,
+        "tokens": 38,
+        "tokens_per_second": 1.6105127491155953
+      },
+      "prompt": {
+        "milliseconds": 15330.26,
+        "tokens": 15,
+        "tokens_per_second": 0.9784569863785741
+      },
+      "wall_seconds": 46.29133462905884,
+      "peak_rss_bytes": 10634887168,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pageable-control/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 626001712.6756756,
+        "physical_read_bytes": 402273252.3243243,
+        "stage_elapsed_ns": 507657192.4594595,
+        "stage_route_wait_ns": 548138.5675675676,
+        "stage_lease_wait_ns": 335541829.3513514,
+        "stage_transfer_submit_ns": 157612106.75675675,
+        "stage_transfer_wait_ns": 106588.75675675676,
+        "stage_h2d_bytes": 1012813491.8918918
+      }
+    },
+    {
+      "name": "speed4-pinned-repeat",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pinned-repeat/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pinned-repeat/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "off",
+        "ESE_EXPERT_FUTURES_MIB": "64",
+        "ESE_EXPERT_RAM_PINNED": "1",
+        "ESE_V41_PREFETCH_CONFIDENCE": "0.85",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 18693.31,
+        "tokens": 38,
+        "tokens_per_second": 2.0328128084325354
+      },
+      "prompt": {
+        "milliseconds": 8896.41,
+        "tokens": 15,
+        "tokens_per_second": 1.6860733711688198
+      },
+      "wall_seconds": 34.685773611068726,
+      "peak_rss_bytes": 10761854976,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pinned-repeat/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 493634311.1621622,
+        "physical_read_bytes": 360203900.5405405,
+        "stage_elapsed_ns": 366660274.5945946,
+        "stage_route_wait_ns": 503208.6756756757,
+        "stage_lease_wait_ns": 353496582.0540541,
+        "stage_transfer_submit_ns": 2622716.378378378,
+        "stage_transfer_wait_ns": 83322.7027027027,
+        "stage_h2d_bytes": 1012813491.8918918
+      }
+    },
+    {
+      "name": "speed4-gated-pinned",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-gated-pinned/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-gated-pinned/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "advice",
+        "ESE_EXPERT_FUTURES_MIB": "256",
+        "ESE_EXPERT_RAM_PINNED": "1",
+        "ESE_V41_PREFETCH_CONFIDENCE": "0.85",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 23688.09,
+        "tokens": 38,
+        "tokens_per_second": 1.6041816794853447
+      },
+      "prompt": {
+        "milliseconds": 10613.97,
+        "tokens": 15,
+        "tokens_per_second": 1.4132318067603358
+      },
+      "wall_seconds": 40.904555559158325,
+      "peak_rss_bytes": 10802868224,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-gated-pinned/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 625990908.5135136,
+        "physical_read_bytes": 438740936.6486486,
+        "stage_elapsed_ns": 472365633.7567568,
+        "stage_route_wait_ns": 594932.4594594594,
+        "stage_lease_wait_ns": 454566739.7297297,
+        "stage_transfer_submit_ns": 3436543.5405405406,
+        "stage_transfer_wait_ns": 101933.37837837837,
+        "stage_h2d_bytes": 1012813491.8918918
+      }
+    },
+    {
+      "name": "speed4-pageable-repeat",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pageable-repeat/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pageable-repeat/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "off",
+        "ESE_EXPERT_FUTURES_MIB": "64",
+        "ESE_EXPERT_RAM_PINNED": "0",
+        "ESE_V41_PREFETCH_CONFIDENCE": "0.85",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 23720.12,
+        "tokens": 38,
+        "tokens_per_second": 1.602015504137416
+      },
+      "prompt": {
+        "milliseconds": 14420.39,
+        "tokens": 15,
+        "tokens_per_second": 1.0401937811668063
+      },
+      "wall_seconds": 44.94827675819397,
+      "peak_rss_bytes": 10694492160,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 745,
+      "realized_expert_capacity_mib": 7090.2,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pageable-repeat/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 628748843.972973,
+        "physical_read_bytes": 393336887.3513514,
+        "stage_elapsed_ns": 510138003.0540541,
+        "stage_route_wait_ns": 545847.7027027027,
+        "stage_lease_wait_ns": 348865083.9189189,
+        "stage_transfer_submit_ns": 148080849.7027027,
+        "stage_transfer_wait_ns": 95487.72972972973,
+        "stage_h2d_bytes": 1015503567.5675676
+      }
+    },
+    {
+      "name": "speed4-pinned-random",
+      "case": "short sky explanation",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pinned-random/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pinned-random/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "off",
+        "ESE_EXPERT_FUTURES_MIB": "64",
+        "ESE_EXPERT_RAM_PINNED": "1",
+        "ESE_V41_PREFETCH_CONFIDENCE": "0.85",
+        "ESE_EXPERT_FILE_ADVICE": "random",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 22584.38,
+        "tokens": 38,
+        "tokens_per_second": 1.6825788443162928
+      },
+      "prompt": {
+        "milliseconds": 11109.01,
+        "tokens": 15,
+        "tokens_per_second": 1.3502553332835239
+      },
+      "wall_seconds": 39.8647243976593,
+      "peak_rss_bytes": 10767245312,
+      "stdout_sha256": "ff0148f6de1ec665309fb89266a6cfb15f4dbd0ae774322586ac20818c71a527",
+      "realized_expert_slots": 751,
+      "realized_expert_capacity_mib": 7142.9,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-pinned-random/trace-summary.json",
+      "decode_calls": 37,
+      "decode_mean": {
+        "host_schedule_ns": 597822127.027027,
+        "physical_read_bytes": 354940983.3513514,
+        "stage_elapsed_ns": 453111558.7837838,
+        "stage_route_wait_ns": 548116.2972972973,
+        "stage_lease_wait_ns": 435205458.9189189,
+        "stage_transfer_submit_ns": 3753961.0,
+        "stage_transfer_wait_ns": 107230.81081081081,
+        "stage_h2d_bytes": 1013889522.1621622
+      }
+    },
+    {
+      "name": "speed4-holdout-pinned",
+      "case": "96-token Fibonacci generation prefix",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-pinned/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-pinned/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "off",
+        "ESE_EXPERT_FUTURES_MIB": "64",
+        "ESE_EXPERT_RAM_PINNED": "1",
+        "ESE_V41_PREFETCH_CONFIDENCE": "0.85",
+        "ESE_EXPERT_FILE_ADVICE": "normal",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 68291.99,
+        "tokens": 96,
+        "tokens_per_second": 1.4057285488385973
+      },
+      "prompt": {
+        "milliseconds": 13162.46,
+        "tokens": 21,
+        "tokens_per_second": 1.5954464439018239
+      },
+      "wall_seconds": 88.66211533546448,
+      "peak_rss_bytes": 10710728704,
+      "stdout_sha256": "c4d1a0b83d77546733f88315694a0e775899d96f056f9771662d7c551ad142e3",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-pinned/trace-summary.json",
+      "decode_calls": 95,
+      "decode_mean": {
+        "host_schedule_ns": 702328797.2421052,
+        "physical_read_bytes": 640209327.1578947,
+        "stage_elapsed_ns": 562259438.4526316,
+        "stage_route_wait_ns": 490051.8736842105,
+        "stage_lease_wait_ns": 547997971.9894737,
+        "stage_transfer_submit_ns": 2107315.8421052634,
+        "stage_transfer_wait_ns": 79611.72631578948,
+        "stage_h2d_bytes": 1074639925.8947368
+      }
+    },
+    {
+      "name": "speed4-holdout-pageable",
+      "case": "96-token Fibonacci generation prefix",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-pageable/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-pageable/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "off",
+        "ESE_EXPERT_FUTURES_MIB": "64",
+        "ESE_EXPERT_RAM_PINNED": "0",
+        "ESE_V41_PREFETCH_CONFIDENCE": "0.85",
+        "ESE_EXPERT_FILE_ADVICE": "normal",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 70184.29,
+        "tokens": 96,
+        "tokens_per_second": 1.3678274725013249
+      },
+      "prompt": {
+        "milliseconds": 14530.65,
+        "tokens": 21,
+        "tokens_per_second": 1.445220963962383
+      },
+      "wall_seconds": 91.75151109695435,
+      "peak_rss_bytes": 10709594112,
+      "stdout_sha256": "c4d1a0b83d77546733f88315694a0e775899d96f056f9771662d7c551ad142e3",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-pageable/trace-summary.json",
+      "decode_calls": 95,
+      "decode_mean": {
+        "host_schedule_ns": 726301361.1263158,
+        "physical_read_bytes": 645510327.2421052,
+        "stage_elapsed_ns": 599193039.9368421,
+        "stage_route_wait_ns": 512879.6210526316,
+        "stage_lease_wait_ns": 462967352.7894737,
+        "stage_transfer_submit_ns": 121514731.55789474,
+        "stage_transfer_wait_ns": 86718.28421052631,
+        "stage_h2d_bytes": 1074639925.8947368
+      }
+    },
+    {
+      "name": "speed4-holdout-ram8",
+      "case": "96-token Fibonacci generation prefix",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-ram8/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-ram8/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "off",
+        "ESE_EXPERT_FUTURES_MIB": "64",
+        "ESE_EXPERT_RAM_PINNED": "0",
+        "ESE_V41_PREFETCH_CONFIDENCE": "0.85",
+        "ESE_EXPERT_FILE_ADVICE": "normal",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 72911.27,
+        "tokens": 96,
+        "tokens_per_second": 1.3166688771159794
+      },
+      "prompt": {
+        "milliseconds": 21384.39,
+        "tokens": 21,
+        "tokens_per_second": 0.982024738606058
+      },
+      "wall_seconds": 102.0790684223175,
+      "peak_rss_bytes": 18757976064,
+      "stdout_sha256": "c4d1a0b83d77546733f88315694a0e775899d96f056f9771662d7c551ad142e3",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-ram8/trace-summary.json",
+      "decode_calls": 95,
+      "decode_mean": {
+        "host_schedule_ns": 750471577.0210526,
+        "physical_read_bytes": 614225898.4421053,
+        "stage_elapsed_ns": 622896223.3368421,
+        "stage_route_wait_ns": 488220.16842105263,
+        "stage_lease_wait_ns": 492662722.49473685,
+        "stage_transfer_submit_ns": 116520957.28421053,
+        "stage_transfer_wait_ns": 81381.43157894736,
+        "stage_h2d_bytes": 1074639925.8947368
+      }
+    },
+    {
+      "name": "speed4-holdout-pinned-repeat",
+      "case": "96-token Fibonacci generation prefix",
+      "record": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-pinned-repeat/run.json",
+      "environment": {
+        "GGML_CUDA_NO_MODEL_PINNED": "1",
+        "ESE_EXPERT_CACHE_RETENTION": "frequency",
+        "ESE_EXPERT_RAM_RETENTION": "frequency",
+        "ESE_CUDA_MOE_BATCH_VECTOR": "1",
+        "ESE_CUDA_DENSE_BATCH_VECTOR": "1",
+        "ESE_V41_DIRECT_BF16_HEAD": "1",
+        "ESE_EXPERT_TRACE": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-pinned-repeat/trace.jsonl",
+        "ESE_V41_EARLY_ROUTER": "off",
+        "ESE_EXPERT_FUTURES_MIB": "64",
+        "ESE_EXPERT_RAM_PINNED": "1",
+        "ESE_V41_PREFETCH_CONFIDENCE": "0.85",
+        "ESE_EXPERT_FILE_ADVICE": "normal",
+        "ESE_V41_EXPERT_DEVICE": "CUDA2"
+      },
+      "generation": {
+        "milliseconds": 64772.79,
+        "tokens": 96,
+        "tokens_per_second": 1.4821038278573457
+      },
+      "prompt": {
+        "milliseconds": 13483.84,
+        "tokens": 21,
+        "tokens_per_second": 1.557419844791988
+      },
+      "wall_seconds": 84.48929524421692,
+      "peak_rss_bytes": 10705653760,
+      "stdout_sha256": "c4d1a0b83d77546733f88315694a0e775899d96f056f9771662d7c551ad142e3",
+      "realized_expert_slots": 754,
+      "realized_expert_capacity_mib": 7168.0,
+      "trace_summary": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-holdout-pinned-repeat/trace-summary.json",
+      "decode_calls": 95,
+      "decode_mean": {
+        "host_schedule_ns": 666663401.9578947,
+        "physical_read_bytes": 555002006.9052632,
+        "stage_elapsed_ns": 528428647.1789474,
+        "stage_route_wait_ns": 485964.5894736842,
+        "stage_lease_wait_ns": 514694610.48421055,
+        "stage_transfer_submit_ns": 2062057.0631578946,
+        "stage_transfer_wait_ns": 76112.81052631579,
+        "stage_h2d_bytes": 1074639925.8947368
+      }
+    }
+  ],
+  "outputs_identical_within_each_case": true,
+  "all_features_fidelity": {
+    "reference": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed3-small-index-eval/logits.bin",
+    "candidate": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-all-features-eval/logits.bin",
+    "all": {
+      "rows": 54,
+      "max_abs_logit_difference": 0.0,
+      "mean_kl": 0.0,
+      "max_kl": 0.0,
+      "argmax_agreement": 1.0,
+      "reference_mean_nll": 1.731471154154414,
+      "candidate_mean_nll": 1.731471154154414
+    },
+    "answer": {
+      "rows": 40,
+      "max_abs_logit_difference": 0.0,
+      "mean_kl": 0.0,
+      "max_kl": 0.0,
+      "argmax_agreement": 1.0,
+      "reference_mean_nll": 0.12406266297824883,
+      "candidate_mean_nll": 0.12406266297824883
+    }
+  },
+  "early_router_probe": {
+    "actual": 8658,
+    "predicted": 8658,
+    "matches": 7165,
+    "actual_misses": 3620,
+    "predicted_misses": 4119,
+    "matched_misses": 2937,
+    "precision": 0.8275583275583276,
+    "miss_precision": 0.7130371449380918,
+    "miss_recall": 0.8113259668508287,
+    "median_lead_ms": 1.800215
+  },
+  "confidence_replay": {
+    "events_checked": 1443,
+    "past_only": true,
+    "trace": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-gated-pinned/trace.jsonl"
+  },
+  "compression_probe": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-compression-probe.json",
+  "checks": {
+    "cuda_cache": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-final-cuda-cache-tests.log",
+    "cuda_native": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-final-cuda-native-tests.log",
+    "cuda_runtime": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-final-cuda-runtime-tests.log",
+    "asan_cache": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-final-asan-cache-tests.log",
+    "asan_native": "/home/xero/Desktop/test/results/deepseek-v41-20260910/speed4-final-asan-native-tests.log"
+  },
+  "checks_status": "passed"
+}

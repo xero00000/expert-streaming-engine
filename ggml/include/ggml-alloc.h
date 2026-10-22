@@ -66,8 +66,27 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+struct ggml_gallocr_buffer_stats {
+    uint64_t allocated_bytes;
+    uint64_t peak_allocated_bytes;
+    uint64_t allocation_budget_bytes;
+    uint64_t required_bytes; // Last measured arena requirement, including rejection.
+    uint64_t allocation_failures;
+    uint64_t budget_rejections;
+};
+// Quota includes the live arena and its replacement during preparation.
+// Aliased buffer types share one arena; the strictest alias quota applies.
+GGML_API bool ggml_gallocr_set_buffer_budget(ggml_gallocr_t galloc, int buffer_id, uint64_t bytes);
+GGML_API bool ggml_gallocr_get_buffer_stats(ggml_gallocr_t galloc, int buffer_id,
+        struct ggml_gallocr_buffer_stats * stats);
+
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
+// Read-only sum of aligned backend allocation requests for unallocated owning
+// tensors. No buffer allocation or tensor mutation; false leaves size untouched.
+GGML_API bool ggml_backend_alloc_ctx_tensors_size(struct ggml_context * ctx,
+        ggml_backend_buffer_type_t buft, size_t * size);
 GGML_API struct ggml_backend_buffer * ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 GGML_API struct ggml_backend_buffer * ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend);
 

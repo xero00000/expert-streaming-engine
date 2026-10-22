@@ -55,15 +55,16 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .node-version
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 10
+          package_json_file: studio/package.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: clippy,rustfmt
+          toolchain: "1.96.0"
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -97,13 +98,13 @@ jobs:
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
       - name: Lint Rust
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: Test Rust backend
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Build DEB and RPM packages
-        run: pnpm tauri build --bundles deb,rpm --config src-tauri/tauri.unsigned.conf.json
+        run: pnpm package:linux --bundles deb,rpm --config src-tauri/tauri.unsigned.conf.json
 
       - name: Install and smoke-test DEB package
         run: |
@@ -137,16 +138,19 @@ jobs:
     runs-on: windows-2022
     # A cold CUDA 12.4 build takes just under two hours on the hosted runner.
     # Leave enough time to verify and preserve it for later PR updates.
-    timeout-minutes: 180
+    timeout-minutes: 240
     defaults:
       run:
         working-directory: studio
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Restored build markers must resolve before ancestry checks.
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .node-version
 
       - uses: actions/setup-python@v5
         with:
@@ -154,18 +158,26 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 10
+          package_json_file: studio/package.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: clippy,rustfmt
+          toolchain: "1.96.0"
+          components: clippy, rustfmt
+
+      - name: Capture Windows CUDA build cache key
+        id: windows-cuda-key
+        shell: pwsh
+        env:
+          ESE_NATIVE_CACHE_KEY: ese-windows-cuda-v2-${{ runner.os }}-cuda12.4-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'include/**', 'src/**', 'common/**', 'examples/CMakeLists.txt', 'examples/server/**', 'vendor/**', '.github/scripts/setup-cuda-windows.ps1', '.github/scripts/prepare-restored-build.py') }}
+        run: Add-Content -Path $env:GITHUB_OUTPUT -Value "key=$env:ESE_NATIVE_CACHE_KEY"
 
       - name: Restore exact Windows CUDA runtime build
         id: windows-cuda-cache
         uses: actions/cache@v4
         with:
           path: build-package
-          key: ese-windows-cuda-v2-${{ runner.os }}-cuda12.4-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'include/**', 'src/**', 'common/**', 'examples/CMakeLists.txt', 'examples/server/**', 'vendor/**', '.github/scripts/setup-cuda-windows.ps1', '.github/scripts/prepare-restored-build.py') }}
+          key: ${{ steps.windows-cuda-key.outputs.key }}
           restore-keys: |
             ese-windows-cuda-v2-${{ runner.os }}-cuda12.4-
             ese-windows-cuda-v1-${{ runner.os }}-cuda12.4-
@@ -195,7 +207,7 @@ jobs:
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build bundled ESE CPU + CUDA runtime
+      - name: Build bundled ESE CUDA runtime
         if: steps.windows-cuda-cache.outputs.cache-hit != 'true'
         working-directory: .
         shell: cmd
@@ -205,6 +217,14 @@ jobs:
           cmake --build build-package --config Release --target llama-server -j 2
           python .github\scripts\prepare-restored-build.py --build-root build-package --record
 
+      - name: Build separate driver-independent Windows CPU runtime
+        working-directory: .
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build-package-cpu -G "Visual Studio 17 2022" -A x64 -DGGML_CUDA=OFF -DGGML_NATIVE=OFF -DESE_QWEN4EXP_PROBE_GATE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=ON
+          cmake --build build-package-cpu --config Release --target llama-server --parallel 2
+
       - name: Build standalone Windows ESE launcher
         working-directory: .
         shell: pwsh
@@ -212,6 +232,10 @@ jobs:
           python -m pip install --disable-pip-version-check "pyinstaller==6.16.0"
           python -m PyInstaller --noconfirm --clean --onefile --name ese --paths . --hidden-import tools.ese --distpath dist --workpath build-pyinstaller --specpath build-pyinstaller ese
           .\dist\ese.exe --version
+
+      - name: Check Windows CPU fallback selection and verification controls
+        working-directory: .
+        run: python -m unittest tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_before_cuda_binary_load tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_preserves_explicit_binary_overrides tests.test_ese_launcher.LauncherTests.test_packaged_windows_cpu_selection_rejects_cuda_payload_in_cpu_directory tests.test_windows_runtime_verify tests.test_windows_msvc
 
       - name: Check installer PowerShell syntax
         shell: pwsh
@@ -232,7 +256,7 @@ jobs:
         working-directory: .
         shell: pwsh
         run: |
-          python .\.github\scripts\verify-windows-runtime.py --runtime-root .\studio\runtime\ese --build-root .\build-package
+          python .\.github\scripts\verify-windows-runtime.py --runtime-root .\studio\runtime\ese --build-root .\build-package --cpu-build-root .\build-package-cpu
           if ($LASTEXITCODE -ne 0) { throw "Staged Windows runtime verification failed" }
           .\studio\runtime\ese\ese.exe doctor --json
           if ($LASTEXITCODE -ne 0) { throw "ESE runtime doctor failed" }
@@ -251,22 +275,24 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: build-package
-          key: ese-windows-cuda-v2-${{ runner.os }}-cuda12.4-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'ggml/**', 'include/**', 'src/**', 'common/**', 'examples/CMakeLists.txt', 'examples/server/**', 'vendor/**', '.github/scripts/setup-cuda-windows.ps1', '.github/scripts/prepare-restored-build.py') }}
+          key: ${{ steps.windows-cuda-key.outputs.key }}
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
       - name: Lint Rust
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: Test Rust backend
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Preserve verified Windows runtime
         uses: actions/upload-artifact@v4
         with:
           name: ese-windows-runtime-${{ github.sha }}
-          path: studio/runtime/ese
+          path: |
+            studio/runtime/ese
+            studio/runtime/msvc
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -284,13 +310,20 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .node-version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 10
+          package_json_file: studio/package.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -303,13 +336,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ese-windows-runtime-${{ github.sha }}
-          path: studio/runtime/ese
+          path: studio/runtime
 
       - name: Verify restored runtime payload
         shell: pwsh
         working-directory: .
         run: |
           $required = @(
+            '.\studio\runtime\msvc\ese-msvc-runtime.json',
             '.\studio\runtime\ese\ese.exe',
             '.\studio\runtime\ese\build\bin\llama-server.exe',
             '.\studio\runtime\ese\build\bin\ese-runtime.json'
@@ -345,6 +379,15 @@ jobs:
         shell: pwsh
         run: throw 'MSI packaging failed; inspect the uploaded WiX diagnostics artifact.'
 
+      - name: Verify Studio app-local MSVC resources
+        working-directory: .
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check "pefile==2023.2.7"
+          if ($LASTEXITCODE -ne 0) { throw "PE parser installation failed" }
+          python -c "from pathlib import Path; from tools.windows_msvc import verify; verify(Path('studio/runtime/msvc'), extra_images=[Path('studio/src-tauri/target/release/ese-studio.exe')])"
+          if ($LASTEXITCODE -ne 0) { throw "Studio MSVC runtime verification failed" }
+
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
@@ -365,13 +408,20 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .node-version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 10
+          package_json_file: studio/package.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -384,13 +434,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ese-windows-runtime-${{ github.sha }}
-          path: studio/runtime/ese
+          path: studio/runtime
 
       - name: Verify restored runtime payload
         shell: pwsh
         working-directory: .
         run: |
           $required = @(
+            './studio/runtime/msvc/ese-msvc-runtime.json',
             './studio/runtime/ese/ese.exe',
             './studio/runtime/ese/build/bin/llama-server.exe',
             './studio/runtime/ese/build/bin/ese-runtime.json'
@@ -407,6 +458,15 @@ jobs:
 
       - name: Build NSIS installer
         run: pnpm tauri build --bundles nsis --config src-tauri/tauri.ci-bundle.conf.json
+
+      - name: Verify Studio app-local MSVC resources
+        working-directory: .
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check "pefile==2023.2.7"
+          if ($LASTEXITCODE -ne 0) { throw "PE parser installation failed" }
+          python -c "from pathlib import Path; from tools.windows_msvc import verify; verify(Path('studio/runtime/msvc'), extra_images=[Path('studio/src-tauri/target/release/ese-studio.exe')])"
+          if ($LASTEXITCODE -ne 0) { throw "Studio MSVC runtime verification failed" }
 
       - name: Upload Windows NSIS installer
         uses: actions/upload-artifact@v4
@@ -427,7 +487,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: telemetry/collector/package-lock.json
 

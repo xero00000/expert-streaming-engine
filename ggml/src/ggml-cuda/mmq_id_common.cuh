@@ -3618,7 +3618,7 @@ static __global__ void mul_mat_q_id(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+                ids_dst_shared[j] = jt*mmq_x + j < col_diff ? ids_dst[col_low + jt*mmq_x + j] : 0;
             }
             __syncthreads();
         }
@@ -3697,7 +3697,7 @@ static __global__ void mul_mat_q_id(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+                ids_dst_shared[j] = jt*mmq_x + j < col_diff ? ids_dst[col_low + jt*mmq_x + j] : 0;
             }
             __syncthreads();
         }
@@ -3821,6 +3821,21 @@ static __global__ void mul_mat_q_stream_k_fixup_id(
         return;
     }
 
+    int tmp = kbc0;
+    const int it = tmp / (nsamples_y*nchannels_y*ntx*blocks_per_ne00);
+    tmp -= it * (nsamples_y*nchannels_y*ntx*blocks_per_ne00);
+    const int wt = tmp / (nchannels_y*ntx*blocks_per_ne00);
+    tmp -= wt * (nchannels_y*ntx*blocks_per_ne00);
+    const int zt = tmp / (ntx*blocks_per_ne00);
+    tmp -= zt * (ntx*blocks_per_ne00);
+    const int jt = tmp / blocks_per_ne00;
+
+    // Empty expert tiles returned without writing a partial sum. Match that
+    // guard before reading the stream-K scratch buffer for their fixup.
+    if (ids_dst && jt*mmq_x >= expert_bounds[zt + 1] - expert_bounds[zt]) {
+        return;
+    }
+
     bool any_fixup = false;
 
     // Iterate over previous blocks and sum up partial sums written to fixup buffer.
@@ -3863,15 +3878,6 @@ static __global__ void mul_mat_q_stream_k_fixup_id(
         return;
     }
 
-    int tmp = kbc0;
-    const int it = tmp / (nsamples_y*nchannels_y*ntx*blocks_per_ne00);
-    tmp -= it * (nsamples_y*nchannels_y*ntx*blocks_per_ne00);
-    const int wt = tmp / (nchannels_y*ntx*blocks_per_ne00);
-    tmp -= wt * (nchannels_y*ntx*blocks_per_ne00);
-    const int zt = tmp / (ntx*blocks_per_ne00);
-    tmp -= zt * (ntx*blocks_per_ne00);
-    const int jt = tmp / blocks_per_ne00;
-
     if (!ids_dst) {
         const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*mmq_x*stride_col_dst + it*mmq_y;
         dst += offset_dst;
@@ -3907,7 +3913,7 @@ static __global__ void mul_mat_q_stream_k_fixup_id(
     const int col_diff = col_high - col_low;
 
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < mmq_x; j += nwarps*warp_size) {
-        ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+        ids_dst_shared[j] = jt*mmq_x + j < col_diff ? ids_dst[col_low + jt*mmq_x + j] : 0;
     }
     __syncthreads();
 

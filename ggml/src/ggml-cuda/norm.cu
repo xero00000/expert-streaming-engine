@@ -242,7 +242,6 @@ static __global__ void rms_norm_f32_nc(
     // sum up partial sums
     tmp = warp_reduce_sum(tmp);
     if constexpr (block_size > WARP_SIZE) {
-        static_assert(block_size == 1024, "unexpected block_size");
         __shared__ float s_sum[32];
         const int warp_id = threadIdx.x / WARP_SIZE;
         const int lane_id = threadIdx.x % WARP_SIZE;
@@ -250,7 +249,7 @@ static __global__ void rms_norm_f32_nc(
             s_sum[warp_id] = tmp;
         }
         __syncthreads();
-        tmp = s_sum[lane_id];
+        tmp = lane_id < block_size/WARP_SIZE ? s_sum[lane_id] : 0.0f;
         tmp = warp_reduce_sum(tmp);
     }
 
@@ -455,8 +454,12 @@ static void rms_norm_f32_nc_cuda(
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (ncols < 1024) {
-        const dim3 block_dims(WARP_SIZE, 1, 1);
-        rms_norm_f32_nc<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+        // Match contiguous rows: layout changes must preserve reduction order.
+        // A one-warp reduction rounded Q/K differently once a batch permuted
+        // their token/head axes, even with identical input values.
+        constexpr int kBlockSize = 256;
+        const dim3 block_dims(kBlockSize, 1, 1);
+        rms_norm_f32_nc<kBlockSize><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
     } else {
         const dim3 block_dims(1024, 1, 1);
         rms_norm_f32_nc<1024><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);

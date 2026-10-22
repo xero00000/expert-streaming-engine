@@ -30,6 +30,9 @@ extern "C" {
         GGML_BACKEND_BUFFER_USAGE_ANY = 0,
         GGML_BACKEND_BUFFER_USAGE_WEIGHTS = 1,
         GGML_BACKEND_BUFFER_USAGE_COMPUTE = 2,
+        // Persistent expert slots: the cache owns padding initialization and
+        // replacement. Tensor aliases must not clear another slot's payload.
+        GGML_BACKEND_BUFFER_USAGE_EXPERT_CACHE = 3,
     };
 
     GGML_API           const char *                   ggml_backend_buffer_name          (ggml_backend_buffer_t buffer);
@@ -226,6 +229,21 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_active_expert_decode(ggml_backend_sched_t sched, bool on_or_off);
     GGML_API void                 ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async);
     GGML_API void                 ggml_backend_sched_set_max_extra_alloc(ggml_backend_sched_t sched, int extra_alloc_MiB);
+
+    struct ggml_backend_sched_handoff_stats {
+        uint64_t allocated_bytes;
+        uint64_t peak_allocated_bytes;
+        uint64_t allocation_budget_bytes;
+        uint64_t allocation_failures;
+        uint64_t budget_rejections;
+    };
+    // Owner-thread queries. Borrowed buffer must not be freed or modified.
+    GGML_API ggml_backend_buffer_t ggml_backend_sched_get_handoff_buffer(ggml_backend_sched_t sched, int backend_id);
+    GGML_API bool ggml_backend_sched_get_handoff_stats(ggml_backend_sched_t sched, int backend_id,
+            struct ggml_backend_sched_handoff_stats * stats);
+    // Bounds live + replacement handoff requests; cannot lower below live use.
+    GGML_API bool ggml_backend_sched_set_handoff_budget(ggml_backend_sched_t sched, int backend_id, uint64_t bytes);
+
 
     typedef struct ggml_expert_lease ggml_backend_expert_lease;
     typedef ggml_expert_acquire_callback ggml_backend_expert_acquire_callback;

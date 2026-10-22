@@ -1,0 +1,40 @@
+{
+  "scope": "Initialized native GGUF load/context/decode and lifecycle, per-backend comparisons; not trained model quality.",
+  "results": [
+    {
+      "backend": "gpu0",
+      "public_vs_direct_max_logit_error": 0.0,
+      "prompt_replay_passes": 2,
+      "passed": true
+    },
+    {
+      "backend": "gpu1",
+      "public_vs_direct_max_logit_error": 0.0,
+      "prompt_replay_passes": 2,
+      "passed": true
+    },
+    {
+      "backend": "gpu2",
+      "public_vs_direct_max_logit_error": 0.0,
+      "prompt_replay_passes": 2,
+      "passed": true
+    },
+    {
+      "backend": "asan",
+      "public_vs_direct_max_logit_error": 0.0,
+      "prompt_replay_passes": 2,
+      "passed": true
+    }
+  ],
+  "cpu_ctest_v41": 15,
+  "cpu_expert_cache": "passed",
+  "cuda_expert_cache": "passed",
+  "initial_cross_backend_synthetic_logit_difference": 0.0597856641,
+  "ordinary_kv_tensors": "asserted absent",
+  "remaining": [
+    "canonical tokenizer/assets package",
+    "trained-weight generation",
+    "ESE tuning",
+    "historical rewind and additional native state APIs"
+  ]
+}

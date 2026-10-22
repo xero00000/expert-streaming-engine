@@ -66,6 +66,7 @@ bool common_speculative_needs_checkpoint(const llama_model * model) {
 void common_speculative_checkpoint::clear() {
     valid = false;
     mode = LLAMA_SPEC_CKPT_NONE;
+    seq_id = -1;
     n_past = 0;
     sampled = LLAMA_TOKEN_NULL;
 
@@ -210,10 +211,7 @@ static int32_t common_speculative_feature_width(const common_speculative * spec)
 static void mtp_invalidate_cached_drafts(common_speculative_state_mtp & state);
 static bool common_speculative_checkpoint_save(
     common_speculative_checkpoint & ckpt,
-    llama_model * model,
     llama_context * ctx,
-    common_sampler * sampler_src,
-    const common_params_sampling & sparams,
     llama_seq_id seq_id,
     llama_pos n_past,
     llama_token sampled,
@@ -2141,12 +2139,15 @@ bool common_speculative_before_draft(
         return false;
     }
 
+    // Verification samples/accepts only the returned prefix. Its sampler is
+    // already committed when model-state recovery runs; no sampler snapshot is
+    // needed. Keep these public arguments for existing callers.
+    GGML_UNUSED(model);
+    GGML_UNUSED(sampler_src);
+    GGML_UNUSED(sparams);
     return common_speculative_checkpoint_save(
         spec->checkpoint,
-        model,
         ctx,
-        sampler_src,
-        sparams,
         seq_id,
         n_past,
         sampled,
@@ -2342,16 +2343,15 @@ bool common_speculative_commit_accepted_output(
 
 static bool common_speculative_checkpoint_save(
         common_speculative_checkpoint & ckpt,
-        llama_model * model,
         llama_context * ctx,
-        common_sampler * sampler_src,
-        const common_params_sampling & sparams,
         llama_seq_id seq_id,
         llama_pos n_past,
         llama_token sampled,
         int max_tokens,
         int ckpt_mode) {
+    if (ckpt.valid) common_speculative_checkpoint_discard(ckpt, ctx);
     ckpt.clear();
+    ckpt.seq_id = seq_id;
     ckpt.n_past = n_past;
     ckpt.sampled = sampled;
 
@@ -2363,18 +2363,9 @@ static bool common_speculative_checkpoint_save(
 
     ckpt.valid = llama_spec_ckpt_save(ctx, seq_id);
     if (!ckpt.valid) {
-        llama_spec_ckpt_discard(ctx);
+        llama_spec_ckpt_discard_seq(ctx, seq_id);
+        ckpt.clear();
         return false;
-    }
-
-    ckpt.sampler = common_sampler_init(model, sparams);
-    if (ckpt.sampler == nullptr) {
-        common_speculative_checkpoint_discard(ckpt, ctx);
-        return false;
-    }
-
-    if (sampler_src != nullptr) {
-        common_sampler_clone(sampler_src, ckpt.sampler);
     }
 
     return true;
@@ -2387,8 +2378,8 @@ const common_speculative_checkpoint * common_speculative_get_checkpoint(const co
 void common_speculative_checkpoint_discard(
         common_speculative_checkpoint & ckpt,
         llama_context * ctx) {
+    llama_spec_ckpt_discard_seq(ctx, ckpt.seq_id);
     ckpt.clear();
-    llama_spec_ckpt_discard(ctx);
 }
 
 bool common_speculative_checkpoint_restore(
@@ -2407,6 +2398,12 @@ bool common_speculative_checkpoint_restore(
         return true;
     }
 
+    if (ckpt.seq_id != seq_id) return false;
+    // common_sampler_sample_and_accept_n stops at the first rejected draft.
+    // sampler_dst therefore already includes exactly ids, including all RNG
+    // draws, adaptive updates, grammar and accept-time state. Rewinding it and
+    // accepting ids again loses sample-time state and can change later tokens.
+    GGML_UNUSED(sampler_dst);
     const int step = (int) ids.size() - 1;
     const enum llama_spec_ckpt_restore_result restore_result = llama_spec_ckpt_restore_ex(
             ctx, seq_id, ckpt.n_past, ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP ? step : 0);
@@ -2417,15 +2414,6 @@ bool common_speculative_checkpoint_restore(
     }
 
     if (restore_result == LLAMA_SPEC_CKPT_RESTORE_DIRECT) {
-        if (ckpt.sampler != nullptr && sampler_dst != nullptr) {
-            common_sampler_clone(ckpt.sampler, sampler_dst);
-        }
-        if (sampler_dst != nullptr) {
-            for (llama_token id : ids) {
-                common_sampler_accept(sampler_dst, ctx, id, true);
-            }
-        }
-
         if (common_speculative_has_target_features(spec) && !mtp_hidden_state_pre.empty()) {
             if (!common_speculative_commit_accepted_hidden_rows(
                     spec,
@@ -2445,10 +2433,6 @@ bool common_speculative_checkpoint_restore(
         LOG_DBG("%s: seq_id=%d per-step restore: step=%d (rejected %d drafts)\n",
                 __func__, (int) seq_id, step, (int) (n_draft - (ids.size() - 1)));
     } else {
-        if (ckpt.sampler != nullptr && sampler_dst != nullptr) {
-            common_sampler_clone(ckpt.sampler, sampler_dst);
-        }
-
         if (!ids.empty()) {
             const int n_re = (int) ids.size();
             std::vector<float> redecoded_hidden;
@@ -2493,12 +2477,6 @@ bool common_speculative_checkpoint_restore(
                 }
             }
             llama_batch_free(re_batch);
-
-            if (sampler_dst != nullptr) {
-                for (llama_token id : ids) {
-                    common_sampler_accept(sampler_dst, ctx, id, true);
-                }
-            }
 
             LOG_DBG("%s: seq_id=%d spec checkpoint restored: re-decoded %d tokens (rejected %d drafts)\n",
                     __func__, (int) seq_id, n_re, (int) (n_draft - (ids.size() - 1)));

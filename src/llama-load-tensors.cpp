@@ -79,6 +79,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     bool create_qwen3next_tensors(const LLM_TN & tn);
 
+    bool create_qwen4exp_tensors(const LLM_TN & tn);
+
     bool create_qwen35moe_tensors(const LLM_TN & tn);
 
     bool create_qwen35_tensors(const LLM_TN & tn);
@@ -123,6 +125,7 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     bool create_deepseek2_tensors(const LLM_TN & tn);
     bool create_deepseek4_tensors(const LLM_TN & tn);
+    bool create_deepseek41_tensors(const LLM_TN & tn);
     bool create_openpangu_tensors(const LLM_TN & tn);
 
     bool create_glm_dsa_tensors(const LLM_TN & tn);
@@ -270,6 +273,7 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
             int nmax = std::min(ml.ncmoe, n_layer);
             for (int i = 0; i < nmax; ++i) {
                 std::string pattern = "blk\\." + std::to_string(i) + "\\.ffn_(up|down|gate|gate_up)_exps\\.(weight|scale)";
+                if (model.arch == LLM_ARCH_DEEPSEEK41) pattern = "blk\\." + std::to_string(i) + "\\.ffn_(up|down|gate|gate_up)_exps(\\.(weight|scale))?$";
                 this->overrides.emplace_back(std::make_pair(std::regex(pattern), buft));
             }
         }
@@ -335,6 +339,7 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
                 int id = model.default_layer_device[i];
                 if (n_override[id] > 0) {
                     std::string pattern = "blk\\." + std::to_string(i) + "\\.(ffn_(up|down|gate|gate_up)_exps\\.weight)";
+                    if (model.arch == LLM_ARCH_DEEPSEEK41) pattern = "blk\\." + std::to_string(i) + "\\.ffn_(up|down|gate|gate_up)_exps(\\.weight)?$";
                     printf("Adding override %s=%s\n", pattern.c_str(), ggml_backend_buft_name(buft));
                     this->overrides.emplace_back(std::make_pair(std::regex(pattern), buft));
                     --n_override[id];
@@ -1634,6 +1639,167 @@ bool create_tensors_helper::create_qwen3next_tensors(const LLM_TN & tn) {
     return use_mmap_buffer;
 }
 
+bool create_tensors_helper::create_qwen4exp_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    const int64_t stream_width = n_embd * hparams.qwen4exp_hc_count;
+    const int64_t key_dim = hparams.ssm_d_state * hparams.ssm_n_group;
+    const int64_t value_dim = hparams.ssm_d_inner;
+    const int64_t recurrent_width = 2 * key_dim + value_dim;
+
+    model.tok_embd = create_tensor(
+        ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+    const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight");
+    const ggml_tensor * ple_meta = ml.require_tensor_meta(ple_name.c_str());
+    const auto & ple_weight = ml.require_weight(ple_name.c_str());
+    if (ple_meta->type != GGML_TYPE_IQ4_NL || ple_meta->ne[0] != 160 || ple_meta->ne[1] <= 0) {
+        throw std::runtime_error("qwen4exp PLE tensor must be IQ4_NL with 160 values per row");
+    }
+    const uint64_t ple_row_size = ggml_row_size(ple_meta->type, ple_meta->ne[0]);
+    const uint64_t ple_bytes = ggml_nbytes(ple_meta);
+    const llama_file & ple_file = *ml.files.at(ple_weight.idx);
+    if (ple_row_size != 90 || ple_bytes != ple_row_size * uint64_t(ple_meta->ne[1])) {
+        throw std::runtime_error("qwen4exp PLE tensor has unsupported quantized row geometry");
+    }
+    model.qwen4exp_ple_source = {
+        true,
+        ple_weight.idx,
+        llama_expert_cache::identify_file_source(ple_file.get_path(), ple_weight.idx),
+        ple_file.size(),
+        ple_weight.offs,
+        ple_bytes,
+        ple_row_size,
+        uint64_t(ple_meta->ne[1]),
+        ple_file.get_path(),
+    };
+    (void) create_tensor(
+        ctx_input, ple_name,
+        {ple_meta->ne[0], ple_meta->ne[1]}, llama_model_loader::TENSOR_SKIP);
+
+    model.output = create_tensor(
+        ctx_output, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab});
+    model.qwen4exp_hc_output_down = create_tensor(
+        ctx_output, tn(LLM_TENSOR_HC_OUTPUT_DOWN, "weight"),
+        {stream_width, hparams.qwen4exp_hc_low_rank});
+    model.qwen4exp_hc_output_norm = create_tensor(
+        ctx_output, tn(LLM_TENSOR_HC_OUTPUT_NORM, "weight"), {stream_width});
+    model.qwen4exp_hc_output_up = create_tensor(
+        ctx_output, tn(LLM_TENSOR_HC_OUTPUT_UP, "weight"),
+        {hparams.qwen4exp_hc_low_rank, stream_width});
+
+    for (int layer_index = 0; layer_index < n_layer; ++layer_index) {
+        ggml_context * ctx_layer = ctx_for_layer(layer_index);
+        ggml_context * ctx_split = ctx_for_layer_split(layer_index);
+        auto & layer = model.layers[layer_index];
+
+        if (hparams.is_recurrent(layer_index)) {
+            layer.wqkv = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_ATTN_QKV, "weight", layer_index), {n_embd, recurrent_width});
+            layer.wqkv_gate = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_ATTN_GATE, "weight", layer_index), {n_embd, value_dim});
+            layer.ssm_conv1d = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_SSM_CONV1D, "weight", layer_index),
+                {hparams.ssm_d_conv, recurrent_width});
+            layer.ssm_dt = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_SSM_DT, "bias", layer_index), {hparams.ssm_dt_rank});
+            layer.ssm_a = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_SSM_A_NOSCAN, layer_index), {hparams.ssm_dt_rank});
+            layer.ssm_alpha = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_SSM_ALPHA, "weight", layer_index), {n_embd, hparams.ssm_dt_rank});
+            layer.ssm_beta = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_SSM_BETA, "weight", layer_index), {n_embd, hparams.ssm_dt_rank});
+            layer.ssm_norm = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_SSM_NORM, "weight", layer_index), {hparams.ssm_d_state});
+            layer.ssm_out = create_tensor(ctx_split,
+                tn(LLM_TENSOR_SSM_OUT, "weight", layer_index), {value_dim, n_embd});
+        } else {
+            layer.wq = create_tensor(ctx_split,
+                tn(LLM_TENSOR_ATTN_Q, "weight", layer_index),
+                {n_embd, n_head * n_embd_head_k * 2});
+            layer.wk = create_tensor(ctx_split,
+                tn(LLM_TENSOR_ATTN_K, "weight", layer_index), {n_embd, n_embd_k_gqa});
+            layer.wv = create_tensor(ctx_split,
+                tn(LLM_TENSOR_ATTN_V, "weight", layer_index), {n_embd, n_embd_v_gqa});
+            layer.wo = create_tensor(ctx_split,
+                tn(LLM_TENSOR_ATTN_OUT, "weight", layer_index),
+                {n_head * n_embd_head_v, n_embd});
+            layer.attn_q_norm = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_ATTN_Q_NORM, "weight", layer_index), {n_embd_head_k});
+            layer.attn_k_norm = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_ATTN_K_NORM, "weight", layer_index), {n_embd_head_k});
+            layer.qwen4exp_indexer_q_proj = create_tensor(ctx_split,
+                tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", layer_index),
+                {n_embd, hparams.indexer_n_head * hparams.indexer_head_size});
+            layer.qwen4exp_indexer_k_proj = create_tensor(ctx_split,
+                tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", layer_index),
+                {n_embd, hparams.indexer_head_size});
+            layer.qwen4exp_indexer_q_norm = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", layer_index),
+                {hparams.indexer_head_size});
+            layer.qwen4exp_indexer_k_norm = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_INDEXER_K_NORM_QWEN4EXP, "weight", layer_index),
+                {hparams.indexer_head_size});
+        }
+
+        layer.ffn_gate_inp = create_tensor(ctx_layer,
+            tn(LLM_TENSOR_FFN_GATE_INP, "weight", layer_index), {n_embd, n_expert});
+        layer.ffn_gate_exps = create_tensor(ctx_split,
+            tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", layer_index), {n_embd, hparams.n_ff_exp, n_expert});
+        layer.ffn_up_exps = create_tensor(ctx_split,
+            tn(LLM_TENSOR_FFN_UP_EXPS, "weight", layer_index), {n_embd, hparams.n_ff_exp, n_expert});
+        layer.ffn_down_exps = create_tensor(ctx_split,
+            tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", layer_index), {hparams.n_ff_exp, n_embd, n_expert});
+        layer.ffn_gate_inp_shexp = create_tensor(ctx_layer,
+            tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", layer_index), {n_embd});
+        layer.ffn_gate_shexp = create_tensor(ctx_split,
+            tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", layer_index), {n_embd, hparams.n_ff_shexp});
+        layer.ffn_up_shexp = create_tensor(ctx_split,
+            tn(LLM_TENSOR_FFN_UP_SHEXP, "weight", layer_index), {n_embd, hparams.n_ff_shexp});
+        layer.ffn_down_shexp = create_tensor(ctx_split,
+            tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", layer_index), {hparams.n_ff_shexp, n_embd});
+
+        layer.qwen4exp_hc_attn_down = create_tensor(ctx_layer,
+            tn(LLM_TENSOR_HC_ATTN_DOWN_QWEN4EXP, "weight", layer_index),
+            {stream_width, hparams.qwen4exp_hc_low_rank});
+        layer.qwen4exp_hc_attn_norm = create_tensor(ctx_layer,
+            tn(LLM_TENSOR_HC_ATTN_NORM_QWEN4EXP, "weight", layer_index), {stream_width});
+        layer.qwen4exp_hc_attn_up = create_tensor(ctx_layer,
+            tn(LLM_TENSOR_HC_ATTN_UP_QWEN4EXP, "weight", layer_index),
+            {hparams.qwen4exp_hc_low_rank, stream_width});
+        layer.qwen4exp_hc_attn_inject = create_tensor(ctx_layer,
+            tn(LLM_TENSOR_HC_ATTN_INJECT_QWEN4EXP, "weight", layer_index),
+            {stream_width, hparams.qwen4exp_hc_count});
+        layer.qwen4exp_hc_ffn_down = create_tensor(ctx_layer,
+            tn(LLM_TENSOR_HC_FFN_DOWN_QWEN4EXP, "weight", layer_index),
+            {stream_width, hparams.qwen4exp_hc_low_rank});
+        layer.qwen4exp_hc_ffn_norm = create_tensor(ctx_layer,
+            tn(LLM_TENSOR_HC_FFN_NORM_QWEN4EXP, "weight", layer_index), {stream_width});
+        layer.qwen4exp_hc_ffn_up = create_tensor(ctx_layer,
+            tn(LLM_TENSOR_HC_FFN_UP_QWEN4EXP, "weight", layer_index),
+            {hparams.qwen4exp_hc_low_rank, stream_width});
+        layer.qwen4exp_hc_ffn_inject = create_tensor(ctx_layer,
+            tn(LLM_TENSOR_HC_FFN_INJECT_QWEN4EXP, "weight", layer_index),
+            {stream_width, hparams.qwen4exp_hc_count});
+
+        if (hparams.qwen4exp_ple_layers[layer_index]) {
+            layer.qwen4exp_ple_conv = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_PLE_CONV1D, "weight", layer_index),
+                {hparams.qwen4exp_ple_conv_kernel, stream_width});
+            layer.qwen4exp_ple_key = create_tensor(ctx_split,
+                tn(LLM_TENSOR_PLE_KEY, "weight", layer_index), {n_embd, stream_width});
+            layer.qwen4exp_ple_value = create_tensor(ctx_split,
+                tn(LLM_TENSOR_PLE_VALUE, "weight", layer_index), {n_embd, n_embd});
+            layer.qwen4exp_ple_norm_query = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", layer_index), {stream_width});
+            layer.qwen4exp_ple_norm_key = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_PLE_NORM_KEY, "weight", layer_index), {stream_width});
+            layer.qwen4exp_ple_norm_conv = create_tensor(ctx_layer,
+                tn(LLM_TENSOR_PLE_NORM_CONV, "weight", layer_index), {stream_width});
+        }
+    }
+    return use_mmap_buffer;
+}
+
 bool create_tensors_helper::create_qwen35moe_tensors(const LLM_TN & tn) {
     LOADING_PRELUDE
     model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
@@ -2913,6 +3079,37 @@ bool create_tensors_helper::create_deepseek2_tensors(const LLM_TN & tn) {
             layer.ffn_down_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd});
             layer.ffn_up_shexp   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared});
         }
+    }
+    return use_mmap_buffer;
+}
+
+bool create_tensors_helper::create_deepseek41_tensors(const LLM_TN &) {
+    LOADING_PRELUDE
+    const auto metadata = deepseek_v41::bind_model_tensors(model.dsv41_config,
+        [&](const std::string & name) { return ml.get_tensor_meta(name.c_str()); });
+    for (const auto & requirement : deepseek_v41::model_tensor_requirements(model.dsv41_config)) {
+        auto found = metadata.find(requirement.name);
+        if (found == metadata.end()) continue;
+        ggml_context * target = requirement.name == "token_embd" ? ctx_input : ctx_output;
+        if (requirement.name.compare(0, 4, "blk.") == 0) {
+            const int layer = std::stoi(requirement.name.substr(4));
+            target = ctx_for_layer(layer);
+        }
+        model.dsv41_tensors[requirement.name] = create_tensor(target, ggml_get_name(found->second), requirement.shape);
+    }
+    auto get = [&](const std::string & name) { return model.dsv41_tensors.at(name); };
+    model.tok_embd = get("token_embd"); model.output_norm = get("output_norm"); model.output = get("output");
+    // Populate the common expert fields used by ESE's residency/index builder.
+    // The dedicated graph binds all other tensors by validated canonical stem.
+    for (int i = 0; i < n_layer; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        auto & layer = model.layers[i];
+        layer.ffn_gate_inp = get(p + "ffn_gate_inp"); layer.ffn_norm = get(p + "ffn_norm");
+        layer.ffn_exp_probs_b = get(p + "exp_probs_b");
+        layer.ffn_gate_exps = get(p + "ffn_gate_exps"); layer.ffn_up_exps = get(p + "ffn_up_exps");
+        layer.ffn_down_exps = get(p + "ffn_down_exps");
+        layer.ffn_gate_shexp = get(p + "ffn_gate_shexp"); layer.ffn_up_shexp = get(p + "ffn_up_shexp");
+        layer.ffn_down_shexp = get(p + "ffn_down_shexp");
     }
     return use_mmap_buffer;
 }
@@ -4996,6 +5193,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_maple_tensors(tn); break;
         case LLM_ARCH_QWEN3NEXT:
             use_mmap_buffer = create_qwen3next_tensors(tn); break;
+        case LLM_ARCH_QWEN4EXP:
+            use_mmap_buffer = create_qwen4exp_tensors(tn); break;
         case LLM_ARCH_QWEN35MOE:
             use_mmap_buffer = create_qwen35moe_tensors(tn); break;
         case LLM_ARCH_QWEN35:
@@ -5050,6 +5249,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_deepseek2_tensors(tn); break;
         case LLM_ARCH_DEEPSEEK4:
             use_mmap_buffer = create_deepseek4_tensors(tn); break;
+        case LLM_ARCH_DEEPSEEK41:
+            use_mmap_buffer = create_deepseek41_tensors(tn); break;
         case LLM_ARCH_GLM_DSA:
             use_mmap_buffer = create_glm_dsa_tensors(tn); break;
         case LLM_ARCH_OPENPANGU:

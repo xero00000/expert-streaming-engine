@@ -1824,6 +1824,27 @@ static __global__ void convert_from_bf16(const nv_bfloat16 * __restrict__ x, dst
     y[i] = __bfloat162float(x[i]);
 }
 
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
+// Keep the scalar conversion instruction, while moving four adjacent values
+// per thread with aligned vector loads/stores. This avoids spending a block
+// per 256 values when explicit F32 matrix products expand immutable weights.
+static __global__ void convert_from_bf16_f32x4(const nv_bfloat16 * __restrict__ x,
+        float * __restrict__ y, const int64_t k) {
+    const int64_t i = 4*((int64_t)blockDim.x*blockIdx.x + threadIdx.x);
+    if (i + 3 < k) {
+        const uint2 packed = *reinterpret_cast<const uint2 *>(x+i);
+        const float4 expanded = make_float4(
+                __bfloat162float(__ushort_as_bfloat16(uint16_t(packed.x))),
+                __bfloat162float(__ushort_as_bfloat16(uint16_t(packed.x >> 16))),
+                __bfloat162float(__ushort_as_bfloat16(uint16_t(packed.y))),
+                __bfloat162float(__ushort_as_bfloat16(uint16_t(packed.y >> 16))));
+        *reinterpret_cast<float4 *>(y+i) = expanded;
+    } else {
+        for (int64_t j = i; j < k; ++j) y[j] = __bfloat162float(x[j]);
+    }
+}
+#endif
+
 static __global__ void convert_to_bf16(const float * __restrict__ x, nv_bfloat16 * __restrict__ y, const int64_t k) {
     const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -1854,6 +1875,17 @@ static void convert_unary_cuda(const void * __restrict__ vx, dst_t * __restrict_
 template <typename dst_t>
 static void convert_from_bf16_cuda(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
     const int64_t k = nrows*n_per_row;
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
+    if constexpr (std::is_same_v<dst_t, float>) {
+        if (reinterpret_cast<uintptr_t>(vx)%alignof(uint2) == 0 &&
+                reinterpret_cast<uintptr_t>(y)%alignof(float4) == 0 && k > 0) {
+            const int num_blocks = (k + 4*CUDA_DEQUANTIZE_BLOCK_SIZE - 1)/(4*CUDA_DEQUANTIZE_BLOCK_SIZE);
+            convert_from_bf16_f32x4<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+                    static_cast<const nv_bfloat16 *>(vx), y, k);
+            return;
+        }
+    }
+#endif
     const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
     convert_from_bf16<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>((const nv_bfloat16 *)vx, y, k);
 }
@@ -1926,6 +1958,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q6_0:
             return dequantize_row_q6_0_cuda;
+        case GGML_TYPE_Q2_0:
+            return dequantize_block_cuda<QK2_0, 1, dequantize_q2_0>;
         case GGML_TYPE_TQ2_0:
             return dequantize_block_cuda<QK_K, 1, dequantize_tq2_0>;
         case GGML_TYPE_Q8_0:
@@ -2034,6 +2068,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q6_0:
             return dequantize_row_q6_0_cuda;
+        case GGML_TYPE_Q2_0:
+            return dequantize_block_cuda<QK2_0, 1, dequantize_q2_0>;
         case GGML_TYPE_TQ2_0:
             return dequantize_block_cuda<QK_K, 1, dequantize_tq2_0>;
         case GGML_TYPE_Q8_0:
@@ -2191,4 +2227,3 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return nullptr;
     }
 }
-

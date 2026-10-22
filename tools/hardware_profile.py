@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import math
@@ -10,6 +11,7 @@ import platform
 import re
 import subprocess
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -123,6 +125,49 @@ def _gpu_identity(capture: Callable[[Sequence[str]], str | None]) -> list[dict[s
     return sorted(devices, key=lambda device: (device["uuid"], device["pci_bus_id"]))
 
 
+def cuda_device_uuids() -> tuple[str, ...] | None:
+    """Return UUIDs in CUDA-visible ordinal order, without creating contexts.
+
+    None means discovery failed; an empty tuple means CUDA exposes no devices.
+    Let the driver interpret CUDA_VISIBLE_DEVICES and CUDA_DEVICE_ORDER,
+    including numeric indices, UUID prefixes, and invalid-index truncation.
+    """
+    try:
+        driver = ctypes.WinDLL("nvcuda.dll") if os.name == "nt" else ctypes.CDLL("libcuda.so.1")
+        init = driver.cuInit
+        init.argtypes = [ctypes.c_uint]
+        init.restype = ctypes.c_int
+        status = init(0)
+        if status == 100:  # CUDA_ERROR_NO_DEVICE
+            return ()
+        if status != 0:
+            return None
+        get_count = driver.cuDeviceGetCount
+        get_count.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        get_count.restype = ctypes.c_int
+        get_device = driver.cuDeviceGet
+        get_device.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        get_device.restype = ctypes.c_int
+        get_uuid = getattr(driver, "cuDeviceGetUuid_v2", None) or driver.cuDeviceGetUuid
+        get_uuid.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        get_uuid.restype = ctypes.c_int
+        count = ctypes.c_int()
+        if get_count(ctypes.byref(count)) != 0 or count.value < 0:
+            return None
+        result: list[str] = []
+        for ordinal in range(count.value):
+            device = ctypes.c_int()
+            raw = (ctypes.c_ubyte * 16)()
+            if get_device(ctypes.byref(device), ordinal) != 0 or get_uuid(ctypes.byref(raw), device) != 0:
+                return None
+            result.append("GPU-" + str(uuid.UUID(bytes=bytes(raw))))
+        if len(set(result)) != len(result):
+            return None
+        return tuple(result)
+    except (OSError, AttributeError):
+        return None
+
+
 def collect_hardware_identity(
     capture: Callable[[Sequence[str]], str | None] = _capture,
 ) -> dict[str, Any]:
@@ -133,6 +178,7 @@ def collect_hardware_identity(
         },
         "cpu": _cpu_topology(capture),
         "gpus": _gpu_identity(capture),
+        "cuda_devices": cuda_device_uuids(),
     }
     topology = capture(("nvidia-smi", "topo", "-m"))
     if topology:
@@ -205,6 +251,11 @@ def stale_profile_reasons(
         new_gpus = current_identity.get("gpus", [])
         if old_gpus != new_gpus:
             reasons.append("GPU, driver, PCIe identity, or device order changed")
+        # Profiles are serialized as JSON lists, while discovery returns a tuple.
+        if tuple(profile["hardware"].get("cuda_devices") or ()) != tuple(
+            current_identity.get("cuda_devices") or ()
+        ):
+            reasons.append("CUDA-visible devices or device order changed")
         if profile["hardware"].get("os") != current_identity.get("os"):
             reasons.append("operating system or kernel changed")
         if profile["hardware"].get("nvidia_topology") != current_identity.get("nvidia_topology"):

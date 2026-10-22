@@ -137,14 +137,14 @@ struct server_task {
 
 struct result_timings {
     int32_t prompt_n = -1;
-    double prompt_ms;
-    double prompt_per_token_ms;
-    double prompt_per_second;
+    double prompt_ms = 0;
+    double prompt_per_token_ms = 0;
+    double prompt_per_second = 0;
 
     int32_t predicted_n = -1;
-    double predicted_ms;
-    double predicted_per_token_ms;
-    double predicted_per_second;
+    double predicted_ms = 0;
+    double predicted_per_token_ms = 0;
+    double predicted_per_second = 0;
     int32_t n_ctx = 0;
     int32_t n_past = 0;
 
@@ -158,14 +158,16 @@ struct result_timings {
 };
 
 struct server_task_result {
+    virtual ~server_task_result() = default;
+
     int id = -1;
     int id_multi = -1;
 
     json data;
 
-    bool stop;
+    bool stop = false;
     enum stop_type termination = STOP_TYPE_NONE;
-    bool error;
+    bool error = false;
     bool final_result = false;
     result_timings timings;
     // OAI-compat fields
@@ -182,17 +184,17 @@ struct server_task_result {
     std::string content;
     std::vector<llama_token> tokens;
 
-    bool stream;
-    bool include_usage;
+    bool stream = false;
+    bool include_usage = false;
     std::string prompt;
     //slot_params generation_params;
 
-    bool truncated;
-    int32_t n_decoded;
-    int32_t n_prompt_tokens;
-    int32_t n_prompt_tokens_cache;
-    int32_t n_tokens_cached;
-    bool has_new_line;
+    bool truncated = false;
+    int32_t n_decoded = 0;
+    int32_t n_prompt_tokens = 0;
+    int32_t n_prompt_tokens_cache = 0;
+    int32_t n_tokens_cached = 0;
+    bool has_new_line = false;
     std::string stopping_word;
 
     bool post_sampling_probs = false;
@@ -340,7 +342,7 @@ struct server_task_result_embd : server_task_result {
     int index = 0;
     std::vector<std::vector<float>> embedding;
 
-    int32_t n_tokens;
+    int32_t n_tokens = 0;
 
     // OAI-compat fields
     oaicompat_type oaicompat = OAICOMPAT_TYPE_NONE;

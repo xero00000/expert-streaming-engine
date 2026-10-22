@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "evidence_sha256": "e10cdf5955daa234cd037b4a0072d9f36e1a42f0205a407d3b2101c40669a34a",
+  "date": "2026-08-26",
+  "architecture": "qwen4exp",
+  "model_tensor_inventory_sha256": "b2a4a7007fa239de1f6654700bc7506f8c54daa60f9c32dcda623edbfff372e7",
+  "trace_sha256": "302548e2a4ad224e730dcaa195572d15960cf3a6731c4dffc39a44fe3c68a4ef",
+  "cache_state": {
+    "os_page_cache": "warm; model shards were hashed and inspected before this run",
+    "ple_row_cache": "iteration 1 cold, iteration 2 warm",
+    "cold_cache_claim": false
+  },
+  "configuration": {
+    "cache_mib": 1,
+    "workers": 4,
+    "iterations": 2,
+    "tokens": 36,
+    "logical_quantized_bytes": 51840
+  },
+  "results": [
+    {
+      "backend": "pread",
+      "elapsed_ns": 16983206,
+      "tokens_per_second": 2119.7411136625205,
+      "token_latency_ns": {
+        "p50": 14740,
+        "p95": 1214631,
+        "p99": 1376642
+      },
+      "reads": {
+        "logical_reads": 248,
+        "logical_bytes": 22320,
+        "source_reads": 248,
+        "source_bytes": 22320,
+        "coalesced_reads": 0,
+        "failed_reads": 0,
+        "peak_queue_depth": 16,
+        "submit_to_ready_p50_ns": 569030,
+        "submit_to_ready_p95_ns": 964041,
+        "submit_to_ready_p99_ns": 1100261
+      },
+      "row_cache": {
+        "capacity_bytes": 1048500,
+        "resident_bytes": 22320,
+        "peak_resident_bytes": 22320,
+        "hits": 328,
+        "misses": 248,
+        "admissions": 248,
+        "evictions": 0,
+        "pinned_capacity_failures": 0
+      }
+    },
+    {
+      "backend": "mmap",
+      "elapsed_ns": 3430383,
+      "tokens_per_second": 10494.45499234342,
+      "token_latency_ns": {
+        "p50": 12190,
+        "p95": 196750,
+        "p99": 664750
+      },
+      "reads": {
+        "logical_reads": 248,
+        "logical_bytes": 22320,
+        "source_reads": 248,
+        "source_bytes": 22320,
+        "coalesced_reads": 0,
+        "failed_reads": 0,
+        "peak_queue_depth": 16,
+        "submit_to_ready_p50_ns": 45760,
+        "submit_to_ready_p95_ns": 179790,
+        "submit_to_ready_p99_ns": 334850
+      },
+      "row_cache": {
+        "capacity_bytes": 1048500,
+        "resident_bytes": 22320,
+        "peak_resident_bytes": 22320,
+        "hits": 328,
+        "misses": 248,
+        "admissions": 248,
+        "evictions": 0,
+        "pinned_capacity_failures": 0
+      }
+    }
+  ]
+}
