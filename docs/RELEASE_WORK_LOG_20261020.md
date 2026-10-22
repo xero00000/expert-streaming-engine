@@ -2280,3 +2280,28 @@ Push the consolidated review branch, retain its exact remote commit identity,
 and update the repository About copy/topics. The README becomes the default
 GitHub landing page after PR integration into `main`. The social preview PNG is
 prepared locally; it is not represented as an applied repository setting.
+
+### GitHub source push and hosted presentation verification
+
+The consolidated update and rebrand were pushed successfully to
+`origin/review/ese-consolidated-20261020`, initially at `1809c8b108df95566f4e90e866afffb1d46d50d6`.
+The repository About description and `local-ai`/`windows` topics now match the
+new presentation. GitHub accepted the existing 79.50 MiB operator-reference JSON
+fixture with a large-file advisory; no model weights or build artifacts were
+added by this presentation change.
+
+The actual pushed GitHub page was opened in an isolated browser at 1280 and
+320 pixels. Both banners loaded correctly, with the compact source selected on
+mobile. Both hosted views were visually checked. The earlier local preview
+unwraps GitHub's automatic picture-image link to use a native `picture`; the
+real hosted component was verified separately, so that local workaround is not
+being mistaken for a hosted result. Screenshots and DOM/source records are in
+`ese-github-rebrand-20261021/hosted-checks.json` and companion captures under the
+private results root.
+
+`main` is unchanged and awaits PR integration. No PR, tag, release upload or
+installer publication occurred. No hosted CI run was triggered on this review
+branch; the README badge continues to describe `main`, not this candidate.
+The social preview PNG is committed and available, but the repository's social
+preview setting was not changed. Windows GPU inference remains deferred and
+unqualified. Release publication remains paused.
