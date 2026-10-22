@@ -62,7 +62,7 @@ PC test, and shared page-cache effects must be disclosed.
 | --- | --- | --- |
 | Linux CPU AppImage/DEB/RPM | Loader/launcher, driverless small-model API and cache controls; Ubuntu/Fedora package installation | Small generated test model; no large-model CPU speed claim |
 | Linux CUDA AppImage/DEB/RPM | Native dependencies, small-model API/cache controls, NVIDIA GPU identity and package installation | Exact recorded controls; no universal model or filled-64K claim |
-| Windows MSI/NSIS | CPU executable and automatic launcher checks in CI; extracted native payloads, licenses and installer hashes | Unsigned; installer execution and Windows GPU inference remain unverified |
+| Windows MSI/NSIS | Actual installation, CPU fallback, runtime identities and short reference-output checks; signed NSIS installed-update checks | No Authenticode signatures; physical Windows GPU inference is deferred and unqualified |
 | New low-memory flagship | Pending | Publish the exact model and hardware row only after actual filled-64K and sustained checks pass |
 
 See the [launch demo](LAUNCH_DEMO.md) for the reproducible flagship record,

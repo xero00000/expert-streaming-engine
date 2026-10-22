@@ -1,447 +1,163 @@
-# Expert Streaming Engine
+<picture>
+  <source media="(max-width: 600px)" srcset="docs/brand/ese-hero-mobile.svg">
+  <img src="docs/brand/ese-hero.svg" alt="ESE — Bigger AI. The PC you already own. Put your SSD, RAM and GPU to work together." width="1280">
+</picture>
 
+# ESE · Bigger AI. The PC you already own.
+
+**Find a model. Start a conversation. Explore what your machine can do.**
+
+Expert Streaming Engine (ESE) brings local AI to a desktop app. Browse models,
+chat on your own computer, and explore larger supported models by putting your
+SSD, system memory and NVIDIA graphics cards to work together. CPU-only
+packages are available too.
+
+**[Start here →](docs/START_HERE.md)** ·
+[See the app](#meet-ese-studio) ·
+[What can my PC run?](docs/WHAT_CAN_MY_PC_RUN.md) ·
+[Downloads](https://github.com/xero00000/expert-streaming-engine/releases)
+
+[![Latest published release](https://img.shields.io/github/v/release/xero00000/expert-streaming-engine)](https://github.com/xero00000/expert-streaming-engine/releases/latest)
 [![CI](https://github.com/xero00000/expert-streaming-engine/actions/workflows/ese-ci.yml/badge.svg?branch=main)](https://github.com/xero00000/expert-streaming-engine/actions/workflows/ese-ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/xero00000/expert-streaming-engine)](https://github.com/xero00000/expert-streaming-engine/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**You shouldn’t need a new computer just to try a bigger model.**
+## Your graphics card is only part of the story
 
-Try larger local AI models on the gaming PC you already own. Expert Streaming
-Engine (ESE) uses SSD storage, RAM and NVIDIA GPUs to run sparse GGUF models
-whose weights do not fit entirely in VRAM. CPU-only runtimes are available too.
+A large AI model can take more memory than your graphics card has. ESE can keep
+supported models' specialist weights on your SSD and move the parts in use
+through RAM and GPU memory. This is called **expert streaming**.
 
-A smaller memory budget can mean more storage reads and longer waits. Your
-model, quantization, CPU, SSD and filled context determine the speed. ESE shows
-its launch plan and measured results so you can decide what is practical.
+That opens up more model choices on the hardware you already have. The tradeoff
+is speed: your model, available memory and SSD determine how quickly it can
+answer. The streaming advantage applies to supported sparse models, also called
+**Mixture of Experts (MoE)** models. Dense models use ordinary placement.
 
-[What can my PC run?](docs/WHAT_CAN_MY_PC_RUN.md) ·
-[Install ESE](docs/install.md) ·
-[Reproduce the launch demo](docs/LAUNCH_DEMO.md)
+| You want to… | ESE helps you… |
+| --- | --- |
+| Try local AI without starting at a terminal | Browse a model library and chat in ESE Studio |
+| Explore models beyond your GPU's memory | Share the work across SSD, RAM and NVIDIA GPUs for supported sparse models |
+| Spend less time guessing settings | Inspect a launch plan and measure configurations on your own PC |
+| Keep local conversations on your machine | Chat with the local model server; benchmark sharing is optional and off by default |
 
-## See what a smaller memory budget can do
+## Meet ESE Studio
 
-Our launch demonstration is being qualified with **at least 64K tokens of actual
-prompt input**, followed by sustained generation. Its published record will name
-the exact model and quant, download revision, hardware, SSD, RAM/VRAM peaks,
-first-response time and generation speed. A 64K allocation with a short prompt
-will not be presented as a filled-64K result.
+Your model library, chat and tuning tools in one desktop app.
 
-**Current status:** the new low-memory flagship result is not yet qualified.
-The [demo record](docs/LAUNCH_DEMO.md) separates the test target from completed
-evidence. [Earlier engineering benchmarks](docs/ESE_BENCHMARKS.md) remain
-available with their original hardware and workload limits.
+![ESE Studio model library, showing model information and launch controls](docs/images/ese-studio-models.jpg)
 
-## Quick start
+**Find your next model.** Search the Model hub or add a folder of models you
+already own. See model sizes and memory-fit recommendations before downloading.
 
-1. Install the CPU or NVIDIA CUDA package using the instructions below.
-2. Open ESE Studio, add your GGUF model folder, and review the model’s launch plan.
-3. Use a measured configuration from the demo record, or run a configuration
-   sweep before treating a context or speed estimate as verified.
+**Talk to it locally.** Start a supported model, open Chat, and keep your
+conversation history on your computer.
 
-For the command line, start by inspecting your PC and model:
+**Find settings worth keeping.** The Config sweeper tries real launches and
+measures the results. Save a verified profile for next time.
 
-```bash
-ese doctor
-ese plan /models/model.gguf --context 65536
-ese serve /models/model.gguf --context 65536
-```
+<details>
+<summary>See the chat and configuration screens</summary>
 
-On Windows use `ese.exe` and a Windows model path. `plan` does not run inference;
-its memory and context estimates are not benchmark results.
+### Local chat
 
-**Available today:** ESE Studio and the ESE launcher on Linux/Windows x86_64,
-CPU-only runtimes, NVIDIA CUDA runtimes, and bounded expert streaming for
-supported sparse models. Exact model/quant/context combinations still need
-workload verification. Experimental Qwen4Exp inference is disabled in production
-builds; vision and MTP on that path are unsupported.
+![ESE Studio chat screen before a model is started](docs/images/ese-studio-chat.jpg)
 
-## Install ESE Studio + ESE
+### Configuration sweeper
 
-The v0.2.1 desktop installers are prepared candidates containing ESE Studio,
-the `ese` launcher and a matching native runtime. Windows packages include CUDA acceleration and a
-separate CPU runtime selected when NVIDIA GPUs are unavailable. Linux downloads
-provide separate `cpu` and `cuda` variants; CUDA requires an NVIDIA driver.
-Windows installers are unsigned; this release does not provide signed in-app
-updates. See [release notes](docs/releases/v0.2.1.md) for verified scope.
+![ESE Studio configuration sweeper](docs/images/ese-studio-config-sweeper.jpg)
 
-Publication is pending. Check the version on the
-[release page](https://github.com/xero00000/expert-streaming-engine/releases)
-before downloading; the latest published version may be earlier than this
-candidate. Use the package and checksum file for the same version.
+These are actual interface captures. The empty chat screen shows the starting
+state; it is not a generated conversation or performance demonstration.
 
-### Linux
+</details>
 
-Choose the CPU AppImage below, or the CUDA variant for NVIDIA acceleration:
+## Start here
 
-```bash
-sha256sum --check --ignore-missing SHA256SUMS
-chmod +x ESE-Studio_0.2.1_linux-x86_64_cpu.AppImage
-./ESE-Studio_0.2.1_linux-x86_64_cpu.AppImage
-```
+1. **Choose your package.** Use the [installation guide](docs/install.md) to
+   pick Windows, Linux CPU, or Linux NVIDIA CUDA.
+2. **Add a model.** Open Studio's Model hub, or add your existing GGUF model
+   folder in Models. GGUF is the model-file format ESE reads.
+3. **Start a conversation.** Review the launch plan, start the model, and open
+   Chat. Begin with a model and context size that fit your available memory.
 
-Native packages integrate with the system package manager and are updated by
-installing the next package release:
+The [beginner guide](docs/START_HERE.md) walks through your first launch and
+explains the unfamiliar terms along the way.
 
-```bash
-sudo apt install ./ESE-Studio_0.2.1_linux-x86_64_cpu.deb       # Debian / Ubuntu
-sudo dnf install ./ESE-Studio_0.2.1_linux-x86_64_cpu.rpm   # Fedora / Nobara
-```
+**Release status:** the v0.2.1 desktop installers are prepared and locally
+checked; publication is pending. The latest published release may be older.
+Always use the instructions, package and checksums for the version you download.
 
-For a user-local accelerated build from source:
+| Your system | v0.2.1 candidate package |
+| --- | --- |
+| Windows x64 | `ESE-Studio_0.2.1_windows-x64-setup.exe` or MSI; both include CPU and CUDA runtimes |
+| Linux x86_64, CPU | `ESE-Studio_0.2.1_linux-x86_64_cpu.AppImage`, DEB or RPM |
+| Linux x86_64, NVIDIA | The matching `_cuda` AppImage, DEB or RPM; compatible NVIDIA driver required |
 
-```bash
-git clone https://github.com/xero00000/expert-streaming-engine.git
-cd expert-streaming-engine
-./studio/scripts/install-local.sh
-ese doctor
-```
+Windows installation, CPU fallback and signed NSIS update checks pass locally.
+Physical Windows NVIDIA inference is deferred and remains unqualified. Windows
+installers lack Authenticode signatures; updater signatures are separate.
+[Installation and update details →](docs/install.md)
 
-The installer lists missing build dependencies and asks before installing
-them. It installs Studio under `~/.local/share/ese-studio`, and installs both
-`ese-studio` and `ese` commands under `~/.local/bin`.
+## Bigger models, with the receipts
 
-### Windows
+An earlier engineering run loaded **GPT-OSS 120B F16 — roughly 61 GiB of model
+weights — with about 18 GiB of combined GPU memory** across two NVIDIA cards,
+about 47 GiB of usable system RAM, and NVMe storage. Recorded short-context
+generation was about **11.5 tokens per second** on that machine.
 
-Download the NSIS `ESE-Studio_0.2.1_windows-x64-setup.exe` (recommended) or MSI,
-compare its SHA-256 value with `SHA256SUMS`, and run it. Studio, a
-standalone `ese.exe`, and the native server are installed together; Python is
-not required at runtime. Install updated packages manually; signed in-app updates are not provided by
-these unsigned installers.
+That is a specific historical result, with its own model and settings. It gives
+a concrete example of memory beyond the GPU; it does not predict your PC's
+speed. [See the hardware, timings and limits](docs/ESE_BENCHMARKS.md#gpt-oss-120b-f16).
 
-To build from source, open PowerShell in the repository:
+The selected experimental Flash-Next profile currently reaches about 19 tok/s
+in short diagnostic repeats. Its production admission remains disabled; it is
+not a beginner model recommendation. Long-context and extended workload checks
+are deferred. [Current candidate scope](docs/RELEASE_CANDIDATE_REVIEW_20261021.md).
 
-```powershell
-cd studio
-.\install.ps1 -Check
-.\install.ps1
-```
+## A few things to know before you download
 
-The preflight can offer to install Python, CMake, Node.js, Rust, MSVC Build
-Tools, and WebView2 through `winget`; it never installs them without consent.
+- **Model choice matters.** An estimated memory fit is a starting point; the
+  exact model, file variant and workload still need a real run. Experimental
+  Qwen4Exp text inference stays disabled in production; vision and MTP on that
+  path are unsupported.
+- **Local chat stays local.** Model searches and downloads contact Hugging Face;
+  update checks contact GitHub. External apps use their own services and
+  privacy settings. Optional sharing sends sanitized benchmark summaries,
+  never your prompts or responses.
+- **Start with the supported desktop path.** Linux and Windows x86_64 packages
+  are prepared. Linux CUDA checks cover the recorded NVIDIA hardware; Windows
+  GPU inference, AMD/Intel acceleration and macOS are not qualified by this
+  candidate. [Check your PC](docs/WHAT_CAN_MY_PC_RUN.md).
 
-## Command-line quick start
+## Prefer the command line?
 
-Requirements: Python 3.10+, CMake, a C++ compiler, and optionally an NVIDIA
-CUDA toolchain. Linux is supported directly; Windows uses the MSVC Build Tools
-and PowerShell.
+From a source checkout:
 
 ```bash
-git clone https://github.com/xero00000/expert-streaming-engine.git
-cd expert-streaming-engine
-
 ./ese doctor
-./ese build                    # auto-detect CUDA; use --backend cpu to force CPU
-./ese plan /models/model.gguf  # inspect the complete command without running it
-./ese serve /models/model.gguf
+./ese build                    # uses CUDA when available; CPU otherwise
+./ese plan /models/model.gguf  # inspect the plan
+./ese serve /models/model.gguf # start the local server
 ```
 
-On Windows, run the same workflow from PowerShell with the included launcher:
+Windows source users can use `ese.cmd`; installed Windows packages include
+`ese.exe`. See the [engineering guide](docs/ENGINEERING_GUIDE.md) for build
+requirements, policies, native controls, API access and measured results.
 
-```powershell
-.\ese.cmd doctor
-.\ese.cmd build --backend cpu
-.\ese.cmd plan C:\Models\model.gguf
-.\ese.cmd serve C:\Models\model.gguf
-```
+## Go deeper
 
-Use `--backend cuda` when the Windows CUDA toolkit and a supported NVIDIA GPU
-are available.
+[Studio guide](studio/README.md) ·
+[Profiles and tuning](docs/ESE_PROFILES.md) ·
+[Architecture](docs/ESE_ARCHITECTURE.md) ·
+[Build from source](docs/build.md) ·
+[Reference benchmarks](docs/ESE_BENCHMARKS.md) ·
+[Community benchmarks](COMMUNITY_BENCHMARKS.md) ·
+[Changelog](CHANGELOG.md) ·
+[Contributing](CONTRIBUTING.md)
 
-The server listens on `http://127.0.0.1:8080` by default. Check it with:
+If ESE helps you explore what your PC can do, star the project or share a
+reproducible result. Found a problem? [Open an issue](https://github.com/xero00000/expert-streaming-engine/issues/new/choose)
+with your model, hardware and steps to reproduce it.
 
-```bash
-curl http://127.0.0.1:8080/health
-```
-
-Split GGUFs are supported: pass any correctly named shard and ESE validates the
-complete set before launch.
-
-## ESE Studio
-
-`studio/` contains the ESE Studio desktop GUI for model discovery, ESE
-planning/serving, configurable CLI apps in embedded terminal tabs, and
-verified configuration sweeps. It is deliberately a control center rather
-than a second inference backend: every model launch still goes through ESE's
-inspectable planner and `llama-server` command. Its installer checks required
-commands and system libraries and asks before installing missing packages.
-
-Studio and ESE are versioned as one unit. From v0.1.1 onward, the packaged
-launcher/runtime is the one Studio uses; an unrelated older `ese` on `PATH`
-does not silently take precedence. The updater interface checks signed artifacts before installing them. The
-current v0.2.1 candidate is unsigned and uses manual package installation.
-
-![ESE Studio model library](docs/images/ese-studio-models.jpg)
-
-| Local chat | Configuration sweeper |
-| --- | --- |
-| ![ESE Studio local chat](docs/images/ese-studio-chat.jpg) | ![ESE Studio configuration sweeper](docs/images/ese-studio-config-sweeper.jpg) |
-
-![ESE Studio settings and signed updater](docs/images/ese-studio-settings-updates.jpg)
-
-### GUI tour
-
-The interface uses a restrained, keyboard-friendly dark layout with six main
-workspaces:
-
-| Screen | What it does |
-| --- | --- |
-| **Models** | Groups discovered GGUFs by model family, keeps each family collapsed until opened, and separates missing profiles into a collapsed unavailable section. Select a model to review its size, architecture, quantization, context, and saved launch profile. |
-| **Chat** | Provides a familiar streaming conversation view for the active local model, with stop, regenerate, clear, keyboard-send controls, and local conversation persistence. Prompts and responses stay between Studio and the local ESE endpoint. |
-| **Model hub** | Searches Hugging Face GGUF repositories, groups quantizations and split shards, recommends a hardware-appropriate download, and shows bytes transferred, speed, ETA, pause/cancel state, and resumable progress. |
-| **Apps** | Detects local agent CLIs such as Codex, Claude Code, OpenCode, Hermes, Gemini CLI, and Aider. Profiles remain editable, so advanced users can add any terminal application or custom arguments. |
-| **Config sweeper** | Runs measured Quick, Standard, or Exhaustive searches. The default objective finds the maximum safe context first and then the fastest stable KV/batch configuration at that context; advanced mode exposes selectable objectives and the full search controls. |
-| **Settings** | Manages model folders, rescans installed applications, controls the optional **Help improve ESE** upload, and shows the portable configuration location. |
-
-Launching a model or CLI app opens it inside Studio's persistent terminal
-area. Terminal tabs can be resized, expanded, collapsed, and restored without
-losing the running session. When a model is active, endpoint-aware apps receive
-its URL, API key, model identity, GGUF metadata, context, KV type, batch, and
-ubatch automatically. The GUI keeps previewed settings, live measurements,
-saved profiles, and unavailable models visually distinct so an estimate cannot
-be mistaken for verified evidence.
-
-Studio automatically discovers supported local agent CLIs from `PATH`, NVM,
-`~/.local/bin`, Cargo, Bun, and npm-global installs without replacing customized
-profiles. Endpoint-aware apps receive the active model URL, API key, model/GGUF
-identity, context, architecture, quantization, KV type, batch, and ubatch in
-their terminal environment. Hermes is additionally synchronized to the active
-`llamacpp` provider before `hermes chat` starts.
-
-The Model hub searches Hugging Face GGUF repositories, groups recognized
-quantizations and shards, and recommends the highest-quality quant that fits a
-conservative aggregate VRAM/RAM budget reported by `ese doctor`. Larger models
-remain selectable and are clearly marked for hybrid/cache or ESE streaming.
-Downloads are revision-pinned, disk-space checked, resumable, cancellable, and
-show live transferred bytes, speed, and ETA. Set `HF_TOKEN` (or
-`HUGGING_FACE_HUB_TOKEN`) in Studio's environment for gated or private models;
-tokens are never written to Studio TOML.
-
-Studio runs real health-checked completion trials, checkpoints every result,
-resumes interrupted matching sweeps, restores the previously active model, and
-can apply the verified context/KV/batch profile to future launches. Preview and
-measured states remain visibly distinct. See the [Studio guide](studio/README.md)
-and [architecture](docs/ESE_STUDIO_ARCHITECTURE.md).
-
-During first-run setup, users may optionally enable **Help improve ESE**. The
-same switch remains available in Settings and is off by default. Enabled
-installations automatically submit sanitized summaries only after verified
-sweeps. Raw submissions remain in a private collector; the public
-[community benchmark list](COMMUNITY_BENCHMARKS.md) contains grouped results
-only and suppresses groups with fewer than three samples.
-
-## How ESE manages memory
-
-The following sections describe placement, caches and implementation details.
-For choosing a first model, start with the [PC guide](docs/WHAT_CAN_MY_PC_RUN.md).
-
-### Four execution policies
-
-`auto` is recommended. ESE inspects GGUF metadata, all model shards, available
-host RAM, and current per-GPU VRAM before choosing a native policy.
-
-| Policy | Use it when | Execution path |
-| --- | --- | --- |
-| `resident` | The model fits safely in VRAM, or is dense | Normal GPU offload and native fit |
-| `hybrid` | You want static CPU/GPU MoE placement | Dense tensors on GPU; experts on CPU; optional GPU MoE tail |
-| `cache` | Sparse weights fit RAM but not VRAM | Bounded RAM leases feeding adaptive per-device VRAM caches |
-| `stream` | Sparse weights exceed the safe RAM budget | Deferred expert storage feeding the same bounded cache hierarchy |
-
-```bash
-./ese serve MODEL.gguf --policy auto
-./ese serve MODEL.gguf --policy hybrid --gpu-resident-moe 6
-./ese serve MODEL.gguf --policy cache --expert-ram-cache 4GiB
-./ese serve MODEL.gguf --policy stream --expert-storage-backend pread
-```
-
-Hardware calibration can propose a mixed CPU/GPU expert split, but ESE will not
-activate it until the exact model, hardware, and launch configuration beats the
-established path with identical deterministic output:
-
-```bash
-./ese calibrate --model MODEL.gguf
-./ese validate-hybrid MODEL.gguf --policy stream
-./ese serve MODEL.gguf --policy stream
-```
-
-On strongly heterogeneous systems where valid per-device calibration disagrees,
-advanced users can test a specific split with
-`./ese validate-hybrid MODEL.gguf --hybrid-candidate N`. The same option on
-`plan` or `serve` remains inert until that exact candidate has passing evidence;
-it cannot bypass missing or stale calibration.
-
-The validator stores no prompts or generated text. It also requires reconciled
-per-layer cache telemetry, mixed CPU/GPU routing, zero forced fallbacks, and CPU
-compute/upload timing that remains within conservative bounds of calibration.
-Its local evidence is private to the user (`0600`) and becomes stale when the
-sampled model contents, hardware topology, or performance-relevant configuration
-changes.
-
-Passing evidence also configures a one-way native serving guard. Rolling CPU and
-upload windows are checked against the calibrated bounds after transfer events
-complete; any contradiction or forced fallback permanently returns subsequent
-graphs to the established path. `GET /props` reports the live
-`expert_hybrid_guard` state and reason for ESE Studio and operators.
-
-Use `./ese plan MODEL.gguf --json` for machine-readable launcher output. Pass
-native `llama-server` options after `--`:
-
-```bash
-./ese serve MODEL.gguf -c 131072 -- --jinja --metrics
-```
-
-## Native memory controller
-
-The launcher discovers hardware and supplies limits; the native runtime makes
-the final allocation decision from real model geometry. Direct native launches
-can use the same interface:
-
-```bash
-build/bin/llama-server -m MODEL.gguf \
-  --memory-policy auto \
-  --max-ram 40GiB \
-  --reserve-vram 1GiB \
-  --min-kv-quality turbo4 \
-  --max-context 128K \
-  --metrics
-```
-
-Before accepting requests, the runtime prints one deterministic JSON plan that
-accounts for:
-
-- dense and routed-expert weights;
-- bounded expert RAM and per-device VRAM caches;
-- KV quality, context, slots, batch, and graph workspace;
-- prompt cache and disk-I/O staging;
-- MTP/draft and multimodal transient modules;
-- a safety reserve on every selected GPU.
-
-The same object is returned by `/props`; `/metrics` reports the selected
-context, planned RAM, transient capacity, and per-device headroom. Requested
-storage backends and KV quality floors fail closed instead of silently falling
-back. Plan transitions use prepare/commit/rollback semantics.
-
-## How data moves
-
-```text
-GGUF shards on NVMe
-        │
-        ▼
-checked expert descriptors ──► bounded RAM leases
-                                      │
-                                      ▼
-                              adaptive GPU caches
-                                      │
-          ┌───────────────────────────┼───────────────────────────┐
-          ▼                           ▼                           ▼
-      resident                    cache/stream                 transient
-    model tensors              routed MoE experts           MTP / mmproj
-          └───────────────────────────┬───────────────────────────┘
-                                      ▼
-                         llama-server / OpenAI API
-```
-
-Every cache has a configured capacity. Expert uploads use dedicated CUDA
-transfer streams and event-scoped readiness; in-flight leases cannot be
-evicted. Multi-GPU placement and reserves are accounted per device.
-
-## Useful commands
-
-```bash
-./ese doctor --json
-./ese build --backend cuda --clean
-./ese plan MODEL.gguf --json
-./ese serve MODEL.gguf --dry-run
-./ese serve MODEL.gguf --slots 2 -c 131072
-./ese serve MODEL.gguf --tensor-split 46,54
-./ese serve MODEL.gguf --reserve-vram 2GiB
-```
-
-Run `./ese <command> --help` for the complete stable launcher interface. The
-full native option reference remains available through
-`build/bin/llama-server --help`.
-
-## Validation status
-
-The merged desktop path is covered by Python surface tests, native release
-tests, ASAN/UBSAN lifecycle tests, CPU server builds, and model-backed CUDA
-validation.
-
-| Area | Current evidence |
-| --- | --- |
-| Expert hierarchy | mmap/pread parity, forced eviction, sanitizer coverage, and 1/2/3-GPU execution |
-| CUDA hardware | RTX 2080 SUPER (`sm_75`), RTX 3060 Ti (`sm_86`), and RTX 3080 (`sm_86`) |
-| Global controller | CPU plus real Turing+Ampere three-GPU model load with explicit 1 GiB reserves |
-| Hardware-adaptive MoE | Schema-v3 DeepSeek-V4-Flash gate measured 7.54x; model-backed one-way live revocation and `/props` status reporting |
-| Kimi Linear | Kimi Linear 48B-A3B MXFP4_MOE loads all 610 tensors; CPU/CUDA KDA parity, deterministic generation, 64K allocation, and bounded top-8 sidecar caching verified |
-| Runtime rebalancing | Occupied KV shrink/grow parity, busy-server rejection, injected migration rollback, and post-failure continuation |
-| Transient/speculation | CPU, Turing, Ampere, and model-backed image→text module swapping |
-| Turbo KV foundation | CPU/CUDA codecs, direct attention paths, lifecycle tests, and quality sweeps |
-
-Ada-or-newer runtime coverage is not claimed: suitable hardware is unavailable
-to the solo maintainer. The runtime must still fail closed rather than inventing
-a synthetic pass.
-
-The Android/QNN port remains a separate draft until it receives physical-device
-build, parity, memory, and thermal evidence. It has no supported remote branch
-or packaged runtime on `main`; see the [Android status](docs/android.md).
-
-## Reference performance
-
-On the consolidated v0.1.0 candidate, a Qwen3.6 35B-A3B MoE reached median
-throughput of 1,612.46 tok/s for 512-token prompt processing, 1,583.32 tok/s
-for 2,048-token prompt processing, and 116.59 tok/s for 128-token generation
-across an RTX 3060 Ti, RTX 2080 SUPER, and RTX 3080.
-
-The consolidated v0.1.0 candidate ran a Qwen3.5 27B Q4_K_M dense model across
-an RTX 3060 Ti, RTX 2080 SUPER, and RTX 3080. Five-run averages were 660.60
-tok/s for 512-token prompt processing, 666.03 tok/s for 2,048-token prompt
-processing, and 26.78 tok/s for 128-token generation. A live 65,536-context
-server also retained more than its declared 1 GiB reserve on every GPU.
-
-The earlier GPT-OSS 120B F16 expert-streaming record remains available: about
-139–141 tok/s warm prefill and 11.5 tok/s short-context decode on the same CPU
-class and NVMe storage. These are machine- and configuration-specific
-engineering records, not universal performance promises. See
-[reference benchmarks](docs/ESE_BENCHMARKS.md) for exact commands, model hash,
-hardware, repetition statistics, cold/warm behavior, and ablations.
-
-Kimi Linear 48B-A3B MXFP4_MOE now runs through ESE's hybrid KDA/MLA and
-sidecar-cache path. On the reference RTX 3060 Ti + RTX 3080 pair, a 65,536-token
-context allocation and deterministic 32-token decode reached 9.29 tok/s with a
-`4,22` layer split and 2 GiB expert cache per device. This was a short-prompt
-decode test, not evidence of a fully populated 64K prompt; exact results and
-the tested command are in the benchmark document.
-
-## Documentation
-
-- [Profiles and tuning](docs/ESE_PROFILES.md)
-- [Global resource controller](docs/PHASE4_GLOBAL_RESOURCE_CONTROLLER.md)
-- [Architecture and invariants](docs/ESE_ARCHITECTURE.md)
-- [ESE Studio architecture](docs/ESE_STUDIO_ARCHITECTURE.md)
-- [ESE Studio release checklist](docs/ESE_STUDIO_RELEASE_CHECKLIST.md)
-- [Expert-cache validation](docs/PHASE2_EXPERT_CACHE_VALIDATION.md)
-- [Turbo KV Phase 1 validation](docs/TURBO_KV_PHASE1_VALIDATION.md)
-- [Reference benchmarks](docs/ESE_BENCHMARKS.md)
-- [Community benchmarks](COMMUNITY_BENCHMARKS.md)
-- [Branch policy and historical lineage](docs/BRANCH_POLICY.md)
-- [Installation](docs/install.md)
-- [Native build guide](docs/build.md)
-- [Containers](docker/README.md)
-- [Android status](docs/android.md)
-- [Native parameter reference](docs/parameters.md)
-- [Changelog](CHANGELOG.md)
-- [Contributing](CONTRIBUTING.md)
-
-## Scope and lineage
-
-ESE prioritizes bounded memory, reproducibility, and correctness over a single
-best benchmark. Experimental formats remain internal until their quality and
-lifecycle gates pass. `main` is the only supported remote branch. Platform and
-research work uses focused pull-request branches and is documented as available
-only while the corresponding remote branch or immutable revision exists.
-
-ESE is MIT licensed. It derives from `ik_llama.cpp`, which derives from
-`llama.cpp`; imported work retains its original attribution and license
-notices. Windows packages also include NVIDIA CUDA redistributable DLLs under
-NVIDIA's terms; see [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) for the
-bundled components, exact license provenance, and checksums.
+ESE is MIT licensed and builds on `ik_llama.cpp` and `llama.cpp`, with their
+original attribution retained. Bundled NVIDIA components have separate terms;
+see [third-party notices](THIRD_PARTY_NOTICES.txt). [Branch policy](docs/BRANCH_POLICY.md).

@@ -1,7 +1,8 @@
 # ESE 0.2.1 candidate review — 21 October 2026
 
-Unpublished local candidate. Push, hosted CI, PR/tag creation and publication
-remain on hold. All eight packages, their source indices, checksums and updater
+Unpublished release candidate. The user subsequently authorized pushing the
+checked source update after the GitHub presentation rebrand. Release tags and
+installer publication remain paused; hosted CI has not run. All eight packages, their source indices, checksums and updater
 feeds are prepared and pass local software qualification. The user explicitly
 deferred physical Windows NVIDIA inference: it remains unqualified. The agreed
 local work list is complete, and work pauses here before release.
@@ -77,10 +78,11 @@ and remains unqualified. The spare GPUs still share IOMMU group 15 with mounted
 storage, USB and Ethernet; no passthrough or host device change was attempted.
 This decision supersedes the earlier unresolved scope question.
 
-All agreed local tasks are complete. Work pauses before release as requested.
-Push, hosted CI, PR/tag creation and release publication remain on hold until
-the user explicitly lifts that hold. No such action has occurred. Hosted
-workflow execution remains future release work and is not claimed as passed.
+All agreed local qualification tasks are complete. The user subsequently
+requested a newcomer-focused GitHub rebrand and authorized a source push. The
+consolidated review branch can be pushed under that instruction; protected
+`main` still follows the PR merge policy. Release tags and installer publication
+remain paused. Hosted workflow execution is not claimed as passed.
 Long context/concurrency runs remain deferred and production Qwen admission
 stays OFF.
 
@@ -153,5 +155,5 @@ Prepared tag message:
 > Windows NVIDIA inference and extended workload qualification are deferred;
 > experimental Qwen admission remains disabled in production builds.
 
-These are local drafts only. No PR or tag has been created; the user's
-publication hold remains active.
+These are local drafts only. No PR or tag has been created. The source-push
+authorization does not represent release tagging or installer publication.

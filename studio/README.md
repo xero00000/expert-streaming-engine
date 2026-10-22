@@ -59,7 +59,8 @@ are recognized rather than overwritten. Use `HF_TOKEN` or
 ## Linux install
 
 The AppImage, DEB and RPM packages contain both Studio and ESE, with separate
-CPU and CUDA variants. Both current v0.2.1 candidate AppImage signatures and local
+CPU and CUDA variants. New users can follow the [first conversation guide](../docs/START_HERE.md).
+Both current v0.2.1 candidate AppImage signatures and local
 installation/recovery checks pass. The candidate remains unpublished; use manual
 package updates until its public channel is enabled. See the [installation guide](../docs/install.md) for exact
 filenames and verification limits.

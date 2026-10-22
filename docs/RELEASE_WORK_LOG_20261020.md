@@ -5,9 +5,10 @@ Starting commit: `332a0af11`.
 
 Work proceeds one task at a time. Finish the task's available checks and record
 its evidence before advancing. An implementation pass does not imply package,
-hardware or release qualification. The user's publication hold
-remains active: no push, remote CI dispatch, public tag or publication until
-that hold is explicitly lifted.
+hardware or release qualification. Release publication remains paused. After
+the local candidate was prepared, the user requested a newcomer-focused GitHub
+rebrand and authorized pushing the checked update. That source-push authorization
+supersedes the earlier push hold; release tags and asset publication stay paused.
 
 GLM/expert-execution, dense-to-MoE and Android work remain on their separate
 review branches. Existing launcher CUDA worktrees and `ESE-current` stay intact.
@@ -2249,3 +2250,33 @@ Only qualification documentation changes after product freeze
 The final documentation/link and version checks pass. Work pauses before release
 as requested. No push, hosted CI dispatch, PR, tag, asset upload or publication
 has occurred. The publication hold remains active until explicitly lifted.
+
+
+### GitHub presentation follow-up — source push authorized
+
+The user requested a more welcoming, advertising-led GitHub presentation, then
+instructed **“Ok after that push the new update if its ready”**. This authorizes
+pushing the checked source update. The earlier local release pause does not
+prevent this source push; creating a release tag or publishing installers remains
+separate from it. The protected public `main` follows the PR merge policy.
+
+The README now leads with **Bigger AI. The PC you already own.**, original
+responsive banner artwork, plain-language benefits, actual Studio captures and
+a three-step start. A new beginner guide explains the first conversation; the
+former README's detailed commands, policies and historical measurements are
+retained in the engineering guide. Installation and PC guidance now reflect
+the completed Windows CPU/install/update checks while keeping physical Windows
+GPU inference explicitly deferred and unqualified. No runtime code changes.
+
+The GitHub Markdown API accepts the presentation. Desktop and 320-pixel local
+previews in light/dark surroundings pass image loading, mobile banner selection,
+page overflow, keyboard details operation and narrow 200% text reflow checks.
+The preview wrapper approximates GitHub CSS; it is not a hosted-page screenshot.
+Documentation links, release versions and remote branch checks pass. Evidence
+and preview captures are retained privately in
+`/home/xero/Desktop/test/results/ese-github-rebrand-20261021/`.
+
+Push the consolidated review branch, retain its exact remote commit identity,
+and update the repository About copy/topics. The README becomes the default
+GitHub landing page after PR integration into `main`. The social preview PNG is
+prepared locally; it is not represented as an applied repository setting.

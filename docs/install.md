@@ -4,8 +4,9 @@ ESE Studio gives you a model library, local chat and measured configuration
 sweeps. Each package includes the matching ESE launcher and native server.
 
 These instructions describe the unpublished **v0.2.1 candidate**. Six Linux
-candidate packages are checked; the complete final package set remains in progress.
-Linux AppImage updater signatures verify, and publication remains on hold.
+packages and both Windows installers are built and pass their recorded local
+software checks. AppImage and NSIS updater signatures verify; publication is
+pending. Physical Windows NVIDIA inference is deferred and remains unqualified.
 The latest public release may still be an earlier
 version. Check the version on the [GitHub release page](https://github.com/xero00000/expert-streaming-engine/releases)
 before choosing a file.
@@ -24,8 +25,9 @@ are not required to run the installed Windows application.
 ## Verify and install
 
 Download `SHA256SUMS` with your package. Check its SHA-256 before installation.
-Both Linux AppImages have verified updater signatures. Their separate CPU/CUDA
-update feeds and installation/recovery paths pass local integration checks;
+Both Linux AppImages and the Windows NSIS installer have verified updater
+signatures. The separate Linux CPU/CUDA feeds and actual AppImage/NSIS installed
+updates pass local checks;
 the public update channel has not been enabled for this candidate. Apply manual
 package updates until publication. Native DEB/RPM package-manager signing and
 Windows Authenticode are not established by an AppImage updater signature.
@@ -61,10 +63,14 @@ In PowerShell, compare the hash with the matching line in `SHA256SUMS`:
 Get-FileHash .\ESE-Studio_0.2.1_windows-x64-setup.exe -Algorithm SHA256
 ```
 
-These are the planned Windows filenames. Current-source MSI/NSIS builds,
-installation and Windows GPU inference remain pending. Earlier unsigned CI
-installers and their CPU selection checks describe older source; use the
-published release's own validation record when choosing an available installer.
+Run the setup EXE (recommended) or MSI after verifying its hash. Both actual
+candidate installers pass installation, app-local Microsoft runtime checks, CPU
+fallback and short reference-output checks. The signed NSIS installed update
+also passes local verification and startup checks. These installers do not have
+Authenticode signatures; the separate NSIS updater signature does not provide
+Windows publisher identity. Physical Windows NVIDIA inference is deferred and
+remains unqualified. See the [candidate review](RELEASE_CANDIDATE_REVIEW_20261021.md)
+for exact source, hashes and qualification scope.
 
 ## Check your PC and first model
 

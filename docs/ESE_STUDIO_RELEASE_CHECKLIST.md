@@ -157,3 +157,12 @@ requested. The publication hold is unchanged: no push, hosted CI dispatch,
 PR/tag creation or upload/publication. Hosted workflow execution has not run.
 See the [candidate review](RELEASE_CANDIDATE_REVIEW_20261021.md) for the final
 local PR/tag drafts, unchanged product source freeze and evidence.
+
+
+### Subsequent authorization — GitHub source update
+
+After requesting the newcomer-facing rebrand, the user authorized pushing the
+checked update. This supersedes the earlier source-push hold. The consolidated
+review branch can be pushed; protected `main` follows the PR merge policy.
+Release tagging and installer publication remain paused. Physical Windows GPU
+inference and long workload checks remain deferred and unqualified.
