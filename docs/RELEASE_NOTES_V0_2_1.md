@@ -1,6 +1,6 @@
 # ESE v0.2.1 release notes
 
-**Working draft — unpublished, updated 21 October 2026.** All eight final
+**Release validation record — updated 22 October 2026.** All eight final
 Linux CPU/CUDA and Windows dual-runtime packages are built, collected and tied
 to one recorded source. Local install/CPU fallback, scoped Linux inference,
 AppImage/NSIS signature verification and installed-update checks pass. Windows
@@ -8,7 +8,8 @@ packages include app-local Microsoft C++ and OpenMP runtimes. DEB/RPM updates
 use their package manager; AppImage and Windows retain signed automatic updates.
 Physical Windows NVIDIA inference is deferred by the user for this candidate
 and remains unqualified. Earlier CI and candidate records below retain their
-original scope. Work pauses before release. See the
+original scope. The user authorized merge and publication after the final
+release-log review. See the
 [current candidate review](RELEASE_CANDIDATE_REVIEW_20261021.md) for the source
 freeze, hashes, evidence and publication hold.
 
@@ -638,37 +639,17 @@ Known limitations of this candidate include:
 
 ## Performance reporting
 
-The October 21 selected Flash-Next IQ2_XS, 1M experimental launcher diagnostic
-records 13.968 / 19.841 / 19.664 tok/s across one start and three requests. The
-user accepted approximately 19 tok/s for this version, superseding the earlier
-80%-of-Strata requirement. This observation is scoped to that recorded short
-workload, not a speed floor at a filled 1M context. Further speed work and
-multi-hour context passes are deferred. See the [release work log](RELEASE_WORK_LOG_20261020.md).
-
-The launch presentation now leads with using the PC you already own. Its
-[PC guide](WHAT_CAN_MY_PC_RUN.md) separates estimates from tested configurations,
-and its [flagship demo record](LAUNCH_DEMO.md) requires actual 64K prompt fill,
-sustained generation and measured RAM/VRAM before establishing a headline.
-
-A separate private Qwen3.8 Flash Next GSQ-RCO IQ2_XS benchmark on the RTX 3060 Ti
-and RTX 3080 records 6.7273 seconds for ESE and 1.2213 seconds for Strata to
-complete 32 warm output tokens, using the same raw prompt/count and fresh
-prompt/session state. ESE is about 5.51 times slower for those configurations.
-Policies and generated continuations differ; OS page-cache state is uncontrolled.
-Both immutable CPU references pass the selected model’s 33-token numerical
-control, but it has no filled-64K qualification. These results do not resolve the
-earlier original-model 33-token failure or enable the production Qwen gate.
-They are an experimental diagnostic, not the supported launch demonstration.
-
-
-There is no current matched release benchmark proving an ESE-versus-Strata
-speed ratio. Historical diagnostic runs used different speculation, cache,
-context and batch settings, so they do not support a "10×" claim.
+The selected experimental Flash-Next IQ2_XS launcher diagnostic records
+13.968 / 19.841 / 19.664 tok/s across one start and three short requests. The
+user accepted the current approximately 19 tok/s baseline and deferred further
+speed optimization. This is a scoped diagnostic, not a production model
+recommendation or a speed floor at a filled 1M context. Extended workload checks
+remain deferred and production admission stays disabled.
 
 Cache improvements, worker counts and specialized kernels are evaluated against
-the same model and resource limits. Individual historical timings and component
-measurements remain scoped to their recorded workloads. This draft deliberately
-does not turn them into a release headline.
+the same model and resource limits. Historical timings retain their original
+workload scope. This release makes no general performance or speed-ratio claim.
+The [PC guide](WHAT_CAN_MY_PC_RUN.md) separates fit estimates from tested results.
 
 ## Compatibility and validation record
 

@@ -6,20 +6,45 @@ authoritative historical record for each tag.
 
 ## [Unreleased]
 
-## [0.2.1] - Unreleased
+## [0.2.1] - 2026-10-22
 
-- Preserve expert-cache payloads across layer-layout changes and overlap
-  independent bounded RAM-cache reads.
-- Expose optional parallel expert loading through the launcher while keeping
-  synchronous loading as the default.
-- Improve allocation accounting, failed-decode recovery and Windows CPU
-  runtime selection.
-- Prepare separate Linux CPU/CUDA packages and Windows dual-runtime installers.
-  Signing, Windows GPU/installer execution and filled-64K qualification remain
-  incomplete. Experimental Qwen inference stays disabled in production.
+### Improved
 
-See [the candidate release notes](docs/releases/v0.2.1.md) and
-[validation scope](docs/RELEASE_NOTES_V0_2_1.md).
+- Reuse compatible expert-cache payloads across layer layouts and overlap
+  independent RAM-cache reads within their configured limits.
+- Improve memory accounting, allocation-failure recovery and server request
+  handling so failed work leaves the runtime ready for the next request.
+- Refresh the GitHub introduction and add a beginner guide covering model
+  discovery, a first local conversation and basic troubleshooting.
+
+### Fixed
+
+- Bundle the Microsoft C++ and OpenMP runtime dependencies needed by Windows
+  Studio and its native servers.
+- Select the separate Windows CPU runtime when NVIDIA hardware is unavailable.
+- Keep DEB/RPM update checks with the package manager instead of offering an
+  AppImage replacement.
+- Use bounded MSI cabinets so the complete CUDA payload can be packaged.
+
+### Packaging and updates
+
+- Provide separate Linux CPU/CUDA AppImage, DEB and RPM packages, plus Windows
+  MSI and setup EXE installers containing both native runtimes.
+- Verify AppImage and NSIS updater signatures and installed-update behavior;
+  Linux update feeds preserve the installed CPU/CUDA variant.
+- Keep synchronous expert loading as the default, with bounded parallel loading
+  available through `--expert-load-workers` for advanced configurations.
+
+### Qualification
+
+- Local source checks, scoped correctness/recovery tests, Linux package
+  installation, Windows installer/CPU fallback and signed-update checks pass.
+- Physical Windows NVIDIA inference and extended context/concurrency checks are
+  deferred and remain unqualified. Experimental Qwen admission stays disabled
+  in production builds. Windows installers lack Authenticode signatures.
+
+See [the release notes](docs/releases/v0.2.1.md) and
+[detailed validation scope](docs/RELEASE_NOTES_V0_2_1.md).
 
 ## [0.2.0] - 2026-08-25
 
@@ -127,7 +152,8 @@ See [the v0.1.1 release notes](docs/releases/v0.1.1.md).
 
 See [the v0.1.0 release notes](docs/releases/v0.1.0.md).
 
-[Unreleased]: https://github.com/xero00000/expert-streaming-engine/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/xero00000/expert-streaming-engine/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/xero00000/expert-streaming-engine/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/xero00000/expert-streaming-engine/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/xero00000/expert-streaming-engine/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/xero00000/expert-streaming-engine/compare/v0.1.0...v0.1.1
