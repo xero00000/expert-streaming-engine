@@ -2,7 +2,7 @@
 
 Organized, privacy-preserving results from users who enabled **Help improve ESE**. Raw submissions remain private. Groups with fewer than three verified sweeps are not published.
 
-Last updated: 2026-10-26T13:13:22.113Z
+Last updated: 2026-11-02T16:06:46.449Z
 
 | Architecture | Quant | GPU configuration | Model size | Context | KV | Batch | Average | Range | Samples |
 |---|---|---|---:|---:|---|---:|---:|---:|---:|
